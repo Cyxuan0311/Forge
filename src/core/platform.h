@@ -62,11 +62,24 @@ static inline int forge_munmap(void* addr, size_t) {
 #include <unistd.h>
 
 typedef struct stat forge_stat_t;
-#define forge_fstat fstat
-#define forge_mmap mmap
-#define forge_munmap munmap
+static inline int forge_fstat(int fd, forge_stat_t* st) {
+    return fstat(fd, st);
+}
+static inline void* forge_mmap(void* a, size_t l, int p, int f, int fd, off_t o) {
+    return mmap(a, l, p, f, fd, o);
+}
+static inline int forge_munmap(void* a, size_t l) {
+    return munmap(a, l);
+}
 #define FORGE_MAP_FAILED MAP_FAILED
-#define forge_open open
-#define forge_close close
-#define forge_read read
+// Use inline functions instead of macros to avoid conflicts with class method names
+static inline int forge_open(const char* path, int flags) {
+    return open(path, flags);
+}
+static inline int forge_close(int fd) {
+    return close(fd);
+}
+static inline ssize_t forge_read(int fd, void* buf, size_t count) {
+    return read(fd, buf, count);
+}
 #endif
