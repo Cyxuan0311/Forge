@@ -305,10 +305,12 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
                 int N_down = static_cast<int>(lw.w2()->shape()[0]);
                 auto ffn_out = std::make_shared<Tensor>(
                     DataType::FP32, std::vector<int64_t>{1, N_down}, DeviceType::CUDA);
+#ifdef USE_CUDA
                 cuda::launch_ffn_down_fused_q4_0(
                     static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
                     static_cast<const float*>(inputs[1]->data()),
                     static_cast<float*>(ffn_out->data()), K_down, N_down);
+#endif
                 return ffn_out;
             },
             dev);
@@ -347,9 +349,11 @@ int LlamaGraphBuilder::build_output_graph(ComputeGraph& graph, int hidden_idx,
                 int N = static_cast<int>(output_weight->shape()[0]);
                 auto logits = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N},
                                                        DeviceType::CUDA);
+#ifdef USE_CUDA
                 cuda::launch_output_proj_q4_0(static_cast<const float*>(inputs[0]->data()),
                                               output_weight->data(),
                                               static_cast<float*>(logits->data()), K, N);
+#endif
                 return logits;
             }
             return ops::matmul_transB(inputs[0], output_weight);

@@ -203,9 +203,11 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
             int N = static_cast<int>(output_weight->shape()[0]);
             logits = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N},
                                               DeviceType::CUDA);
+#ifdef USE_CUDA
             cuda::launch_output_proj_q4_0(static_cast<const float*>(cur_hidden->data()),
                                           output_weight->data(),
                                           static_cast<float*>(logits->data()), K, N);
+#endif
         } else {
             logits = ops::matmul_transB(cur_hidden, output_weight);
         }

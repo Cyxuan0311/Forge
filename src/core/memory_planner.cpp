@@ -60,8 +60,6 @@ size_t MemoryPlanner::estimate_output_size(const GraphNode& node,
 
     case OpType::FLASH_ATTN_GQA: {
         // Need Q shape + num_heads/head_dim from params
-        if (!node.op_params)
-            return 0;
         int num_heads = node.op_params[0];
         int head_dim = node.op_params[2];
         int64_t seq_len_q = first_input->shape()[0];

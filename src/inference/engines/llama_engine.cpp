@@ -44,6 +44,7 @@ TensorPtr LlamaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
         PERF_SCOPE("layer/qkv_proj");
         if (dev == DeviceType::CUDA && seq_len == 1 && lw.wq()->dtype() == DataType::Q4_0 &&
             lw.wk()->dtype() == DataType::Q4_0 && lw.wv()->dtype() == DataType::Q4_0) {
+#ifdef USE_CUDA
             int K_proj = static_cast<int>(lw.wq()->shape()[1]);
             int N_q = static_cast<int>(lw.wq()->shape()[0]);
             int N_k = static_cast<int>(lw.wk()->shape()[0]);
@@ -77,6 +78,7 @@ TensorPtr LlamaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
                                       static_cast<const float*>(lw.bv()->data()),
                                       static_cast<float*>(v->data()), N_v);
             }
+#endif
         } else if (dev == DeviceType::CPU && seq_len == 1 && lw.wq()->dtype() == DataType::Q4_0 &&
                    lw.wk()->dtype() == DataType::Q4_0 && lw.wv()->dtype() == DataType::Q4_0) {
             int N_q = static_cast<int>(lw.wq()->shape()[0]);
@@ -212,21 +214,24 @@ TensorPtr LlamaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
                                                 DeviceType::CUDA);
             if (seq_len == 1) {
                 // Decode path: use optimized single-pass online softmax kernel
-                // (no KV expand, Q cached in shared memory, vectorized float4 access)
+#ifdef USE_CUDA
                 cuda::launch_flash_attention_gqa_decode(static_cast<const float*>(q_rope->data()),
                                                         static_cast<const float*>(k_sliced->data()),
                                                         static_cast<const float*>(v_sliced->data()),
                                                         static_cast<float*>(attn_out->data()),
                                                         total_len, num_heads, num_kv_heads,
                                                         head_dim);
+#endif
             } else {
                 // Prefill path: use generic GQA flash attention
+#ifdef USE_CUDA
                 cuda::launch_flash_attention_gqa(static_cast<const float*>(q_rope->data()),
                                                  static_cast<const float*>(k_sliced->data()),
                                                  static_cast<const float*>(v_sliced->data()),
                                                  static_cast<float*>(attn_out->data()), seq_len,
                                                  total_len, num_heads, num_kv_heads, head_dim,
                                                  true);
+#endif
             }
         } else if (dev == DeviceType::CUDA) {
             // Non-GQA: use standard flash attention
@@ -291,10 +296,12 @@ TensorPtr LlamaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
             int N_down = static_cast<int>(lw.w2()->shape()[0]);
             ffn_out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_down},
                                                DeviceType::CUDA);
+#ifdef USE_CUDA
             cuda::launch_ffn_down_fused_q4_0(static_cast<const float*>(ffn_mid->data()),
                                              lw.w2()->data(),
                                              static_cast<const float*>(hidden_after_attn->data()),
                                              static_cast<float*>(ffn_out->data()), K_down, N_down);
+#endif
         } else if (dev == DeviceType::CPU && seq_len == 1 && lw.w2()->dtype() == DataType::Q4_0) {
             ffn_out = ops::matmul_transB_fused_ffn_down_residual_q4_0(ffn_mid, lw.w2(),
                                                                       hidden_after_attn);
