@@ -1,10 +1,10 @@
-#include "nanoinfer/context.h"
-#include "nanoinfer/model.h"
-#include "nanoinfer/engine.h"
-#include "nanoinfer/engines/llama_engine.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/perf_profiler.h"
-#include "nanoinfer/backend.h"
+#include "forge/context.h"
+#include "forge/model.h"
+#include "forge/engine.h"
+#include "forge/engines/llama_engine.h"
+#include "forge/logger.h"
+#include "forge/perf_profiler.h"
+#include "forge/backend.h"
 #include <stdexcept>
 #include <cstring>
 
@@ -12,7 +12,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 InferenceContext::InferenceContext(const Model& model)
     : model_(model), params_{} {
@@ -231,4 +231,4 @@ void InferenceContext::warmup() {
     LOG_INFO("Warmup completed");
 }
 
-} // namespace nanoinfer
+} // namespace forge

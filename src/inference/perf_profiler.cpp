@@ -1,10 +1,10 @@
-#include "nanoinfer/perf_profiler.h"
+#include "forge/perf_profiler.h"
 
-namespace nanoinfer {
+namespace forge {
 
 PerfProfiler& PerfProfiler::instance() {
     static PerfProfiler profiler;
     return profiler;
 }
 
-} // namespace nanoinfer
+} // namespace forge

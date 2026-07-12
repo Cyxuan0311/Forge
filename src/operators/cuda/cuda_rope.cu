@@ -1,7 +1,7 @@
 #include "cuda_rope.h"
 #include <cmath>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 __global__ void rope_q_kernel(const float* x, float* x_out,
@@ -84,4 +84,4 @@ void launch_expand_kv(const float* kv, float* out,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

@@ -1,7 +1,7 @@
-#include "nanoinfer/weight_store.h"
-#include "nanoinfer/weight_mapper.h"
+#include "forge/weight_store.h"
+#include "forge/weight_mapper.h"
 
-namespace nanoinfer {
+namespace forge {
 
 void WeightStore::set(const std::string& name, TensorPtr tensor) {
     weights_[name] = std::move(tensor);
@@ -66,4 +66,4 @@ void WeightStore::to_device_layer(int layer_idx, DeviceType device, const std::s
     }
 }
 
-} // namespace nanoinfer
+} // namespace forge

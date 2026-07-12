@@ -1,12 +1,12 @@
-#include "nanoinfer/model_weights.h"
-#include "nanoinfer/model_config.h"
-#include "nanoinfer/arch_registry.h"
-#include "nanoinfer/weight_mapper.h"
-#include "nanoinfer/operator_matmul.h"
-#include "nanoinfer/logger.h"
+#include "forge/model_weights.h"
+#include "forge/model_config.h"
+#include "forge/arch_registry.h"
+#include "forge/weight_mapper.h"
+#include "forge/operator_matmul.h"
+#include "forge/logger.h"
 #include <chrono>
 
-namespace nanoinfer {
+namespace forge {
 
 void LayerWeights::to_device(DeviceType device) {
     for (auto& [name, t] : weights) {
@@ -125,7 +125,7 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             load_if("bv", base + ".bv");
 
             LOG_WARN("No registered weight init for arch '" + config.arch_type +
-                     "', using default GQA init. Consider registering via NANOINFER_REGISTER_WEIGHT_INIT.");
+                     "', using default GQA init. Consider registering via FORGE_REGISTER_WEIGHT_INIT.");
         }
 
         if (lw.layer_type == LayerType::FullAttention && !is_qwen35) {
@@ -159,4 +159,4 @@ void ModelWeights::move_layer_weights(int layer_idx, DeviceType target_dev) {
     layers[layer_idx].to_device(target_dev);
 }
 
-} // namespace nanoinfer
+} // namespace forge

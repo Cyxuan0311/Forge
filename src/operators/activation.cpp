@@ -1,14 +1,14 @@
-#include "nanoinfer/operator_activation.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/perf_profiler.h"
-#include "nanoinfer/op_dispatch.h"
+#include "forge/operator_activation.h"
+#include "forge/cuda_kernels.h"
+#include "forge/perf_profiler.h"
+#include "forge/op_dispatch.h"
 #include <cmath>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace ops {
 
 TensorPtr silu(const TensorPtr& x) {
@@ -120,4 +120,4 @@ __attribute__((constructor)) void register_activation_ops() {
 }
 }
 
-} // namespace nanoinfer
+} // namespace forge

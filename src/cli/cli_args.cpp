@@ -1,5 +1,5 @@
 /**
- * NanoInfer CLI - Argument parsing
+ * Forge CLI - Argument parsing
  */
 
 #include "cli_common.h"
@@ -10,7 +10,7 @@
 
 static void print_usage(const char* prog) {
     std::cout <<
-        "NanoInfer CLI - Lightweight LLM inference tool v0.5.0\n"
+        "Forge CLI - Lightweight LLM inference tool v0.5.0\n"
         "\n"
         "Usage: " << prog << " [options]\n"
         "\n"

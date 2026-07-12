@@ -1,7 +1,7 @@
-#include "nanoinfer/cuda_kernels.h"
+#include "forge/cuda_kernels.h"
 #include "cuda_common.h"
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 // ---- FP32 GEMV (M=1, decode) ----
@@ -1845,4 +1845,4 @@ void launch_qkv_fused_q4_0(const float* x,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

@@ -1,7 +1,7 @@
 #include "cuda_elementwise.h"
 #include <cmath>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 __global__ void add_bias_kernel(const float* data, const float* bias, float* out, int n) {
@@ -65,4 +65,4 @@ void launch_gelu_multiply(const float* gate, const float* up, float* out,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

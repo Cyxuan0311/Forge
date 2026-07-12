@@ -6,7 +6,7 @@
 #include <immintrin.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace cpu {
 
 #ifdef USE_AVX2
@@ -64,4 +64,4 @@ static inline float fp16_to_float_scalar(uint16_t bits) {
 }
 
 } // namespace cpu
-} // namespace nanoinfer
+} // namespace forge

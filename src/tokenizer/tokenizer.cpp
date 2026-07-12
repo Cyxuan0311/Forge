@@ -1,5 +1,5 @@
-#include "nanoinfer/tokenizer.h"
-#include "nanoinfer/logger.h"
+#include "forge/tokenizer.h"
+#include "forge/logger.h"
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -9,7 +9,7 @@
 #include <queue>
 #include <map>
 
-namespace nanoinfer {
+namespace forge {
 
 // ===== Unicode helpers =====
 
@@ -878,4 +878,4 @@ int32_t Tokenizer::token_type(int32_t id) const {
     return vocab_.token_types[id];
 }
 
-} // namespace nanoinfer
+} // namespace forge

@@ -1,7 +1,7 @@
-#include "nanoinfer/cuda_kernels.h"
+#include "forge/cuda_kernels.h"
 #include "cuda_common.h"
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 // ---- FP32 Embedding ----
@@ -350,4 +350,4 @@ void launch_embedding_q6_k(const void* q_weight, const int32_t* indices, float* 
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

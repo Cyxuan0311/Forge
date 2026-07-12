@@ -1,11 +1,11 @@
-#include "nanoinfer/backend_scheduler.h"
-#include "nanoinfer/compute_graph.h"
-#include "nanoinfer/logger.h"
+#include "forge/backend_scheduler.h"
+#include "forge/compute_graph.h"
+#include "forge/logger.h"
 #include <algorithm>
 #include <cmath>
 #include <set>
 
-namespace nanoinfer {
+namespace forge {
 
 BackendScheduler::BackendScheduler() = default;
 
@@ -221,4 +221,4 @@ SchedulingPlan BackendScheduler::schedule(const ComputeGraph& graph) {
     return plan;
 }
 
-} // namespace nanoinfer
+} // namespace forge

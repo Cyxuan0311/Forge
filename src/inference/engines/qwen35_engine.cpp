@@ -1,7 +1,7 @@
-#include "nanoinfer/engines/qwen35_engine.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/logger.h"
+#include "forge/engines/qwen35_engine.h"
+#include "forge/operators.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -27,7 +27,7 @@
 // FATAL errors always print
 #define QFATAL(fmt, ...) do { fprintf(stderr, fmt, ##__VA_ARGS__); fflush(stderr); } while(0)
 
-namespace nanoinfer {
+namespace forge {
 
 // ============================================================================
 // Engine constructor
@@ -817,4 +817,4 @@ static EngineAutoRegister _reg_qwen35("qwen35", [](Model& model, InferenceContex
 });
 }
 
-} // namespace nanoinfer
+} // namespace forge

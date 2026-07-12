@@ -1,7 +1,7 @@
-#include "nanoinfer/operator_norm.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/perf_profiler.h"
-#include "nanoinfer/op_dispatch.h"
+#include "forge/operator_norm.h"
+#include "forge/cuda_kernels.h"
+#include "forge/perf_profiler.h"
+#include "forge/op_dispatch.h"
 #include <stdexcept>
 #include <cmath>
 #include <cstring>
@@ -18,7 +18,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace ops {
 
 TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
@@ -227,4 +227,4 @@ __attribute__((constructor)) void register_norm_ops() {
 }
 }
 
-} // namespace nanoinfer
+} // namespace forge

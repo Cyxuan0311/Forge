@@ -1,8 +1,8 @@
-#include "nanoinfer/logger.h"
+#include "forge/logger.h"
 #include <cstdio>
 #include <mutex>
 
-namespace nanoinfer {
+namespace forge {
 
 static const char* level_name(LogLevel level) {
     switch (level) {
@@ -36,7 +36,7 @@ void Logger::log(LogLevel level, const std::string& msg) const {
     if (sink_) {
         sink_(level, msg);
     } else {
-        std::fprintf(stderr, "[NanoInfer %s] %s\n", level_name(level), msg.c_str());
+        std::fprintf(stderr, "[Forge %s] %s\n", level_name(level), msg.c_str());
     }
 }
 
@@ -48,4 +48,4 @@ void Logger::reset_sink() {
     sink_ = nullptr;
 }
 
-} // namespace nanoinfer
+} // namespace forge

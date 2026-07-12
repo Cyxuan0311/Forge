@@ -1,5 +1,5 @@
-#include "nanoinfer/paged_kv_cache.h"
-#include "nanoinfer/logger.h"
+#include "forge/paged_kv_cache.h"
+#include "forge/logger.h"
 #include <cstring>
 #include <algorithm>
 
@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 bool PagedKVCache::init(int num_layers, int num_kv_heads, int head_dim,
                          int max_seq_len, int block_size, int max_num_seqs,
@@ -317,4 +317,4 @@ int PagedKVCache::num_total_blocks() const {
     return static_cast<int>(layer_blocks_[0].size());
 }
 
-} // namespace nanoinfer
+} // namespace forge

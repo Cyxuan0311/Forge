@@ -10,7 +10,7 @@
 #include <immintrin.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace cpu {
 
 // Q8_K block structure (256 elements)
@@ -109,4 +109,4 @@ static inline __m128i get_scale_shuffle(int i) {
 #endif // USE_AVX2
 
 } // namespace cpu
-} // namespace nanoinfer
+} // namespace forge

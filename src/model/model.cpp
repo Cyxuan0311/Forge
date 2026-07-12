@@ -1,16 +1,16 @@
-#include "nanoinfer/model.h"
-#include "nanoinfer/ninf_model.h"
-#include "nanoinfer/gguf_model.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/types.h"
-#include "nanoinfer/operator_matmul.h"
+#include "forge/model.h"
+#include "forge/ninf_model.h"
+#include "forge/gguf_model.h"
+#include "forge/logger.h"
+#include "forge/types.h"
+#include "forge/operator_matmul.h"
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
 
-namespace nanoinfer {
+namespace forge {
 
 static TensorPtr inverse_neox_permute_rows(const TensorPtr& tensor, int num_heads, int head_dim) {
     if (!tensor || tensor->ndim() != 2) return tensor;
@@ -254,7 +254,7 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             load_if("bv", base + ".bv");
 
             LOG_WARN("No registered weight init for arch '" + config.arch_type +
-                     "', using default GQA init. Consider registering via NANOINFER_REGISTER_WEIGHT_INIT.");
+                     "', using default GQA init. Consider registering via FORGE_REGISTER_WEIGHT_INIT.");
         }
 
         // Validate required weights
@@ -379,7 +379,7 @@ ModelConfig Model::parse_config_from_gguf(ModelLoader& loader) {
     // Fallback: parse common fields for unregistered architectures
     auto cfg = parse_common_gguf_config(loader, arch);
     LOG_WARN("No registered config parser for arch '" + arch +
-             "', using default parsing. Consider registering a parser via NANOINFER_REGISTER_CONFIG_PARSER.");
+             "', using default parsing. Consider registering a parser via FORGE_REGISTER_CONFIG_PARSER.");
     return cfg;
 }
 
@@ -1168,4 +1168,4 @@ static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35",
     ArchCapability{.use_ssm = true, .use_mrope = true});
 } // anonymous namespace for arch capabilities
 
-} // namespace nanoinfer
+} // namespace forge

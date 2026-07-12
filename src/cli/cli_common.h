@@ -1,5 +1,5 @@
 /**
- * NanoInfer CLI - Shared definitions
+ * Forge CLI - Shared definitions
  */
 
 #pragma once
@@ -9,7 +9,7 @@
 #include <cstdint>
 
 // Forward declarations
-namespace nanoinfer {
+namespace forge {
 class Tokenizer;
 class InferenceContext;
 class Model;
@@ -73,10 +73,10 @@ struct ChatMessage {
     std::string content;
 };
 
-ChatTemplateType detect_template_type(const nanoinfer::Tokenizer& tokenizer);
+ChatTemplateType detect_template_type(const forge::Tokenizer& tokenizer);
 
 std::vector<int32_t> apply_chat_template(
-    const nanoinfer::Tokenizer& tokenizer,
+    const forge::Tokenizer& tokenizer,
     const std::vector<ChatMessage>& messages,
     ChatTemplateType tmpl_type,
     bool add_generation_prompt = true);
@@ -97,8 +97,8 @@ struct GenerationStats {
 // ============================================================================
 
 GenerationStats generate_streaming(
-    nanoinfer::InferenceContext& ctx,
-    const nanoinfer::Tokenizer& tokenizer,
+    forge::InferenceContext& ctx,
+    const forge::Tokenizer& tokenizer,
     const std::vector<int32_t>& prompt_tokens,
     int max_new_tokens,
     float temperature,
@@ -110,8 +110,8 @@ GenerationStats generate_streaming(
     int eos_token_id);
 
 GenerationStats generate_batch(
-    nanoinfer::InferenceContext& ctx,
-    const nanoinfer::Tokenizer& tokenizer,
+    forge::InferenceContext& ctx,
+    const forge::Tokenizer& tokenizer,
     const std::vector<int32_t>& prompt_tokens,
     int max_new_tokens,
     float temperature,
@@ -127,9 +127,9 @@ GenerationStats generate_batch(
 // ============================================================================
 
 void interactive_chat(
-    nanoinfer::Model& model,
-    nanoinfer::Tokenizer& tokenizer,
-    nanoinfer::VisionEncoder* vision,
+    forge::Model& model,
+    forge::Tokenizer& tokenizer,
+    forge::VisionEncoder* vision,
     const CliArgs& args);
 
 // ============================================================================
@@ -139,9 +139,9 @@ void interactive_chat(
 std::string format_bytes(size_t bytes);
 std::string trim(const std::string& s);
 void print_logo();
-void print_model_info(const nanoinfer::Model& model, const nanoinfer::Tokenizer& tokenizer);
-void run_benchmark(nanoinfer::InferenceContext& ctx, const nanoinfer::Tokenizer& tokenizer, int n_gpu_layers);
-std::vector<float> encode_image(nanoinfer::VisionEncoder& vision, const std::string& image_path, int& num_tokens);
+void print_model_info(const forge::Model& model, const forge::Tokenizer& tokenizer);
+void run_benchmark(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer, int n_gpu_layers);
+std::vector<float> encode_image(forge::VisionEncoder& vision, const std::string& image_path, int& num_tokens);
 
 // Global interrupt flag
 extern volatile bool g_interrupted;

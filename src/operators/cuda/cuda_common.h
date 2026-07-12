@@ -2,12 +2,12 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#if NANOINFER_USE_CUBLAS
+#if FORGE_USE_CUBLAS
 #include <cublas_v2.h>
 #endif
 #include <cstdint>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 // Thread-local scratch memory pool for temporary device allocations.
@@ -31,7 +31,7 @@ inline CudaScratchPool& scratch_pool() {
     return pool;
 }
 
-#if NANOINFER_USE_CUBLAS
+#if FORGE_USE_CUBLAS
 // Lazily-initialized cublas handle (one per process).
 inline cublasHandle_t get_cublas_handle(cudaStream_t stream = 0) {
     static cublasHandle_t handle = nullptr;
@@ -75,4 +75,4 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

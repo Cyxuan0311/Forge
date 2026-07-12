@@ -1,5 +1,5 @@
-#include "nanoinfer/ninf_model.h"
-#include "nanoinfer/logger.h"
+#include "forge/ninf_model.h"
+#include "forge/logger.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -10,7 +10,7 @@
 #include <cctype>
 #include <cstdlib>
 
-namespace nanoinfer {
+namespace forge {
 
 class MiniJson {
 public:
@@ -275,4 +275,4 @@ std::vector<int64_t> NinfModel::get_tensor_shape(const std::string& name) const 
     return tensors_[it->second].shape;
 }
 
-} // namespace nanoinfer
+} // namespace forge

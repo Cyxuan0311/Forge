@@ -1,5 +1,5 @@
-#include "nanoinfer/backend.h"
-#include "nanoinfer/logger.h"
+#include "forge/backend.h"
+#include "forge/logger.h"
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 BackendStream::~BackendStream() {
     if (backend && handle) {
@@ -384,4 +384,4 @@ std::vector<DeviceInfo> BackendManager::available_devices() {
     return devices;
 }
 
-} // namespace nanoinfer
+} // namespace forge

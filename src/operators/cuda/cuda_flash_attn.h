@@ -3,7 +3,7 @@
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 void launch_flash_attention(const float* Q, const float* K, const float* V, float* O,
@@ -19,4 +19,4 @@ void launch_flash_attention_gqa_decode(const float* Q, const float* K, const flo
                                        int head_dim, cudaStream_t stream = 0);
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

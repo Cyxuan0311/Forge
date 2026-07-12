@@ -1,8 +1,8 @@
-#include "nanoinfer/generator.h"
-#include "nanoinfer/engine.h"
-#include "nanoinfer/engines/llama_engine.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/generator.h"
+#include "forge/engine.h"
+#include "forge/engines/llama_engine.h"
+#include "forge/logger.h"
+#include "forge/perf_profiler.h"
 #include <stdexcept>
 #include <cstring>
 #include <chrono>
@@ -11,7 +11,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(
@@ -163,4 +163,4 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     return result;
 }
 
-} // namespace nanoinfer
+} // namespace forge

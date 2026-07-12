@@ -5,7 +5,7 @@
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 void launch_gemv_transB(const float* x, const float* W, float* out,
@@ -45,4 +45,4 @@ void launch_gemv_q6_k_transB_batch(const float* x, const void* q_weight, float* 
                                    int M, int K, int N, cudaStream_t stream = 0);
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

@@ -1,7 +1,7 @@
-#include "nanoinfer/weight_mapper.h"
+#include "forge/weight_mapper.h"
 #include <unordered_map>
 
-namespace nanoinfer {
+namespace forge {
 
 // ============================================================================
 // Architecture weight name mappings
@@ -153,4 +153,4 @@ TensorPtr WeightMapper::resolve(const WeightStore& store, const WeightAlias& ali
     return nullptr;
 }
 
-} // namespace nanoinfer
+} // namespace forge

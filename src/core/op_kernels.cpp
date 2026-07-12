@@ -1,10 +1,10 @@
-#include "nanoinfer/op_dispatch.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/cuda_kernels.h"
+#include "forge/op_dispatch.h"
+#include "forge/operators.h"
+#include "forge/cuda_kernels.h"
 #include <cstring>
 #include <cmath>
 
-namespace nanoinfer {
+namespace forge {
 namespace {
 
 // ---- ADD ----
@@ -217,4 +217,4 @@ static bool register_all_kernels() {
 static bool _kernels_registered = register_all_kernels();
 
 } // anonymous namespace
-} // namespace nanoinfer
+} // namespace forge

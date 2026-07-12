@@ -1,4 +1,4 @@
-#include "nanoinfer/memory_pool.h"
+#include "forge/memory_pool.h"
 #include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 MemoryPool::MemoryPool(DeviceType device, size_t pool_size)
     : device_(device), capacity_(pool_size) {}
@@ -139,4 +139,4 @@ void MemoryPool::reset() {
     reuse_count_ = 0;
 }
 
-} // namespace nanoinfer
+} // namespace forge

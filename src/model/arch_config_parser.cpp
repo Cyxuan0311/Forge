@@ -1,8 +1,8 @@
-#include "nanoinfer/arch_registry.h"
-#include "nanoinfer/model_loader.h"
-#include "nanoinfer/logger.h"
+#include "forge/arch_registry.h"
+#include "forge/model_loader.h"
+#include "forge/logger.h"
 
-namespace nanoinfer {
+namespace forge {
 
 // ============================================================================
 // ConfigParserRegistry implementation
@@ -197,4 +197,4 @@ static ConfigParserAutoRegister _reg_cfg_falcon("falcon", [](ModelLoader& loader
 });
 
 } // anonymous namespace
-} // namespace nanoinfer
+} // namespace forge

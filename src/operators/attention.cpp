@@ -1,6 +1,6 @@
-#include "nanoinfer/operator_attention.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/operator_attention.h"
+#include "forge/cuda_kernels.h"
+#include "forge/perf_profiler.h"
 #include <cmath>
 #include <cstring>
 
@@ -16,7 +16,7 @@
 #include <omp.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace ops {
 
 #ifdef USE_AVX2
@@ -529,4 +529,4 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
 }
 
 } // namespace ops
-} // namespace nanoinfer
+} // namespace forge

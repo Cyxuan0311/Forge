@@ -1,5 +1,5 @@
 /**
- * NanoInfer CLI - Interactive chat mode
+ * Forge CLI - Interactive chat mode
  */
 
 #include "cli_common.h"
@@ -8,16 +8,16 @@
 #include <fstream>
 #include <chrono>
 
-#include "nanoinfer/model.h"
-#include "nanoinfer/tokenizer.h"
-#include "nanoinfer/context.h"
-#include "nanoinfer/engine.h"
-#include "nanoinfer/types.h"
-#include "nanoinfer/vision_encoder.h"
-#include "nanoinfer/kv_cache.h"
-#include "nanoinfer/engines/transformer_engine.h"
+#include "forge/model.h"
+#include "forge/tokenizer.h"
+#include "forge/context.h"
+#include "forge/engine.h"
+#include "forge/types.h"
+#include "forge/vision_encoder.h"
+#include "forge/kv_cache.h"
+#include "forge/engines/transformer_engine.h"
 
-using namespace nanoinfer;
+using namespace forge;
 
 void interactive_chat(
     Model& model,

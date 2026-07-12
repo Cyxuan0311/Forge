@@ -1,8 +1,8 @@
-#include "nanoinfer/cuda_kernels.h"
+#include "forge/cuda_kernels.h"
 #include "cuda_common.h"
 #include <cmath>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 // ---- RMS Norm ----
@@ -151,4 +151,4 @@ void launch_silu_multiply(const float* gate, const float* up, float* out,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

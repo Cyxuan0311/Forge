@@ -1,9 +1,9 @@
-#include "nanoinfer/engines/transformer_engine.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/perf_profiler.h"
-#include "nanoinfer/backend_scheduler.h"
+#include "forge/engines/transformer_engine.h"
+#include "forge/operators.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/perf_profiler.h"
+#include "forge/backend_scheduler.h"
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -19,7 +19,7 @@
 #include <immintrin.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
     : model_(model), ctx_(ctx), workspace_pool_(model.device()) {
@@ -348,4 +348,4 @@ TensorPtr TransformerEngine::expand_kv_heads(const TensorPtr& kv, int seq_len, i
     return expanded;
 }
 
-} // namespace nanoinfer
+} // namespace forge

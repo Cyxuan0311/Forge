@@ -3,7 +3,7 @@
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 void launch_add_bias(const float* data, const float* bias, float* out,
@@ -19,4 +19,4 @@ void launch_gelu_multiply(const float* gate, const float* up, float* out,
                            int n, cudaStream_t stream = 0);
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

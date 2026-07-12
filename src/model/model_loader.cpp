@@ -1,6 +1,6 @@
-#include "nanoinfer/model_loader.h"
+#include "forge/model_loader.h"
 
-namespace nanoinfer {
+namespace forge {
 
 ModelLoaderRegistry& ModelLoaderRegistry::instance() {
     static ModelLoaderRegistry reg;
@@ -42,4 +42,4 @@ LoaderAutoRegister::LoaderAutoRegister(const std::string& format_name, ModelLoad
     ModelLoaderRegistry::instance().register_loader(format_name, std::move(creator));
 }
 
-} // namespace nanoinfer
+} // namespace forge

@@ -1,8 +1,8 @@
-#include "nanoinfer/vision_encoder.h"
-#include "nanoinfer/model.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/vision_encoder.h"
+#include "forge/model.h"
+#include "forge/operators.h"
+#include "forge/logger.h"
+#include "forge/perf_profiler.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -14,7 +14,7 @@
 #include <omp.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 // Forward declaration
 static TensorPtr dequant_to_fp32_cpu(const TensorPtr& w);
@@ -678,4 +678,4 @@ std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int h
     return std::vector<float>(proj_data, proj_data + num_tokens * proj_dim);
 }
 
-} // namespace nanoinfer
+} // namespace forge

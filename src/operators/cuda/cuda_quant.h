@@ -5,7 +5,7 @@
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 void launch_dequant_q4_0(const void* q_data, float* out, int n, cudaStream_t stream = 0);
@@ -34,4 +34,4 @@ void launch_cublas_sgemm(const float* A, const float* B, float* C,
                          int M, int K, int N, bool transB, cudaStream_t stream = 0);
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

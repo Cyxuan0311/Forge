@@ -1,7 +1,7 @@
-#include "nanoinfer/cuda_kernels.h"
+#include "forge/cuda_kernels.h"
 #include "cuda_common.h"
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 // ---- Q4_0 Vector Dequantization ----
@@ -581,7 +581,7 @@ void launch_argmax(const float* data, int32_t* out_idx, int n, cudaStream_t stre
 void launch_cublas_sgemm(const float* A, const float* B, float* C,
                            int M, int K, int N, bool transB,
                            cudaStream_t stream) {
-#if NANOINFER_USE_CUBLAS
+#if FORGE_USE_CUBLAS
     cublasHandle_t handle = get_cublas_handle(stream);
 
     const float alpha = 1.0f;
@@ -604,4 +604,4 @@ void launch_cublas_sgemm(const float* A, const float* B, float* C,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

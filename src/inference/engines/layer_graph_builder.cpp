@@ -1,7 +1,7 @@
-#include "nanoinfer/engines/layer_graph_builder.h"
-#include "nanoinfer/logger.h"
+#include "forge/engines/layer_graph_builder.h"
+#include "forge/logger.h"
 
-namespace nanoinfer {
+namespace forge {
 
 GraphBuilderRegistry& GraphBuilderRegistry::instance() {
     static GraphBuilderRegistry reg;
@@ -32,4 +32,4 @@ GraphBuilderAutoRegister::GraphBuilderAutoRegister(const std::string& arch,
     GraphBuilderRegistry::instance().register_builder(arch, std::move(creator));
 }
 
-} // namespace nanoinfer
+} // namespace forge

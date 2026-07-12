@@ -1,9 +1,9 @@
-#include "nanoinfer/cuda_kernels.h"
+#include "forge/cuda_kernels.h"
 #include "cuda_common.h"
 #include <cmath>
 #include <cstdio>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 // ---- RoPE kernel (combined Q+K) ----
@@ -532,4 +532,4 @@ void launch_flash_attention_gqa_decode(const float* Q, const float* K, const flo
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

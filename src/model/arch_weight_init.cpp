@@ -1,8 +1,8 @@
-#include "nanoinfer/arch_registry.h"
-#include "nanoinfer/weight_store.h"
-#include "nanoinfer/logger.h"
+#include "forge/arch_registry.h"
+#include "forge/weight_store.h"
+#include "forge/logger.h"
 
-namespace nanoinfer {
+namespace forge {
 
 // ============================================================================
 // WeightInitRegistry implementation
@@ -151,4 +151,4 @@ static WeightInitAutoRegister _reg_winit_gemma("gemma", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_gemma2("gemma2", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_falcon("falcon", init_falcon_layer_weights);
 
-} // namespace nanoinfer
+} // namespace forge

@@ -1,6 +1,6 @@
 #include "cuda_common.h"
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 template <int T>
@@ -58,4 +58,4 @@ void launch_gemm_tiled(const float* A, const float* B, float* C,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

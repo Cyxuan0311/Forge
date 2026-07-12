@@ -1,13 +1,13 @@
-#include "nanoinfer/operator_rope.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/operator_rope.h"
+#include "forge/cuda_kernels.h"
+#include "forge/perf_profiler.h"
 #include <cmath>
 
 #ifdef USE_AVX2
 #include <immintrin.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace ops {
 
 TensorPtr rope(const TensorPtr& q, const TensorPtr& k, int64_t pos, float theta) {
@@ -63,4 +63,4 @@ TensorPtr rope(const TensorPtr& q, const TensorPtr& k, int64_t pos, float theta)
 }
 
 } // namespace ops
-} // namespace nanoinfer
+} // namespace forge

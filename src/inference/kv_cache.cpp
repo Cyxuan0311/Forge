@@ -1,7 +1,7 @@
-#include "nanoinfer/kv_cache.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/kv_cache.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/perf_profiler.h"
 #include <cstring>
 #include <cmath>
 
@@ -9,7 +9,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 KVCache::~KVCache() {
 #ifdef USE_CUDA
@@ -413,4 +413,4 @@ void KVCache::dequantize_layer_cuda(int layer) {
 #endif
 }
 
-} // namespace nanoinfer
+} // namespace forge

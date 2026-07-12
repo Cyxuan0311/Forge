@@ -1,11 +1,11 @@
-#include "nanoinfer/memory_planner.h"
-#include "nanoinfer/compute_graph.h"
-#include "nanoinfer/types.h"
-#include "nanoinfer/logger.h"
+#include "forge/memory_planner.h"
+#include "forge/compute_graph.h"
+#include "forge/types.h"
+#include "forge/logger.h"
 #include <algorithm>
 #include <cstring>
 
-namespace nanoinfer {
+namespace forge {
 
 size_t MemoryPlanner::estimate_output_size(const GraphNode& node,
                                             const std::vector<TensorPtr>& graph_inputs) {
@@ -268,4 +268,4 @@ GraphBuffer& GraphBuffer::operator=(GraphBuffer&& other) noexcept {
     return *this;
 }
 
-} // namespace nanoinfer
+} // namespace forge

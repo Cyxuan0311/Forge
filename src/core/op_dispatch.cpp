@@ -1,6 +1,6 @@
-#include "nanoinfer/op_dispatch.h"
+#include "forge/op_dispatch.h"
 
-namespace nanoinfer {
+namespace forge {
 
 OpDispatch& OpDispatch::instance() {
     static OpDispatch dispatch;
@@ -58,4 +58,4 @@ bool OpDispatch::can_inplace(OpType op) const {
     }
 }
 
-} // namespace nanoinfer
+} // namespace forge

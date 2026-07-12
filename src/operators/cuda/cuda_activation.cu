@@ -1,7 +1,7 @@
 #include "cuda_activation.h"
 #include <cmath>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 __global__ void silu_kernel(const float* x, float* out, int n) {
@@ -66,4 +66,4 @@ void launch_tanh(const float* x, float* out, int n, cudaStream_t stream) {
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

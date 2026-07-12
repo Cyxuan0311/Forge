@@ -1,6 +1,6 @@
-#include "nanoinfer/arch_registry.h"
+#include "forge/arch_registry.h"
 
-namespace nanoinfer {
+namespace forge {
 
 ArchCapabilityRegistry& ArchCapabilityRegistry::instance() {
     static ArchCapabilityRegistry registry;
@@ -65,4 +65,4 @@ static ArchCapabilityAutoRegister _reg_cap_falcon("falcon",
     ArchCapability{.use_gqa = true, .use_neox_rope = true});
 } // anonymous namespace
 
-} // namespace nanoinfer
+} // namespace forge

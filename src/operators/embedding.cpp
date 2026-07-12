@@ -1,7 +1,7 @@
-#include "nanoinfer/operator_embedding.h"
-#include "nanoinfer/operator_matmul.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/operator_embedding.h"
+#include "forge/operator_matmul.h"
+#include "forge/cuda_kernels.h"
+#include "forge/perf_profiler.h"
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -9,7 +9,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace ops {
 
 static inline float fp16_to_fp32_embed(uint16_t bits) {
@@ -365,4 +365,4 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
 }
 
 } // namespace ops
-} // namespace nanoinfer
+} // namespace forge

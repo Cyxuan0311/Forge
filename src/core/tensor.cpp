@@ -1,5 +1,5 @@
-#include "nanoinfer/tensor.h"
-#include "nanoinfer/memory_pool.h"
+#include "forge/tensor.h"
+#include "forge/memory_pool.h"
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 Tensor::Tensor(DataType dtype, const std::vector<int64_t>& shape, DeviceType device)
     : shape_(shape), dtype_(dtype), device_(device) {
@@ -235,4 +235,4 @@ Tensor Tensor::from_buffer(void* ptr, DataType dtype, const std::vector<int64_t>
     return t;
 }
 
-} // namespace nanoinfer
+} // namespace forge

@@ -12,7 +12,7 @@
 #include <immintrin.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace cpu {
 
 // ---- FP32 GEMM (a[M,K] @ b[K,N] -> out[M,N]) ----
@@ -152,4 +152,4 @@ static void gemm_q4_0_avx2(
 #endif // USE_AVX2
 
 } // namespace cpu
-} // namespace nanoinfer
+} // namespace forge

@@ -5,7 +5,7 @@
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 void launch_rope_fp32(const float* q, const float* k, float* q_out, float* k_out,
@@ -21,4 +21,4 @@ void launch_expand_kv(const float* kv, float* out,
                       cudaStream_t stream = 0);
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

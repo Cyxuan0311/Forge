@@ -1,8 +1,8 @@
-#include "nanoinfer/engines/qwen35_graph_builder.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/logger.h"
+#include "forge/engines/qwen35_graph_builder.h"
+#include "forge/operators.h"
+#include "forge/logger.h"
 
-namespace nanoinfer {
+namespace forge {
 
 int Qwen35GraphBuilder::build_layer_graph(ComputeGraph& graph,
                                            int hidden_idx,
@@ -63,4 +63,4 @@ int Qwen35GraphBuilder::build_output_graph(ComputeGraph& graph,
 //     return std::make_unique<Qwen35GraphBuilder>();
 // });
 
-} // namespace nanoinfer
+} // namespace forge

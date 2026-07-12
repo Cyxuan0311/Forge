@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 __global__ void rms_norm_kernel(const float* x, const float* weight, float* out,
@@ -46,4 +46,4 @@ void launch_rms_norm_fp16(const void* x, const void* weight, void* out,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

@@ -1,8 +1,8 @@
-#include "nanoinfer/engine.h"
-#include "nanoinfer/model.h"
-#include "nanoinfer/logger.h"
+#include "forge/engine.h"
+#include "forge/model.h"
+#include "forge/logger.h"
 
-namespace nanoinfer {
+namespace forge {
 
 EngineRegistry& EngineRegistry::instance() {
     static EngineRegistry registry;
@@ -61,4 +61,4 @@ EngineAutoRegister::EngineAutoRegister(const std::string& arch, EngineCreator cr
     EngineRegistry::instance().register_engine(arch, std::move(creator));
 }
 
-} // namespace nanoinfer
+} // namespace forge

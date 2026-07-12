@@ -1,5 +1,5 @@
 /**
- * NanoInfer CLI - Streaming and batch generation
+ * Forge CLI - Streaming and batch generation
  */
 
 #include "cli_common.h"
@@ -8,19 +8,19 @@
 #include <cstring>
 #include <chrono>
 
-#include "nanoinfer/tokenizer.h"
-#include "nanoinfer/context.h"
-#include "nanoinfer/generator.h"
-#include "nanoinfer/sampler.h"
-#include "nanoinfer/engine.h"
-#include "nanoinfer/types.h"
-#include "nanoinfer/tensor.h"
+#include "forge/tokenizer.h"
+#include "forge/context.h"
+#include "forge/generator.h"
+#include "forge/sampler.h"
+#include "forge/engine.h"
+#include "forge/types.h"
+#include "forge/tensor.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
 
-using namespace nanoinfer;
+using namespace forge;
 
 GenerationStats generate_streaming(
     InferenceContext& ctx,

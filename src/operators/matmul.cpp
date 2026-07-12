@@ -1,8 +1,8 @@
-#include "nanoinfer/operator_matmul.h"
-#include "nanoinfer/operator_elementwise.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/operator_matmul.h"
+#include "forge/operator_elementwise.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/perf_profiler.h"
 #include "cpu_gemv.h"
 #include <stdexcept>
 #include <vector>
@@ -18,11 +18,11 @@
 #include <omp.h>
 #endif
 
-#if NANOINFER_USE_OPENBLAS
+#if FORGE_USE_OPENBLAS
 #include <cblas.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace ops {
 
 #ifdef USE_CUDA
@@ -461,7 +461,7 @@ TensorPtr matmul(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias) 
         const float* a_data = static_cast<const float*>(a->data());
         const float* b_data = static_cast<const float*>(b_fp32->data());
         float* o_data = static_cast<float*>(out->data());
-#if NANOINFER_USE_OPENBLAS
+#if FORGE_USE_OPENBLAS
         PERF_SCOPE("matmul/fp32_gemm_openblas");
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     M, N, K, 1.0f, a_data, K, b_data, N, 0.0f, o_data, N);
@@ -744,7 +744,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                     }
                 }
 #else
-#if NANOINFER_USE_OPENBLAS
+#if FORGE_USE_OPENBLAS
                 PERF_SCOPE("matmul_transB/dequant+gemm_openblas");
                 {
                     std::vector<float> b_fp32(N * K);
@@ -776,7 +776,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
 #endif
             }
         } else {
-#if NANOINFER_USE_OPENBLAS
+#if FORGE_USE_OPENBLAS
             PERF_SCOPE("matmul_transB/fp32_gemm_openblas");
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         M, N, K, 1.0f, a_data, K,
@@ -1210,4 +1210,4 @@ TensorPtr matmul_transB_fused_ffn_up_q4_0(const TensorPtr& input,
 }
 
 } // namespace ops
-} // namespace nanoinfer
+} // namespace forge

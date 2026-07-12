@@ -1,9 +1,9 @@
-#include "nanoinfer/engines/llama_graph_builder.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/op_enum.h"
-#include "nanoinfer/op_dispatch.h"
+#include "forge/engines/llama_graph_builder.h"
+#include "forge/operators.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/op_enum.h"
+#include "forge/op_dispatch.h"
 #include <cmath>
 #include <cstring>
 
@@ -11,7 +11,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 // Static helper for rope computation
 static void apply_rope_standard_cpu(const float* q_data, const float* k_data,
@@ -372,4 +372,4 @@ static GraphBuilderAutoRegister _reg_yi_gb("yi", []() -> std::unique_ptr<LayerGr
     return std::make_unique<LlamaGraphBuilder>();
 });
 
-} // namespace nanoinfer
+} // namespace forge

@@ -1,14 +1,14 @@
-#include "nanoinfer/compute_graph.h"
-#include "nanoinfer/memory_planner.h"
-#include "nanoinfer/backend.h"
-#include "nanoinfer/logger.h"
+#include "forge/compute_graph.h"
+#include "forge/memory_planner.h"
+#include "forge/backend.h"
+#include "forge/logger.h"
 #include <cstring>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 int ComputeGraph::add_input(const TensorPtr& tensor) {
     int idx = static_cast<int>(inputs_.size());
@@ -400,4 +400,4 @@ std::unique_ptr<ComputeGraph> GraphBuilder::build() {
     return graph;
 }
 
-} // namespace nanoinfer
+} // namespace forge

@@ -1,5 +1,5 @@
-#include "nanoinfer/gguf_model.h"
-#include "nanoinfer/logger.h"
+#include "forge/gguf_model.h"
+#include "forge/logger.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -15,7 +15,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 static DataType ggml_dtype_to_dtype(GgmlDType dt) {
     switch (dt) {
@@ -404,4 +404,4 @@ std::vector<int64_t> GgufModel::get_tensor_shape(const std::string& name) const 
     return tensors_[it->second].shape;
 }
 
-} // namespace nanoinfer
+} // namespace forge

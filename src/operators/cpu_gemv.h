@@ -12,7 +12,7 @@
 #include <immintrin.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace cpu {
 
 // ---- Q4_0 fused GEMV (transB layout: weight is [N, K] quantized) ----
@@ -2043,4 +2043,4 @@ static void gemv_q6_k_ffn_down_residual_avx2(
 #endif // USE_AVX2
 
 } // namespace cpu
-} // namespace nanoinfer
+} // namespace forge

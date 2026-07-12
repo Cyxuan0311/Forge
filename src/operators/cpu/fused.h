@@ -12,7 +12,7 @@
 #include <immintrin.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 namespace cpu {
 
 // ---- Fused QKV projection for Q4_0 decode ----
@@ -319,4 +319,4 @@ static void gemv_q4_K_fused_qkv_avx2(
 #endif // USE_AVX2
 
 } // namespace cpu
-} // namespace nanoinfer
+} // namespace forge

@@ -2,7 +2,7 @@
 #include "cuda_common.h"
 
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 
@@ -821,4 +821,4 @@ void launch_gemv_q6_k_transB_batch(const float* x, const void* q_weight, float* 
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

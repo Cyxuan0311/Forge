@@ -1,9 +1,9 @@
-#include "nanoinfer/engines/deepseek_graph_builder.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/op_enum.h"
-#include "nanoinfer/op_dispatch.h"
+#include "forge/engines/deepseek_graph_builder.h"
+#include "forge/operators.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/op_enum.h"
+#include "forge/op_dispatch.h"
 #include <cmath>
 #include <cstring>
 
@@ -11,7 +11,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 static void rope_q_only_cpu(const float* q_data, float* q_out,
                             int seq_len, int num_heads, int head_dim,
@@ -443,4 +443,4 @@ static GraphBuilderAutoRegister _reg_deepseek_v3_gb("deepseek_v3", []() -> std::
     return std::make_unique<DeepSeekGraphBuilder>();
 });
 
-} // namespace nanoinfer
+} // namespace forge

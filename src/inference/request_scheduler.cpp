@@ -1,7 +1,7 @@
-#include "nanoinfer/request_scheduler.h"
-#include "nanoinfer/engine.h"
-#include "nanoinfer/engines/llama_engine.h"
-#include "nanoinfer/logger.h"
+#include "forge/request_scheduler.h"
+#include "forge/engine.h"
+#include "forge/engines/llama_engine.h"
+#include "forge/logger.h"
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seqs)
     : model_(model), ctx_(model), sampler_(SamplerConfig{}), max_num_seqs_(max_num_seqs) {
@@ -262,4 +262,4 @@ void RequestScheduler::reset() {
     while (!waiting_queue_.empty()) waiting_queue_.pop();
 }
 
-} // namespace nanoinfer
+} // namespace forge

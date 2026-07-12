@@ -4,7 +4,7 @@
 #include "cuda_quant.h"
 
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 // ---- FFN Up Fused Q4_0 (shared memory, M=1, decode) ----
@@ -1027,4 +1027,4 @@ void launch_qkv_fused_q4_0(const float* x,
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

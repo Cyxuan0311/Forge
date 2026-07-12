@@ -1,4 +1,4 @@
-add_library(nanoinfer_ops STATIC
+add_library(forge_ops STATIC
     dispatch.cpp
     norm.cpp
     activation.cpp
@@ -9,7 +9,7 @@ add_library(nanoinfer_ops STATIC
     attention.cpp
 )
 if(CUDAToolkit_FOUND)
-    target_sources(nanoinfer_ops PRIVATE
+    target_sources(forge_ops PRIVATE
         cuda/cuda_rms_norm.cu
         cuda/cuda_activation.cu
         cuda/cuda_elementwise.cu
@@ -21,15 +21,15 @@ if(CUDAToolkit_FOUND)
         cuda/cuda_quant.cu
         cuda/cuda_gemm.cu
     )
-    target_include_directories(nanoinfer_ops PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
-    target_compile_definitions(nanoinfer_ops PUBLIC USE_CUDA)
-    target_compile_definitions(nanoinfer_ops PRIVATE NANOINFER_USE_CUBLAS=$<BOOL:${USE_CUBLAS}>)
-    target_link_libraries(nanoinfer_ops PUBLIC $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
+    target_include_directories(forge_ops PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(forge_ops PUBLIC USE_CUDA)
+    target_compile_definitions(forge_ops PRIVATE FORGE_USE_CUBLAS=$<BOOL:${USE_CUBLAS}>)
+    target_link_libraries(forge_ops PUBLIC $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
 endif()
-target_compile_definitions(nanoinfer_ops PRIVATE NANOINFER_USE_OPENBLAS=$<BOOL:${USE_OPENBLAS}>)
-target_include_directories(nanoinfer_ops PRIVATE ${OPENBLAS_INCLUDE_DIRS})
-target_link_libraries(nanoinfer_ops PUBLIC
-    nanoinfer_core
+target_compile_definitions(forge_ops PRIVATE FORGE_USE_OPENBLAS=$<BOOL:${USE_OPENBLAS}>)
+target_include_directories(forge_ops PRIVATE ${OPENBLAS_INCLUDE_DIRS})
+target_link_libraries(forge_ops PUBLIC
+    forge_core
     $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )

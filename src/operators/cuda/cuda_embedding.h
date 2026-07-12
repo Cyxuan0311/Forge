@@ -5,7 +5,7 @@
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 void launch_embedding_fp32(const float* weight, const int32_t* indices, float* out,
@@ -29,4 +29,4 @@ void launch_embedding_q6_k(const void* q_weight, const int32_t* indices, float* 
                            bool transposed = false, cudaStream_t stream = 0);
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

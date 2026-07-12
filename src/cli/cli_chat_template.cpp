@@ -1,12 +1,12 @@
 /**
- * NanoInfer CLI - Chat template detection and application
+ * Forge CLI - Chat template detection and application
  */
 
 #include "cli_common.h"
 
-#include "nanoinfer/tokenizer.h"
+#include "forge/tokenizer.h"
 
-using namespace nanoinfer;
+using namespace forge;
 
 ChatTemplateType detect_template_type(const Tokenizer& tokenizer) {
     if (tokenizer.token_to_id("<|im_start|>") >= 0) {

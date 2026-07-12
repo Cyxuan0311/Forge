@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cstdio>
 
-namespace nanoinfer {
+namespace forge {
 namespace cuda {
 
 template<int HEAD_DIM, int BLOCK_SIZE>
@@ -368,4 +368,4 @@ void launch_flash_attention_gqa_decode(const float* Q, const float* K, const flo
 }
 
 } // namespace cuda
-} // namespace nanoinfer
+} // namespace forge

@@ -1,7 +1,7 @@
-#include "nanoinfer/sampler.h"
-#include "nanoinfer/cuda_kernels.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/sampler.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/perf_profiler.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -15,7 +15,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace nanoinfer {
+namespace forge {
 
 Sampler::Sampler(const SamplerConfig& config) : config_(config) {
     rng_state_ = config.seed != 0 ? config.seed : 12345;
@@ -343,4 +343,4 @@ void Sampler::clear_history() {
     token_history_.clear();
 }
 
-} // namespace nanoinfer
+} // namespace forge

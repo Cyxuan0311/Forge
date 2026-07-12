@@ -1,8 +1,8 @@
 #pragma once
 
-#include "nanoinfer/tensor.h"
+#include "forge/tensor.h"
 
-namespace nanoinfer {
+namespace forge {
 namespace dispatch {
 
 enum class Backend { CPU, CUDA };
@@ -63,4 +63,4 @@ inline auto execute(const TensorPtr&, CpuFn&& cpu_fn, GpuFn&&)
 #endif
 
 } // namespace dispatch
-} // namespace nanoinfer
+} // namespace forge

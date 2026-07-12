@@ -1,36 +1,36 @@
 #pragma once
-// Shared header for NanoInfer Python bindings modules.
+// Shared header for Forge Python bindings modules.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
 
-#include "nanoinfer/tensor.h"
-#include "nanoinfer/model.h"
-#include "nanoinfer/model_loader.h"
-#include "nanoinfer/engine.h"
-#include "nanoinfer/operators.h"
-#include "nanoinfer/logger.h"
-#include "nanoinfer/engines/transformer_engine.h"
-#include "nanoinfer/engines/llama_engine.h"
-#include "nanoinfer/engines/deepseek_engine.h"
-#include "nanoinfer/ninf_model.h"
-#include "nanoinfer/gguf_model.h"
-#include "nanoinfer/generator.h"
-#include "nanoinfer/sampler.h"
-#include "nanoinfer/context.h"
-#include "nanoinfer/request_scheduler.h"
-#include "nanoinfer/paged_kv_cache.h"
-#include "nanoinfer/backend.h"
-#include "nanoinfer/compute_graph.h"
-#include "nanoinfer/tokenizer.h"
-#include "nanoinfer/vision_encoder.h"
-#include "nanoinfer/engines/qwen35_engine.h"
-#include "nanoinfer/perf_profiler.h"
+#include "forge/tensor.h"
+#include "forge/model.h"
+#include "forge/model_loader.h"
+#include "forge/engine.h"
+#include "forge/operators.h"
+#include "forge/logger.h"
+#include "forge/engines/transformer_engine.h"
+#include "forge/engines/llama_engine.h"
+#include "forge/engines/deepseek_engine.h"
+#include "forge/ninf_model.h"
+#include "forge/gguf_model.h"
+#include "forge/generator.h"
+#include "forge/sampler.h"
+#include "forge/context.h"
+#include "forge/request_scheduler.h"
+#include "forge/paged_kv_cache.h"
+#include "forge/backend.h"
+#include "forge/compute_graph.h"
+#include "forge/tokenizer.h"
+#include "forge/vision_encoder.h"
+#include "forge/engines/qwen35_engine.h"
+#include "forge/perf_profiler.h"
 
 namespace py = pybind11;
-using namespace nanoinfer;
+using namespace forge;
 
 // ---- Registration helpers ----
 
