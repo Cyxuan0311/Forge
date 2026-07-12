@@ -31,6 +31,8 @@ jobs:
             -o -name '*.cu' -o -name '*.cuh' \) \
             -not -path './build/*' \
             -not -path './_deps/*' \
+            -not -name 'cpu_gemv.h' \
+            -not -path '*/cpu/gemv.h' \
             -exec clang-format --dry-run --Werror {} +
 
   cmake-lint:

@@ -584,8 +584,9 @@ int main(int argc, char** argv) {
     double ctx_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
     double total_ms = std::chrono::duration<double, std::milli>(t5 - t0).count();
     std::cout << "Startup total: " << total_ms << " ms"
-              << " (tokenizer=" << tok_ms << "ms, model=" << model_ms << "ms, ctx=" << ctx_ms
-              << "ms)\n";
+              << " (tokenizer=" << tok_ms << "ms"
+              << ", model=" << model_ms << "ms"
+              << ", ctx=" << ctx_ms << "ms)\n";
 
     // ---- Benchmark mode ----
     if (args.bench) {
