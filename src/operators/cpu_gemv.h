@@ -1022,6 +1022,7 @@ struct block_q8_0 {
     int8_t qs[32];
 };
 
+#ifdef USE_AVX2
 static inline uint16_t fp32_to_fp16_bits(float f) {
     __m128 f32 = _mm_set_ss(f);
     __m128i f16 = _mm_cvtps_ph(f32, _MM_ROUND_NEAREST);
@@ -1174,6 +1175,7 @@ static void gemv_q4_0_transB_avx2_q8(const float* a, const uint8_t* w, float* ou
             out[n + 3] = hsum_avx2(acc3);
     }
 }
+#endif  // USE_AVX2
 
 // ---- Fused QKV projection for Q4_0 decode ----
 // Reads input vector once, computes Q + K + V outputs simultaneously.

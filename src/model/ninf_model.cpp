@@ -1,9 +1,5 @@
 #include "forge/ninf_model.h"
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "../core/platform.h"
 
 #include <algorithm>
 #include <cctype>
@@ -188,15 +184,15 @@ bool NinfModel::load(const std::string& path) {
     if (fd_ < 0)
         return false;
 
-    struct stat sb;
-    if (fstat(fd_, &sb) < 0) {
+    forge_stat_t sb;
+    if (forge_fstat(fd_, &sb) < 0) {
         close();
         return false;
     }
     mapped_size_ = static_cast<size_t>(sb.st_size);
 
-    mapped_data_ = mmap(nullptr, mapped_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    if (mapped_data_ == MAP_FAILED) {
+    mapped_data_ = forge_mmap(nullptr, mapped_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+    if (mapped_data_ == FORGE_MAP_FAILED) {
         close();
         return false;
     }
@@ -239,8 +235,8 @@ bool NinfModel::load(const std::string& path) {
 }
 
 void NinfModel::close() {
-    if (mapped_data_ && mapped_data_ != MAP_FAILED) {
-        munmap(mapped_data_, mapped_size_);
+    if (mapped_data_ && mapped_data_ != FORGE_MAP_FAILED) {
+        forge_munmap(mapped_data_, mapped_size_);
         mapped_data_ = nullptr;
     }
     if (fd_ >= 0) {

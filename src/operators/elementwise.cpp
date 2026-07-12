@@ -215,7 +215,7 @@ TensorPtr softmax(const TensorPtr& x, float temperature) {
 }  // namespace ops
 
 namespace {
-__attribute__((constructor)) void register_elementwise_ops() {
+static void register_elementwise_ops() {
     auto& dispatch = OpDispatch::instance();
 
     // ADD: inputs[0] = a, inputs[1] = b
@@ -250,6 +250,7 @@ __attribute__((constructor)) void register_elementwise_ops() {
             return ops::softmax(inputs[0], temp);
         });
 }
+static const bool _auto_register_elementwise_ops = (register_elementwise_ops(), true);
 }  // namespace
 
 }  // namespace forge

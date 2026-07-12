@@ -200,7 +200,7 @@ TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPt
 
 // OpDispatch registration
 namespace {
-__attribute__((constructor)) void register_norm_ops() {
+static void register_norm_ops() {
     auto& dispatch = OpDispatch::instance();
 
     // rms_norm: inputs[0]=x, inputs[1]=weight (optional, fallback to 1.0)
@@ -213,6 +213,7 @@ __attribute__((constructor)) void register_norm_ops() {
                 int32_t eps_bits = params[0];
                 std::memcpy(&eps, &eps_bits, sizeof(eps));
             }
+static const bool _auto_register_norm_ops = (register_norm_ops(), true);
             TensorPtr weight;
             if (inputs.size() > 1 && inputs[1]) {
                 weight = inputs[1];
@@ -235,6 +236,7 @@ __attribute__((constructor)) void register_norm_ops() {
             return ops::rms_norm(inputs[0], weight, eps);
         });
 }
+static const bool _auto_register_norm_ops = (register_norm_ops(), true);
 }  // namespace
 
 }  // namespace forge

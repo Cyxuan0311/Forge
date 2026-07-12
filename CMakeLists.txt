@@ -12,8 +12,12 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
-set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -Wno-deprecated-gpu-targets")
+if(MSVC)
+  set(CMAKE_CXX_FLAGS_RELEASE "/O2")
+else()
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
+  set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -Wno-deprecated-gpu-targets")
+endif()
 
 # Detect AVX2 support
 include(CheckCXXCompilerFlag)

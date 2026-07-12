@@ -81,7 +81,7 @@ TensorPtr gelu_tanh(const TensorPtr& x) {
 }  // namespace ops
 
 namespace {
-__attribute__((constructor)) void register_activation_ops() {
+static void register_activation_ops() {
     auto& dispatch = OpDispatch::instance();
 
     dispatch.register_kernel(OpType::SILU, DeviceType::CPU,
@@ -114,6 +114,7 @@ __attribute__((constructor)) void register_activation_ops() {
                                  return ops::gelu_tanh(inputs[0]);
                              });
 }
+static const bool _auto_register_activation_ops = (register_activation_ops(), true);
 }  // namespace
 
 }  // namespace forge
