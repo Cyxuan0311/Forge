@@ -30,21 +30,21 @@ class TestLogger:
         def capture(level, msg):
             logs.append((level, msg))
 
-        forge.Logger.set_level(forge.LogLevel.ERROR)
+        forge.Logger.set_level(forge.LogLevel.LOG_ERROR)
         forge.Logger.set_python_sink(capture)
 
         ids = np.array([1], dtype=np.int32)
         loaded_context.forward(ids)
 
         for lvl, _ in logs:
-            assert lvl <= forge.LogLevel.ERROR.value
+            assert lvl <= forge.LogLevel.LOG_ERROR.value
 
         forge.Logger.reset_sink()
         forge.Logger.set_level(forge.LogLevel.WARN)
 
     def test_log_level_enum(self):
         assert forge.LogLevel.NONE.value == 0
-        assert forge.LogLevel.ERROR.value == 1
+        assert forge.LogLevel.LOG_ERROR.value == 1
         assert forge.LogLevel.WARN.value == 2
         assert forge.LogLevel.INFO.value == 3
         assert forge.LogLevel.DEBUG.value == 4
