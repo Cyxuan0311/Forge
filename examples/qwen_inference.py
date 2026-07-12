@@ -1,7 +1,7 @@
 """
-Qwen2.5-7B-Instruct Q4_0 interactive chat using NanoInfer.
+Qwen2.5-7B-Instruct Q4_0 interactive chat using Forge.
 
-Uses NanoInfer's built-in Tokenizer loaded directly from GGUF files.
+Uses Forge's built-in Tokenizer loaded directly from GGUF files.
 No external tokenizer files or transformers dependency required.
 
 Prerequisites:
@@ -37,7 +37,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 import numpy as np
 
 MODEL_DIR = "/mnt/g/AI/Qwen2.5-7B-Instruct-GGUF"
@@ -125,7 +125,7 @@ profiling_enabled = False
 def print_cpp_profiler_summary():
     """Print the C++ PerfProfiler summary (operator-level timing)."""
     try:
-        summary = nanoinfer.profiler_summary()
+        summary = forge.profiler_summary()
         if not summary:
             return
         print("\n" + "=" * 90)
@@ -155,14 +155,14 @@ def print_full_profile():
 
 
 def load_tokenizer(model_path):
-    """Load tokenizer from GGUF file using NanoInfer's built-in Tokenizer."""
-    tok = nanoinfer.Tokenizer()
+    """Load tokenizer from GGUF file using Forge's built-in Tokenizer."""
+    tok = forge.Tokenizer()
     tok.load_from_gguf(model_path)
     return tok
 
 
 def verify_tokenizer(tokenizer, tokenizer_dir):
-    """Verify NanoInfer tokenizer against transformers reference."""
+    """Verify Forge tokenizer against transformers reference."""
     try:
         from transformers import AutoTokenizer
     except ImportError:
@@ -199,7 +199,7 @@ def verify_tokenizer(tokenizer, tokenizer_dir):
     ]
 
     print("\n" + "=" * 60)
-    print("  Tokenizer Verification: NanoInfer vs transformers")
+    print("  Tokenizer Verification: Forge vs transformers")
     print("=" * 60)
 
     encode_pass = 0
@@ -287,7 +287,7 @@ def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
     generated_tokens = []
     token_buffer = []
     decode_start = time.time()
-    debug_tokens = os.environ.get("NANOINFER_DEBUG_TOKENS", "0") == "1"
+    debug_tokens = os.environ.get("FORGE_DEBUG_TOKENS", "0") == "1"
 
     # Per-token timing for profiling
     token_times = [] if profiling_enabled else None
@@ -402,7 +402,7 @@ def interactive_chat(model, tokenizer, args):
     ctx = None
 
     print("\n" + "=" * 60)
-    print("  Qwen2.5-7B-Instruct Interactive Chat (NanoInfer)")
+    print("  Qwen2.5-7B-Instruct Interactive Chat (Forge)")
     print(f"  Device: {args.device}")
     if profiling_enabled:
         print("  Profiling: ON (Python + C++ PerfProfiler)")
@@ -436,11 +436,11 @@ def interactive_chat(model, tokenizer, args):
         elif user_input == "/profile":
             profiling_enabled = not profiling_enabled
             if profiling_enabled:
-                nanoinfer.profiler_enable()
-                nanoinfer.profiler_reset()
+                forge.profiler_enable()
+                forge.profiler_reset()
                 perf.reset()
             else:
-                nanoinfer.profiler_disable()
+                forge.profiler_disable()
             print(f"[Profiling {'enabled' if profiling_enabled else 'disabled'}]\n")
             continue
 
@@ -515,14 +515,14 @@ def interactive_chat(model, tokenizer, args):
         if profiling_enabled:
             print_full_profile()
             perf.reset()
-            nanoinfer.profiler_reset()
+            forge.profiler_reset()
 
         conversation.append({"role": "assistant", "content": assistant_text})
         print()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct inference with NanoInfer")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct inference with Forge")
     parser.add_argument("--model-path", type=str, default=None,
                         help="Path to .gguf or .ninf model file")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
@@ -568,7 +568,7 @@ def main():
         elif os.path.exists(NINF_MODEL_PATH):
             model_path = NINF_MODEL_PATH
         else:
-            print(f"No model file found. Searched:")
+            print("No model file found. Searched:")
             print(f"  {GGUF_MODEL_PATH}")
             print(f"  {NINF_MODEL_PATH}")
             print("Please specify --model-path")
@@ -594,10 +594,10 @@ def main():
         return
 
     print(f"Loading model ({'GGUF' if is_gguf else 'NINF'}) on {args.device}...")
-    nanoinfer.Logger.set_level(2 if args.verbose else 1)
+    forge.Logger.set_level(2 if args.verbose else 1)
 
     t2 = time.time()
-    model = nanoinfer.Model()
+    model = forge.Model()
     if is_gguf:
         model.load_gguf(model_path, device=args.device)
     else:
@@ -606,11 +606,11 @@ def main():
     print(f"Model loaded! [{t3-t2:.2f}s]")
 
     if profiling_enabled:
-        nanoinfer.profiler_enable()
+        forge.profiler_enable()
         if args.device == "cuda":
-            nanoinfer.profiler_set_cuda_events(True)
+            forge.profiler_set_cuda_events(True)
         else:
-            nanoinfer.profiler_set_cuda_events(False)
+            forge.profiler_set_cuda_events(False)
 
     t4 = time.time()
     ctx = model.create_context(

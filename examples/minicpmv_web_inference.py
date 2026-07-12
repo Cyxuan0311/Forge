@@ -13,7 +13,6 @@ Requirements:
 
 import sys
 import os
-import time
 import gc
 import numpy as np
 from pathlib import Path
@@ -22,7 +21,7 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "build"))
 
-import nanoinfer
+import forge
 
 # ============================================================
 # Configuration
@@ -170,7 +169,7 @@ def find_thinking_tokens(tokenizer):
                 think_end_id = tid
             if think_start_id is not None and think_end_id is not None:
                 break
-        except:
+        except Exception:
             pass
     return think_start_id, think_end_id
 
@@ -204,7 +203,7 @@ class MiniCPMVModel:
 
         # Load tokenizer
         print("Loading tokenizer...")
-        self.tokenizer = nanoinfer.Tokenizer()
+        self.tokenizer = forge.Tokenizer()
         self.tokenizer.load_from_gguf(llm_path)
         print(f"  vocab_size={self.tokenizer.vocab_size}, "
               f"bos_id={self.tokenizer.bos_token_id}, "
@@ -212,7 +211,7 @@ class MiniCPMVModel:
 
         # Load multimodal model
         print("Loading multimodal model...")
-        self.mm_model = nanoinfer.MultimodalModel()
+        self.mm_model = forge.MultimodalModel()
         try:
             self.mm_model.load_with_mmproj(llm_path, mmproj_path, self.device)
         except RuntimeError as e:
@@ -502,10 +501,10 @@ def create_web_interface(model):
         return [], ""
 
     # Build interface
-    with gr.Blocks(title="MiniCPM-V 4.6 - NanoInfer") as demo:
+    with gr.Blocks(title="MiniCPM-V 4.6 - Forge") as demo:
         gr.Markdown(
             "# MiniCPM-V 4.6 Multimodal Chat\n"
-            "Powered by NanoInfer - Upload an image and ask questions about it!"
+            "Powered by Forge - Upload an image and ask questions about it!"
         )
 
         with gr.Row():
@@ -564,7 +563,7 @@ def create_web_interface(model):
 # ============================================================
 def main():
     print("=" * 60)
-    print("MiniCPM-V 4.6 Multimodal Inference - NanoInfer")
+    print("MiniCPM-V 4.6 Multimodal Inference - Forge")
     print("=" * 60)
 
     model = MiniCPMVModel(MODEL_DIR, DEVICE, GPU_LAYERS)

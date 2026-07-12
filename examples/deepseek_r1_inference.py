@@ -1,7 +1,7 @@
 """
-DeepSeek-R1-Distill-Qwen-7B Q4_K_M interactive chat using NanoInfer.
+DeepSeek-R1-Distill-Qwen-7B Q4_K_M interactive chat using Forge.
 
-Uses NanoInfer's built-in Tokenizer loaded directly from GGUF files.
+Uses Forge's built-in Tokenizer loaded directly from GGUF files.
 No external tokenizer files or transformers dependency required.
 
 Prerequisites:
@@ -36,7 +36,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 import numpy as np
 
 
@@ -106,7 +106,7 @@ profiling_enabled = False
 def print_cpp_profiler_summary():
     """Print the C++ PerfProfiler summary (operator-level timing)."""
     try:
-        summary = nanoinfer.profiler_summary()
+        summary = forge.profiler_summary()
         if not summary:
             return
         print("\n" + "=" * 90)
@@ -139,14 +139,14 @@ TOKENIZER_DIR = "/mnt/g/AI/DeepSeek-R1-Distill-Qwen-7B"
 
 
 def load_tokenizer(model_path):
-    """Load tokenizer from GGUF file using NanoInfer's built-in Tokenizer."""
-    tok = nanoinfer.Tokenizer()
+    """Load tokenizer from GGUF file using Forge's built-in Tokenizer."""
+    tok = forge.Tokenizer()
     tok.load_from_gguf(model_path)
     return tok
 
 
 def verify_tokenizer(tokenizer, tokenizer_dir):
-    """Verify NanoInfer tokenizer against transformers reference."""
+    """Verify Forge tokenizer against transformers reference."""
     try:
         from transformers import AutoTokenizer
     except ImportError:
@@ -183,7 +183,7 @@ def verify_tokenizer(tokenizer, tokenizer_dir):
     ]
 
     print("\n" + "=" * 60)
-    print("  Tokenizer Verification: NanoInfer vs transformers")
+    print("  Tokenizer Verification: Forge vs transformers")
     print("=" * 60)
 
     encode_pass = 0
@@ -387,7 +387,7 @@ def interactive_chat(model, tokenizer, args):
     turn_count = 0
 
     print("\n" + "=" * 60)
-    print("  DeepSeek-R1-Distill-Qwen-7B Interactive Chat (NanoInfer)")
+    print("  DeepSeek-R1-Distill-Qwen-7B Interactive Chat (Forge)")
     print(f"  Device: {args.device}")
     print(f"  Profiling: {'ON' if profiling_enabled else 'OFF'}")
     print("  Commands: /quit, /clear, /help, /profile")
@@ -420,13 +420,13 @@ def interactive_chat(model, tokenizer, args):
         elif user_input == "/profile":
             profiling_enabled = not profiling_enabled
             if profiling_enabled:
-                nanoinfer.profiler_enable()
-                nanoinfer.profiler_reset()
+                forge.profiler_enable()
+                forge.profiler_reset()
                 perf.reset()
-                print(f"[Profiling ON - C++ profiler + Python timing enabled]\n")
+                print("[Profiling ON - C++ profiler + Python timing enabled]\n")
             else:
-                nanoinfer.profiler_disable()
-                print(f"[Profiling OFF]\n")
+                forge.profiler_disable()
+                print("[Profiling OFF]\n")
             continue
 
         turn_count += 1
@@ -504,14 +504,14 @@ def interactive_chat(model, tokenizer, args):
         if profiling_enabled:
             print_full_profile()
             perf.reset()
-            nanoinfer.profiler_reset()
+            forge.profiler_reset()
 
         conversation.append({"role": "assistant", "content": assistant_text})
         print()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="DeepSeek-R1-Distill-Qwen-7B inference with NanoInfer")
+    parser = argparse.ArgumentParser(description="DeepSeek-R1-Distill-Qwen-7B inference with Forge")
     parser.add_argument("--model-path", type=str, default=None,
                         help="Path to .gguf model file")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
@@ -548,11 +548,11 @@ def main():
 
     if args.profile:
         profiling_enabled = True
-        nanoinfer.profiler_enable()
+        forge.profiler_enable()
         if args.device == "cuda":
-            nanoinfer.profiler_set_cuda_events(True)
+            forge.profiler_set_cuda_events(True)
         else:
-            nanoinfer.profiler_set_cuda_events(False)
+            forge.profiler_set_cuda_events(False)
         print("[Profiling enabled - Python timing + C++ PerfProfiler]")
 
     model_path = args.model_path
@@ -560,7 +560,7 @@ def main():
         if os.path.exists(GGUF_MODEL_PATH):
             model_path = GGUF_MODEL_PATH
         else:
-            print(f"No model file found. Searched:")
+            print("No model file found. Searched:")
             print(f"  {GGUF_MODEL_PATH}")
             print("Please specify --model-path")
             sys.exit(1)
@@ -584,11 +584,11 @@ def main():
         return
 
     print(f"Loading GGUF model on {args.device}...")
-    nanoinfer.Logger.set_level(2 if args.verbose else 1)
+    forge.Logger.set_level(2 if args.verbose else 1)
 
     if profiling_enabled:
         perf.start("startup.model_load")
-    model = nanoinfer.Model()
+    model = forge.Model()
     model.load_gguf(model_path, device=args.device)
     if profiling_enabled:
         perf.stop("startup.model_load")
@@ -600,7 +600,7 @@ def main():
 
     if args.device == "cpu":
         cpu_threads = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count()
-        nanoinfer.set_num_threads(cpu_threads)
+        forge.set_num_threads(cpu_threads)
         print(f"CPU threads set to: {cpu_threads}")
 
     if profiling_enabled:
@@ -633,7 +633,7 @@ def main():
         print("\n--- Startup Profile ---")
         perf.print_summary()
         perf.reset()
-        nanoinfer.profiler_reset()
+        forge.profiler_reset()
 
     interactive_chat(model, tokenizer, args)
 

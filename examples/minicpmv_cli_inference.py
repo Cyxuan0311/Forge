@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MiniCPM-V 4.6 Interactive Chat using NanoInfer.
+"""MiniCPM-V 4.6 Interactive Chat using Forge.
 
 Supports multi-turn conversation with optional image input.
 
@@ -32,7 +32,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 # Constants
 MODEL_PATH = "/mnt/g/AI/MiniCPM-V-4.6.F16"
@@ -275,7 +275,7 @@ def interactive_chat(mm_model, tokenizer, args):
     ctx = None
 
     print("\n" + "=" * 60)
-    print("  MiniCPM-V 4.6 Interactive Chat (NanoInfer)")
+    print("  MiniCPM-V 4.6 Interactive Chat (Forge)")
     print(f"  Device: {args.device}")
     print("  Commands: /image <path>, /video <path>, /clear, /quit, /help")
     print("=" * 60 + "\n")
@@ -325,9 +325,9 @@ def interactive_chat(mm_model, tokenizer, args):
                 image_embeddings = emb
                 num_img_tokens_list = [emb.shape[0]]
                 print(f"  Image loaded: {img.size}, {emb.shape[0]} tokens, took {time.time()-t0:.2f}s")
-                if nanoinfer.profiler_enabled():
-                    nanoinfer.profiler_print()
-                    nanoinfer.profiler_reset()
+                if forge.profiler_enabled():
+                    forge.profiler_print()
+                    forge.profiler_reset()
                 print()
             except Exception as e:
                 print(f"  ERROR encoding image: {e}\n")
@@ -356,9 +356,9 @@ def interactive_chat(mm_model, tokenizer, args):
                 num_img_tokens_list = [emb.shape[0] for emb in frame_embs]
                 total_tok = image_embeddings.shape[0]
                 print(f"  Video loaded: {len(frames)} frames, {total_tok} tokens, took {time.time()-t0:.2f}s\n")
-                if nanoinfer.profiler_enabled():
-                    nanoinfer.profiler_print()
-                    nanoinfer.profiler_reset()
+                if forge.profiler_enabled():
+                    forge.profiler_print()
+                    forge.profiler_reset()
             except ImportError:
                 print("  ERROR: decord not installed. Run: pip install decord\n")
                 image_embeddings = None
@@ -451,27 +451,27 @@ def main():
     llm_path = os.path.join(args.model_path, LLM_FILE)
     mmproj_path = os.path.join(args.model_path, MMPROJ_FILE)
 
-    tokenizer = nanoinfer.Tokenizer()
+    tokenizer = forge.Tokenizer()
     tokenizer.load_from_gguf(llm_path)
     print(f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
           f"bos_id={tokenizer.bos_token_id}, eos_id={tokenizer.eos_token_id}")
 
     if args.trace:
-        nanoinfer.Logger.set_level(5)  # TRACE
+        forge.Logger.set_level(5)  # TRACE
     elif args.debug:
-        nanoinfer.Logger.set_level(4)  # DEBUG
+        forge.Logger.set_level(4)  # DEBUG
     else:
-        nanoinfer.Logger.set_level(2 if args.verbose else 1)  # existing: WARN/VERBOSE
+        forge.Logger.set_level(2 if args.verbose else 1)  # existing: WARN/VERBOSE
 
     if args.profile or args.profile_cuda:
-        nanoinfer.profiler_enable()
-        nanoinfer.profiler_set_cuda_events(args.profile_cuda)
+        forge.profiler_enable()
+        forge.profiler_set_cuda_events(args.profile_cuda)
         mode = "CUDA events" if args.profile_cuda else "chrono"
         print(f"Performance profiler enabled ({mode})")
 
     print(f"Loading multimodal model on {args.device}...")
 
-    mm_model = nanoinfer.MultimodalModel()
+    mm_model = forge.MultimodalModel()
     try:
         mm_model.load_with_mmproj(llm_path, mmproj_path, args.device)
     except RuntimeError as e:

@@ -1,7 +1,7 @@
 """
-TinyLlama-1.1B-Chat-v1.0 Q4_0 interactive chat using NanoInfer.
+TinyLlama-1.1B-Chat-v1.0 Q4_0 interactive chat using Forge.
 
-Uses NanoInfer's built-in Tokenizer loaded directly from GGUF files.
+Uses Forge's built-in Tokenizer loaded directly from GGUF files.
 No external tokenizer files or transformers dependency required.
 
 Prerequisites:
@@ -11,7 +11,7 @@ Prerequisites:
   2. (Optional) Download tokenizer files for verification:
      HF_ENDPOINT=https://hf-mirror.com huggingface-cli download TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
          tokenizer.model tokenizer_config.json tokenizer.json special_tokens_map.json \
-         --local-dir /path/to/NanoInfer/models/tinyllama-tokenizer
+         --local-dir /path/to/Forge/models/tinyllama-tokenizer
 
 Usage:
   # Interactive chat mode (default):
@@ -44,7 +44,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 import numpy as np
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -118,7 +118,7 @@ profiling_enabled = False
 def print_cpp_profiler_summary():
     """Print the C++ PerfProfiler summary (operator-level timing)."""
     try:
-        summary = nanoinfer.profiler_summary()
+        summary = forge.profiler_summary()
         if not summary:
             return
         print("\n" + "=" * 90)
@@ -159,21 +159,21 @@ def download_model(model_path):
     )
     if ret != 0:
         print("Failed to download model. Please download manually:")
-        print(f"  wget https://hf-mirror.com/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf")
+        print("  wget https://hf-mirror.com/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf")
         return False
     print("Model downloaded successfully!")
     return True
 
 
 def load_tokenizer(model_path):
-    """Load tokenizer from GGUF file using NanoInfer's built-in Tokenizer."""
-    tok = nanoinfer.Tokenizer()
+    """Load tokenizer from GGUF file using Forge's built-in Tokenizer."""
+    tok = forge.Tokenizer()
     tok.load_from_gguf(model_path)
     return tok
 
 
 def verify_tokenizer(tokenizer, tokenizer_dir):
-    """Verify NanoInfer tokenizer against transformers reference."""
+    """Verify Forge tokenizer against transformers reference."""
     try:
         from transformers import AutoTokenizer
     except ImportError:
@@ -210,7 +210,7 @@ def verify_tokenizer(tokenizer, tokenizer_dir):
     ]
 
     print("\n" + "=" * 60)
-    print("  Tokenizer Verification: NanoInfer vs transformers")
+    print("  Tokenizer Verification: Forge vs transformers")
     print("=" * 60)
 
     encode_pass = 0
@@ -419,7 +419,7 @@ def interactive_chat(model, tokenizer, args):
     ctx = None
 
     print("\n" + "=" * 60)
-    print("  TinyLlama-1.1B-Chat Interactive Chat (NanoInfer)")
+    print("  TinyLlama-1.1B-Chat Interactive Chat (Forge)")
     print(f"  Device: {args.device}")
     if profiling_enabled:
         print("  Profiling: ON (Python + C++ PerfProfiler)")
@@ -452,11 +452,11 @@ def interactive_chat(model, tokenizer, args):
         elif user_input == "/profile":
             profiling_enabled = not profiling_enabled
             if profiling_enabled:
-                nanoinfer.profiler_enable()
-                nanoinfer.profiler_reset()
+                forge.profiler_enable()
+                forge.profiler_reset()
                 perf.reset()
             else:
-                nanoinfer.profiler_disable()
+                forge.profiler_disable()
             print(f"[Profiling {'enabled' if profiling_enabled else 'disabled'}]\n")
             continue
 
@@ -531,14 +531,14 @@ def interactive_chat(model, tokenizer, args):
         if profiling_enabled:
             print_full_profile()
             perf.reset()
-            nanoinfer.profiler_reset()
+            forge.profiler_reset()
 
         conversation.append({"role": "assistant", "content": assistant_text})
         print()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TinyLlama-1.1B-Chat inference with NanoInfer")
+    parser = argparse.ArgumentParser(description="TinyLlama-1.1B-Chat inference with Forge")
     parser.add_argument("--model-path", type=str, default=None,
                         help="Path to .gguf model file")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
@@ -595,9 +595,9 @@ def main():
         return
 
     print(f"Loading model (GGUF) on {args.device}...")
-    nanoinfer.Logger.set_level(2 if args.verbose else 1)
+    forge.Logger.set_level(2 if args.verbose else 1)
 
-    model = nanoinfer.Model()
+    model = forge.Model()
     model.load_gguf(model_path, device=args.device)
 
     cfg = model.config
@@ -606,12 +606,12 @@ def main():
           f"kv_heads={cfg.num_kv_heads}, vocab={cfg.vocab_size}")
 
     if profiling_enabled:
-        nanoinfer.profiler_enable()
+        forge.profiler_enable()
         # Use CPU timing for CPU inference, CUDA events for GPU
         if args.device == "cuda":
-            nanoinfer.profiler_set_cuda_events(True)
+            forge.profiler_set_cuda_events(True)
         else:
-            nanoinfer.profiler_set_cuda_events(False)
+            forge.profiler_set_cuda_events(False)
 
     ctx = model.create_context(
         kv_cache_dtype=args.kv_cache_dtype,
