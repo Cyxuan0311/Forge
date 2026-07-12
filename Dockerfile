@@ -7,6 +7,7 @@ ARG USE_OPENBLAS=OFF
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    git \
     ninja-build \
     python3-dev \
     python3-pip \
