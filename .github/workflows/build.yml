@@ -28,7 +28,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.20
         with:
           cuda: ${{ matrix.cuda }}
-          linux-local-args: '--toolkit'
+          linux-local-args: '["--toolkit"]'
 
       - name: Install system dependencies
         run: |
@@ -103,7 +103,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.20
         with:
           cuda: ${{ matrix.cuda }}
-          linux-local-args: '--toolkit'
+          linux-local-args: '["--toolkit"]'
 
       - name: Install system dependencies
         run: |
