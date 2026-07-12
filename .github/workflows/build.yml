@@ -50,7 +50,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+          pip install "numpy>=1.21.0" "pytest>=7.0" pytest-timeout
 
       - name: Verify environment
         run: |
@@ -67,7 +67,7 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="86;89"
 
       - name: Build
-        run: cmake --build build -j $(nproc)
+        run: cmake --build build -j "$(nproc)"
 
       - name: Test CLI
         run: ./build/forge-cli --help
@@ -125,7 +125,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+          pip install "numpy>=1.21.0" "pytest>=7.0" pytest-timeout
 
       - name: Configure CMake (no cuBLAS)
         run: |
@@ -135,7 +135,7 @@ jobs:
             -DUSE_CUBLAS=OFF
 
       - name: Build
-        run: cmake --build build -j $(nproc)
+        run: cmake --build build -j "$(nproc)"
 
       - name: Test CLI
         run: ./build/forge-cli --help
@@ -178,7 +178,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+          pip install "numpy>=1.21.0" "pytest>=7.0" pytest-timeout
 
       - name: Verify environment
         run: |
@@ -193,7 +193,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build -j $(sysctl -n hw.logicalcpu)
+        run: cmake --build build -j "$(sysctl -n hw.logicalcpu)"
 
       - name: Test CLI
         run: ./build/forge-cli --help
@@ -231,7 +231,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+          pip install "numpy>=1.21.0" "pytest>=7.0" pytest-timeout
 
       - name: Verify environment
         run: |

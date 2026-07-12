@@ -45,7 +45,7 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
 
       - name: Build
-        run: cmake --build build -j $(nproc)
+        run: cmake --build build -j "$(nproc)"
 
       - name: Package release artifacts
         run: |
