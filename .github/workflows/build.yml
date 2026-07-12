@@ -19,7 +19,7 @@ jobs:
     strategy:
       matrix:
         python: ['3.10', '3.11', '3.12']
-        cuda: ['12.1', '12.4']
+        cuda: ['12.1.1', '12.4.0']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -94,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        cuda: ['12.4']
+        cuda: ['12.4.0']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

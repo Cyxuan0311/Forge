@@ -19,7 +19,7 @@ jobs:
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.20
         with:
-          cuda: '12.4'
+          cuda: '12.4.0'
           linux-local-args: '--toolkit'
 
       - name: Install system dependencies
