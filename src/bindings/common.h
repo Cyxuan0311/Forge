@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "../core/platform.h"
 #include "forge/backend.h"
 #include "forge/compute_graph.h"
 #include "forge/context.h"
