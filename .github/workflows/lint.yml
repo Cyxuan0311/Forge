@@ -50,6 +50,7 @@ jobs:
           find . -name 'CMakeLists.txt' \
             -not -path './build/*' \
             -not -path './_deps/*' \
+            -not -path './.cache/*' \
             -exec cmake-format --check {} +
 
   python-lint:
