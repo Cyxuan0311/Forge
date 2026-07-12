@@ -166,13 +166,13 @@ NinfModel::~NinfModel() {
 }
 
 bool NinfModel::supports_format(const std::string& path) const {
-    int fd = open(path.c_str(), O_RDONLY);
+    int fd = forge_open(path.c_str(), O_RDONLY);
     if (fd < 0)
         return false;
 
     char magic[8] = {};
-    ssize_t n = read(fd, magic, 8);
-    ::close(fd);
+    ssize_t n = forge_read(fd, magic, 8);
+    forge_close(fd);
 
     if (n != 8)
         return false;
@@ -180,7 +180,7 @@ bool NinfModel::supports_format(const std::string& path) const {
 }
 
 bool NinfModel::load(const std::string& path) {
-    fd_ = open(path.c_str(), O_RDONLY);
+    fd_ = forge_open(path.c_str(), O_RDONLY);
     if (fd_ < 0)
         return false;
 
@@ -240,7 +240,7 @@ void NinfModel::close() {
         mapped_data_ = nullptr;
     }
     if (fd_ >= 0) {
-        ::close(fd_);
+        forge_close(fd_);
         fd_ = -1;
     }
     mapped_size_ = 0;

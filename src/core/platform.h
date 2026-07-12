@@ -2,19 +2,29 @@
 // Cross-platform portability helpers
 
 #ifdef _WIN32
-// MSVC POSIX compat
-#    include <BaseTsd.h>
-typedef SSIZE_T ssize_t;
-#    define open _open
-#    define close _close
-#    define read _read
-#    define O_RDONLY _O_RDONLY
-#    define PROT_READ 0
-#    define MAP_PRIVATE 0
+#include <BaseTsd.h>
+#include <io.h>
+#include <sys/stat.h>
+#include <windows.h>
 
-#    include <io.h>
-#    include <sys/stat.h>
-#    include <windows.h>
+typedef SSIZE_T ssize_t;
+#define PROT_READ 0
+#define MAP_PRIVATE 0
+#define FORGE_MAP_FAILED ((void*)-1)
+#ifndef O_RDONLY
+#define O_RDONLY _O_RDONLY
+#endif
+
+// POSIX compat wrappers (avoid macro conflicts with class method names)
+static inline int forge_open(const char* path, int flags) {
+    return _open(path, flags);
+}
+static inline int forge_close(int fd) {
+    return _close(fd);
+}
+static inline ssize_t forge_read(int fd, void* buf, size_t count) {
+    return static_cast<ssize_t>(_read(fd, buf, static_cast<unsigned int>(count)));
+}
 
 struct PortStat {
     long st_size;
@@ -45,17 +55,18 @@ static inline int forge_munmap(void* addr, size_t) {
     return UnmapViewOfFile(addr) ? 0 : -1;
 }
 
-#    define FORGE_MAP_FAILED ((void*)-1)
-
 #else
-#    include <fcntl.h>
-#    include <sys/mman.h>
-#    include <sys/stat.h>
-#    include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef struct stat forge_stat_t;
-#    define forge_fstat fstat
-#    define forge_mmap mmap
-#    define forge_munmap munmap
-#    define FORGE_MAP_FAILED MAP_FAILED
+#define forge_fstat fstat
+#define forge_mmap mmap
+#define forge_munmap munmap
+#define FORGE_MAP_FAILED MAP_FAILED
+#define forge_open open
+#define forge_close close
+#define forge_read read
 #endif

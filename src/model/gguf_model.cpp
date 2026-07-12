@@ -54,13 +54,13 @@ GgufModel::~GgufModel() {
 }
 
 bool GgufModel::supports_format(const std::string& path) const {
-    int fd = open(path.c_str(), O_RDONLY);
+    int fd = forge_open(path.c_str(), O_RDONLY);
     if (fd < 0)
         return false;
 
     uint32_t magic = 0;
-    ssize_t n = read(fd, &magic, 4);
-    ::close(fd);
+    ssize_t n = forge_read(fd, &magic, 4);
+    forge_close(fd);
 
     if (n != 4)
         return false;
@@ -68,7 +68,7 @@ bool GgufModel::supports_format(const std::string& path) const {
 }
 
 bool GgufModel::load(const std::string& path) {
-    fd_ = open(path.c_str(), O_RDONLY);
+    fd_ = forge_open(path.c_str(), O_RDONLY);
     if (fd_ < 0)
         return false;
 
@@ -384,7 +384,7 @@ void GgufModel::close() {
         mapped_data_ = nullptr;
     }
     if (fd_ >= 0) {
-        ::close(fd_);
+        forge_close(fd_);
         fd_ = -1;
     }
     mapped_size_ = 0;
