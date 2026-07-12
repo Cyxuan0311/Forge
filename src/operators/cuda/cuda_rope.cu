@@ -1,18 +1,21 @@
-#include "cuda_rope.h"
 #include <cmath>
+
+#include "cuda_rope.h"
 
 namespace forge {
 namespace cuda {
 
-__global__ void rope_q_kernel(const float* x, float* x_out,
-                               int seq_len, int num_heads, int head_dim, int64_t pos, float theta) {
+__global__ void rope_q_kernel(const float* x, float* x_out, int seq_len, int num_heads,
+                              int head_dim, int64_t pos, float theta) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = seq_len * num_heads * head_dim;
-    if (idx >= total) return;
+    if (idx >= total)
+        return;
 
     int d = idx % head_dim;
     int half_dim = head_dim / 2;
-    if (d >= half_dim) return;
+    if (d >= half_dim)
+        return;
 
     int h = (idx / head_dim) % num_heads;
     int s = idx / (num_heads * head_dim);
@@ -30,38 +33,42 @@ __global__ void rope_q_kernel(const float* x, float* x_out,
     x_out[i1] = x0 * sin_a + x1 * cos_a;
 }
 
-void launch_rope_fp32(const float* q, const float* k, float* q_out, float* k_out,
-                      int num_heads, int head_dim, int seq_len, int64_t pos,
-                      float theta, cudaStream_t stream) {
+void launch_rope_fp32(const float* q, const float* k, float* q_out, float* k_out, int num_heads,
+                      int head_dim, int seq_len, int64_t pos, float theta, cudaStream_t stream) {
     int q_total = seq_len * num_heads * head_dim;
     int threads = 256;
     int blocks = (q_total + threads - 1) / threads;
-    rope_q_kernel<<<blocks, threads, 0, stream>>>(q, q_out, seq_len, num_heads, head_dim, pos, theta);
+    rope_q_kernel<<<blocks, threads, 0, stream>>>(q, q_out, seq_len, num_heads, head_dim, pos,
+                                                  theta);
 
     int k_total = seq_len * num_heads * head_dim;
     blocks = (k_total + threads - 1) / threads;
-    rope_q_kernel<<<blocks, threads, 0, stream>>>(k, k_out, seq_len, num_heads, head_dim, pos, theta);
+    rope_q_kernel<<<blocks, threads, 0, stream>>>(k, k_out, seq_len, num_heads, head_dim, pos,
+                                                  theta);
 }
 
-void launch_rope_gqa(const float* q, const float* k, float* q_out, float* k_out,
-                     int num_q_heads, int num_kv_heads, int head_dim, int seq_len, int64_t pos,
-                     float theta, cudaStream_t stream) {
+void launch_rope_gqa(const float* q, const float* k, float* q_out, float* k_out, int num_q_heads,
+                     int num_kv_heads, int head_dim, int seq_len, int64_t pos, float theta,
+                     cudaStream_t stream) {
     int threads = 256;
 
     int q_total = seq_len * num_q_heads * head_dim;
     int q_blocks = (q_total + threads - 1) / threads;
-    rope_q_kernel<<<q_blocks, threads, 0, stream>>>(q, q_out, seq_len, num_q_heads, head_dim, pos, theta);
+    rope_q_kernel<<<q_blocks, threads, 0, stream>>>(q, q_out, seq_len, num_q_heads, head_dim, pos,
+                                                    theta);
 
     int k_total = seq_len * num_kv_heads * head_dim;
     int k_blocks = (k_total + threads - 1) / threads;
-    rope_q_kernel<<<k_blocks, threads, 0, stream>>>(k, k_out, seq_len, num_kv_heads, head_dim, pos, theta);
+    rope_q_kernel<<<k_blocks, threads, 0, stream>>>(k, k_out, seq_len, num_kv_heads, head_dim, pos,
+                                                    theta);
 }
 
-__global__ void expand_kv_kernel(const float* kv, float* out,
-                                  int seq_len, int num_heads, int num_kv_heads, int head_dim) {
+__global__ void expand_kv_kernel(const float* kv, float* out, int seq_len, int num_heads,
+                                 int num_kv_heads, int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = seq_len * num_heads * head_dim;
-    if (idx >= total) return;
+    if (idx >= total)
+        return;
 
     int d = idx % head_dim;
     int h = (idx / head_dim) % num_heads;
@@ -74,14 +81,14 @@ __global__ void expand_kv_kernel(const float* kv, float* out,
     out[idx] = kv[src_idx];
 }
 
-void launch_expand_kv(const float* kv, float* out,
-                      int seq_len, int num_heads, int num_kv_heads, int head_dim,
-                      cudaStream_t stream) {
+void launch_expand_kv(const float* kv, float* out, int seq_len, int num_heads, int num_kv_heads,
+                      int head_dim, cudaStream_t stream) {
     int total = seq_len * num_heads * head_dim;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    expand_kv_kernel<<<blocks, threads, 0, stream>>>(kv, out, seq_len, num_heads, num_kv_heads, head_dim);
+    expand_kv_kernel<<<blocks, threads, 0, stream>>>(kv, out, seq_len, num_heads, num_kv_heads,
+                                                     head_dim);
 }
 
-} // namespace cuda
-} // namespace forge
+}  // namespace cuda
+}  // namespace forge

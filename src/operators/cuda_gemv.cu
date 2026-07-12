@@ -1,5 +1,5 @@
-#include "forge/cuda_kernels.h"
 #include "cuda_common.h"
+#include "forge/cuda_kernels.h"
 
 namespace forge {
 namespace cuda {
@@ -7,11 +7,12 @@ namespace cuda {
 // ---- FP32 GEMV (M=1, decode) ----
 
 __global__ void gemv_transB_kernel(const float* __restrict__ x, const float* __restrict__ W,
-                                    float* __restrict__ out, int K, int N) {
+                                   float* __restrict__ out, int K, int N) {
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     float sum = 0.0f;
     const float* row = W + warp_id * K;
@@ -26,21 +27,22 @@ __global__ void gemv_transB_kernel(const float* __restrict__ x, const float* __r
     sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
     sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
 
-    if (lane == 0) out[warp_id] = sum;
+    if (lane == 0)
+        out[warp_id] = sum;
 }
 
-void launch_gemv_transB(const float* x, const float* W, float* out,
-                         int K, int N, cudaStream_t stream) {
+void launch_gemv_transB(const float* x, const float* W, float* out, int K, int N,
+                        cudaStream_t stream) {
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (N + warps_per_block - 1) / warps_per_block;
     gemv_transB_kernel<<<blocks, threads, 0, stream>>>(x, W, out, K, N);
 }
 
-__global__ void gemv_kernel(const float* x, const float* W, float* out,
-                             int K, int N) {
+__global__ void gemv_kernel(const float* x, const float* W, float* out, int K, int N) {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
+    if (n >= N)
+        return;
 
     float sum = 0.0f;
     for (int k = 0; k < K; ++k) {
@@ -49,8 +51,7 @@ __global__ void gemv_kernel(const float* x, const float* W, float* out,
     out[n] = sum;
 }
 
-void launch_gemv(const float* x, const float* W, float* out,
-                  int K, int N, cudaStream_t stream) {
+void launch_gemv(const float* x, const float* W, float* out, int K, int N, cudaStream_t stream) {
     int threads = 256;
     int blocks = (N + threads - 1) / threads;
     gemv_kernel<<<blocks, threads, 0, stream>>>(x, W, out, K, N);
@@ -64,8 +65,8 @@ void launch_gemv(const float* x, const float* W, float* out,
 
 template <int ROWS_PER_BLOCK>
 __global__ void gemv_q4_0_transB_smem_kernel(const float* __restrict__ x,
-                                               const uint8_t* __restrict__ q_weight,
-                                               float* __restrict__ out, int K, int N) {
+                                             const uint8_t* __restrict__ q_weight,
+                                             float* __restrict__ out, int K, int N) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -95,7 +96,8 @@ __global__ void gemv_q4_0_transB_smem_kernel(const float* __restrict__ x,
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     const uint8_t* row_ptr = q_weight + (size_t)warp_id * num_blocks_row * Q4_0_BLOCK_SIZE;
 
@@ -112,9 +114,10 @@ __global__ void gemv_q4_0_transB_smem_kernel(const float* __restrict__ x,
         const uint8_t* qs = block_ptr + sizeof(uint16_t);
 
         int base = bi * BLOCK_ELEMS;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack(qs, j);
             sum += smem_x[base + j] * (static_cast<float>(val) * scale);
         }
@@ -132,9 +135,8 @@ __global__ void gemv_q4_0_transB_smem_kernel(const float* __restrict__ x,
 }
 
 __global__ void gemv_q4_0_splitK_kernel(const float* __restrict__ x,
-                                          const uint8_t* __restrict__ q_weight,
-                                          float* __restrict__ out, int K, int N,
-                                          int warps_per_row) {
+                                        const uint8_t* __restrict__ q_weight,
+                                        float* __restrict__ out, int K, int N, int warps_per_row) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -145,7 +147,8 @@ __global__ void gemv_q4_0_splitK_kernel(const float* __restrict__ x,
     int row = global_warp_id / warps_per_row;
     int sub_warp = global_warp_id % warps_per_row;
 
-    if (row >= N) return;
+    if (row >= N)
+        return;
 
     const uint8_t* row_ptr = q_weight + (size_t)row * num_blocks_row * Q4_0_BLOCK_SIZE;
 
@@ -165,9 +168,10 @@ __global__ void gemv_q4_0_splitK_kernel(const float* __restrict__ x,
         const uint8_t* qs = block_ptr + sizeof(uint16_t);
 
         int base = bi * BLOCK_ELEMS;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack(qs, j);
             sum += x[base + j] * (static_cast<float>(val) * scale);
         }
@@ -184,12 +188,14 @@ __global__ void gemv_q4_0_splitK_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_gemv_q4_0_transB(const float* x, const void* q_weight, float* out,
-                               int K, int N, cudaStream_t stream) {
+void launch_gemv_q4_0_transB(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream) {
     int num_blocks_row = (K + 31) / 32;
     int warps_per_row = (num_blocks_row + 31) / 32;
-    if (warps_per_row < 1) warps_per_row = 1;
-    if (warps_per_row > 8) warps_per_row = 8;
+    if (warps_per_row < 1)
+        warps_per_row = 1;
+    if (warps_per_row > 8)
+        warps_per_row = 8;
 
     if (warps_per_row <= 1) {
         // Use shared-memory kernel: 8 warps per block, x loaded once per block
@@ -212,9 +218,9 @@ void launch_gemv_q4_0_transB(const float* x, const void* q_weight, float* out,
 
 // ---- Batched Q4_0 GEMV (M > 1) ----
 
-__global__ void gemv_q4_0_transB_batch_kernel(
-    const float* __restrict__ x, const uint8_t* __restrict__ q_weight,
-    float* __restrict__ out, int M, int K, int N) {
+__global__ void gemv_q4_0_transB_batch_kernel(const float* __restrict__ x,
+                                              const uint8_t* __restrict__ q_weight,
+                                              float* __restrict__ out, int M, int K, int N) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -223,7 +229,8 @@ __global__ void gemv_q4_0_transB_batch_kernel(
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int total_warps = M * N;
-    if (warp_id >= total_warps) return;
+    if (warp_id >= total_warps)
+        return;
 
     int m = warp_id / N;
     int n = warp_id % N;
@@ -242,9 +249,10 @@ __global__ void gemv_q4_0_transB_batch_kernel(
         float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
         const uint8_t* qs = block_ptr + sizeof(uint16_t);
 
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack(qs, j);
             sum += x_row[base + j] * (static_cast<float>(val) * scale);
         }
@@ -261,8 +269,8 @@ __global__ void gemv_q4_0_transB_batch_kernel(
     }
 }
 
-void launch_gemv_q4_0_transB_batch(const float* x, const void* q_weight, float* out,
-                                     int M, int K, int N, cudaStream_t stream) {
+void launch_gemv_q4_0_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
+                                   int N, cudaStream_t stream) {
     int total_warps = M * N;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
@@ -274,9 +282,9 @@ void launch_gemv_q4_0_transB_batch(const float* x, const void* q_weight, float* 
 // ---- Q4_0 Dual GEMV (gate + up combined) ----
 
 __global__ void gemv_q4_0_transB_dual_kernel(const float* __restrict__ x,
-                                               const uint8_t* __restrict__ q_weight1, int N1,
-                                               const uint8_t* __restrict__ q_weight2, int N2,
-                                               float* __restrict__ out, int K) {
+                                             const uint8_t* __restrict__ q_weight1, int N1,
+                                             const uint8_t* __restrict__ q_weight2, int N2,
+                                             float* __restrict__ out, int K) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -285,7 +293,8 @@ __global__ void gemv_q4_0_transB_dual_kernel(const float* __restrict__ x,
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int total_N = N1 + N2;
-    if (warp_id >= total_N) return;
+    if (warp_id >= total_N)
+        return;
 
     const uint8_t* row_ptr;
     float* out_ptr;
@@ -303,7 +312,8 @@ __global__ void gemv_q4_0_transB_dual_kernel(const float* __restrict__ x,
 
     for (int b = 0; b < blocks_per_thread; ++b) {
         int bi = b * 32 + lane;
-        if (bi >= num_blocks_row) break;
+        if (bi >= num_blocks_row)
+            break;
 
         const uint8_t* block_ptr = row_ptr + bi * Q4_0_BLOCK_SIZE;
 
@@ -314,9 +324,10 @@ __global__ void gemv_q4_0_transB_dual_kernel(const float* __restrict__ x,
         const uint8_t* qs = block_ptr + sizeof(uint16_t);
 
         int base = bi * BLOCK_ELEMS;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack(qs, j);
             sum += x[base + j] * (static_cast<float>(val) * scale);
         }
@@ -333,27 +344,24 @@ __global__ void gemv_q4_0_transB_dual_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_gemv_q4_0_transB_dual(const float* x,
-                                    const void* q_weight1, int N1,
-                                    const void* q_weight2, int N2,
-                                    float* out, int K,
-                                    cudaStream_t stream) {
+void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
+                                  const void* q_weight2, int N2, float* out, int K,
+                                  cudaStream_t stream) {
     int total_N = N1 + N2;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (total_N + warps_per_block - 1) / warps_per_block;
     gemv_q4_0_transB_dual_kernel<<<blocks, threads, 0, stream>>>(
-        x, static_cast<const uint8_t*>(q_weight1), N1,
-        static_cast<const uint8_t*>(q_weight2), N2,
+        x, static_cast<const uint8_t*>(q_weight1), N1, static_cast<const uint8_t*>(q_weight2), N2,
         out, K);
 }
 
 // ---- FFN Up Fused Q4_0 (M=1, decode) - Optimized with shared memory ----
 
 __global__ void ffn_up_fused_q4_0_kernel(const float* __restrict__ x,
-                                           const uint8_t* __restrict__ q_w1,
-                                           const uint8_t* __restrict__ q_w3,
-                                           float* __restrict__ out, int K, int N) {
+                                         const uint8_t* __restrict__ q_w1,
+                                         const uint8_t* __restrict__ q_w3, float* __restrict__ out,
+                                         int K, int N) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -382,7 +390,8 @@ __global__ void ffn_up_fused_q4_0_kernel(const float* __restrict__ x,
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     const uint8_t* w1_row = q_w1 + (size_t)warp_id * num_blocks_row * Q4_0_BLOCK_SIZE;
     const uint8_t* w3_row = q_w3 + (size_t)warp_id * num_blocks_row * Q4_0_BLOCK_SIZE;
@@ -405,9 +414,10 @@ __global__ void ffn_up_fused_q4_0_kernel(const float* __restrict__ x,
         float w3_scale = __half2float(reinterpret_cast<const __half&>(w3_scale_bits));
         const uint8_t* w3_qs = w3_block + sizeof(uint16_t);
 
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             float x_val = smem_x[base + j];
             gate_sum += x_val * (static_cast<float>(q4_unpack(w1_qs, j)) * w1_scale);
             up_sum += x_val * (static_cast<float>(q4_unpack(w3_qs, j)) * w3_scale);
@@ -432,26 +442,23 @@ __global__ void ffn_up_fused_q4_0_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_ffn_up_fused_q4_0(const float* x,
-                                const void* q_w1, const void* q_w3,
-                                float* out, int K, int intermediate_dim,
-                                cudaStream_t stream) {
+void launch_ffn_up_fused_q4_0(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
+                              int intermediate_dim, cudaStream_t stream) {
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
     size_t smem_bytes = K * sizeof(float);
     ffn_up_fused_q4_0_kernel<<<blocks, threads, smem_bytes, stream>>>(
-        x, static_cast<const uint8_t*>(q_w1),
-        static_cast<const uint8_t*>(q_w3),
-        out, K, intermediate_dim);
+        x, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3), out, K,
+        intermediate_dim);
 }
 
 // ---- FFN Up Fused Q4_0 Batch GEMV (M > 1, small batch) ----
 
-__global__ void ffn_up_fused_q4_0_batch_gemv_kernel(
-    const float* __restrict__ x, const uint8_t* __restrict__ q_w1,
-    const uint8_t* __restrict__ q_w3, float* __restrict__ out,
-    int M, int K, int N) {
+__global__ void ffn_up_fused_q4_0_batch_gemv_kernel(const float* __restrict__ x,
+                                                    const uint8_t* __restrict__ q_w1,
+                                                    const uint8_t* __restrict__ q_w3,
+                                                    float* __restrict__ out, int M, int K, int N) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -460,7 +467,8 @@ __global__ void ffn_up_fused_q4_0_batch_gemv_kernel(
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int total_warps = M * N;
-    if (warp_id >= total_warps) return;
+    if (warp_id >= total_warps)
+        return;
 
     int m = warp_id / N;
     int n = warp_id % N;
@@ -487,9 +495,10 @@ __global__ void ffn_up_fused_q4_0_batch_gemv_kernel(
         float w3_scale = __half2float(reinterpret_cast<const __half&>(w3_scale_bits));
         const uint8_t* w3_qs = w3_block + sizeof(uint16_t);
 
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             float x_val = x_row[base + j];
             gate_sum += x_val * (static_cast<float>(q4_unpack(w1_qs, j)) * w1_scale);
             up_sum += x_val * (static_cast<float>(q4_unpack(w3_qs, j)) * w3_scale);
@@ -514,26 +523,20 @@ __global__ void ffn_up_fused_q4_0_batch_gemv_kernel(
     }
 }
 
-void launch_ffn_up_fused_q4_0_batch_gemv(const float* x,
-                                            const void* q_w1, const void* q_w3,
-                                            float* out, int M, int K, int N,
-                                            cudaStream_t stream) {
+void launch_ffn_up_fused_q4_0_batch_gemv(const float* x, const void* q_w1, const void* q_w3,
+                                         float* out, int M, int K, int N, cudaStream_t stream) {
     int total_warps = M * N;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
     ffn_up_fused_q4_0_batch_gemv_kernel<<<blocks, threads, 0, stream>>>(
-        x, static_cast<const uint8_t*>(q_w1),
-        static_cast<const uint8_t*>(q_w3),
-        out, M, K, N);
+        x, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3), out, M, K, N);
 }
 
 // ---- FFN Up Fused Q4_0 Batch (M > 1, prefill, dequant + cublas) ----
 
-void launch_ffn_up_fused_q4_0_batch(const float* x,
-                                      const void* q_w1, const void* q_w3,
-                                      float* out, int M, int K, int intermediate_dim,
-                                      cudaStream_t stream) {
+void launch_ffn_up_fused_q4_0_batch(const float* x, const void* q_w1, const void* q_w3, float* out,
+                                    int M, int K, int intermediate_dim, cudaStream_t stream) {
     size_t fp32_bytes = (size_t)intermediate_dim * K * sizeof(float);
     size_t result_bytes = (size_t)M * intermediate_dim * sizeof(float);
     size_t total_bytes = fp32_bytes * 2 + result_bytes * 2;
@@ -555,10 +558,8 @@ void launch_ffn_up_fused_q4_0_batch(const float* x,
 
 // ---- FFN Up Fused Q4_K Batch (M > 1, prefill) ----
 
-void launch_ffn_up_fused_q4_k_batch(const float* x,
-                                      const void* q_w1, const void* q_w3,
-                                      float* out, int M, int K, int intermediate_dim,
-                                      cudaStream_t stream) {
+void launch_ffn_up_fused_q4_k_batch(const float* x, const void* q_w1, const void* q_w3, float* out,
+                                    int M, int K, int intermediate_dim, cudaStream_t stream) {
     size_t fp32_bytes = (size_t)intermediate_dim * K * sizeof(float);
     size_t result_bytes = (size_t)M * intermediate_dim * sizeof(float);
     size_t total_bytes = fp32_bytes * 2 + result_bytes * 2;
@@ -581,8 +582,8 @@ void launch_ffn_up_fused_q4_k_batch(const float* x,
 // ---- Q4_K GEMV (M=1, decode) ----
 
 __global__ void gemv_q4_k_transB_kernel(const float* __restrict__ x,
-                                          const uint8_t* __restrict__ q_weight,
-                                          float* __restrict__ out, int K, int N) {
+                                        const uint8_t* __restrict__ q_weight,
+                                        float* __restrict__ out, int K, int N) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -590,7 +591,8 @@ __global__ void gemv_q4_k_transB_kernel(const float* __restrict__ x,
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     const uint8_t* row_ptr = q_weight + warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
 
@@ -600,7 +602,8 @@ __global__ void gemv_q4_k_transB_kernel(const float* __restrict__ x,
 
     for (int sb = 0; sb < super_blocks_per_thread; ++sb) {
         int bi = sb * 32 + lane;
-        if (bi >= blocks_per_row) break;
+        if (bi >= blocks_per_row)
+            break;
 
         const uint8_t* block_ptr = row_ptr + bi * Q4_K_BLOCK_SIZE;
         uint16_t d_bits, dmin_bits;
@@ -625,8 +628,10 @@ __global__ void gemv_q4_k_transB_kernel(const float* __restrict__ x,
             for (int l = 0; l < 32; ++l) {
                 int idx0 = base + l;
                 int idx1 = base + 32 + l;
-                if (idx0 < K) sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
-                if (idx1 < K) sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
+                if (idx0 < K)
+                    sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
+                if (idx1 < K)
+                    sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
             }
             qs += 32;
             is += 2;
@@ -647,9 +652,8 @@ __global__ void gemv_q4_k_transB_kernel(const float* __restrict__ x,
 // ---- Q4_K Split-K GEMV (M=1, decode, for large K) ----
 
 __global__ void gemv_q4_k_splitK_kernel(const float* __restrict__ x,
-                                          const uint8_t* __restrict__ q_weight,
-                                          float* __restrict__ out, int K, int N,
-                                          int warps_per_row) {
+                                        const uint8_t* __restrict__ q_weight,
+                                        float* __restrict__ out, int K, int N, int warps_per_row) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -660,7 +664,8 @@ __global__ void gemv_q4_k_splitK_kernel(const float* __restrict__ x,
     int row = global_warp_id / warps_per_row;
     int sub_warp = global_warp_id % warps_per_row;
 
-    if (row >= N) return;
+    if (row >= N)
+        return;
 
     const uint8_t* row_ptr = q_weight + row * blocks_per_row * Q4_K_BLOCK_SIZE;
 
@@ -694,8 +699,10 @@ __global__ void gemv_q4_k_splitK_kernel(const float* __restrict__ x,
             for (int l = 0; l < 32; ++l) {
                 int idx0 = base + l;
                 int idx1 = base + 32 + l;
-                if (idx0 < K) sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
-                if (idx1 < K) sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
+                if (idx0 < K)
+                    sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
+                if (idx1 < K)
+                    sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
             }
             qs += 32;
             is += 2;
@@ -720,8 +727,8 @@ __global__ void gemv_q4_k_splitK_kernel(const float* __restrict__ x,
 // where each thread processes a different super-block with 256-float stride.
 
 __global__ void gemv_q4_k_transB_v2_kernel(const float* __restrict__ x,
-                                              const uint8_t* __restrict__ q_weight,
-                                              float* __restrict__ out, int K, int N) {
+                                           const uint8_t* __restrict__ q_weight,
+                                           float* __restrict__ out, int K, int N) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -729,7 +736,8 @@ __global__ void gemv_q4_k_transB_v2_kernel(const float* __restrict__ x,
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     const uint8_t* row_ptr = q_weight + (size_t)warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
 
@@ -783,11 +791,12 @@ __global__ void gemv_q4_k_transB_v2_kernel(const float* __restrict__ x,
     sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
     sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
 
-    if (lane == 0) out[warp_id] = sum;
+    if (lane == 0)
+        out[warp_id] = sum;
 }
 
-void launch_gemv_q4_k_transB(const float* x, const void* q_weight, float* out,
-                               int K, int N, cudaStream_t stream) {
+void launch_gemv_q4_k_transB(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream) {
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (N + warps_per_block - 1) / warps_per_block;
@@ -800,9 +809,9 @@ void launch_gemv_q4_k_transB(const float* x, const void* q_weight, float* out,
 // Each warp handles one (m, n) output element, all 32 threads process
 // the same super-block for coalesced x reads.
 
-__global__ void gemv_q4_k_transB_batch_v2_kernel(
-    const float* __restrict__ x, const uint8_t* __restrict__ q_weight,
-    float* __restrict__ out, int M, int K, int N) {
+__global__ void gemv_q4_k_transB_batch_v2_kernel(const float* __restrict__ x,
+                                                 const uint8_t* __restrict__ q_weight,
+                                                 float* __restrict__ out, int M, int K, int N) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -811,7 +820,8 @@ __global__ void gemv_q4_k_transB_batch_v2_kernel(
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int total_warps = M * N;
-    if (warp_id >= total_warps) return;
+    if (warp_id >= total_warps)
+        return;
 
     int m = warp_id / N;
     int n = warp_id % N;
@@ -872,8 +882,8 @@ __global__ void gemv_q4_k_transB_batch_v2_kernel(
     }
 }
 
-void launch_gemv_q4_k_transB_batch(const float* x, const void* q_weight, float* out,
-                                     int M, int K, int N, cudaStream_t stream) {
+void launch_gemv_q4_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
+                                   int N, cudaStream_t stream) {
     int total_warps = M * N;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
@@ -887,9 +897,9 @@ void launch_gemv_q4_k_transB_batch(const float* x, const void* q_weight, float* 
 // sharing the x vector read across gate and up projections.
 
 __global__ void ffn_up_fused_q4_k_kernel(const float* __restrict__ x,
-                                            const uint8_t* __restrict__ q_w1,
-                                            const uint8_t* __restrict__ q_w3,
-                                            float* __restrict__ out, int K, int N) {
+                                         const uint8_t* __restrict__ q_w1,
+                                         const uint8_t* __restrict__ q_w3, float* __restrict__ out,
+                                         int K, int N) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -897,7 +907,8 @@ __global__ void ffn_up_fused_q4_k_kernel(const float* __restrict__ x,
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     const uint8_t* w1_row = q_w1 + warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
     const uint8_t* w3_row = q_w3 + warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
@@ -909,7 +920,8 @@ __global__ void ffn_up_fused_q4_k_kernel(const float* __restrict__ x,
 
     for (int sb = 0; sb < super_blocks_per_thread; ++sb) {
         int bi = sb * 32 + lane;
-        if (bi >= blocks_per_row) break;
+        if (bi >= blocks_per_row)
+            break;
 
         // Process w1 (gate) block
         {
@@ -936,8 +948,10 @@ __global__ void ffn_up_fused_q4_k_kernel(const float* __restrict__ x,
                 for (int l = 0; l < 32; ++l) {
                     int idx0 = base + l;
                     int idx1 = base + 32 + l;
-                    if (idx0 < K) gate_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
-                    if (idx1 < K) gate_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
+                    if (idx0 < K)
+                        gate_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
+                    if (idx1 < K)
+                        gate_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
                 }
                 qs += 32;
                 is += 2;
@@ -969,8 +983,10 @@ __global__ void ffn_up_fused_q4_k_kernel(const float* __restrict__ x,
                 for (int l = 0; l < 32; ++l) {
                     int idx0 = base + l;
                     int idx1 = base + 32 + l;
-                    if (idx0 < K) up_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
-                    if (idx1 < K) up_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
+                    if (idx0 < K)
+                        up_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
+                    if (idx1 < K)
+                        up_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
                 }
                 qs += 32;
                 is += 2;
@@ -1001,10 +1017,10 @@ __global__ void ffn_up_fused_q4_k_kernel(const float* __restrict__ x,
 // Results are accumulated via atomicAdd into a shared output buffer.
 
 __global__ void ffn_up_fused_q4_k_splitK_kernel(const float* __restrict__ x,
-                                                   const uint8_t* __restrict__ q_w1,
-                                                   const uint8_t* __restrict__ q_w3,
-                                                   float* __restrict__ out, int K, int N,
-                                                   int warps_per_row) {
+                                                const uint8_t* __restrict__ q_w1,
+                                                const uint8_t* __restrict__ q_w3,
+                                                float* __restrict__ out, int K, int N,
+                                                int warps_per_row) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -1015,7 +1031,8 @@ __global__ void ffn_up_fused_q4_k_splitK_kernel(const float* __restrict__ x,
     int row = global_warp_id / warps_per_row;
     int sub_warp = global_warp_id % warps_per_row;
 
-    if (row >= N) return;
+    if (row >= N)
+        return;
 
     const uint8_t* w1_row = q_w1 + row * blocks_per_row * Q4_K_BLOCK_SIZE;
     const uint8_t* w3_row = q_w3 + row * blocks_per_row * Q4_K_BLOCK_SIZE;
@@ -1053,8 +1070,10 @@ __global__ void ffn_up_fused_q4_k_splitK_kernel(const float* __restrict__ x,
                 for (int l = 0; l < 32; ++l) {
                     int idx0 = base + l;
                     int idx1 = base + 32 + l;
-                    if (idx0 < K) gate_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
-                    if (idx1 < K) gate_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
+                    if (idx0 < K)
+                        gate_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
+                    if (idx1 < K)
+                        gate_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
                 }
                 qs += 32;
                 is += 2;
@@ -1086,8 +1105,10 @@ __global__ void ffn_up_fused_q4_k_splitK_kernel(const float* __restrict__ x,
                 for (int l = 0; l < 32; ++l) {
                     int idx0 = base + l;
                     int idx1 = base + 32 + l;
-                    if (idx0 < K) up_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
-                    if (idx1 < K) up_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
+                    if (idx0 < K)
+                        up_sum += x[idx0] * (d1 * (qs[l] & 0xF) - m1_val);
+                    if (idx1 < K)
+                        up_sum += x[idx1] * (d2 * (qs[l] >> 4) - m2_val);
                 }
                 qs += 32;
                 is += 2;
@@ -1119,9 +1140,9 @@ __global__ void ffn_up_fused_q4_k_splitK_kernel(const float* __restrict__ x,
 // Both gate and up projections share the same x values per super-block.
 
 __global__ void ffn_up_fused_q4_k_v2_kernel(const float* __restrict__ x,
-                                               const uint8_t* __restrict__ q_w1,
-                                               const uint8_t* __restrict__ q_w3,
-                                               float* __restrict__ out, int K, int N) {
+                                            const uint8_t* __restrict__ q_w1,
+                                            const uint8_t* __restrict__ q_w3,
+                                            float* __restrict__ out, int K, int N) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -1129,7 +1150,8 @@ __global__ void ffn_up_fused_q4_k_v2_kernel(const float* __restrict__ x,
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     const uint8_t* w1_row = q_w1 + (size_t)warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
     const uint8_t* w3_row = q_w3 + (size_t)warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
@@ -1235,24 +1257,21 @@ __global__ void ffn_up_fused_q4_k_v2_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_ffn_up_fused_q4_k(const float* x,
-                                const void* q_w1, const void* q_w3,
-                                float* out, int K, int intermediate_dim,
-                                cudaStream_t stream) {
+void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
+                              int intermediate_dim, cudaStream_t stream) {
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
     ffn_up_fused_q4_k_v2_kernel<<<blocks, threads, 0, stream>>>(
-        x, static_cast<const uint8_t*>(q_w1),
-        static_cast<const uint8_t*>(q_w3),
-        out, K, intermediate_dim);
+        x, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3), out, K,
+        intermediate_dim);
 }
 
 // ---- Q4_1 GEMV (M=1, decode) ----
 
 __global__ void gemv_q4_1_transB_kernel(const float* __restrict__ x,
-                                          const uint8_t* __restrict__ q_weight,
-                                          float* __restrict__ out, int K, int N) {
+                                        const uint8_t* __restrict__ q_weight,
+                                        float* __restrict__ out, int K, int N) {
     const int Q4_1_BLOCK_SIZE = 20;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -1260,7 +1279,8 @@ __global__ void gemv_q4_1_transB_kernel(const float* __restrict__ x,
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     const uint8_t* row_ptr = q_weight + warp_id * num_blocks_row * Q4_1_BLOCK_SIZE;
 
@@ -1270,7 +1290,8 @@ __global__ void gemv_q4_1_transB_kernel(const float* __restrict__ x,
 
     for (int b = 0; b < blocks_per_thread; ++b) {
         int bi = b * 32 + lane;
-        if (bi >= num_blocks_row) break;
+        if (bi >= num_blocks_row)
+            break;
 
         const uint8_t* block_ptr = row_ptr + bi * Q4_1_BLOCK_SIZE;
 
@@ -1283,9 +1304,10 @@ __global__ void gemv_q4_1_transB_kernel(const float* __restrict__ x,
         const uint8_t* qs = block_ptr + 4;
 
         int base = bi * BLOCK_ELEMS;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack_unsigned(qs, j);
             sum += x[base + j] * (static_cast<float>(val) * d_val + m_val);
         }
@@ -1302,8 +1324,8 @@ __global__ void gemv_q4_1_transB_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_gemv_q4_1_transB(const float* x, const void* q_weight, float* out,
-                               int K, int N, cudaStream_t stream) {
+void launch_gemv_q4_1_transB(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream) {
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (N + warps_per_block - 1) / warps_per_block;
@@ -1313,9 +1335,9 @@ void launch_gemv_q4_1_transB(const float* x, const void* q_weight, float* out,
 
 // ---- Batched Q4_1 GEMV (M > 1) ----
 
-__global__ void gemv_q4_1_transB_batch_kernel(
-    const float* __restrict__ x, const uint8_t* __restrict__ q_weight,
-    float* __restrict__ out, int M, int K, int N) {
+__global__ void gemv_q4_1_transB_batch_kernel(const float* __restrict__ x,
+                                              const uint8_t* __restrict__ q_weight,
+                                              float* __restrict__ out, int M, int K, int N) {
     const int Q4_1_BLOCK_SIZE = 20;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -1324,7 +1346,8 @@ __global__ void gemv_q4_1_transB_batch_kernel(
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int total_warps = M * N;
-    if (warp_id >= total_warps) return;
+    if (warp_id >= total_warps)
+        return;
 
     int m = warp_id / N;
     int n = warp_id % N;
@@ -1338,7 +1361,8 @@ __global__ void gemv_q4_1_transB_batch_kernel(
 
     for (int b = 0; b < blocks_per_thread; ++b) {
         int bi = b * 32 + lane;
-        if (bi >= num_blocks_row) break;
+        if (bi >= num_blocks_row)
+            break;
 
         const uint8_t* block_ptr = w_row + bi * Q4_1_BLOCK_SIZE;
 
@@ -1351,9 +1375,10 @@ __global__ void gemv_q4_1_transB_batch_kernel(
         const uint8_t* qs = block_ptr + 4;
 
         int base = bi * BLOCK_ELEMS;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack_unsigned(qs, j);
             sum += x_row[base + j] * (static_cast<float>(val) * d_val + m_val);
         }
@@ -1370,8 +1395,8 @@ __global__ void gemv_q4_1_transB_batch_kernel(
     }
 }
 
-void launch_gemv_q4_1_transB_batch(const float* x, const void* q_weight, float* out,
-                                     int M, int K, int N, cudaStream_t stream) {
+void launch_gemv_q4_1_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
+                                   int N, cudaStream_t stream) {
     int total_warps = M * N;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
@@ -1383,15 +1408,16 @@ void launch_gemv_q4_1_transB_batch(const float* x, const void* q_weight, float* 
 // ---- Q6_K GEMV (M=1, decode) ----
 
 __global__ void gemv_q6_k_transB_kernel(const float* __restrict__ x,
-                                          const uint8_t* __restrict__ q_weight,
-                                          float* __restrict__ out, int K, int N) {
+                                        const uint8_t* __restrict__ q_weight,
+                                        float* __restrict__ out, int K, int N) {
     const int QK_K = 256;
     const int Q6_K_BLOCK_SIZE = 210;
 
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
-    if (warp_id >= N) return;
+    if (warp_id >= N)
+        return;
 
     int blocks_per_row = (K + QK_K - 1) / QK_K;
     const uint8_t* row_ptr = q_weight + warp_id * blocks_per_row * Q6_K_BLOCK_SIZE;
@@ -1402,7 +1428,8 @@ __global__ void gemv_q6_k_transB_kernel(const float* __restrict__ x,
 
     for (int sb = 0; sb < super_blocks_per_thread; ++sb) {
         int bi = sb * 32 + lane;
-        if (bi >= blocks_per_row) break;
+        if (bi >= blocks_per_row)
+            break;
 
         const uint8_t* block_ptr = row_ptr + bi * Q6_K_BLOCK_SIZE;
         const uint8_t* ql = block_ptr;
@@ -1420,20 +1447,28 @@ __global__ void gemv_q6_k_transB_kernel(const float* __restrict__ x,
             int base = bi * QK_K + n;
             for (int l = 0; l < 32; ++l) {
                 int is = l / 16;
-                int8_t q1 = (int8_t)((ql_cur[l +  0] & 0xF) | (((qh_cur[l] >> 0) & 3) << 4)) - 32;
+                int8_t q1 = (int8_t)((ql_cur[l + 0] & 0xF) | (((qh_cur[l] >> 0) & 3) << 4)) - 32;
                 int8_t q2 = (int8_t)((ql_cur[l + 32] & 0xF) | (((qh_cur[l] >> 2) & 3) << 4)) - 32;
-                int8_t q3 = (int8_t)((ql_cur[l +  0] >> 4) | (((qh_cur[l] >> 4) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql_cur[l + 0] >> 4) | (((qh_cur[l] >> 4) & 3) << 4)) - 32;
                 int8_t q4 = (int8_t)((ql_cur[l + 32] >> 4) | (((qh_cur[l] >> 6) & 3) << 4)) - 32;
 
-                int idx0 = base + l +  0;
+                int idx0 = base + l + 0;
                 int idx1 = base + l + 32;
                 int idx2 = base + l + 64;
                 int idx3 = base + l + 96;
 
-                if (idx0 < K) sum += x[idx0] * d * static_cast<float>(sc_cur[is + 0]) * static_cast<float>(q1);
-                if (idx1 < K) sum += x[idx1] * d * static_cast<float>(sc_cur[is + 2]) * static_cast<float>(q2);
-                if (idx2 < K) sum += x[idx2] * d * static_cast<float>(sc_cur[is + 4]) * static_cast<float>(q3);
-                if (idx3 < K) sum += x[idx3] * d * static_cast<float>(sc_cur[is + 6]) * static_cast<float>(q4);
+                if (idx0 < K)
+                    sum +=
+                        x[idx0] * d * static_cast<float>(sc_cur[is + 0]) * static_cast<float>(q1);
+                if (idx1 < K)
+                    sum +=
+                        x[idx1] * d * static_cast<float>(sc_cur[is + 2]) * static_cast<float>(q2);
+                if (idx2 < K)
+                    sum +=
+                        x[idx2] * d * static_cast<float>(sc_cur[is + 4]) * static_cast<float>(q3);
+                if (idx3 < K)
+                    sum +=
+                        x[idx3] * d * static_cast<float>(sc_cur[is + 6]) * static_cast<float>(q4);
             }
             ql_cur += 64;
             qh_cur += 32;
@@ -1452,8 +1487,8 @@ __global__ void gemv_q6_k_transB_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_gemv_q6_k_transB(const float* x, const void* q_weight, float* out,
-                               int K, int N, cudaStream_t stream) {
+void launch_gemv_q6_k_transB(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream) {
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (N + warps_per_block - 1) / warps_per_block;
@@ -1463,9 +1498,9 @@ void launch_gemv_q6_k_transB(const float* x, const void* q_weight, float* out,
 
 // ---- Batched Q6_K GEMV (M > 1) ----
 
-__global__ void gemv_q6_k_transB_batch_kernel(
-    const float* __restrict__ x, const uint8_t* __restrict__ q_weight,
-    float* __restrict__ out, int M, int K, int N) {
+__global__ void gemv_q6_k_transB_batch_kernel(const float* __restrict__ x,
+                                              const uint8_t* __restrict__ q_weight,
+                                              float* __restrict__ out, int M, int K, int N) {
     const int QK_K = 256;
     const int Q6_K_BLOCK_SIZE = 210;
 
@@ -1473,7 +1508,8 @@ __global__ void gemv_q6_k_transB_batch_kernel(
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int total_warps = M * N;
-    if (warp_id >= total_warps) return;
+    if (warp_id >= total_warps)
+        return;
 
     int m = warp_id / N;
     int n = warp_id % N;
@@ -1488,7 +1524,8 @@ __global__ void gemv_q6_k_transB_batch_kernel(
 
     for (int sb = 0; sb < super_blocks_per_thread; ++sb) {
         int bi = sb * 32 + lane;
-        if (bi >= blocks_per_row) break;
+        if (bi >= blocks_per_row)
+            break;
 
         const uint8_t* block_ptr = row_ptr + bi * Q6_K_BLOCK_SIZE;
         const uint8_t* ql = block_ptr;
@@ -1506,20 +1543,28 @@ __global__ void gemv_q6_k_transB_batch_kernel(
             int base = bi * QK_K + nn;
             for (int l = 0; l < 32; ++l) {
                 int is_ = l / 16;
-                int8_t q1 = (int8_t)((ql_cur[l +  0] & 0xF) | (((qh_cur[l] >> 0) & 3) << 4)) - 32;
+                int8_t q1 = (int8_t)((ql_cur[l + 0] & 0xF) | (((qh_cur[l] >> 0) & 3) << 4)) - 32;
                 int8_t q2 = (int8_t)((ql_cur[l + 32] & 0xF) | (((qh_cur[l] >> 2) & 3) << 4)) - 32;
-                int8_t q3 = (int8_t)((ql_cur[l +  0] >> 4) | (((qh_cur[l] >> 4) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql_cur[l + 0] >> 4) | (((qh_cur[l] >> 4) & 3) << 4)) - 32;
                 int8_t q4 = (int8_t)((ql_cur[l + 32] >> 4) | (((qh_cur[l] >> 6) & 3) << 4)) - 32;
 
-                int idx0 = base + l +  0;
+                int idx0 = base + l + 0;
                 int idx1 = base + l + 32;
                 int idx2 = base + l + 64;
                 int idx3 = base + l + 96;
 
-                if (idx0 < K) sum += x_row[idx0] * d * static_cast<float>(sc_cur[is_ + 0]) * static_cast<float>(q1);
-                if (idx1 < K) sum += x_row[idx1] * d * static_cast<float>(sc_cur[is_ + 2]) * static_cast<float>(q2);
-                if (idx2 < K) sum += x_row[idx2] * d * static_cast<float>(sc_cur[is_ + 4]) * static_cast<float>(q3);
-                if (idx3 < K) sum += x_row[idx3] * d * static_cast<float>(sc_cur[is_ + 6]) * static_cast<float>(q4);
+                if (idx0 < K)
+                    sum += x_row[idx0] * d * static_cast<float>(sc_cur[is_ + 0]) *
+                           static_cast<float>(q1);
+                if (idx1 < K)
+                    sum += x_row[idx1] * d * static_cast<float>(sc_cur[is_ + 2]) *
+                           static_cast<float>(q2);
+                if (idx2 < K)
+                    sum += x_row[idx2] * d * static_cast<float>(sc_cur[is_ + 4]) *
+                           static_cast<float>(q3);
+                if (idx3 < K)
+                    sum += x_row[idx3] * d * static_cast<float>(sc_cur[is_ + 6]) *
+                           static_cast<float>(q4);
             }
             ql_cur += 64;
             qh_cur += 32;
@@ -1538,8 +1583,8 @@ __global__ void gemv_q6_k_transB_batch_kernel(
     }
 }
 
-void launch_gemv_q6_k_transB_batch(const float* x, const void* q_weight, float* out,
-                                     int M, int K, int N, cudaStream_t stream) {
+void launch_gemv_q6_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
+                                   int N, cudaStream_t stream) {
     int total_warps = M * N;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
@@ -1561,13 +1606,10 @@ void launch_gemv_q6_k_transB_batch(const float* x, const void* q_weight, float* 
 //   After:   896 warps * 74KB =  66MB ffn_mid reads (4x reduction)
 
 template <int ROWS_PER_WARP>
-__global__ void ffn_down_fused_q4_0_tiled_kernel(
-    const float* __restrict__ ffn_mid,
-    const uint8_t* __restrict__ q_w2,
-    const float* __restrict__ residual,
-    float* __restrict__ out,
-    int K, int N) {
-
+__global__ void ffn_down_fused_q4_0_tiled_kernel(const float* __restrict__ ffn_mid,
+                                                 const uint8_t* __restrict__ q_w2,
+                                                 const float* __restrict__ residual,
+                                                 float* __restrict__ out, int K, int N) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -1576,12 +1618,14 @@ __global__ void ffn_down_fused_q4_0_tiled_kernel(
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int first_row = global_warp_id * ROWS_PER_WARP;
-    if (first_row >= N) return;
+    if (first_row >= N)
+        return;
 
     // Accumulate partial sums for ROWS_PER_WARP output rows in registers
     float sums[ROWS_PER_WARP];
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_WARP; ++r) sums[r] = 0.0f;
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r)
+        sums[r] = 0.0f;
 
     // Each lane processes different Q4_0 blocks; ffn_mid values are loaded once
     // and reused across all ROWS_PER_WARP output rows
@@ -1590,16 +1634,17 @@ __global__ void ffn_down_fused_q4_0_tiled_kernel(
 
         // Load ffn_mid values for this block (shared across all output rows)
         float x_vals[BLOCK_ELEMS];
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
             x_vals[j] = (base + j < K) ? ffn_mid[base + j] : 0.0f;
         }
 
-        // Compute contribution to each output row using the same x_vals
-        #pragma unroll
+// Compute contribution to each output row using the same x_vals
+#pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             int row = first_row + r;
-            if (row >= N) break;
+            if (row >= N)
+                break;
 
             const uint8_t* row_ptr = q_w2 + (size_t)row * num_blocks_row * Q4_0_BLOCK_SIZE;
             const uint8_t* block_ptr = row_ptr + bi * Q4_0_BLOCK_SIZE;
@@ -1610,7 +1655,7 @@ __global__ void ffn_down_fused_q4_0_tiled_kernel(
 
             const uint8_t* qs = block_ptr + sizeof(uint16_t);
 
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < BLOCK_ELEMS; ++j) {
                 int val = q4_unpack(qs, j);
                 sums[r] += x_vals[j] * (static_cast<float>(val) * scale);
@@ -1618,11 +1663,12 @@ __global__ void ffn_down_fused_q4_0_tiled_kernel(
         }
     }
 
-    // Warp reduce and write results for each row
-    #pragma unroll
+// Warp reduce and write results for each row
+#pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) {
         int row = first_row + r;
-        if (row >= N) break;
+        if (row >= N)
+            break;
 
         float s = sums[r];
         s += __shfl_down_sync(0xFFFFFFFF, s, 16);
@@ -1637,20 +1683,15 @@ __global__ void ffn_down_fused_q4_0_tiled_kernel(
     }
 }
 
-void launch_ffn_down_fused_q4_0(const float* ffn_mid,
-                                  const void* q_w2,
-                                  const float* residual,
-                                  float* out,
-                                  int K, int hidden_dim,
-                                  cudaStream_t stream) {
+void launch_ffn_down_fused_q4_0(const float* ffn_mid, const void* q_w2, const float* residual,
+                                float* out, int K, int hidden_dim, cudaStream_t stream) {
     const int ROWS_PER_WARP = 4;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int num_warps = (hidden_dim + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
     int blocks = (num_warps + warps_per_block - 1) / warps_per_block;
     ffn_down_fused_q4_0_tiled_kernel<ROWS_PER_WARP><<<blocks, threads, 0, stream>>>(
-        ffn_mid, static_cast<const uint8_t*>(q_w2),
-        residual, out, K, hidden_dim);
+        ffn_mid, static_cast<const uint8_t*>(q_w2), residual, out, K, hidden_dim);
 }
 
 // ---- Output Proj Q4_0 (M=1, decode, large N) ----
@@ -1659,9 +1700,8 @@ void launch_ffn_down_fused_q4_0(const float* ffn_mid,
 // for the input vector to maximize throughput.
 
 __global__ void output_proj_q4_0_kernel(const float* __restrict__ x,
-                                          const uint8_t* __restrict__ q_weight,
-                                          float* __restrict__ out, int K, int N,
-                                          int warps_per_row) {
+                                        const uint8_t* __restrict__ q_weight,
+                                        float* __restrict__ out, int K, int N, int warps_per_row) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -1672,7 +1712,8 @@ __global__ void output_proj_q4_0_kernel(const float* __restrict__ x,
     int row = global_warp_id / warps_per_row;
     int sub_warp = global_warp_id % warps_per_row;
 
-    if (row >= N) return;
+    if (row >= N)
+        return;
 
     const uint8_t* row_ptr = q_weight + (size_t)row * num_blocks_row * Q4_0_BLOCK_SIZE;
 
@@ -1692,9 +1733,10 @@ __global__ void output_proj_q4_0_kernel(const float* __restrict__ x,
         const uint8_t* qs = block_ptr + sizeof(uint16_t);
 
         int base = bi * BLOCK_ELEMS;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack(qs, j);
             sum += x[base + j] * (static_cast<float>(val) * scale);
         }
@@ -1711,14 +1753,16 @@ __global__ void output_proj_q4_0_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_output_proj_q4_0(const float* x, const void* q_weight, float* out,
-                               int K, int N, cudaStream_t stream) {
+void launch_output_proj_q4_0(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream) {
     int num_blocks_row = (K + 31) / 32;
     // For output_proj with large N (e.g., 152064), use more warps per row
     // to keep GPU busy. Each warp handles a subset of blocks for one row.
     int warps_per_row = (num_blocks_row + 31) / 32;
-    if (warps_per_row < 1) warps_per_row = 1;
-    if (warps_per_row > 16) warps_per_row = 16;  // Allow more warps for large K
+    if (warps_per_row < 1)
+        warps_per_row = 1;
+    if (warps_per_row > 16)
+        warps_per_row = 16;  // Allow more warps for large K
 
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
@@ -1735,14 +1779,11 @@ void launch_output_proj_q4_0(const float* x, const void* q_weight, float* out,
 // - Each warp computes one output row of Q, K, or V
 // - Eliminates 2 extra kernel launches and 2 extra x reads from global memory
 
-__global__ void qkv_fused_q4_0_kernel(const float* __restrict__ x,
-                                        const uint8_t* __restrict__ q_wq, int N_q,
-                                        const uint8_t* __restrict__ q_wk, int N_k,
-                                        const uint8_t* __restrict__ q_wv, int N_v,
-                                        float* __restrict__ out_q,
-                                        float* __restrict__ out_k,
-                                        float* __restrict__ out_v,
-                                        int K) {
+__global__ void qkv_fused_q4_0_kernel(const float* __restrict__ x, const uint8_t* __restrict__ q_wq,
+                                      int N_q, const uint8_t* __restrict__ q_wk, int N_k,
+                                      const uint8_t* __restrict__ q_wv, int N_v,
+                                      float* __restrict__ out_q, float* __restrict__ out_k,
+                                      float* __restrict__ out_v, int K) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -1772,7 +1813,8 @@ __global__ void qkv_fused_q4_0_kernel(const float* __restrict__ x,
     int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
 
     int total_N = N_q + N_k + N_v;
-    if (warp_id >= total_N) return;
+    if (warp_id >= total_N)
+        return;
 
     // Determine which weight matrix and output this warp handles
     const uint8_t* row_ptr;
@@ -1806,9 +1848,10 @@ __global__ void qkv_fused_q4_0_kernel(const float* __restrict__ x,
         const uint8_t* qs = block_ptr + sizeof(uint16_t);
 
         int base = bi * BLOCK_ELEMS;
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < BLOCK_ELEMS; ++j) {
-            if (base + j >= K) break;
+            if (base + j >= K)
+                break;
             int val = q4_unpack(qs, j);
             sum += smem_x[base + j] * (static_cast<float>(val) * scale);
         }
@@ -1825,24 +1868,18 @@ __global__ void qkv_fused_q4_0_kernel(const float* __restrict__ x,
     }
 }
 
-void launch_qkv_fused_q4_0(const float* x,
-                             const void* q_wq, int N_q,
-                             const void* q_wk, int N_k,
-                             const void* q_wv, int N_v,
-                             float* out_q, float* out_k, float* out_v,
-                             int K, cudaStream_t stream) {
+void launch_qkv_fused_q4_0(const float* x, const void* q_wq, int N_q, const void* q_wk, int N_k,
+                           const void* q_wv, int N_v, float* out_q, float* out_k, float* out_v,
+                           int K, cudaStream_t stream) {
     int total_N = N_q + N_k + N_v;
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (total_N + warps_per_block - 1) / warps_per_block;
     size_t smem_bytes = K * sizeof(float);
     qkv_fused_q4_0_kernel<<<blocks, threads, smem_bytes, stream>>>(
-        x,
-        static_cast<const uint8_t*>(q_wq), N_q,
-        static_cast<const uint8_t*>(q_wk), N_k,
-        static_cast<const uint8_t*>(q_wv), N_v,
-        out_q, out_k, out_v, K);
+        x, static_cast<const uint8_t*>(q_wq), N_q, static_cast<const uint8_t*>(q_wk), N_k,
+        static_cast<const uint8_t*>(q_wv), N_v, out_q, out_k, out_v, K);
 }
 
-} // namespace cuda
-} // namespace forge
+}  // namespace cuda
+}  // namespace forge

@@ -1,14 +1,15 @@
 #pragma once
 
-#include <string>
 #include <functional>
+#include <string>
 #include <unordered_map>
+
+#include "model_config.h"
+#include "model_loader.h"
+#include "model_weights.h"
 #include "tensor.h"
 #include "types.h"
-#include "model_loader.h"
-#include "model_config.h"
 #include "weight_store.h"
-#include "model_weights.h"
 
 namespace forge {
 
@@ -41,8 +42,7 @@ struct ConfigParserAutoRegister {
 #define FORGE_REGISTER_CONFIG_PARSER_IMPL(line, arch, fn) \
     FORGE_REGISTER_CONFIG_PARSER_IMPL2(line, arch, fn)
 
-#define FORGE_REGISTER_CONFIG_PARSER(arch, fn) \
-    FORGE_REGISTER_CONFIG_PARSER_IMPL(__LINE__, arch, fn)
+#define FORGE_REGISTER_CONFIG_PARSER(arch, fn) FORGE_REGISTER_CONFIG_PARSER_IMPL(__LINE__, arch, fn)
 
 // ============================================================================
 // Weight Init Registry
@@ -80,8 +80,7 @@ struct WeightInitAutoRegister {
 #define FORGE_REGISTER_WEIGHT_INIT_IMPL(line, arch, fn) \
     FORGE_REGISTER_WEIGHT_INIT_IMPL2(line, arch, fn)
 
-#define FORGE_REGISTER_WEIGHT_INIT(arch, fn) \
-    FORGE_REGISTER_WEIGHT_INIT_IMPL(__LINE__, arch, fn)
+#define FORGE_REGISTER_WEIGHT_INIT(arch, fn) FORGE_REGISTER_WEIGHT_INIT_IMPL(__LINE__, arch, fn)
 
 // ============================================================================
 // Arch Capability Registry
@@ -128,9 +127,9 @@ struct ArchCapabilityAutoRegister {
 // ============================================================================
 
 #define FORGE_REGISTER_ARCH_IMPL2(line, arch, engine_creator, config_fn, weight_init_fn, cap) \
-    static ::forge::EngineAutoRegister _engine_reg_##line(arch, engine_creator); \
-    static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn); \
-    static ::forge::WeightInitAutoRegister _weight_init_reg_##line(arch, weight_init_fn); \
+    static ::forge::EngineAutoRegister _engine_reg_##line(arch, engine_creator);              \
+    static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn);      \
+    static ::forge::WeightInitAutoRegister _weight_init_reg_##line(arch, weight_init_fn);     \
     static ::forge::ArchCapabilityAutoRegister _arch_cap_reg_##line(arch, cap)
 
 #define FORGE_REGISTER_ARCH_IMPL(line, arch, engine_creator, config_fn, weight_init_fn, cap) \
@@ -139,4 +138,4 @@ struct ArchCapabilityAutoRegister {
 #define FORGE_REGISTER_ARCH(arch, engine_creator, config_fn, weight_init_fn, cap) \
     FORGE_REGISTER_ARCH_IMPL(__LINE__, arch, engine_creator, config_fn, weight_init_fn, cap)
 
-} // namespace forge
+}  // namespace forge

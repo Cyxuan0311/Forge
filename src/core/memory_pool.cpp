@@ -1,10 +1,11 @@
 #include "forge/memory_pool.h"
+
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
-#include <algorithm>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -32,7 +33,8 @@ void* MemoryPool::allocate(size_t size) {
     } else {
 #ifdef USE_CUDA
         cudaError_t err = cudaMalloc(&ptr, aligned);
-        if (err != cudaSuccess) return nullptr;
+        if (err != cudaSuccess)
+            return nullptr;
 #endif
     }
 
@@ -82,7 +84,8 @@ void* MemoryPool::allocate_reuse(size_t size) {
     } else {
 #ifdef USE_CUDA
         cudaError_t err = cudaMalloc(&ptr, aligned);
-        if (err != cudaSuccess) return nullptr;
+        if (err != cudaSuccess)
+            return nullptr;
 #endif
     }
 
@@ -139,4 +142,4 @@ void MemoryPool::reset() {
     reuse_count_ = 0;
 }
 
-} // namespace forge
+}  // namespace forge

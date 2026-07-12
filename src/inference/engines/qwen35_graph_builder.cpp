@@ -1,18 +1,14 @@
 #include "forge/engines/qwen35_graph_builder.h"
-#include "forge/operators.h"
+
 #include "forge/logger.h"
+#include "forge/operators.h"
 
 namespace forge {
 
-int Qwen35GraphBuilder::build_layer_graph(ComputeGraph& graph,
-                                           int hidden_idx,
-                                           const LayerWeights& lw,
-                                           const ModelConfig& cfg,
-                                           int layer_idx,
-                                           int seq_len,
-                                           int64_t start_pos,
-                                           DeviceType dev,
-                                           KVCache& kv_cache) {
+int Qwen35GraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
+                                          const LayerWeights& lw, const ModelConfig& cfg,
+                                          int layer_idx, int seq_len, int64_t start_pos,
+                                          DeviceType dev, KVCache& kv_cache) {
     // Qwen35 has complex stateful operations (SSM, MRoPE, Gated Delta Net)
     // that are tightly coupled with Qwen35Engine's internal state.
     //
@@ -30,18 +26,18 @@ int Qwen35GraphBuilder::build_layer_graph(ComputeGraph& graph,
     return -1;  // Signal that graph building is not supported
 }
 
-int Qwen35GraphBuilder::build_output_graph(ComputeGraph& graph,
-                                            int hidden_idx,
-                                            const ModelWeights& weights,
-                                            const ModelConfig& cfg) {
+int Qwen35GraphBuilder::build_output_graph(ComputeGraph& graph, int hidden_idx,
+                                           const ModelWeights& weights, const ModelConfig& cfg) {
     // Output norm
-    int norm_idx = graph.add_node("output_norm", "rms_norm", {hidden_idx},
+    int norm_idx = graph.add_node(
+        "output_norm", "rms_norm", {hidden_idx},
         [&weights, eps = cfg.rms_norm_eps](const std::vector<TensorPtr>& inputs) -> TensorPtr {
             return ops::rms_norm(inputs[0], weights.output_norm, eps);
         });
 
     // Output projection
-    int logits_idx = graph.add_node("output_proj", "matmul_transB", {norm_idx},
+    int logits_idx = graph.add_node(
+        "output_proj", "matmul_transB", {norm_idx},
         [&weights, tie = cfg.tie_embeddings](const std::vector<TensorPtr>& inputs) -> TensorPtr {
             auto output_weight = weights.output_weight;
             if (!output_weight && tie) {
@@ -59,8 +55,9 @@ int Qwen35GraphBuilder::build_output_graph(ComputeGraph& graph,
 // imperative mode automatically.
 //
 // To enable in the future, uncomment the following:
-// static GraphBuilderAutoRegister _reg_qwen35_gb("qwen35", []() -> std::unique_ptr<LayerGraphBuilder> {
+// static GraphBuilderAutoRegister _reg_qwen35_gb("qwen35", []() ->
+// std::unique_ptr<LayerGraphBuilder> {
 //     return std::make_unique<Qwen35GraphBuilder>();
 // });
 
-} // namespace forge
+}  // namespace forge

@@ -38,8 +38,9 @@ std::vector<std::string> ModelLoaderRegistry::supported_formats() const {
     return result;
 }
 
-LoaderAutoRegister::LoaderAutoRegister(const std::string& format_name, ModelLoaderRegistry::LoaderCreator creator) {
+LoaderAutoRegister::LoaderAutoRegister(const std::string& format_name,
+                                       ModelLoaderRegistry::LoaderCreator creator) {
     ModelLoaderRegistry::instance().register_loader(format_name, std::move(creator));
 }
 
-} // namespace forge
+}  // namespace forge

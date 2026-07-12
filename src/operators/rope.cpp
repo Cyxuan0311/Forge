@@ -1,10 +1,11 @@
-#include "forge/operator_rope.h"
-#include "forge/cuda_kernels.h"
-#include "forge/perf_profiler.h"
 #include <cmath>
 
+#include "forge/cuda_kernels.h"
+#include "forge/operator_rope.h"
+#include "forge/perf_profiler.h"
+
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 namespace forge {
@@ -21,12 +22,9 @@ TensorPtr rope(const TensorPtr& q, const TensorPtr& k, int64_t pos, float theta)
     if (q->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         cuda::launch_rope_fp32(
-            static_cast<const float*>(q->data()),
-            static_cast<const float*>(k->data()),
-            static_cast<float*>(q_out->data()),
-            static_cast<float*>(k_out->data()),
-            num_heads, head_dim, seq_len, pos, theta
-        );
+            static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+            static_cast<float*>(q_out->data()), static_cast<float*>(k_out->data()), num_heads,
+            head_dim, seq_len, pos, theta);
 #endif
     } else {
         PERF_SCOPE("rope/cpu");
@@ -62,5 +60,5 @@ TensorPtr rope(const TensorPtr& q, const TensorPtr& k, int64_t pos, float theta)
     return q_out;
 }
 
-} // namespace ops
-} // namespace forge
+}  // namespace ops
+}  // namespace forge

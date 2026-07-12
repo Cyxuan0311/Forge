@@ -1,12 +1,13 @@
 #pragma once
 
-#include <string>
-#include <vector>
-#include <unordered_map>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "model_config.h"
 #include "tensor.h"
 #include "types.h"
-#include "model_config.h"
 #include "weight_store.h"
 
 namespace forge {
@@ -21,13 +22,9 @@ struct LayerWeights {
         return it != weights.end() ? it->second : nullptr;
     }
 
-    void set(const std::string& name, TensorPtr tensor) {
-        weights[name] = std::move(tensor);
-    }
+    void set(const std::string& name, TensorPtr tensor) { weights[name] = std::move(tensor); }
 
-    bool has(const std::string& name) const {
-        return weights.find(name) != weights.end();
-    }
+    bool has(const std::string& name) const { return weights.find(name) != weights.end(); }
 
     void to_device(DeviceType device);
 
@@ -88,4 +85,4 @@ struct ModelWeights {
     void move_layer_weights(int layer_idx, DeviceType target_dev);
 };
 
-} // namespace forge
+}  // namespace forge

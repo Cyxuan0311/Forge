@@ -7,5 +7,5 @@ namespace ops {
 
 TensorPtr rope(const TensorPtr& q, const TensorPtr& k, int64_t pos, float theta);
 
-} // namespace ops
-} // namespace forge
+}  // namespace ops
+}  // namespace forge

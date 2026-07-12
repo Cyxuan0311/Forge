@@ -1,4 +1,5 @@
 #include "forge/engines/layer_graph_builder.h"
+
 #include "forge/logger.h"
 
 namespace forge {
@@ -15,7 +16,8 @@ void GraphBuilderRegistry::register_builder(const std::string& arch, BuilderCrea
 
 std::unique_ptr<LayerGraphBuilder> GraphBuilderRegistry::create(const std::string& arch) const {
     auto it = creators_.find(arch);
-    if (it == creators_.end()) return nullptr;
+    if (it == creators_.end())
+        return nullptr;
     return it->second();
 }
 
@@ -28,8 +30,8 @@ std::vector<std::string> GraphBuilderRegistry::registered_archs() const {
 }
 
 GraphBuilderAutoRegister::GraphBuilderAutoRegister(const std::string& arch,
-                                                    GraphBuilderRegistry::BuilderCreator creator) {
+                                                   GraphBuilderRegistry::BuilderCreator creator) {
     GraphBuilderRegistry::instance().register_builder(arch, std::move(creator));
 }
 
-} // namespace forge
+}  // namespace forge

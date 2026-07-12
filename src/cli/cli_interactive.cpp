@@ -2,29 +2,24 @@
  * Forge CLI - Interactive chat mode
  */
 
-#include "cli_common.h"
-
-#include <iostream>
-#include <fstream>
 #include <chrono>
+#include <fstream>
+#include <iostream>
 
-#include "forge/model.h"
-#include "forge/tokenizer.h"
+#include "cli_common.h"
 #include "forge/context.h"
 #include "forge/engine.h"
+#include "forge/engines/transformer_engine.h"
+#include "forge/kv_cache.h"
+#include "forge/model.h"
+#include "forge/tokenizer.h"
 #include "forge/types.h"
 #include "forge/vision_encoder.h"
-#include "forge/kv_cache.h"
-#include "forge/engines/transformer_engine.h"
 
 using namespace forge;
 
-void interactive_chat(
-    Model& model,
-    Tokenizer& tokenizer,
-    VisionEncoder* vision,
-    const CliArgs& args)
-{
+void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
+                      const CliArgs& args) {
     const auto& cfg = model.config();
     auto tmpl_type = detect_template_type(tokenizer);
 
@@ -58,13 +53,13 @@ void interactive_chat(
         }
 
         user_input = trim(user_input);
-        if (user_input.empty()) continue;
+        if (user_input.empty())
+            continue;
 
         if (user_input == "/quit" || user_input == "/exit") {
             std::cout << "Goodbye!\n";
             break;
-        }
-        else if (user_input == "/clear") {
+        } else if (user_input == "/clear") {
             conversation.clear();
             if (!current_system.empty()) {
                 conversation.push_back({"system", current_system});
@@ -73,8 +68,7 @@ void interactive_chat(
             current_num_img_tokens = 0;
             std::cout << "  [Conversation cleared]\n\n";
             continue;
-        }
-        else if (user_input == "/help") {
+        } else if (user_input == "/help") {
             std::cout << "  /quit, /exit      Exit\n";
             std::cout << "  /clear            Clear conversation history\n";
             std::cout << "  /system TEXT      Set system prompt\n";
@@ -82,8 +76,7 @@ void interactive_chat(
             std::cout << "  /save PATH        Save conversation to file\n";
             std::cout << "  /help             Show help\n\n";
             continue;
-        }
-        else if (user_input.rfind("/system ", 0) == 0) {
+        } else if (user_input.rfind("/system ", 0) == 0) {
             current_system = user_input.substr(8);
             if (!conversation.empty() && conversation[0].role == "system") {
                 conversation[0].content = current_system;
@@ -92,8 +85,7 @@ void interactive_chat(
             }
             std::cout << "  [System prompt set: " << current_system << "]\n\n";
             continue;
-        }
-        else if (user_input.rfind("/image ", 0) == 0) {
+        } else if (user_input.rfind("/image ", 0) == 0) {
             if (!vision) {
                 std::cout << "  [Error: Vision encoder not loaded, use --mmproj]\n\n";
                 continue;
@@ -111,8 +103,7 @@ void interactive_chat(
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             std::cout << "  [Image loaded: " << n_tokens << " tokens, " << ms << "ms]\n\n";
             continue;
-        }
-        else if (user_input.rfind("/save ", 0) == 0) {
+        } else if (user_input.rfind("/save ", 0) == 0) {
             std::string save_path = user_input.substr(6);
             std::ofstream out(save_path);
             if (!out.is_open()) {
@@ -143,7 +134,8 @@ void interactive_chat(
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
         if (tfm_eng) {
             KVCacheDType kv_dtype = KVCacheDType::FP32;
-            if (args.kv_cache_dtype == "q4_0") kv_dtype = KVCacheDType::Q4_0;
+            if (args.kv_cache_dtype == "q4_0")
+                kv_dtype = KVCacheDType::Q4_0;
             tfm_eng->set_kv_cache_dtype(kv_dtype);
             tfm_eng->set_gpu_layers(args.n_gpu_layers);
         }
@@ -156,15 +148,14 @@ void interactive_chat(
         GenerationStats stats;
 
         if (args.no_stream) {
-            stats = generate_batch(*ctx, tokenizer, prompt_ids,
-                args.n_predict, args.temperature, args.top_k, args.top_p,
-                args.repeat_penalty, !args.no_sample, args.seed,
-                tokenizer.eos_token_id());
+            stats = generate_batch(*ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
+                                   args.top_k, args.top_p, args.repeat_penalty, !args.no_sample,
+                                   args.seed, tokenizer.eos_token_id());
         } else {
-            stats = generate_streaming(*ctx, tokenizer, prompt_ids,
-                args.n_predict, args.temperature, args.top_k, args.top_p,
-                args.repeat_penalty, !args.no_sample, args.seed,
-                tokenizer.eos_token_id());
+            stats =
+                generate_streaming(*ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
+                                   args.top_k, args.top_p, args.repeat_penalty, !args.no_sample,
+                                   args.seed, tokenizer.eos_token_id());
         }
 
         std::cout << "\n";
@@ -172,9 +163,10 @@ void interactive_chat(
         if (stats.num_generated_tokens > 0) {
             double prompt_tok_s = stats.num_prompt_tokens / (stats.prompt_eval_ms / 1000.0);
             double gen_tok_s = stats.num_generated_tokens / (stats.elapsed_ms / 1000.0);
-            printf("  [%d prompt tokens, %.1f ms, %.1f tok/s | %d generated, %.1f ms, %.1f tok/s]\n",
-                   stats.num_prompt_tokens, stats.prompt_eval_ms, prompt_tok_s,
-                   stats.num_generated_tokens, stats.elapsed_ms, gen_tok_s);
+            printf(
+                "  [%d prompt tokens, %.1f ms, %.1f tok/s | %d generated, %.1f ms, %.1f tok/s]\n",
+                stats.num_prompt_tokens, stats.prompt_eval_ms, prompt_tok_s,
+                stats.num_generated_tokens, stats.elapsed_ms, gen_tok_s);
         }
 
         conversation.push_back({"assistant", ""});

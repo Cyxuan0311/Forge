@@ -1,20 +1,21 @@
 #include "forge/engines/gemma_engine.h"
-#include "forge/operators.h"
-#include "forge/cuda_kernels.h"
-#include "forge/logger.h"
-#include "forge/perf_profiler.h"
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/operators.h"
+#include "forge/perf_profiler.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
 
-GemmaEngine::GemmaEngine(Model& model, InferenceContext& ctx)
-    : TransformerEngine(model, ctx) {
+GemmaEngine::GemmaEngine(Model& model, InferenceContext& ctx) : TransformerEngine(model, ctx) {
     is_gemma2_ = (model.config().arch_type == "gemma2");
     if (!init_weights()) {
         throw std::runtime_error("GemmaEngine: failed to initialize weights");
@@ -69,10 +70,8 @@ TensorPtr GemmaEngine::forward(const TensorPtr& input_ids, int64_t start_pos) {
     return logits;
 }
 
-TensorPtr GemmaEngine::forward_layer(const TensorPtr& hidden,
-                                      int layer_idx,
-                                      int seq_len, int64_t start_pos,
-                                      DeviceType dev) {
+TensorPtr GemmaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                     int64_t start_pos, DeviceType dev) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -162,13 +161,12 @@ TensorPtr GemmaEngine::forward_layer(const TensorPtr& hidden,
     {
         PERF_SCOPE("layer/attention");
         if (num_kv_heads < num_heads) {
-            attn_out = ops::scaled_dot_product_attention_2d_gqa(
-                q_rope, k_sliced, v_sliced, seq_len, total_len,
-                num_heads, num_kv_heads, head_dim, true);
+            attn_out = ops::scaled_dot_product_attention_2d_gqa(q_rope, k_sliced, v_sliced, seq_len,
+                                                                total_len, num_heads, num_kv_heads,
+                                                                head_dim, true);
         } else {
-            attn_out = ops::scaled_dot_product_attention_2d(
-                q_rope, k_sliced, v_sliced, seq_len, total_len,
-                num_heads, head_dim, true);
+            attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_sliced, v_sliced, seq_len,
+                                                            total_len, num_heads, head_dim, true);
         }
     }
 
@@ -226,6 +224,6 @@ EngineAutoRegister _reg_gemma("gemma", [](Model& model, InferenceContext& ctx) {
 EngineAutoRegister _reg_gemma2("gemma2", [](Model& model, InferenceContext& ctx) {
     return std::make_unique<GemmaEngine>(model, ctx);
 });
-} // anonymous namespace
+}  // anonymous namespace
 
-} // namespace forge
+}  // namespace forge

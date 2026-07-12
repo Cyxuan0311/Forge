@@ -1,17 +1,18 @@
 #include "forge/paged_kv_cache.h"
-#include "forge/logger.h"
-#include <cstring>
+
 #include <algorithm>
+#include <cstring>
+
+#include "forge/logger.h"
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
 
-bool PagedKVCache::init(int num_layers, int num_kv_heads, int head_dim,
-                         int max_seq_len, int block_size, int max_num_seqs,
-                         DeviceType device) {
+bool PagedKVCache::init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
+                        int block_size, int max_num_seqs, DeviceType device) {
     num_layers_ = num_layers;
     num_kv_heads_ = num_kv_heads;
     head_dim_ = head_dim;
@@ -29,10 +30,10 @@ bool PagedKVCache::init(int num_layers, int num_kv_heads, int head_dim,
         layer_blocks_[l].resize(num_blocks);
         for (int b = 0; b < num_blocks; ++b) {
             auto& blk = layer_blocks_[l][b];
-            blk.key_block = std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{block_size, kv_dim}, device);
-            blk.value_block = std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{block_size, kv_dim}, device);
+            blk.key_block = std::make_shared<Tensor>(
+                DataType::FP32, std::vector<int64_t>{block_size, kv_dim}, device);
+            blk.value_block = std::make_shared<Tensor>(
+                DataType::FP32, std::vector<int64_t>{block_size, kv_dim}, device);
             blk.key_block->zero_();
             blk.value_block->zero_();
             blk.ref_count = 0;
@@ -73,7 +74,8 @@ void PagedKVCache::release_seq(int seq_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = seq_tables_.find(seq_id);
-    if (it == seq_tables_.end()) return;
+    if (it == seq_tables_.end())
+        return;
 
     for (int l = 0; l < num_layers_; ++l) {
         for (int bid : it->second[l].block_ids) {
@@ -110,26 +112,29 @@ void PagedKVCache::free_block(int block_id) {
     free_block_ids_.push_back(block_id);
 }
 
-int PagedKVCache::append(int seq_id, int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+int PagedKVCache::append(int seq_id, int layer, const TensorPtr& new_key,
+                         const TensorPtr& new_value, int seq_len) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = seq_tables_.find(seq_id);
-    if (it == seq_tables_.end()) return -1;
+    if (it == seq_tables_.end())
+        return -1;
 
     auto& table = it->second[layer];
     int kv_dim = num_kv_heads_ * head_dim_;
 
-    int total_filled = static_cast<int>(table.block_ids.size()) * block_size_
-                       - block_size_ + table.num_filled_in_last;
+    int total_filled = static_cast<int>(table.block_ids.size()) * block_size_ - block_size_ +
+                       table.num_filled_in_last;
     if (!table.block_ids.empty()) {
-        total_filled = (static_cast<int>(table.block_ids.size()) - 1) * block_size_ + table.num_filled_in_last;
+        total_filled =
+            (static_cast<int>(table.block_ids.size()) - 1) * block_size_ + table.num_filled_in_last;
     } else {
         total_filled = 0;
     }
 
     int slots_needed = total_filled + seq_len;
-    int slots_available = table.block_ids.empty() ? 0 :
-                          (static_cast<int>(table.block_ids.size()) * block_size_);
+    int slots_available =
+        table.block_ids.empty() ? 0 : (static_cast<int>(table.block_ids.size()) * block_size_);
 
     ensure_seq_capacity(seq_id, layer, slots_needed);
 
@@ -156,7 +161,8 @@ int PagedKVCache::append(int seq_id, int layer, const TensorPtr& new_key, const 
 
         while (block_idx >= static_cast<int>(table.block_ids.size())) {
             int bid = alloc_block();
-            if (bid < 0) return -1;
+            if (bid < 0)
+                return -1;
             table.block_ids.push_back(bid);
             table.num_filled_in_last = 0;
         }
@@ -192,7 +198,8 @@ void PagedKVCache::ensure_seq_capacity(int seq_id, int layer, int needed_slots) 
     int current_capacity = static_cast<int>(table.block_ids.size()) * block_size_;
     while (current_capacity < needed_slots) {
         int bid = alloc_block();
-        if (bid < 0) return;
+        if (bid < 0)
+            return;
         table.block_ids.push_back(bid);
         table.num_filled_in_last = 0;
         current_capacity += block_size_;
@@ -201,18 +208,21 @@ void PagedKVCache::ensure_seq_capacity(int seq_id, int layer, int needed_slots) 
 
 TensorPtr PagedKVCache::get_key(int seq_id, int layer) const {
     auto it = seq_tables_.find(seq_id);
-    if (it == seq_tables_.end()) return nullptr;
+    if (it == seq_tables_.end())
+        return nullptr;
 
     const auto& table = it->second[layer];
     int total_filled = 0;
     if (!table.block_ids.empty()) {
-        total_filled = (static_cast<int>(table.block_ids.size()) - 1) * block_size_ + table.num_filled_in_last;
+        total_filled =
+            (static_cast<int>(table.block_ids.size()) - 1) * block_size_ + table.num_filled_in_last;
     }
-    if (total_filled == 0) return nullptr;
+    if (total_filled == 0)
+        return nullptr;
 
     int kv_dim = num_kv_heads_ * head_dim_;
     auto result = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{total_filled, kv_dim}, device_);
+                                           std::vector<int64_t>{total_filled, kv_dim}, device_);
     result->zero_();
 
     float* dst = static_cast<float*>(result->data());
@@ -225,13 +235,11 @@ TensorPtr PagedKVCache::get_key(int seq_id, int layer) const {
 
         if (device_ == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cudaMemcpy(dst, blk.key_block->data(),
-                       rows_in_this_block * kv_dim * sizeof(float),
+            cudaMemcpy(dst, blk.key_block->data(), rows_in_this_block * kv_dim * sizeof(float),
                        cudaMemcpyDeviceToDevice);
 #endif
         } else {
-            std::memcpy(dst, blk.key_block->data(),
-                        rows_in_this_block * kv_dim * sizeof(float));
+            std::memcpy(dst, blk.key_block->data(), rows_in_this_block * kv_dim * sizeof(float));
         }
 
         dst += rows_in_this_block * kv_dim;
@@ -243,18 +251,21 @@ TensorPtr PagedKVCache::get_key(int seq_id, int layer) const {
 
 TensorPtr PagedKVCache::get_value(int seq_id, int layer) const {
     auto it = seq_tables_.find(seq_id);
-    if (it == seq_tables_.end()) return nullptr;
+    if (it == seq_tables_.end())
+        return nullptr;
 
     const auto& table = it->second[layer];
     int total_filled = 0;
     if (!table.block_ids.empty()) {
-        total_filled = (static_cast<int>(table.block_ids.size()) - 1) * block_size_ + table.num_filled_in_last;
+        total_filled =
+            (static_cast<int>(table.block_ids.size()) - 1) * block_size_ + table.num_filled_in_last;
     }
-    if (total_filled == 0) return nullptr;
+    if (total_filled == 0)
+        return nullptr;
 
     int kv_dim = num_kv_heads_ * head_dim_;
     auto result = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{total_filled, kv_dim}, device_);
+                                           std::vector<int64_t>{total_filled, kv_dim}, device_);
     result->zero_();
 
     float* dst = static_cast<float*>(result->data());
@@ -267,13 +278,11 @@ TensorPtr PagedKVCache::get_value(int seq_id, int layer) const {
 
         if (device_ == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cudaMemcpy(dst, blk.value_block->data(),
-                       rows_in_this_block * kv_dim * sizeof(float),
+            cudaMemcpy(dst, blk.value_block->data(), rows_in_this_block * kv_dim * sizeof(float),
                        cudaMemcpyDeviceToDevice);
 #endif
         } else {
-            std::memcpy(dst, blk.value_block->data(),
-                        rows_in_this_block * kv_dim * sizeof(float));
+            std::memcpy(dst, blk.value_block->data(), rows_in_this_block * kv_dim * sizeof(float));
         }
 
         dst += rows_in_this_block * kv_dim;
@@ -285,10 +294,12 @@ TensorPtr PagedKVCache::get_value(int seq_id, int layer) const {
 
 int PagedKVCache::filled(int seq_id, int layer) const {
     auto it = seq_tables_.find(seq_id);
-    if (it == seq_tables_.end()) return 0;
+    if (it == seq_tables_.end())
+        return 0;
 
     const auto& table = it->second[layer];
-    if (table.block_ids.empty()) return 0;
+    if (table.block_ids.empty())
+        return 0;
     return (static_cast<int>(table.block_ids.size()) - 1) * block_size_ + table.num_filled_in_last;
 }
 
@@ -301,7 +312,8 @@ bool PagedKVCache::has_seq(int seq_id) const {
 }
 
 size_t PagedKVCache::nbytes() const {
-    if (layer_blocks_.empty()) return 0;
+    if (layer_blocks_.empty())
+        return 0;
     int num_blocks = static_cast<int>(layer_blocks_[0].size());
     int kv_dim = num_kv_heads_ * head_dim_;
     size_t per_block = block_size_ * kv_dim * sizeof(float) * 2;
@@ -313,8 +325,9 @@ int PagedKVCache::num_free_blocks() const {
 }
 
 int PagedKVCache::num_total_blocks() const {
-    if (layer_blocks_.empty()) return 0;
+    if (layer_blocks_.empty())
+        return 0;
     return static_cast<int>(layer_blocks_[0].size());
 }
 
-} // namespace forge
+}  // namespace forge

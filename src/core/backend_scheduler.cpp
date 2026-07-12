@@ -1,9 +1,11 @@
 #include "forge/backend_scheduler.h"
-#include "forge/compute_graph.h"
-#include "forge/logger.h"
+
 #include <algorithm>
 #include <cmath>
 #include <set>
+
+#include "forge/compute_graph.h"
+#include "forge/logger.h"
 
 namespace forge {
 
@@ -34,15 +36,15 @@ size_t BackendScheduler::estimate_node_size(const GraphNode& node) {
     return 0;
 }
 
-std::vector<int> BackendScheduler::greedy_assign(
-        const ComputeGraph& graph,
-        const std::vector<DeviceInfo>& devices,
-        std::vector<size_t>& node_sizes) {
+std::vector<int> BackendScheduler::greedy_assign(const ComputeGraph& graph,
+                                                 const std::vector<DeviceInfo>& devices,
+                                                 std::vector<size_t>& node_sizes) {
     int n_nodes = graph.num_nodes();
     int n_devices = static_cast<int>(devices.size());
-    std::vector<int> assignments(n_nodes, 0); // Default: device 0 (CPU)
+    std::vector<int> assignments(n_nodes, 0);  // Default: device 0 (CPU)
 
-    if (n_devices == 0) return assignments;
+    if (n_devices == 0)
+        return assignments;
     if (n_devices == 1) {
         // Only one device available
         std::fill(assignments.begin(), assignments.end(), 0);
@@ -72,9 +74,10 @@ std::vector<int> BackendScheduler::greedy_assign(
 
     // Build node order: sort by size descending (large nodes first)
     std::vector<int> order(n_nodes);
-    for (int i = 0; i < n_nodes; ++i) order[i] = i;
+    for (int i = 0; i < n_nodes; ++i)
+        order[i] = i;
     std::sort(order.begin(), order.end(),
-        [&](int a, int b) { return node_sizes[a] > node_sizes[b]; });
+              [&](int a, int b) { return node_sizes[a] > node_sizes[b]; });
 
     // Assign each node to best device
     for (int node_idx : order) {
@@ -83,21 +86,18 @@ std::vector<int> BackendScheduler::greedy_assign(
             assignments[node_idx] = 0;
             continue;
         }
-        assignments[node_idx] = pick_device(
-            node_idx, assignments, node_sizes,
-            devices, device_used_bytes, pred_indices);
+        assignments[node_idx] = pick_device(node_idx, assignments, node_sizes, devices,
+                                            device_used_bytes, pred_indices);
     }
 
     return assignments;
 }
 
-int BackendScheduler::pick_device(
-        int node_idx,
-        const std::vector<int>& current_assignments,
-        const std::vector<size_t>& node_sizes,
-        const std::vector<DeviceInfo>& devices,
-        std::vector<size_t>& device_used_bytes,
-        const std::vector<std::vector<int>>& pred_indices) const {
+int BackendScheduler::pick_device(int node_idx, const std::vector<int>& current_assignments,
+                                  const std::vector<size_t>& node_sizes,
+                                  const std::vector<DeviceInfo>& devices,
+                                  std::vector<size_t>& device_used_bytes,
+                                  const std::vector<std::vector<int>>& pred_indices) const {
     int n_devices = static_cast<int>(devices.size());
     size_t node_size = node_sizes[node_idx];
 
@@ -120,7 +120,7 @@ int BackendScheduler::pick_device(
     }
 
     // Score each device
-    int best_device = 0; // Default: CPU
+    int best_device = 0;  // Default: CPU
     int best_score = -1;
 
     for (int d = 0; d < n_devices; ++d) {
@@ -145,7 +145,7 @@ int BackendScheduler::pick_device(
 
         if (node_size <= available || node_size == 0) {
             // Can fit on this GPU
-            int score = pred_count[d] * 10 + 5; // GPU bonus
+            int score = pred_count[d] * 10 + 5;  // GPU bonus
             if (score > best_score) {
                 best_score = score;
                 best_device = d;
@@ -213,7 +213,8 @@ SchedulingPlan BackendScheduler::schedule(const ComputeGraph& graph) {
         const auto& dev = plan.devices[d];
         int count = 0;
         for (int a : node_to_device) {
-            if (a == static_cast<int>(d)) count++;
+            if (a == static_cast<int>(d))
+                count++;
         }
         LOG_INFO("  " + dev.name + ": " + std::to_string(count) + " nodes");
     }
@@ -221,4 +222,4 @@ SchedulingPlan BackendScheduler::schedule(const ComputeGraph& graph) {
     return plan;
 }
 
-} // namespace forge
+}  // namespace forge

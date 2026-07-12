@@ -1,26 +1,26 @@
 #pragma once
 
-#include <vector>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <functional>
+#include <vector>
 
-#include "tensor.h"
 #include "backend.h"
-#include "op_enum.h"
-#include "op_dispatch.h"
-#include "memory_planner.h"
 #include "backend_scheduler.h"
+#include "memory_planner.h"
+#include "op_dispatch.h"
+#include "op_enum.h"
+#include "tensor.h"
 
 namespace forge {
 
 struct GraphNode {
     std::string name;
     OpType op_type = OpType::NONE;
-    std::vector<int> input_indices;           // >=0 = graph input, <0 = -node_idx-1
-    std::vector<TensorPtr> resolved_inputs;   // Resolved at execution time
+    std::vector<int> input_indices;          // >=0 = graph input, <0 = -node_idx-1
+    std::vector<TensorPtr> resolved_inputs;  // Resolved at execution time
     TensorPtr output;
 
     // Legacy: optional closure for ops that haven't migrated to OpDispatch yet
@@ -41,15 +41,11 @@ public:
     int add_input(const TensorPtr& tensor);
 
     // Add a node with an OpType (for OpDispatch-based execution)
-    int add_node(const std::string& name,
-                 OpType op_type,
-                 const std::vector<int>& input_indices,
-                 const int32_t* op_params = nullptr,
-                 DeviceType dev = DeviceType::CPU);
+    int add_node(const std::string& name, OpType op_type, const std::vector<int>& input_indices,
+                 const int32_t* op_params = nullptr, DeviceType dev = DeviceType::CPU);
 
     // Legacy: add a node with a compute_fn closure
-    int add_node(const std::string& name,
-                 const std::string& op_type_str,
+    int add_node(const std::string& name, const std::string& op_type_str,
                  const std::vector<int>& input_indices,
                  std::function<TensorPtr(const std::vector<TensorPtr>&)> compute_fn,
                  DeviceType dev = DeviceType::CPU);
@@ -125,8 +121,7 @@ public:
 
     GraphBuilder& input(const TensorPtr& tensor);
 
-    GraphBuilder& op(const std::string& name,
-                     const std::string& op_type_str,
+    GraphBuilder& op(const std::string& name, const std::string& op_type_str,
                      const std::vector<int>& deps,
                      std::function<TensorPtr(const std::vector<TensorPtr>&)> fn);
 
@@ -143,4 +138,4 @@ private:
     std::vector<PendingNode> pending_nodes_;
 };
 
-} // namespace forge
+}  // namespace forge

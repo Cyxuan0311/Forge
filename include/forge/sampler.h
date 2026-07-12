@@ -1,8 +1,9 @@
 #pragma once
 
-#include <vector>
 #include <cstdint>
 #include <memory>
+#include <vector>
+
 #include "tensor.h"
 
 namespace forge {
@@ -47,4 +48,4 @@ private:
     float next_uniform();
 };
 
-} // namespace forge
+}  // namespace forge

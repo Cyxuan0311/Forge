@@ -1,7 +1,8 @@
 #pragma once
 
-#include <vector>
 #include <memory>
+#include <vector>
+
 #include "tensor.h"
 
 namespace forge {
@@ -28,11 +29,10 @@ public:
     KVCache() = default;
     ~KVCache();
 
-    bool init(int num_layers, int num_kv_heads, int head_dim,
-              int max_seq_len, DeviceType device);
+    bool init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len, DeviceType device);
 
-    bool init_quantized(int num_layers, int num_kv_heads, int head_dim,
-                        int max_seq_len, DeviceType device, KVCacheDType kv_dtype);
+    bool init_quantized(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
+                        DeviceType device, KVCacheDType kv_dtype);
 
     void reset();
 
@@ -57,8 +57,10 @@ public:
     void dequantize_layer(int layer);
 
 private:
-    int update_quantized(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
-    int update_quantized_cuda(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
+    int update_quantized(int layer, const TensorPtr& new_key, const TensorPtr& new_value,
+                         int seq_len);
+    int update_quantized_cuda(int layer, const TensorPtr& new_key, const TensorPtr& new_value,
+                              int seq_len);
     void dequantize_layer_cuda(int layer);
     void alloc_cuda_q_cache(int layer, size_t bytes);
 
@@ -70,4 +72,4 @@ private:
     KVCacheDType kv_dtype_ = KVCacheDType::FP32;
 };
 
-} // namespace forge
+}  // namespace forge

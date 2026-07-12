@@ -1,8 +1,9 @@
 #pragma once
 
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
+
 #include "tensor.h"
 #include "types.h"
 
@@ -22,10 +23,11 @@ public:
     std::vector<std::string> weight_names() const;
 
     void to_device(DeviceType device);
-    void to_device_layer(int layer_idx, DeviceType device, const std::string& prefix_pattern = "model.layers.{}");
+    void to_device_layer(int layer_idx, DeviceType device,
+                         const std::string& prefix_pattern = "model.layers.{}");
 
 private:
     std::unordered_map<std::string, TensorPtr> weights_;
 };
 
-} // namespace forge
+}  // namespace forge

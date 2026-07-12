@@ -1,6 +1,6 @@
 #include "forge/arch_registry.h"
-#include "forge/weight_store.h"
 #include "forge/logger.h"
+#include "forge/weight_store.h"
 
 namespace forge {
 
@@ -41,7 +41,8 @@ namespace {
 static void load_if_present(const WeightStore& store, LayerWeights& lw,
                             const std::string& canonical, const std::string& store_name) {
     auto t = store.get(store_name);
-    if (t) lw.set(canonical, t);
+    if (t)
+        lw.set(canonical, t);
 }
 
 static void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
@@ -130,7 +131,7 @@ static void init_falcon_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "attn_norm_2_bias", base + ".attn_norm_2_bias");
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // Register weight init functions for each architecture
@@ -151,4 +152,4 @@ static WeightInitAutoRegister _reg_winit_gemma("gemma", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_gemma2("gemma2", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_falcon("falcon", init_falcon_layer_weights);
 
-} // namespace forge
+}  // namespace forge

@@ -1,8 +1,8 @@
 #pragma once
 
-#include <string>
-#include <functional>
 #include <cstddef>
+#include <functional>
+#include <string>
 
 namespace forge {
 
@@ -36,17 +36,17 @@ private:
     Sink sink_;
 };
 
-} // namespace forge
+}  // namespace forge
 
-#define NI_LOG(level, msg)                                          \
-    do {                                                            \
-        if (::forge::Logger::instance().should_log(level)) {    \
-            ::forge::Logger::instance().log(level, msg);        \
-        }                                                           \
+#define NI_LOG(level, msg)                                   \
+    do {                                                     \
+        if (::forge::Logger::instance().should_log(level)) { \
+            ::forge::Logger::instance().log(level, msg);     \
+        }                                                    \
     } while (0)
 
 #define LOG_ERROR(msg) NI_LOG(::forge::LogLevel::ERROR, msg)
-#define LOG_WARN(msg)  NI_LOG(::forge::LogLevel::WARN, msg)
-#define LOG_INFO(msg)  NI_LOG(::forge::LogLevel::INFO, msg)
+#define LOG_WARN(msg) NI_LOG(::forge::LogLevel::WARN, msg)
+#define LOG_INFO(msg) NI_LOG(::forge::LogLevel::INFO, msg)
 #define LOG_DEBUG(msg) NI_LOG(::forge::LogLevel::DEBUG, msg)
 #define LOG_TRACE(msg) NI_LOG(::forge::LogLevel::TRACE, msg)

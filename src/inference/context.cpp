@@ -1,21 +1,22 @@
 #include "forge/context.h"
-#include "forge/model.h"
+
+#include <cstring>
+#include <stdexcept>
+
+#include "forge/backend.h"
 #include "forge/engine.h"
 #include "forge/engines/llama_engine.h"
 #include "forge/logger.h"
+#include "forge/model.h"
 #include "forge/perf_profiler.h"
-#include "forge/backend.h"
-#include <stdexcept>
-#include <cstring>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
 
-InferenceContext::InferenceContext(const Model& model)
-    : model_(model), params_{} {
+InferenceContext::InferenceContext(const Model& model) : model_(model), params_{} {
     params_.device = model.device();
     params_.max_seq_len = model.config().max_seq_len;
 }
@@ -33,7 +34,8 @@ InferenceContext::InferenceContext(const Model& model, const ContextParams& para
 InferenceContext::~InferenceContext() = default;
 
 bool InferenceContext::init_kv_cache() {
-    if (kv_cache_initialized_) return true;
+    if (kv_cache_initialized_)
+        return true;
 
     const auto& cfg = model_.config();
     kv_cache_ = std::make_unique<KVCache>();
@@ -48,15 +50,15 @@ bool InferenceContext::init_kv_cache() {
 
     // Cap max_seq_len to avoid OOM
     if (kv_max_seq > KV_MAX_SEQ_CAP) {
-        LOG_INFO("Capping KV cache max_seq_len from " + std::to_string(kv_max_seq) +
-                 " to " + std::to_string(KV_MAX_SEQ_CAP) + " to avoid OOM");
+        LOG_INFO("Capping KV cache max_seq_len from " + std::to_string(kv_max_seq) + " to " +
+                 std::to_string(KV_MAX_SEQ_CAP) + " to avoid OOM");
         kv_max_seq = KV_MAX_SEQ_CAP;
     }
 
     // If CUDA, check available memory and further reduce if needed
     if (kv_dev == DeviceType::CUDA) {
-        size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq *
-                          cfg.num_kv_heads * cfg.head_dim * sizeof(float);
+        size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
+                          cfg.head_dim * sizeof(float);
         auto backend = BackendManager::instance().get_cuda_backend();
         if (backend) {
             size_t free_mem = backend->device_memory_free();
@@ -64,14 +66,16 @@ bool InferenceContext::init_kv_cache() {
             const size_t headroom = 256 * 1024 * 1024;
             if (kv_bytes + headroom > free_mem && free_mem > headroom) {
                 size_t available = free_mem - headroom;
-                int reduced_seq = static_cast<int>(available /
-                    ((size_t)cfg.num_layers * 2 * cfg.num_kv_heads * cfg.head_dim * sizeof(float)));
+                int reduced_seq =
+                    static_cast<int>(available / ((size_t)cfg.num_layers * 2 * cfg.num_kv_heads *
+                                                  cfg.head_dim * sizeof(float)));
                 if (reduced_seq < kv_max_seq) {
                     // Round down to nearest 256 for alignment
                     reduced_seq = (reduced_seq / 256) * 256;
-                    if (reduced_seq < 256) reduced_seq = 256;
-                    LOG_WARN("KV cache needs " + std::to_string(kv_bytes / (1024*1024)) +
-                             "MB but only " + std::to_string(free_mem / (1024*1024)) +
+                    if (reduced_seq < 256)
+                        reduced_seq = 256;
+                    LOG_WARN("KV cache needs " + std::to_string(kv_bytes / (1024 * 1024)) +
+                             "MB but only " + std::to_string(free_mem / (1024 * 1024)) +
                              "MB free, reducing max_seq_len from " + std::to_string(kv_max_seq) +
                              " to " + std::to_string(reduced_seq));
                     kv_max_seq = reduced_seq;
@@ -80,9 +84,8 @@ bool InferenceContext::init_kv_cache() {
         }
     }
 
-    kv_cache_->init_quantized(
-        cfg.num_layers, cfg.num_kv_heads, cfg.head_dim,
-        kv_max_seq, kv_dev, params_.kv_cache_dtype);
+    kv_cache_->init_quantized(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq, kv_dev,
+                              params_.kv_cache_dtype);
 
     kv_cache_initialized_ = true;
     LOG_INFO("KV cache initialized: " + std::to_string(cfg.num_layers) +
@@ -104,8 +107,8 @@ TensorPtr InferenceContext::forward(const TensorPtr& input_ids, int64_t start_po
 }
 
 TensorPtr InferenceContext::decode(int token_id, int64_t start_pos) {
-    auto input = std::make_shared<Tensor>(DataType::INT32,
-        std::vector<int64_t>{1}, DeviceType::CPU);
+    auto input =
+        std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CPU);
     *static_cast<int32_t*>(input->data()) = token_id;
 
     if (params_.device == DeviceType::CUDA) {
@@ -131,7 +134,7 @@ void InferenceContext::reset_kv_cache() {
 }
 
 int InferenceContext::generate(int start_token, int max_tokens,
-                                std::function<int(float*, int)> sampler_fn) {
+                               std::function<int(float*, int)> sampler_fn) {
     int token = start_token;
     for (int i = 0; i < max_tokens; ++i) {
         auto logits = decode(token, current_pos_);
@@ -140,8 +143,8 @@ int InferenceContext::generate(int start_token, int max_tokens,
         std::vector<float> host_logits(logits->numel());
         if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cudaMemcpy(host_logits.data(), logits->data(),
-                       logits->numel() * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(host_logits.data(), logits->data(), logits->numel() * sizeof(float),
+                       cudaMemcpyDeviceToHost);
 #endif
         } else {
             std::memcpy(host_logits.data(), logits->data(), logits->nbytes());
@@ -194,8 +197,8 @@ void InferenceContext::warmup() {
 
     // Run a short dummy forward pass to trigger CUDA kernel compilation
     // Use 2 tokens for prefill + 1 token for decode to cover both paths
-    auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-        std::vector<int64_t>{2}, DeviceType::CPU);
+    auto input_ids =
+        std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{2}, DeviceType::CPU);
     auto* ids = static_cast<int32_t*>(input_ids->data());
     ids[0] = 0;
     ids[1] = 0;
@@ -208,8 +211,8 @@ void InferenceContext::warmup() {
     engine_->forward(input_ids, 0);
 
     // Decode warmup
-    auto decode_input = std::make_shared<Tensor>(DataType::INT32,
-        std::vector<int64_t>{1}, DeviceType::CPU);
+    auto decode_input =
+        std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CPU);
     *static_cast<int32_t*>(decode_input->data()) = 0;
     if (params_.device == DeviceType::CUDA) {
         decode_input->to_device(DeviceType::CUDA);
@@ -231,4 +234,4 @@ void InferenceContext::warmup() {
     LOG_INFO("Warmup completed");
 }
 
-} // namespace forge
+}  // namespace forge

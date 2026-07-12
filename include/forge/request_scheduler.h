@@ -1,16 +1,17 @@
 #pragma once
 
-#include <vector>
-#include <queue>
-#include <memory>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <unordered_map>
-#include <mutex>
-#include "model.h"
+#include <vector>
+
 #include "context.h"
-#include "sampler.h"
+#include "model.h"
 #include "paged_kv_cache.h"
+#include "sampler.h"
 
 namespace forge {
 
@@ -35,7 +36,8 @@ struct GenerateRequest {
     int current_pos = 0;
     std::string finish_reason;
 
-    using Callback = std::function<void(int request_id, int32_t token_id, int step, RequestStatus status)>;
+    using Callback =
+        std::function<void(int request_id, int32_t token_id, int step, RequestStatus status)>;
     Callback callback;
 };
 
@@ -43,10 +45,8 @@ class RequestScheduler {
 public:
     explicit RequestScheduler(Model& model, int block_size = 16, int max_num_seqs = 4);
 
-    int submit(const std::vector<int32_t>& prompt_tokens,
-               int max_new_tokens = 256,
-               int eos_token_id = -1,
-               const SamplerConfig& sampler_cfg = SamplerConfig{},
+    int submit(const std::vector<int32_t>& prompt_tokens, int max_new_tokens = 256,
+               int eos_token_id = -1, const SamplerConfig& sampler_cfg = SamplerConfig{},
                GenerateRequest::Callback callback = nullptr);
 
     bool step();
@@ -86,4 +86,4 @@ private:
     mutable std::mutex mutex_;
 };
 
-} // namespace forge
+}  // namespace forge

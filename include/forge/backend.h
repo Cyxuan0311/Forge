@@ -1,11 +1,12 @@
 #pragma once
 
 #include <cstddef>
-#include <string>
-#include <memory>
-#include <vector>
-#include <unordered_map>
 #include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "types.h"
 
 struct CUstream_st;
@@ -24,13 +25,13 @@ struct BackendStream {
 
 // Backend capability flags
 enum class BackendCapability : uint32_t {
-    None        = 0,
-    FP32        = 1 << 0,
-    FP16        = 1 << 1,
-    INT8        = 1 << 2,
-    Quantized   = 1 << 3,   // Q4_0, Q8_0, etc.
-    UnifiedMemory = 1 << 4, // Host and device share address space
-    StreamAsync = 1 << 5,   // Supports async stream operations
+    None = 0,
+    FP32 = 1 << 0,
+    FP16 = 1 << 1,
+    INT8 = 1 << 2,
+    Quantized = 1 << 3,      // Q4_0, Q8_0, etc.
+    UnifiedMemory = 1 << 4,  // Host and device share address space
+    StreamAsync = 1 << 5,    // Supports async stream operations
 };
 
 inline BackendCapability operator|(BackendCapability a, BackendCapability b) {
@@ -91,17 +92,17 @@ public:
 using BackendFactory = std::function<std::shared_ptr<Backend>(int device_id)>;
 
 struct BackendInfo {
-    std::string name;           // e.g., "cpu", "cuda", "metal"
+    std::string name;  // e.g., "cpu", "cuda", "metal"
     DeviceType device_type;
     BackendFactory factory;
-    bool available;             // Whether the backend is usable on this system
+    bool available;  // Whether the backend is usable on this system
 };
 
 // Runtime device info for scheduling (BackendScheduler)
 struct DeviceInfo {
-    std::string name;               // "cpu", "cuda:0"
+    std::string name;  // "cpu", "cuda:0"
     DeviceType type;
-    int device_id;                  // -1 for CPU, 0+ for CUDA
+    int device_id;  // -1 for CPU, 0+ for CUDA
     std::shared_ptr<Backend> backend;
     size_t memory_total = 0;
     size_t memory_free = 0;
@@ -118,8 +119,7 @@ public:
     std::shared_ptr<Backend> get_cuda_backend(int device_id = 0);
 
     // Plugin-based registration
-    void register_backend(const std::string& name, DeviceType device_type,
-                          BackendFactory factory);
+    void register_backend(const std::string& name, DeviceType device_type, BackendFactory factory);
     void unregister_backend(const std::string& name);
 
     // Get backend by name
@@ -150,4 +150,4 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Backend>> cached_backends_;
 };
 
-} // namespace forge
+}  // namespace forge

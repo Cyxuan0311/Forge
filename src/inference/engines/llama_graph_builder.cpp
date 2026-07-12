@@ -1,23 +1,24 @@
 #include "forge/engines/llama_graph_builder.h"
-#include "forge/operators.h"
-#include "forge/cuda_kernels.h"
-#include "forge/logger.h"
-#include "forge/op_enum.h"
-#include "forge/op_dispatch.h"
+
 #include <cmath>
 #include <cstring>
 
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/op_dispatch.h"
+#include "forge/op_enum.h"
+#include "forge/operators.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
 
 // Static helper for rope computation
-static void apply_rope_standard_cpu(const float* q_data, const float* k_data,
-                                     float* q_out, float* k_out,
-                                     int seq_len, int num_heads, int num_kv_heads,
-                                     int head_dim, int64_t start_pos, float theta) {
+static void apply_rope_standard_cpu(const float* q_data, const float* k_data, float* q_out,
+                                    float* k_out, int seq_len, int num_heads, int num_kv_heads,
+                                    int head_dim, int64_t start_pos, float theta) {
     int half_dim = head_dim / 2;
     int q_stride = num_heads * head_dim;
     int k_stride = num_kv_heads * head_dim;
@@ -47,10 +48,9 @@ static void apply_rope_standard_cpu(const float* q_data, const float* k_data,
     }
 }
 
-static void apply_rope_neox_cpu(const float* q_data, const float* k_data,
-                                 float* q_out, float* k_out,
-                                 int seq_len, int num_heads, int num_kv_heads,
-                                 int head_dim, int64_t start_pos, float theta) {
+static void apply_rope_neox_cpu(const float* q_data, const float* k_data, float* q_out,
+                                float* k_out, int seq_len, int num_heads, int num_kv_heads,
+                                int head_dim, int64_t start_pos, float theta) {
     int half_dim = head_dim / 2;
     int q_stride = num_heads * head_dim;
     int k_stride = num_kv_heads * head_dim;
@@ -80,9 +80,8 @@ static void apply_rope_neox_cpu(const float* q_data, const float* k_data,
     }
 }
 
-static void rope_q_only_cpu(const float* q_data, float* q_out,
-                            int seq_len, int num_heads, int head_dim,
-                            int64_t start_pos, float theta, bool use_neox) {
+static void rope_q_only_cpu(const float* q_data, float* q_out, int seq_len, int num_heads,
+                            int head_dim, int64_t start_pos, float theta, bool use_neox) {
     (void)use_neox;
     int half_dim = head_dim / 2;
     int q_stride = num_heads * head_dim;
@@ -104,9 +103,8 @@ static void rope_q_only_cpu(const float* q_data, float* q_out,
     }
 }
 
-static void rope_k_only_cpu(const float* k_data, float* k_out,
-                            int seq_len, int num_kv_heads, int head_dim,
-                            int64_t start_pos, float theta, bool use_neox) {
+static void rope_k_only_cpu(const float* k_data, float* k_out, int seq_len, int num_kv_heads,
+                            int head_dim, int64_t start_pos, float theta, bool use_neox) {
     (void)use_neox;
     int half_dim = head_dim / 2;
     int k_stride = num_kv_heads * head_dim;
@@ -128,17 +126,14 @@ static void rope_k_only_cpu(const float* k_data, float* k_out,
     }
 }
 
-static inline int ref(int node_idx) { return -(node_idx + 1); }
+static inline int ref(int node_idx) {
+    return -(node_idx + 1);
+}
 
-int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph,
-                                          int hidden_idx,
-                                          const LayerWeights& lw,
-                                          const ModelConfig& cfg,
-                                          int layer_idx,
-                                          int seq_len,
-                                          int64_t start_pos,
-                                          DeviceType dev,
-                                          KVCache& kv_cache) {
+int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
+                                         const LayerWeights& lw, const ModelConfig& cfg,
+                                         int layer_idx, int seq_len, int64_t start_pos,
+                                         DeviceType dev, KVCache& kv_cache) {
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
     int head_dim = cfg.head_dim;
@@ -152,25 +147,28 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph,
     int attn_w_idx = graph.add_input(lw.attn_norm());
     int32_t eps_params[OP_PARAMS_MAX_SIZE / sizeof(int32_t)] = {};
     std::memcpy(eps_params, &rms_eps, sizeof(float));
-    int normed_idx = graph.add_node("attn_norm", OpType::RMS_NORM,
-        {hidden_idx, attn_w_idx}, eps_params, dev);
+    int normed_idx =
+        graph.add_node("attn_norm", OpType::RMS_NORM, {hidden_idx, attn_w_idx}, eps_params, dev);
 
     // Node: q_proj
     int wq_idx = graph.add_input(lw.wq());
     std::vector<int> q_inputs = {ref(normed_idx), wq_idx};
-    if (lw.bq()) q_inputs.push_back(graph.add_input(lw.bq()));
+    if (lw.bq())
+        q_inputs.push_back(graph.add_input(lw.bq()));
     int q_idx = graph.add_node("q_proj", OpType::MUL_MAT_TRANSB, q_inputs, nullptr, dev);
 
     // Node: k_proj
     int wk_idx = graph.add_input(lw.wk());
     std::vector<int> k_inputs = {ref(normed_idx), wk_idx};
-    if (lw.bk()) k_inputs.push_back(graph.add_input(lw.bk()));
+    if (lw.bk())
+        k_inputs.push_back(graph.add_input(lw.bk()));
     int k_idx = graph.add_node("k_proj", OpType::MUL_MAT_TRANSB, k_inputs, nullptr, dev);
 
     // Node: v_proj
     int wv_idx = graph.add_input(lw.wv());
     std::vector<int> v_inputs = {ref(normed_idx), wv_idx};
-    if (lw.bv()) v_inputs.push_back(graph.add_input(lw.bv()));
+    if (lw.bv())
+        v_inputs.push_back(graph.add_input(lw.bv()));
     int v_idx = graph.add_node("v_proj", OpType::MUL_MAT_TRANSB, v_inputs, nullptr, dev);
 
     // Helper to pack ROPE params
@@ -198,7 +196,8 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph,
     delete[] k_rope_params;
 
     // Node: cache_cpy (update KV cache: store k_rope + v, optionally dequantize)
-    int cache_idx = graph.add_node("cache_cpy", "cpy_k", {ref(k_rope_idx), ref(v_idx)},
+    int cache_idx = graph.add_node(
+        "cache_cpy", "cpy_k", {ref(k_rope_idx), ref(v_idx)},
         [&kv_cache, layer_idx, seq_len, dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
             auto k_rope = inputs[0];
             auto v = inputs[1];
@@ -206,33 +205,39 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph,
             if (kv_cache.kv_dtype() == KVCacheDType::Q4_0) {
                 kv_cache.dequantize_layer(layer_idx);
             }
-            return std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{1}, dev);
-        }, dev);
+            return std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1}, dev);
+        },
+        dev);
 
     // Node: get_k (read filled K from cache, optionally copy to CUDA)
-    int k_cache_idx = graph.add_node("get_k", "get_k", {ref(cache_idx)},
+    int k_cache_idx = graph.add_node(
+        "get_k", "get_k", {ref(cache_idx)},
         [&kv_cache, layer_idx, dev](const std::vector<TensorPtr>&) -> TensorPtr {
             TensorPtr k_sliced = kv_cache.get_key_filled(layer_idx);
             if (dev == DeviceType::CUDA && k_sliced->device() == DeviceType::CPU) {
-                auto k_cuda = std::make_shared<Tensor>(DataType::FP32, k_sliced->shape(), DeviceType::CUDA);
+                auto k_cuda =
+                    std::make_shared<Tensor>(DataType::FP32, k_sliced->shape(), DeviceType::CUDA);
                 k_cuda->copy_from(*k_sliced);
                 k_sliced = k_cuda;
             }
             return k_sliced;
-        }, dev);
+        },
+        dev);
 
     // Node: get_v (read filled V from cache, optionally copy to CUDA)
-    int v_cache_idx = graph.add_node("get_v", "get_v", {ref(cache_idx)},
+    int v_cache_idx = graph.add_node(
+        "get_v", "get_v", {ref(cache_idx)},
         [&kv_cache, layer_idx, dev](const std::vector<TensorPtr>&) -> TensorPtr {
             TensorPtr v_sliced = kv_cache.get_value_filled(layer_idx);
             if (dev == DeviceType::CUDA && v_sliced->device() == DeviceType::CPU) {
-                auto v_cuda = std::make_shared<Tensor>(DataType::FP32, v_sliced->shape(), DeviceType::CUDA);
+                auto v_cuda =
+                    std::make_shared<Tensor>(DataType::FP32, v_sliced->shape(), DeviceType::CUDA);
                 v_cuda->copy_from(*v_sliced);
                 v_sliced = v_cuda;
             }
             return v_sliced;
-        }, dev);
+        },
+        dev);
 
     // Node: attention (flash attention or expand + sdpa)
     int32_t fa_params[OP_PARAMS_MAX_SIZE / sizeof(int32_t)] = {};
@@ -242,95 +247,95 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph,
     fa_params[3] = 1;  // causal
     fa_params[4] = (dev == DeviceType::CUDA) ? 1 : 0;
 
-    int attn_idx = graph.add_node("attention", OpType::FLASH_ATTN_GQA,
-        {ref(q_rope_idx), ref(k_cache_idx), ref(v_cache_idx)}, fa_params, dev);
+    int attn_idx =
+        graph.add_node("attention", OpType::FLASH_ATTN_GQA,
+                       {ref(q_rope_idx), ref(k_cache_idx), ref(v_cache_idx)}, fa_params, dev);
 
     // Node: out_proj
     int wo_idx = graph.add_input(lw.wo());
-    int proj_idx = graph.add_node("out_proj", OpType::MUL_MAT_TRANSB,
-        {ref(attn_idx), wo_idx}, nullptr, dev);
+    int proj_idx =
+        graph.add_node("out_proj", OpType::MUL_MAT_TRANSB, {ref(attn_idx), wo_idx}, nullptr, dev);
 
     // Node: residual_add (hidden + attn_proj)
-    int after_attn_idx = graph.add_node("residual_add", OpType::ADD,
-        {hidden_idx, ref(proj_idx)}, nullptr, dev);
+    int after_attn_idx =
+        graph.add_node("residual_add", OpType::ADD, {hidden_idx, ref(proj_idx)}, nullptr, dev);
 
     // === FFN block (fine-grained nodes) ===
 
     // Node: ffn_rms_norm
     int ffn_w_idx = graph.add_input(lw.ffn_norm());
     int ffn_normed_idx = graph.add_node("ffn_norm", OpType::RMS_NORM,
-        {ref(after_attn_idx), ffn_w_idx}, eps_params, dev);
+                                        {ref(after_attn_idx), ffn_w_idx}, eps_params, dev);
 
     // FFN core: fused or split gate/up/silu path
     int ffn_mid_idx;
-    bool use_ffn_up_fused = (dev == DeviceType::CUDA &&
-                             lw.w1()->dtype() == DataType::Q4_0 &&
+    bool use_ffn_up_fused = (dev == DeviceType::CUDA && lw.w1()->dtype() == DataType::Q4_0 &&
                              lw.w3()->dtype() == DataType::Q4_0);
     if (use_ffn_up_fused) {
-        ffn_mid_idx = graph.add_node("ffn_up_fused", "ffn_up_fused", {ref(ffn_normed_idx)},
+        ffn_mid_idx = graph.add_node(
+            "ffn_up_fused", "ffn_up_fused", {ref(ffn_normed_idx)},
             [&lw](const std::vector<TensorPtr>& inputs) -> TensorPtr {
                 return ops::ffn_up_fused(inputs[0], lw.w1(), lw.w3(),
-                    static_cast<int>(lw.w1()->shape()[0]));
-            }, dev);
+                                         static_cast<int>(lw.w1()->shape()[0]));
+            },
+            dev);
     } else {
         int w1_idx = graph.add_input(lw.w1());
         int gate_idx = graph.add_node("gate_proj", OpType::MUL_MAT_TRANSB,
-            {ref(ffn_normed_idx), w1_idx}, nullptr, dev);
+                                      {ref(ffn_normed_idx), w1_idx}, nullptr, dev);
         int w3_idx = graph.add_input(lw.w3());
         int up_idx = graph.add_node("up_proj", OpType::MUL_MAT_TRANSB,
-            {ref(ffn_normed_idx), w3_idx}, nullptr, dev);
-        ffn_mid_idx = graph.add_node("silu_multiply", "silu_multiply",
-            {ref(gate_idx), ref(up_idx)},
+                                    {ref(ffn_normed_idx), w3_idx}, nullptr, dev);
+        ffn_mid_idx = graph.add_node(
+            "silu_multiply", "silu_multiply", {ref(gate_idx), ref(up_idx)},
             [](const std::vector<TensorPtr>& inputs) -> TensorPtr {
                 return ops::silu_multiply(inputs[0], inputs[1]);
-            }, dev);
+            },
+            dev);
     }
 
     // FFN down: fused or regular matmul + residual
-    bool use_ffn_down_fused = (dev == DeviceType::CUDA &&
-                               lw.w2()->dtype() == DataType::Q4_0);
+    bool use_ffn_down_fused = (dev == DeviceType::CUDA && lw.w2()->dtype() == DataType::Q4_0);
     int last_idx;
     if (use_ffn_down_fused) {
-        last_idx = graph.add_node("ffn_down_fused", "ffn_down_fused",
-            {ref(ffn_mid_idx), ref(after_attn_idx)},
+        last_idx = graph.add_node(
+            "ffn_down_fused", "ffn_down_fused", {ref(ffn_mid_idx), ref(after_attn_idx)},
             [&lw](const std::vector<TensorPtr>& inputs) -> TensorPtr {
                 int K_down = static_cast<int>(lw.w2()->shape()[1]);
                 int N_down = static_cast<int>(lw.w2()->shape()[0]);
-                auto ffn_out = std::make_shared<Tensor>(DataType::FP32,
-                    std::vector<int64_t>{1, N_down}, DeviceType::CUDA);
+                auto ffn_out = std::make_shared<Tensor>(
+                    DataType::FP32, std::vector<int64_t>{1, N_down}, DeviceType::CUDA);
                 cuda::launch_ffn_down_fused_q4_0(
-                    static_cast<const float*>(inputs[0]->data()),
-                    lw.w2()->data(),
+                    static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
                     static_cast<const float*>(inputs[1]->data()),
-                    static_cast<float*>(ffn_out->data()),
-                    K_down, N_down);
+                    static_cast<float*>(ffn_out->data()), K_down, N_down);
                 return ffn_out;
-            }, dev);
+            },
+            dev);
     } else {
         int w2_idx = graph.add_input(lw.w2());
         int down_idx = graph.add_node("down_proj", OpType::MUL_MAT_TRANSB,
-            {ref(ffn_mid_idx), w2_idx}, nullptr, dev);
+                                      {ref(ffn_mid_idx), w2_idx}, nullptr, dev);
         last_idx = graph.add_node("ffn_residual_add", OpType::ADD,
-            {ref(after_attn_idx), ref(down_idx)}, nullptr, dev);
+                                  {ref(after_attn_idx), ref(down_idx)}, nullptr, dev);
     }
 
     return last_idx;
 }
 
-int LlamaGraphBuilder::build_output_graph(ComputeGraph& graph,
-                                           int hidden_idx,
-                                           const ModelWeights& weights,
-                                            const ModelConfig& cfg) {
+int LlamaGraphBuilder::build_output_graph(ComputeGraph& graph, int hidden_idx,
+                                          const ModelWeights& weights, const ModelConfig& cfg) {
     // Node: Output norm
     int out_norm_w_idx = graph.add_input(weights.output_norm);
     float out_eps = cfg.rms_norm_eps;
     int32_t out_eps_params[OP_PARAMS_MAX_SIZE / sizeof(int32_t)] = {};
     std::memcpy(out_eps_params, &out_eps, sizeof(float));
-    int norm_idx = graph.add_node("output_norm", OpType::RMS_NORM,
-        {hidden_idx, out_norm_w_idx}, out_eps_params);
+    int norm_idx = graph.add_node("output_norm", OpType::RMS_NORM, {hidden_idx, out_norm_w_idx},
+                                  out_eps_params);
 
     // Node: Output projection
-    int logits_idx = graph.add_node("output_proj", "mul_mat_transB", {ref(norm_idx)},
+    int logits_idx = graph.add_node(
+        "output_proj", "mul_mat_transB", {ref(norm_idx)},
         [&weights, tie = cfg.tie_embeddings](const std::vector<TensorPtr>& inputs) -> TensorPtr {
             auto output_weight = weights.output_weight;
             if (!output_weight && tie) {
@@ -340,13 +345,11 @@ int LlamaGraphBuilder::build_output_graph(ComputeGraph& graph,
                 output_weight->dtype() == DataType::Q4_0 && inputs[0]->shape()[0] == 1) {
                 int K = static_cast<int>(output_weight->shape()[1]);
                 int N = static_cast<int>(output_weight->shape()[0]);
-                auto logits = std::make_shared<Tensor>(DataType::FP32,
-                    std::vector<int64_t>{1, N}, DeviceType::CUDA);
-                cuda::launch_output_proj_q4_0(
-                    static_cast<const float*>(inputs[0]->data()),
-                    output_weight->data(),
-                    static_cast<float*>(logits->data()),
-                    K, N);
+                auto logits = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N},
+                                                       DeviceType::CUDA);
+                cuda::launch_output_proj_q4_0(static_cast<const float*>(inputs[0]->data()),
+                                              output_weight->data(),
+                                              static_cast<float*>(logits->data()), K, N);
                 return logits;
             }
             return ops::matmul_transB(inputs[0], output_weight);
@@ -359,9 +362,10 @@ int LlamaGraphBuilder::build_output_graph(ComputeGraph& graph,
 static GraphBuilderAutoRegister _reg_llama_gb("llama", []() -> std::unique_ptr<LayerGraphBuilder> {
     return std::make_unique<LlamaGraphBuilder>();
 });
-static GraphBuilderAutoRegister _reg_mistral_gb("mistral", []() -> std::unique_ptr<LayerGraphBuilder> {
-    return std::make_unique<LlamaGraphBuilder>();
-});
+static GraphBuilderAutoRegister _reg_mistral_gb("mistral",
+                                                []() -> std::unique_ptr<LayerGraphBuilder> {
+                                                    return std::make_unique<LlamaGraphBuilder>();
+                                                });
 static GraphBuilderAutoRegister _reg_qwen_gb("qwen", []() -> std::unique_ptr<LayerGraphBuilder> {
     return std::make_unique<LlamaGraphBuilder>();
 });
@@ -372,4 +376,4 @@ static GraphBuilderAutoRegister _reg_yi_gb("yi", []() -> std::unique_ptr<LayerGr
     return std::make_unique<LlamaGraphBuilder>();
 });
 
-} // namespace forge
+}  // namespace forge

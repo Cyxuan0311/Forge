@@ -1,6 +1,6 @@
 #include "forge/engine.h"
-#include "forge/model.h"
 #include "forge/logger.h"
+#include "forge/model.h"
 
 namespace forge {
 
@@ -13,11 +13,12 @@ void EngineRegistry::register_engine(const std::string& arch, EngineCreator crea
     creators_[arch] = std::move(creator);
 }
 
-std::unique_ptr<InferenceEngine> EngineRegistry::create(const std::string& arch,
-                                                         Model& model, InferenceContext& ctx) {
+std::unique_ptr<InferenceEngine> EngineRegistry::create(const std::string& arch, Model& model,
+                                                        InferenceContext& ctx) {
     // Try exact match first
     auto it = creators_.find(arch);
-    if (it != creators_.end()) return it->second(model, ctx);
+    if (it != creators_.end())
+        return it->second(model, ctx);
 
     // Fallback: use architecture capability to auto-select engine
     auto& cap_registry = ArchCapabilityRegistry::instance();
@@ -26,17 +27,20 @@ std::unique_ptr<InferenceEngine> EngineRegistry::create(const std::string& arch,
         // SSM → Qwen35Engine
         if (cap.use_ssm) {
             auto ssm_it = creators_.find("qwen35");
-            if (ssm_it != creators_.end()) return ssm_it->second(model, ctx);
+            if (ssm_it != creators_.end())
+                return ssm_it->second(model, ctx);
         }
         // MLA → DeepSeekEngine
         if (cap.use_mla) {
             auto mla_it = creators_.find("deepseek_v2");
-            if (mla_it != creators_.end()) return mla_it->second(model, ctx);
+            if (mla_it != creators_.end())
+                return mla_it->second(model, ctx);
         }
         // GQA (default) → LlamaEngine
         if (cap.use_gqa) {
             auto gqa_it = creators_.find("llama");
-            if (gqa_it != creators_.end()) return gqa_it->second(model, ctx);
+            if (gqa_it != creators_.end())
+                return gqa_it->second(model, ctx);
         }
     }
 
@@ -61,4 +65,4 @@ EngineAutoRegister::EngineAutoRegister(const std::string& arch, EngineCreator cr
     EngineRegistry::instance().register_engine(arch, std::move(creator));
 }
 
-} // namespace forge
+}  // namespace forge

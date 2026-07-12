@@ -1,28 +1,30 @@
-#include "forge/operator_norm.h"
-#include "forge/cuda_kernels.h"
-#include "forge/perf_profiler.h"
-#include "forge/op_dispatch.h"
-#include <stdexcept>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+
+#include "forge/cuda_kernels.h"
+#include "forge/op_dispatch.h"
+#include "forge/operator_norm.h"
+#include "forge/perf_profiler.h"
 
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 #ifdef _OPENMP
-#include <omp.h>
+#    include <omp.h>
 #endif
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
 namespace ops {
 
 TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
-    if (x->ndim() != 2) throw std::runtime_error("rms_norm expects 2D input");
+    if (x->ndim() != 2)
+        throw std::runtime_error("rms_norm expects 2D input");
     int rows = static_cast<int>(x->shape()[0]);
     int cols = static_cast<int>(x->shape()[1]);
 
@@ -30,12 +32,9 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
 
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cuda::launch_rms_norm(
-            static_cast<const float*>(x->data()),
-            static_cast<const float*>(weight->data()),
-            static_cast<float*>(out->data()),
-            rows, cols, eps
-        );
+        cuda::launch_rms_norm(static_cast<const float*>(x->data()),
+                              static_cast<const float*>(weight->data()),
+                              static_cast<float*>(out->data()), rows, cols, eps);
 #endif
     } else {
         PERF_SCOPE("rms_norm/cpu");
@@ -43,7 +42,7 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
         const float* w_data = static_cast<const float*>(weight->data());
         float* o_data = static_cast<float*>(out->data());
 
-        #pragma omp parallel for schedule(static) if(rows > 1)
+#pragma omp parallel for schedule(static) if (rows > 1)
         for (int r = 0; r < rows; ++r) {
             const float* x_row = x_data + r * cols;
             float* o_row = o_data + r * cols;
@@ -93,8 +92,10 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
     return out;
 }
 
-TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPtr& bias, float eps) {
-    if (x->ndim() != 2) throw std::runtime_error("layer_norm expects 2D input");
+TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPtr& bias,
+                     float eps) {
+    if (x->ndim() != 2)
+        throw std::runtime_error("layer_norm expects 2D input");
     int rows = static_cast<int>(x->shape()[0]);
     int cols = static_cast<int>(x->shape()[1]);
 
@@ -123,9 +124,12 @@ TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPt
                 uint32_t exp = (h >> 10) & 0x1f;
                 uint32_t mant = h & 0x3ff;
                 float f;
-                if (exp == 0) f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
-                else if (exp == 31) f = std::numeric_limits<float>::infinity();
-                else f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
+                if (exp == 0)
+                    f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
+                else if (exp == 31)
+                    f = std::numeric_limits<float>::infinity();
+                else
+                    f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
                 w_fp32[i] = sign ? -f : f;
             }
         }
@@ -141,9 +145,12 @@ TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPt
                 uint32_t exp = (h >> 10) & 0x1f;
                 uint32_t mant = h & 0x3ff;
                 float f;
-                if (exp == 0) f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
-                else if (exp == 31) f = std::numeric_limits<float>::infinity();
-                else f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
+                if (exp == 0)
+                    f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
+                else if (exp == 31)
+                    f = std::numeric_limits<float>::infinity();
+                else
+                    f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
                 b_fp32[i] = sign ? -f : f;
             }
         }
@@ -160,10 +167,11 @@ TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPt
     const float* x_data = static_cast<const float*>(x_cpu->data());
     float* o_data = static_cast<float*>(out->data());
 
-    #pragma omp parallel for schedule(static) if(rows > 1)
+#pragma omp parallel for schedule(static) if (rows > 1)
     for (int r = 0; r < rows; ++r) {
         float mean = 0.0f;
-        for (int c = 0; c < cols; ++c) mean += x_data[r * cols + c];
+        for (int c = 0; c < cols; ++c)
+            mean += x_data[r * cols + c];
         mean /= cols;
 
         float var = 0.0f;
@@ -188,7 +196,7 @@ TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPt
     return out;
 }
 
-} // namespace ops
+}  // namespace ops
 
 // OpDispatch registration
 namespace {
@@ -197,7 +205,8 @@ __attribute__((constructor)) void register_norm_ops() {
 
     // rms_norm: inputs[0]=x, inputs[1]=weight (optional, fallback to 1.0)
     //           op_params[0] = float eps (bit-cast)
-    dispatch.register_kernel(OpType::RMS_NORM, DeviceType::CPU,
+    dispatch.register_kernel(
+        OpType::RMS_NORM, DeviceType::CPU,
         [](const std::vector<TensorPtr>& inputs, const int32_t* params) -> TensorPtr {
             float eps = 1e-5f;
             if (params) {
@@ -211,7 +220,8 @@ __attribute__((constructor)) void register_norm_ops() {
             return ops::rms_norm(inputs[0], weight, eps);
         });
 
-    dispatch.register_kernel(OpType::RMS_NORM, DeviceType::CUDA,
+    dispatch.register_kernel(
+        OpType::RMS_NORM, DeviceType::CUDA,
         [](const std::vector<TensorPtr>& inputs, const int32_t* params) -> TensorPtr {
             float eps = 1e-5f;
             if (params) {
@@ -225,6 +235,6 @@ __attribute__((constructor)) void register_norm_ops() {
             return ops::rms_norm(inputs[0], weight, eps);
         });
 }
-}
+}  // namespace
 
-} // namespace forge
+}  // namespace forge

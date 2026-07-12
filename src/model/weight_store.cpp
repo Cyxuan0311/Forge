@@ -1,4 +1,5 @@
 #include "forge/weight_store.h"
+
 #include "forge/weight_mapper.h"
 
 namespace forge {
@@ -9,7 +10,8 @@ void WeightStore::set(const std::string& name, TensorPtr tensor) {
 
 TensorPtr WeightStore::get(const std::string& name) const {
     auto it = weights_.find(name);
-    if (it == weights_.end()) return nullptr;
+    if (it == weights_.end())
+        return nullptr;
     return it->second;
 }
 
@@ -36,7 +38,8 @@ void WeightStore::clear() {
 size_t WeightStore::total_bytes() const {
     size_t total = 0;
     for (const auto& [_, t] : weights_) {
-        if (t) total += t->nbytes();
+        if (t)
+            total += t->nbytes();
     }
     return total;
 }
@@ -52,11 +55,13 @@ std::vector<std::string> WeightStore::weight_names() const {
 
 void WeightStore::to_device(DeviceType device) {
     for (auto& [_, t] : weights_) {
-        if (t) t->to_device(device);
+        if (t)
+            t->to_device(device);
     }
 }
 
-void WeightStore::to_device_layer(int layer_idx, DeviceType device, const std::string& prefix_pattern) {
+void WeightStore::to_device_layer(int layer_idx, DeviceType device,
+                                  const std::string& prefix_pattern) {
     std::string prefix = WeightMapper::format_layer_prefix(prefix_pattern, layer_idx);
     std::string base = "layers." + std::to_string(layer_idx);
     for (auto& [name, t] : weights_) {
@@ -66,4 +71,4 @@ void WeightStore::to_device_layer(int layer_idx, DeviceType device, const std::s
     }
 }
 
-} // namespace forge
+}  // namespace forge

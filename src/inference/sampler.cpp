@@ -1,18 +1,20 @@
 #include "forge/sampler.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
 #include "forge/cuda_kernels.h"
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
-#include <cmath>
-#include <algorithm>
-#include <limits>
-#include <cstring>
 
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -63,10 +65,8 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
             }
             {
                 PERF_SCOPE("sampler/argmax_gpu");
-                cuda::launch_argmax(
-                    static_cast<const float*>(logits->data()),
-                    static_cast<int32_t*>(cuda_argmax_buf_),
-                    vocab_size);
+                cuda::launch_argmax(static_cast<const float*>(logits->data()),
+                                    static_cast<int32_t*>(cuda_argmax_buf_), vocab_size);
             }
             int32_t result;
             {
@@ -83,7 +83,8 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         PERF_SCOPE("sampler/logits_d2h");
-        cudaMemcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float),
+                   cudaMemcpyDeviceToHost);
 #endif
     } else {
         PERF_SCOPE("sampler/logits_memcpy");
@@ -108,18 +109,26 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
                 __m256 v = _mm256_loadu_ps(&host_logits[i]);
                 __m256 cmp = _mm256_cmp_ps(v, vmax, _CMP_GT_OS);
                 vmax = _mm256_blendv_ps(vmax, v, cmp);
-                __m256i new_idx = _mm256_add_epi32(_mm256_set1_epi32(i), _mm256_setr_epi32(0,1,2,3,4,5,6,7));
+                __m256i new_idx = _mm256_add_epi32(_mm256_set1_epi32(i),
+                                                   _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
                 vidx = _mm256_blendv_epi8(vidx, new_idx, _mm256_castps_si256(cmp));
             }
             // Find max among the 8 remaining candidates
-            float vals[8]; int idxs[8];
+            float vals[8];
+            int idxs[8];
             _mm256_storeu_ps(vals, vmax);
             _mm256_storeu_si256((__m256i*)idxs, vidx);
             for (int j = 0; j < 8; ++j) {
-                if (vals[j] > best_val) { best_val = vals[j]; best = idxs[j]; }
+                if (vals[j] > best_val) {
+                    best_val = vals[j];
+                    best = idxs[j];
+                }
             }
             for (; i < vocab_size; ++i) {
-                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
+                if (host_logits[i] > best_val) {
+                    best_val = host_logits[i];
+                    best = i;
+                }
             }
         }
 #else
@@ -141,7 +150,8 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         PERF_SCOPE("sampler/logits_d2h");
-        cudaMemcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float),
+                   cudaMemcpyDeviceToHost);
 #endif
     } else {
         PERF_SCOPE("sampler/logits_memcpy");
@@ -169,12 +179,14 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
             // Horizontal max
             __m128 hi = _mm256_extractf128_ps(vmax, 1);
             __m128 lo = _mm256_castps256_ps128(vmax);
-            __m128 m = _mm256_castps256_ps128(_mm256_max_ps(vmax, _mm256_permute2f128_ps(vmax, vmax, 0x01)));
+            __m128 m = _mm256_castps256_ps128(
+                _mm256_max_ps(vmax, _mm256_permute2f128_ps(vmax, vmax, 0x01)));
             m = _mm_max_ps(m, _mm_movehl_ps(m, m));
             m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
             max_val = _mm_cvtss_f32(m);
             for (; i < vocab_size; ++i) {
-                if (host_logits[i] > max_val) max_val = host_logits[i];
+                if (host_logits[i] > max_val)
+                    max_val = host_logits[i];
             }
         }
 #else
@@ -210,7 +222,8 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
                 p = _mm256_fmadd_ps(f, p, _mm256_set1_ps(0.693147f));
                 p = _mm256_fmadd_ps(f, p, _mm256_set1_ps(1.0f));
                 // 2^n via bit manipulation
-                __m256i n_shifted = _mm256_slli_epi32(_mm256_add_epi32(n, _mm256_set1_epi32(127)), 23);
+                __m256i n_shifted =
+                    _mm256_slli_epi32(_mm256_add_epi32(n, _mm256_set1_epi32(127)), 23);
                 exp_v = _mm256_mul_ps(p, _mm256_castsi256_ps(n_shifted));
                 _mm256_storeu_ps(&probs[i], exp_v);
                 vsum = _mm256_add_ps(vsum, exp_v);
@@ -306,7 +319,8 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
         float cumsum = 0.0f;
         for (int i = 0; i < vocab_size; ++i) {
             cumsum += probs[i];
-            if (cumsum >= r) return i;
+            if (cumsum >= r)
+                return i;
         }
 
         return vocab_size - 1;
@@ -315,7 +329,8 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
 
 void Sampler::set_config(const SamplerConfig& config) {
     config_ = config;
-    if (config.seed != 0) rng_state_ = config.seed;
+    if (config.seed != 0)
+        rng_state_ = config.seed;
 }
 
 const SamplerConfig& Sampler::config() const {
@@ -343,4 +358,4 @@ void Sampler::clear_history() {
     token_history_.clear();
 }
 
-} // namespace forge
+}  // namespace forge

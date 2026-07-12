@@ -1,22 +1,22 @@
 #pragma once
 
-#include <string>
-#include <vector>
-#include <unordered_map>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace forge {
 
 enum class TokenizerModelType : int {
-    SPM,    // SentencePiece (llama, mistral, etc.)
-    BPE,    // GPT-2 style BPE (qwen2, gpt2, etc.)
+    SPM,  // SentencePiece (llama, mistral, etc.)
+    BPE,  // GPT-2 style BPE (qwen2, gpt2, etc.)
 };
 
 struct TokenizerVocab {
-    std::vector<std::string> tokens;       // id -> token string
-    std::vector<float> scores;             // id -> score
-    std::vector<int32_t> token_types;      // id -> token type
+    std::vector<std::string> tokens;                       // id -> token string
+    std::vector<float> scores;                             // id -> score
+    std::vector<int32_t> token_types;                      // id -> token type
     std::unordered_map<std::string, int32_t> token_to_id;  // token string -> id
 };
 
@@ -33,8 +33,8 @@ public:
     /// @param add_dummy_prefix If true, add SPM dummy prefix (▁) at the start.
     ///                         Should be false when encoding text that follows a
     ///                         special token or newline (no leading space desired).
-    std::vector<int32_t> encode(const std::string& text, bool add_bos = true,
-                                bool add_eos = false, bool add_dummy_prefix = true) const;
+    std::vector<int32_t> encode(const std::string& text, bool add_bos = true, bool add_eos = false,
+                                bool add_dummy_prefix = true) const;
 
     /// Decode token IDs back to text.
     /// @param strip_leading_space If true, remove the leading space from SPM dummy prefix.
@@ -71,7 +71,7 @@ public:
 private:
     // SPM encoding
     std::vector<int32_t> encode_spm(const std::string& text, bool add_bos, bool add_eos,
-                                     bool add_dummy_prefix = true) const;
+                                    bool add_dummy_prefix = true) const;
     std::vector<int32_t> encode_spm_greedy(const std::string& spm_text) const;
 
     // BPE encoding
@@ -113,4 +113,4 @@ private:
     std::unordered_map<std::string, uint8_t> unicode_char_to_byte_;
 };
 
-} // namespace forge
+}  // namespace forge

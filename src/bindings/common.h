@@ -1,33 +1,33 @@
 #pragma once
 // Shared header for Forge Python bindings modules.
 
+#include <pybind11/functional.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/numpy.h>
-#include <pybind11/functional.h>
 
-#include "forge/tensor.h"
-#include "forge/model.h"
-#include "forge/model_loader.h"
-#include "forge/engine.h"
-#include "forge/operators.h"
-#include "forge/logger.h"
-#include "forge/engines/transformer_engine.h"
-#include "forge/engines/llama_engine.h"
-#include "forge/engines/deepseek_engine.h"
-#include "forge/ninf_model.h"
-#include "forge/gguf_model.h"
-#include "forge/generator.h"
-#include "forge/sampler.h"
-#include "forge/context.h"
-#include "forge/request_scheduler.h"
-#include "forge/paged_kv_cache.h"
 #include "forge/backend.h"
 #include "forge/compute_graph.h"
+#include "forge/context.h"
+#include "forge/engine.h"
+#include "forge/engines/deepseek_engine.h"
+#include "forge/engines/llama_engine.h"
+#include "forge/engines/qwen35_engine.h"
+#include "forge/engines/transformer_engine.h"
+#include "forge/generator.h"
+#include "forge/gguf_model.h"
+#include "forge/logger.h"
+#include "forge/model.h"
+#include "forge/model_loader.h"
+#include "forge/ninf_model.h"
+#include "forge/operators.h"
+#include "forge/paged_kv_cache.h"
+#include "forge/perf_profiler.h"
+#include "forge/request_scheduler.h"
+#include "forge/sampler.h"
+#include "forge/tensor.h"
 #include "forge/tokenizer.h"
 #include "forge/vision_encoder.h"
-#include "forge/engines/qwen35_engine.h"
-#include "forge/perf_profiler.h"
 
 namespace py = pybind11;
 using namespace forge;
@@ -39,7 +39,8 @@ inline void ensure_engines_registered() {
     // (linker can discard translation units with no referenced symbols).
     // We explicitly register engines here as a reliable fallback.
     static bool registered = false;
-    if (registered) return;
+    if (registered)
+        return;
     registered = true;
 
     auto& reg = EngineRegistry::instance();
@@ -96,16 +97,15 @@ inline void ensure_engines_registered() {
 
 inline void ensure_loaders_registered() {
     static bool registered = false;
-    if (registered) return;
+    if (registered)
+        return;
     registered = true;
 
     auto& reg = ModelLoaderRegistry::instance();
-    reg.register_loader("ninf", []() -> std::unique_ptr<ModelLoader> {
-        return std::make_unique<NinfModel>();
-    });
-    reg.register_loader("gguf", []() -> std::unique_ptr<ModelLoader> {
-        return std::make_unique<GgufModel>();
-    });
+    reg.register_loader(
+        "ninf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<NinfModel>(); });
+    reg.register_loader(
+        "gguf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<GgufModel>(); });
 }
 
 // ---- Utility ----
@@ -125,8 +125,8 @@ inline py::array_t<float> tensor_to_numpy(const TensorPtr& tensor) {
         np_strides[i] = static_cast<ssize_t>(cpu_tensor->strides()[i]) * sizeof(float);
     }
 
-    return py::array_t<float>(np_shape, np_strides,
-        static_cast<const float*>(cpu_tensor->data()), py::cast(cpu_tensor));
+    return py::array_t<float>(np_shape, np_strides, static_cast<const float*>(cpu_tensor->data()),
+                              py::cast(cpu_tensor));
 }
 
 // ---- Wrapper classes ----
@@ -144,7 +144,8 @@ public:
     int gpu_layers() const { return ctx_.gpu_layers(); }
     void set_use_graph(bool use_graph) {
         auto* engine = ctx_.engine();
-        if (!engine) throw std::runtime_error("No inference engine available");
+        if (!engine)
+            throw std::runtime_error("No inference engine available");
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
         if (tfm_eng) {
             tfm_eng->set_use_graph(use_graph);
@@ -152,21 +153,24 @@ public:
     }
     bool use_graph() const {
         auto* engine = const_cast<InferenceContext&>(ctx_).engine();
-        if (!engine) return false;
+        if (!engine)
+            return false;
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
         return tfm_eng ? tfm_eng->use_graph() : false;
     }
     DeviceType device() const { return ctx_.device(); }
 
-    py::array_t<float> forward(py::array_t<int32_t, py::array::c_style> input_ids, int start_pos = 0) {
+    py::array_t<float> forward(py::array_t<int32_t, py::array::c_style> input_ids,
+                               int start_pos = 0) {
         auto buf = input_ids.request();
-        if (buf.ndim != 1) throw std::runtime_error("input_ids must be 1D");
+        if (buf.ndim != 1)
+            throw std::runtime_error("input_ids must be 1D");
 
         int seq_len = static_cast<int>(buf.shape[0]);
         DeviceType dev = ctx_.device();
 
-        auto ids_tensor = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{seq_len}, DeviceType::CPU);
+        auto ids_tensor = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{seq_len},
+                                                   DeviceType::CPU);
         std::memcpy(ids_tensor->data(), buf.ptr, seq_len * sizeof(int32_t));
 
         if (dev == DeviceType::CUDA) {
@@ -174,21 +178,24 @@ public:
         }
 
         auto* engine = ctx_.engine();
-        if (!engine) throw std::runtime_error("No inference engine available");
+        if (!engine)
+            throw std::runtime_error("No inference engine available");
 
         auto logits = engine->forward(ids_tensor, start_pos);
         return tensor_to_numpy(logits);
     }
 
-    py::array_t<float> forward_with_embeddings(py::array_t<float, py::array::c_style> embeddings, int start_pos = 0) {
+    py::array_t<float> forward_with_embeddings(py::array_t<float, py::array::c_style> embeddings,
+                                               int start_pos = 0) {
         auto buf = embeddings.request();
-        if (buf.ndim != 2) throw std::runtime_error("embeddings must be 2D (seq_len, hidden_dim)");
+        if (buf.ndim != 2)
+            throw std::runtime_error("embeddings must be 2D (seq_len, hidden_dim)");
 
         int seq_len = static_cast<int>(buf.shape[0]);
         int hidden_dim = static_cast<int>(buf.shape[1]);
 
-        auto hidden_tensor = std::make_shared<Tensor>(DataType::FP32,
-            std::vector<int64_t>{seq_len, hidden_dim}, DeviceType::CPU);
+        auto hidden_tensor = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, hidden_dim}, DeviceType::CPU);
         std::memcpy(hidden_tensor->data(), buf.ptr, seq_len * hidden_dim * sizeof(float));
 
         DeviceType dev = ctx_.device();
@@ -197,7 +204,8 @@ public:
         }
 
         auto* engine = ctx_.engine();
-        if (!engine) throw std::runtime_error("No inference engine available");
+        if (!engine)
+            throw std::runtime_error("No inference engine available");
 
         auto logits = engine->forward_from_hidden(hidden_tensor, start_pos);
         return tensor_to_numpy(logits);
@@ -205,17 +213,19 @@ public:
 
     py::array_t<float> get_embeddings(py::array_t<int32_t, py::array::c_style> input_ids) {
         auto buf = input_ids.request();
-        if (buf.ndim != 1) throw std::runtime_error("input_ids must be 1D");
+        if (buf.ndim != 1)
+            throw std::runtime_error("input_ids must be 1D");
 
         int seq_len = static_cast<int>(buf.shape[0]);
         const int32_t* ids = static_cast<const int32_t*>(buf.ptr);
 
         const auto& model = ctx_.model();
         auto token_emb = model.weights().get("token_embedding");
-        if (!token_emb) throw std::runtime_error("token_embedding weight not found");
+        if (!token_emb)
+            throw std::runtime_error("token_embedding weight not found");
 
-        auto ids_tensor = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{seq_len}, DeviceType::CPU);
+        auto ids_tensor = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{seq_len},
+                                                   DeviceType::CPU);
         std::memcpy(ids_tensor->data(), ids, seq_len * sizeof(int32_t));
 
         // If token_embedding is on CUDA, move indices to CUDA as well
@@ -225,7 +235,8 @@ public:
         }
 
         auto hidden = ops::embedding(token_emb, ids_tensor);
-        if (!hidden) throw std::runtime_error("embedding lookup failed");
+        if (!hidden)
+            throw std::runtime_error("embedding lookup failed");
 
         return tensor_to_numpy(hidden);
     }
@@ -233,9 +244,11 @@ public:
     py::dict memory_stats() const {
         py::dict stats;
         auto* engine = ctx_.engine();
-        if (!engine) return stats;
+        if (!engine)
+            return stats;
         auto* tfm_eng = dynamic_cast<const TransformerEngine*>(engine);
-        if (!tfm_eng) return stats;
+        if (!tfm_eng)
+            return stats;
 
         const auto& cache = tfm_eng->kv_cache();
         stats["kv_cache_nbytes"] = static_cast<int64_t>(cache.nbytes());
@@ -252,13 +265,10 @@ public:
     PyModel() = default;
 
     void load(const std::string& path, int vocab_size, int hidden_dim, int intermediate_dim,
-              int num_layers, int num_heads, int num_kv_heads, int head_dim,
-              float rope_theta, float rms_norm_eps, int max_seq_len,
-              const std::string& arch_type,
-              const std::string& norm_type_str,
-              const std::string& activation_str,
-              bool tie_embeddings,
-              const std::string& device_str) {
+              int num_layers, int num_heads, int num_kv_heads, int head_dim, float rope_theta,
+              float rms_norm_eps, int max_seq_len, const std::string& arch_type,
+              const std::string& norm_type_str, const std::string& activation_str,
+              bool tie_embeddings, const std::string& device_str) {
         ensure_loaders_registered();
         ensure_engines_registered();
         ModelConfig cfg;
@@ -291,8 +301,8 @@ public:
 
         cfg.use_gqa = (cfg.num_kv_heads != cfg.num_heads);
 
-        DeviceType dev = (device_str == "cuda" || device_str == "cuda:0")
-                         ? DeviceType::CUDA : DeviceType::CPU;
+        DeviceType dev =
+            (device_str == "cuda" || device_str == "cuda:0") ? DeviceType::CUDA : DeviceType::CPU;
 
         if (!model_.load_with_config(path, cfg, dev)) {
             throw std::runtime_error("Failed to load model from: " + path);
@@ -302,8 +312,8 @@ public:
     void load_gguf(const std::string& path, const std::string& device_str) {
         ensure_loaders_registered();
         ensure_engines_registered();
-        DeviceType dev = (device_str == "cuda" || device_str == "cuda:0")
-                         ? DeviceType::CUDA : DeviceType::CPU;
+        DeviceType dev =
+            (device_str == "cuda" || device_str == "cuda:0") ? DeviceType::CUDA : DeviceType::CPU;
 
         if (!model_.load(path, dev)) {
             throw std::runtime_error("Failed to load GGUF model from: " + path);
@@ -313,8 +323,8 @@ public:
     void load_auto(const std::string& path, const std::string& device_str) {
         ensure_loaders_registered();
         ensure_engines_registered();
-        DeviceType dev = (device_str == "cuda" || device_str == "cuda:0")
-                         ? DeviceType::CUDA : DeviceType::CPU;
+        DeviceType dev =
+            (device_str == "cuda" || device_str == "cuda:0") ? DeviceType::CUDA : DeviceType::CPU;
 
         if (!model_.load(path, dev)) {
             throw std::runtime_error("Failed to load model from: " + path);
@@ -335,7 +345,8 @@ public:
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
         if (tfm_eng) {
             KVCacheDType kv_dtype = KVCacheDType::FP32;
-            if (kv_cache_dtype_str == "q4_0") kv_dtype = KVCacheDType::Q4_0;
+            if (kv_cache_dtype_str == "q4_0")
+                kv_dtype = KVCacheDType::Q4_0;
             tfm_eng->set_kv_cache_dtype(kv_dtype);
             tfm_eng->set_gpu_layers(gpu_layers);
         }
@@ -344,17 +355,14 @@ public:
         return ctx.release();
     }
 
-    py::dict generate(py::array_t<int32_t, py::array::c_style> prompt_ids,
-                      int max_new_tokens, float temperature, int top_k,
-                      float top_p, float repeat_penalty, bool do_sample,
-                      uint64_t seed, int eos_token_id,
+    py::dict generate(py::array_t<int32_t, py::array::c_style> prompt_ids, int max_new_tokens,
+                      float temperature, int top_k, float top_p, float repeat_penalty,
+                      bool do_sample, uint64_t seed, int eos_token_id,
                       const std::string& kv_cache_dtype_str, int gpu_layers);
-    void generate_stream(py::array_t<int32_t, py::array::c_style> prompt_ids,
-                          py::object callback,
-                          int max_new_tokens, float temperature, int top_k,
-                          float top_p, float repeat_penalty, bool do_sample,
-                          uint64_t seed, int eos_token_id,
-                          const std::string& kv_cache_dtype_str, int gpu_layers);
+    void generate_stream(py::array_t<int32_t, py::array::c_style> prompt_ids, py::object callback,
+                         int max_new_tokens, float temperature, int top_k, float top_p,
+                         float repeat_penalty, bool do_sample, uint64_t seed, int eos_token_id,
+                         const std::string& kv_cache_dtype_str, int gpu_layers);
 
     const ModelConfig& config() const { return model_.config(); }
     Model& get_model() { return model_; }
@@ -364,7 +372,8 @@ public:
         ensure_engines_registered();
         auto archs = EngineRegistry::instance().registered_archs();
         py::list result;
-        for (const auto& a : archs) result.append(a);
+        for (const auto& a : archs)
+            result.append(a);
         return result;
     }
 
@@ -388,9 +397,8 @@ public:
         return RequestScheduler(model, block_size, max_num_seqs);
     }
 
-    int submit(const std::vector<int32_t>& prompt_tokens,
-               int max_new_tokens = 256, int eos_token_id = -1,
-               const SamplerConfig& sampler_cfg = SamplerConfig{}) {
+    int submit(const std::vector<int32_t>& prompt_tokens, int max_new_tokens = 256,
+               int eos_token_id = -1, const SamplerConfig& sampler_cfg = SamplerConfig{}) {
         return scheduler_.submit(prompt_tokens, max_new_tokens, eos_token_id, sampler_cfg);
     }
 
@@ -399,7 +407,8 @@ public:
     py::list get_finished() {
         auto finished = scheduler_.get_finished();
         py::list result;
-        for (auto& req : finished) result.append(std::move(req));
+        for (auto& req : finished)
+            result.append(std::move(req));
         return result;
     }
 
@@ -415,20 +424,13 @@ private:
 
 class PyLogger {
 public:
-    static void set_level(int level) {
-        Logger::instance().set_level(static_cast<LogLevel>(level));
-    }
-    static int level() {
-        return static_cast<int>(Logger::instance().level());
-    }
+    static void set_level(int level) { Logger::instance().set_level(static_cast<LogLevel>(level)); }
+    static int level() { return static_cast<int>(Logger::instance().level()); }
     static void set_python_sink(const py::function& fn) {
-        Logger::instance().set_sink([fn](LogLevel lvl, const std::string& msg) {
-            fn(static_cast<int>(lvl), msg);
-        });
+        Logger::instance().set_sink(
+            [fn](LogLevel lvl, const std::string& msg) { fn(static_cast<int>(lvl), msg); });
     }
-    static void reset_sink() {
-        Logger::instance().reset_sink();
-    }
+    static void reset_sink() { Logger::instance().reset_sink(); }
 };
 
 class PyMultimodalModel {
@@ -439,31 +441,30 @@ public:
         load(model_path, "", device_str);
     }
 
-    void load(const std::string& model_path, const std::string& mmproj_path, const std::string& device_str);
+    void load(const std::string& model_path, const std::string& mmproj_path,
+              const std::string& device_str);
 
     py::array_t<float> encode_image(py::array_t<uint8_t, py::array::c_style> image);
 
-    py::dict generate(py::array_t<int32_t, py::array::c_style> prompt_ids,
-                      int max_new_tokens, float temperature, int top_k,
-                      float top_p, float repeat_penalty, bool do_sample,
-                      uint64_t seed, int eos_token_id,
+    py::dict generate(py::array_t<int32_t, py::array::c_style> prompt_ids, int max_new_tokens,
+                      float temperature, int top_k, float top_p, float repeat_penalty,
+                      bool do_sample, uint64_t seed, int eos_token_id,
                       const std::string& kv_cache_dtype_str, int gpu_layers);
 
-    void generate_stream(py::array_t<int32_t, py::array::c_style> prompt_ids,
-                          py::object callback,
-                          int max_new_tokens, float temperature, int top_k,
-                          float top_p, float repeat_penalty, bool do_sample,
-                          uint64_t seed, int eos_token_id,
-                          const std::string& kv_cache_dtype_str, int gpu_layers);
+    void generate_stream(py::array_t<int32_t, py::array::c_style> prompt_ids, py::object callback,
+                         int max_new_tokens, float temperature, int top_k, float top_p,
+                         float repeat_penalty, bool do_sample, uint64_t seed, int eos_token_id,
+                         const std::string& kv_cache_dtype_str, int gpu_layers);
 
     const ModelConfig& config() const { return model_.config(); }
     const VisionConfig& vision_config() const { return vision_.config(); }
 
     PyInferenceContext* create_context(const std::string& kv_cache_dtype_str = "fp32",
-                                        int gpu_layers = -1) {
+                                       int gpu_layers = -1) {
         auto ctx = new PyInferenceContext(model_);
 
-        auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, ctx->get());
+        auto engine =
+            EngineRegistry::instance().create(model_.config().arch_type, model_, ctx->get());
         if (!engine) {
             delete ctx;
             throw std::runtime_error("No engine registered for arch: " + model_.config().arch_type);
@@ -472,7 +473,8 @@ public:
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
         if (tfm_eng) {
             KVCacheDType kv_dtype = KVCacheDType::FP32;
-            if (kv_cache_dtype_str == "q4_0") kv_dtype = KVCacheDType::Q4_0;
+            if (kv_cache_dtype_str == "q4_0")
+                kv_dtype = KVCacheDType::Q4_0;
             tfm_eng->set_kv_cache_dtype(kv_dtype);
             tfm_eng->set_gpu_layers(gpu_layers);
         }

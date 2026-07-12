@@ -1,23 +1,23 @@
 #pragma once
 
 #include <cstddef>
-#include <vector>
 #include <memory>
+#include <vector>
 
-#include "tensor.h"
 #include "backend.h"
+#include "tensor.h"
 
 namespace forge {
 
 class ComputeGraph;
 
 struct PlannedAllocation {
-    int node_idx;           // Which node's output this is
-    size_t size;            // Bytes needed
-    int lifetime_begin;     // Producing node index
-    int lifetime_end;       // Last consuming node index
-    size_t offset;          // Assigned offset in the global buffer
-    bool is_graph_output;   // true = last node, keep alive
+    int node_idx;          // Which node's output this is
+    size_t size;           // Bytes needed
+    int lifetime_begin;    // Producing node index
+    int lifetime_end;      // Last consuming node index
+    size_t offset;         // Assigned offset in the global buffer
+    bool is_graph_output;  // true = last node, keep alive
 };
 
 class MemoryPlanner {
@@ -35,7 +35,7 @@ public:
 
     // Estimated size for a node's output (before execution)
     static size_t estimate_output_size(const class GraphNode& node,
-                                        const std::vector<TensorPtr>& graph_inputs);
+                                       const std::vector<TensorPtr>& graph_inputs);
 
     // Debug info
     size_t allocation_count() const { return allocations_.size(); }
@@ -45,7 +45,9 @@ private:
     size_t allocate_offset(size_t size);
 
     std::vector<PlannedAllocation> allocations_;
-    struct FreeRegion { size_t offset, size; };
+    struct FreeRegion {
+        size_t offset, size;
+    };
     std::vector<FreeRegion> free_regions_;
     size_t total_size_ = 0;
 };
@@ -72,4 +74,4 @@ private:
     size_t size_ = 0;
 };
 
-} // namespace forge
+}  // namespace forge

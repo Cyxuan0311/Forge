@@ -3,7 +3,6 @@
  */
 
 #include "cli_common.h"
-
 #include "forge/tokenizer.h"
 
 using namespace forge;
@@ -21,12 +20,9 @@ ChatTemplateType detect_template_type(const Tokenizer& tokenizer) {
     return ChatTemplateType::Plain;
 }
 
-std::vector<int32_t> apply_chat_template(
-    const Tokenizer& tokenizer,
-    const std::vector<ChatMessage>& messages,
-    ChatTemplateType tmpl_type,
-    bool add_generation_prompt)
-{
+std::vector<int32_t> apply_chat_template(const Tokenizer& tokenizer,
+                                         const std::vector<ChatMessage>& messages,
+                                         ChatTemplateType tmpl_type, bool add_generation_prompt) {
     std::vector<int32_t> ids;
 
     switch (tmpl_type) {
@@ -59,7 +55,8 @@ std::vector<int32_t> apply_chat_template(
         int32_t user_id = tokenizer.token_to_id("<｜User｜>");
         int32_t asst_id = tokenizer.token_to_id("<｜Assistant｜>");
 
-        if (bos_id >= 0) ids.push_back(bos_id);
+        if (bos_id >= 0)
+            ids.push_back(bos_id);
 
         for (const auto& msg : messages) {
             if (msg.role == "system") {
@@ -91,17 +88,20 @@ std::vector<int32_t> apply_chat_template(
         for (const auto& msg : messages) {
             if (msg.role == "system" && first) {
                 ids.push_back(bos_id >= 0 ? bos_id : tokenizer.token_to_id("<s>"));
-                auto inst_ids = tokenizer.encode("[INST] <<SYS>>\n" + msg.content + "\n<</SYS>>\n\n", false, false);
+                auto inst_ids = tokenizer.encode(
+                    "[INST] <<SYS>>\n" + msg.content + "\n<</SYS>>\n\n", false, false);
                 ids.insert(ids.end(), inst_ids.begin(), inst_ids.end());
                 first = false;
             } else if (msg.role == "user") {
                 if (first) {
                     ids.push_back(bos_id >= 0 ? bos_id : tokenizer.token_to_id("<s>"));
-                    auto inst_ids = tokenizer.encode("[INST] " + msg.content + " [/INST]", false, false);
+                    auto inst_ids =
+                        tokenizer.encode("[INST] " + msg.content + " [/INST]", false, false);
                     ids.insert(ids.end(), inst_ids.begin(), inst_ids.end());
                     first = false;
                 } else {
-                    auto inst_ids = tokenizer.encode("<s>[INST] " + msg.content + " [/INST]", false, false);
+                    auto inst_ids =
+                        tokenizer.encode("<s>[INST] " + msg.content + " [/INST]", false, false);
                     ids.insert(ids.end(), inst_ids.begin(), inst_ids.end());
                 }
             } else if (msg.role == "assistant") {

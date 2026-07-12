@@ -28,11 +28,10 @@ void register_profiler(py::module_& m) {
     m.def("profiler_disable", []() { PerfProfiler::instance().disable(); });
     m.def("profiler_reset", []() { PerfProfiler::instance().reset(); });
     m.def("profiler_enabled", []() { return PerfProfiler::instance().enabled(); });
-    m.def("profiler_set_cuda_events", [](bool use_cuda) {
-        PerfProfiler::instance().set_use_cuda_events(use_cuda);
-    });
+    m.def("profiler_set_cuda_events",
+          [](bool use_cuda) { PerfProfiler::instance().set_use_cuda_events(use_cuda); });
     m.def("profiler_summary", []() {
-        // Must flush deferred CUDA events first, same as print_summary()
+    // Must flush deferred CUDA events first, same as print_summary()
 #ifdef USE_CUDA
         PerfProfiler::instance().flush_deferred();
 #endif

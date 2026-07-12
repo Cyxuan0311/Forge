@@ -2,12 +2,13 @@
 
 // ---- PyMultimodalModel method implementations ----
 
-void PyMultimodalModel::load(const std::string& model_path, const std::string& mmproj_path, const std::string& device_str) {
+void PyMultimodalModel::load(const std::string& model_path, const std::string& mmproj_path,
+                             const std::string& device_str) {
     ensure_loaders_registered();
     ensure_engines_registered();
 
-    DeviceType dev = (device_str == "cuda" || device_str == "cuda:0")
-                     ? DeviceType::CUDA : DeviceType::CPU;
+    DeviceType dev =
+        (device_str == "cuda" || device_str == "cuda:0") ? DeviceType::CUDA : DeviceType::CPU;
 
     if (!model_.load(model_path, dev)) {
         throw std::runtime_error("Failed to load model from: " + model_path);
@@ -27,20 +28,29 @@ void PyMultimodalModel::load(const std::string& model_path, const std::string& m
     if (!mmproj_path.empty()) {
         auto mmproj_loader = ModelLoaderRegistry::instance().create_loader(mmproj_path);
         if (mmproj_loader && mmproj_loader->load(mmproj_path)) {
-            vis_cfg.image_size = static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.image_size", 448));
-            vis_cfg.patch_size = static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.patch_size", 14));
-            vis_cfg.embedding_length = static_cast<int>(mmproj_loader->get_metadata_int("v.embedding_length", 1152));
-            vis_cfg.feed_forward_length = static_cast<int>(mmproj_loader->get_metadata_int("v.feed_forward_length", 4304));
-            vis_cfg.block_count = static_cast<int>(mmproj_loader->get_metadata_int("v.block_count", 27));
-            vis_cfg.head_count = static_cast<int>(mmproj_loader->get_metadata_int("v.attention.head_count", 16));
+            vis_cfg.image_size =
+                static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.image_size", 448));
+            vis_cfg.patch_size =
+                static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.patch_size", 14));
+            vis_cfg.embedding_length =
+                static_cast<int>(mmproj_loader->get_metadata_int("v.embedding_length", 1152));
+            vis_cfg.feed_forward_length =
+                static_cast<int>(mmproj_loader->get_metadata_int("v.feed_forward_length", 4304));
+            vis_cfg.block_count =
+                static_cast<int>(mmproj_loader->get_metadata_int("v.block_count", 27));
+            vis_cfg.head_count =
+                static_cast<int>(mmproj_loader->get_metadata_int("v.attention.head_count", 16));
             vis_cfg.projection_dim = cfg.hidden_dim;
-            vis_cfg.scale_factor = static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.projector.scale_factor", 4));
+            vis_cfg.scale_factor = static_cast<int>(
+                mmproj_loader->get_metadata_int("clip.vision.projector.scale_factor", 4));
             // wa_layer_indexes stores the ViT merger insertion point (insert_layer_id)
-            auto wa_layers = mmproj_loader->get_metadata_int_array("clip.vision.wa_layer_indexes", {});
+            auto wa_layers =
+                mmproj_loader->get_metadata_int_array("clip.vision.wa_layer_indexes", {});
             if (!wa_layers.empty()) {
                 vis_cfg.insert_layer_id = static_cast<int>(wa_layers[0]);
             } else {
-                vis_cfg.insert_layer_id = static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.insert_layer_id", 6));
+                vis_cfg.insert_layer_id = static_cast<int>(
+                    mmproj_loader->get_metadata_int("clip.vision.insert_layer_id", 6));
             }
             mmproj_loader->close();
         }
@@ -51,9 +61,11 @@ void PyMultimodalModel::load(const std::string& model_path, const std::string& m
     if (loader && loader->load(model_path)) {
         // Override image_size from LLM if mmproj didn't set it
         if (vis_cfg.image_size == 448) {
-            vis_cfg.image_size = static_cast<int>(loader->get_metadata_int("minicpmv.image_size", vis_cfg.image_size));
+            vis_cfg.image_size = static_cast<int>(
+                loader->get_metadata_int("minicpmv.image_size", vis_cfg.image_size));
         }
-        vis_cfg.patch_size = static_cast<int>(loader->get_metadata_int("minicpmv.patch_size", vis_cfg.patch_size));
+        vis_cfg.patch_size =
+            static_cast<int>(loader->get_metadata_int("minicpmv.patch_size", vis_cfg.patch_size));
         // If insert_layer_id still not set, try LLM file
         if (vis_cfg.insert_layer_id < 0) {
             auto wa_layers = loader->get_metadata_int_array("clip.vision.wa_layer_indexes", {});
@@ -109,16 +121,14 @@ py::array_t<float> PyMultimodalModel::encode_image(py::array_t<uint8_t, py::arra
     auto embeddings = vision_.encode(rgb.data(), width, height, 3);
     int num_tokens = embeddings.size() / vision_.config().projection_dim;
 
-    return py::array_t<float>(
-        {num_tokens, vision_.config().projection_dim},
-        embeddings.data());
+    return py::array_t<float>({num_tokens, vision_.config().projection_dim}, embeddings.data());
 }
 
 py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> prompt_ids,
-                      int max_new_tokens, float temperature, int top_k,
-                      float top_p, float repeat_penalty, bool do_sample,
-                      uint64_t seed, int eos_token_id,
-                      const std::string& kv_cache_dtype_str, int gpu_layers) {
+                                     int max_new_tokens, float temperature, int top_k, float top_p,
+                                     float repeat_penalty, bool do_sample, uint64_t seed,
+                                     int eos_token_id, const std::string& kv_cache_dtype_str,
+                                     int gpu_layers) {
     auto ctx = std::make_unique<InferenceContext>(model_);
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, *ctx);
     if (!engine) {
@@ -128,7 +138,8 @@ py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> pr
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
     if (tfm_eng) {
         KVCacheDType kv_dtype = KVCacheDType::FP32;
-        if (kv_cache_dtype_str == "q4_0") kv_dtype = KVCacheDType::Q4_0;
+        if (kv_cache_dtype_str == "q4_0")
+            kv_dtype = KVCacheDType::Q4_0;
         tfm_eng->set_kv_cache_dtype(kv_dtype);
         tfm_eng->set_gpu_layers(gpu_layers);
     }
@@ -162,11 +173,10 @@ py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> pr
 }
 
 void PyMultimodalModel::generate_stream(py::array_t<int32_t, py::array::c_style> prompt_ids,
-                          py::object callback,
-                          int max_new_tokens, float temperature, int top_k,
-                          float top_p, float repeat_penalty, bool do_sample,
-                          uint64_t seed, int eos_token_id,
-                          const std::string& kv_cache_dtype_str, int gpu_layers) {
+                                        py::object callback, int max_new_tokens, float temperature,
+                                        int top_k, float top_p, float repeat_penalty,
+                                        bool do_sample, uint64_t seed, int eos_token_id,
+                                        const std::string& kv_cache_dtype_str, int gpu_layers) {
     auto ctx = std::make_unique<InferenceContext>(model_);
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, *ctx);
     if (!engine) {
@@ -176,7 +186,8 @@ void PyMultimodalModel::generate_stream(py::array_t<int32_t, py::array::c_style>
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
     if (tfm_eng) {
         KVCacheDType kv_dtype = KVCacheDType::FP32;
-        if (kv_cache_dtype_str == "q4_0") kv_dtype = KVCacheDType::Q4_0;
+        if (kv_cache_dtype_str == "q4_0")
+            kv_dtype = KVCacheDType::Q4_0;
         tfm_eng->set_kv_cache_dtype(kv_dtype);
         tfm_eng->set_gpu_layers(gpu_layers);
     }
@@ -213,44 +224,31 @@ void PyMultimodalModel::generate_stream(py::array_t<int32_t, py::array::c_style>
 void register_multimodal(py::module_& m) {
     py::class_<PyMultimodalModel>(m, "MultimodalModel")
         .def(py::init<>())
-        .def("load", (void (PyMultimodalModel::*)(const std::string&, const std::string&)) &PyMultimodalModel::load,
-             py::arg("model_path"),
-             py::arg("device") = "cuda")
-        .def("load_with_mmproj", (void (PyMultimodalModel::*)(const std::string&, const std::string&, const std::string&)) &PyMultimodalModel::load,
-             py::arg("model_path"),
-             py::arg("mmproj_path"),
-             py::arg("device") = "cuda")
-        .def("encode_image", &PyMultimodalModel::encode_image,
-             py::arg("image"))
-        .def("generate", &PyMultimodalModel::generate,
-             py::arg("prompt_ids"),
-             py::arg("max_new_tokens") = 256,
-             py::arg("temperature") = 1.0f,
-             py::arg("top_k") = 0,
-             py::arg("top_p") = 1.0f,
-             py::arg("repeat_penalty") = 1.0f,
-             py::arg("do_sample") = true,
-             py::arg("seed") = 0,
-             py::arg("eos_token_id") = -1,
-             py::arg("kv_cache_dtype") = "fp32",
+        .def("load",
+             (void(PyMultimodalModel::*)(const std::string&, const std::string&)) &
+                 PyMultimodalModel::load,
+             py::arg("model_path"), py::arg("device") = "cuda")
+        .def("load_with_mmproj",
+             (void(PyMultimodalModel::*)(const std::string&, const std::string&,
+                                         const std::string&)) &
+                 PyMultimodalModel::load,
+             py::arg("model_path"), py::arg("mmproj_path"), py::arg("device") = "cuda")
+        .def("encode_image", &PyMultimodalModel::encode_image, py::arg("image"))
+        .def("generate", &PyMultimodalModel::generate, py::arg("prompt_ids"),
+             py::arg("max_new_tokens") = 256, py::arg("temperature") = 1.0f, py::arg("top_k") = 0,
+             py::arg("top_p") = 1.0f, py::arg("repeat_penalty") = 1.0f, py::arg("do_sample") = true,
+             py::arg("seed") = 0, py::arg("eos_token_id") = -1, py::arg("kv_cache_dtype") = "fp32",
              py::arg("gpu_layers") = -1)
-        .def("generate_stream", &PyMultimodalModel::generate_stream,
-             py::arg("prompt_ids"),
-             py::arg("callback"),
-             py::arg("max_new_tokens") = 256,
-             py::arg("temperature") = 1.0f,
-             py::arg("top_k") = 0,
-             py::arg("top_p") = 1.0f,
-             py::arg("repeat_penalty") = 1.0f,
-             py::arg("do_sample") = true,
-             py::arg("seed") = 0,
-             py::arg("eos_token_id") = -1,
-             py::arg("kv_cache_dtype") = "fp32",
-             py::arg("gpu_layers") = -1)
-        .def_property_readonly("config", &PyMultimodalModel::config, py::return_value_policy::reference)
-        .def_property_readonly("vision_config", &PyMultimodalModel::vision_config, py::return_value_policy::reference)
+        .def("generate_stream", &PyMultimodalModel::generate_stream, py::arg("prompt_ids"),
+             py::arg("callback"), py::arg("max_new_tokens") = 256, py::arg("temperature") = 1.0f,
+             py::arg("top_k") = 0, py::arg("top_p") = 1.0f, py::arg("repeat_penalty") = 1.0f,
+             py::arg("do_sample") = true, py::arg("seed") = 0, py::arg("eos_token_id") = -1,
+             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1)
+        .def_property_readonly("config", &PyMultimodalModel::config,
+                               py::return_value_policy::reference)
+        .def_property_readonly("vision_config", &PyMultimodalModel::vision_config,
+                               py::return_value_policy::reference)
         .def("create_context", &PyMultimodalModel::create_context,
-             py::arg("kv_cache_dtype") = "fp32",
-             py::arg("gpu_layers") = -1,
+             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
              py::return_value_policy::take_ownership);
 }

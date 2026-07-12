@@ -9,5 +9,5 @@ TensorPtr silu(const TensorPtr& x);
 TensorPtr gelu(const TensorPtr& x);
 TensorPtr gelu_tanh(const TensorPtr& x);
 
-} // namespace ops
-} // namespace forge
+}  // namespace ops
+}  // namespace forge

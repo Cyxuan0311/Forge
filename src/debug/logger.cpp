@@ -1,4 +1,5 @@
 #include "forge/logger.h"
+
 #include <cstdio>
 #include <mutex>
 
@@ -6,12 +7,18 @@ namespace forge {
 
 static const char* level_name(LogLevel level) {
     switch (level) {
-        case LogLevel::ERROR: return "ERROR";
-        case LogLevel::WARN:  return "WARN";
-        case LogLevel::INFO:  return "INFO";
-        case LogLevel::DEBUG: return "DEBUG";
-        case LogLevel::TRACE: return "TRACE";
-        default:              return "NONE";
+    case LogLevel::ERROR:
+        return "ERROR";
+    case LogLevel::WARN:
+        return "WARN";
+    case LogLevel::INFO:
+        return "INFO";
+    case LogLevel::DEBUG:
+        return "DEBUG";
+    case LogLevel::TRACE:
+        return "TRACE";
+    default:
+        return "NONE";
     }
 }
 
@@ -48,4 +55,4 @@ void Logger::reset_sink() {
     sink_ = nullptr;
 }
 
-} // namespace forge
+}  // namespace forge

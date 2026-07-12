@@ -1,12 +1,14 @@
 #include "forge/kv_cache.h"
+
+#include <cmath>
+#include <cstring>
+
 #include "forge/cuda_kernels.h"
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
-#include <cstring>
-#include <cmath>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -14,8 +16,10 @@ namespace forge {
 KVCache::~KVCache() {
 #ifdef USE_CUDA
     for (auto& layer : layers_) {
-        if (layer.d_q_key_cache) cudaFree(layer.d_q_key_cache);
-        if (layer.d_q_value_cache) cudaFree(layer.d_q_value_cache);
+        if (layer.d_q_key_cache)
+            cudaFree(layer.d_q_key_cache);
+        if (layer.d_q_value_cache)
+            cudaFree(layer.d_q_value_cache);
         layer.d_q_key_cache = nullptr;
         layer.d_q_value_cache = nullptr;
     }
@@ -27,14 +31,14 @@ size_t KVCache::q4_0_block_nbytes(int n) {
     return num_blocks * (sizeof(float) + 16);
 }
 
-bool KVCache::init(int num_layers, int num_kv_heads, int head_dim,
-                    int max_seq_len, DeviceType device) {
-    return init_quantized(num_layers, num_kv_heads, head_dim,
-                          max_seq_len, device, KVCacheDType::FP32);
+bool KVCache::init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
+                   DeviceType device) {
+    return init_quantized(num_layers, num_kv_heads, head_dim, max_seq_len, device,
+                          KVCacheDType::FP32);
 }
 
-bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim,
-                              int max_seq_len, DeviceType device, KVCacheDType kv_dtype) {
+bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
+                             DeviceType device, KVCacheDType kv_dtype) {
     num_kv_heads_ = num_kv_heads;
     head_dim_ = head_dim;
     max_seq_len_ = max_seq_len;
@@ -62,9 +66,8 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim,
     }
 
     LOG_INFO("KVCache initialized: " + std::to_string(num_layers) + " layers, " +
-             std::to_string(num_kv_heads) + " kv_heads, " +
-             std::to_string(head_dim) + " head_dim, " +
-             std::to_string(max_seq_len) + " max_seq_len, " +
+             std::to_string(num_kv_heads) + " kv_heads, " + std::to_string(head_dim) +
+             " head_dim, " + std::to_string(max_seq_len) + " max_seq_len, " +
              (device == DeviceType::CUDA ? "CUDA" : "CPU") + ", " +
              (kv_dtype == KVCacheDType::Q4_0 ? "Q4_0" : "FP32"));
 
@@ -90,7 +93,8 @@ static void quantize_q4_0_cpu(const float* data, uint8_t* q_data, int n) {
             amax = std::max(amax, std::fabs(data[i]));
         }
         float scale = amax / 7.0f;
-        if (scale == 0.0f) scale = 1.0f;
+        if (scale == 0.0f)
+            scale = 1.0f;
         float inv_scale = 1.0f / scale;
 
         uint8_t* block_ptr = q_data + b * (sizeof(float) + 16);
@@ -101,10 +105,15 @@ static void quantize_q4_0_cpu(const float* data, uint8_t* q_data, int n) {
             int idx0 = start + i * 2;
             int idx1 = start + i * 2 + 1;
 
-            int8_t v0 = (idx0 < end) ? static_cast<int8_t>(std::round(std::max(-8.0f, std::min(7.0f, data[idx0] * inv_scale)))) : 0;
-            int8_t v1 = (idx1 < end) ? static_cast<int8_t>(std::round(std::max(-8.0f, std::min(7.0f, data[idx1] * inv_scale)))) : 0;
+            int8_t v0 = (idx0 < end) ? static_cast<int8_t>(std::round(
+                                           std::max(-8.0f, std::min(7.0f, data[idx0] * inv_scale))))
+                                     : 0;
+            int8_t v1 = (idx1 < end) ? static_cast<int8_t>(std::round(
+                                           std::max(-8.0f, std::min(7.0f, data[idx1] * inv_scale))))
+                                     : 0;
 
-            uint8_t packed = (static_cast<uint8_t>(v0) & 0x0F) | ((static_cast<uint8_t>(v1) & 0x0F) << 4);
+            uint8_t packed =
+                (static_cast<uint8_t>(v0) & 0x0F) | ((static_cast<uint8_t>(v1) & 0x0F) << 4);
             qs[i] = packed;
         }
     }
@@ -124,14 +133,18 @@ static void dequantize_q4_0_cpu(const uint8_t* q_data, float* out, int n) {
         for (int i = 0; i < 16; ++i) {
             uint8_t packed = qs[i];
             int8_t v0 = packed & 0x0F;
-            if (v0 & 0x08) v0 -= 16;
+            if (v0 & 0x08)
+                v0 -= 16;
             int8_t v1 = (packed >> 4) & 0x0F;
-            if (v1 & 0x08) v1 -= 16;
+            if (v1 & 0x08)
+                v1 -= 16;
 
             int idx0 = start + i * 2;
             int idx1 = start + i * 2 + 1;
-            if (idx0 < n) out[idx0] = static_cast<float>(v0) * scale;
-            if (idx1 < n) out[idx1] = static_cast<float>(v1) * scale;
+            if (idx0 < n)
+                out[idx0] = static_cast<float>(v0) * scale;
+            if (idx1 < n)
+                out[idx1] = static_cast<float>(v1) * scale;
         }
     }
 }
@@ -151,8 +164,7 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
 
     if (filled + seq_len > max_seq_len_) {
         LOG_ERROR("KVCache::update: cache overflow, filled=" + std::to_string(filled) +
-                  " seq_len=" + std::to_string(seq_len) +
-                  " max=" + std::to_string(max_seq_len_));
+                  " seq_len=" + std::to_string(seq_len) + " max=" + std::to_string(max_seq_len_));
         return -1;
     }
 
@@ -180,8 +192,10 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
         if (new_key->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
             std::vector<float> h_key(seq_len * kv_dim), h_value(seq_len * kv_dim);
-            cudaMemcpy(h_key.data(), new_key->data(), seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_value.data(), new_value->data(), seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_key.data(), new_key->data(), seq_len * kv_dim * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_value.data(), new_value->data(), seq_len * kv_dim * sizeof(float),
+                       cudaMemcpyDeviceToHost);
             std::memcpy(k_dst, h_key.data(), seq_len * kv_dim * sizeof(float));
             std::memcpy(v_dst, h_value.data(), seq_len * kv_dim * sizeof(float));
 #endif
@@ -197,19 +211,23 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
     return kv.filled;
 }
 
-int KVCache::update_quantized(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+int KVCache::update_quantized(int layer, const TensorPtr& new_key, const TensorPtr& new_value,
+                              int seq_len) {
     // Use CUDA path if device is CUDA
     if (device_ == DeviceType::CUDA) {
         int result = update_quantized_cuda(layer, new_key, new_value, seq_len);
-        if (result >= 0) return result;
+        if (result >= 0)
+            return result;
         // Fall through to CPU path if CUDA path fails
     }
 
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return -1;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return -1;
 
     auto& kv = layers_[layer];
     int filled = kv.filled;
-    if (filled + seq_len > max_seq_len_) return -1;
+    if (filled + seq_len > max_seq_len_)
+        return -1;
 
     int kv_dim = num_kv_heads_ * head_dim_;
     size_t q_row_size = q4_0_block_nbytes(kv_dim);
@@ -218,8 +236,10 @@ int KVCache::update_quantized(int layer, const TensorPtr& new_key, const TensorP
 
     if (new_key->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cudaMemcpy(h_key.data(), new_key->data(), seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_value.data(), new_value->data(), seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_key.data(), new_key->data(), seq_len * kv_dim * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_value.data(), new_value->data(), seq_len * kv_dim * sizeof(float),
+                   cudaMemcpyDeviceToHost);
 #endif
     } else {
         std::memcpy(h_key.data(), new_key->data(), seq_len * kv_dim * sizeof(float));
@@ -238,8 +258,10 @@ int KVCache::update_quantized(int layer, const TensorPtr& new_key, const TensorP
 }
 
 void KVCache::dequantize_layer(int layer) {
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return;
-    if (kv_dtype_ != KVCacheDType::Q4_0) return;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return;
+    if (kv_dtype_ != KVCacheDType::Q4_0)
+        return;
 
     // Use CUDA path if device is CUDA and CUDA quantized cache exists
     if (device_ == DeviceType::CUDA && layers_[layer].d_q_key_cache) {
@@ -261,7 +283,8 @@ void KVCache::dequantize_layer(int layer) {
 
     if (device_ == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cudaMemcpy(kv.key_cache->data(), h_out.data(), filled * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(kv.key_cache->data(), h_out.data(), filled * kv_dim * sizeof(float),
+                   cudaMemcpyHostToDevice);
 #endif
     } else {
         std::memcpy(kv.key_cache->data(), h_out.data(), filled * kv_dim * sizeof(float));
@@ -275,7 +298,8 @@ void KVCache::dequantize_layer(int layer) {
 
     if (device_ == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cudaMemcpy(kv.value_cache->data(), h_out.data(), filled * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(kv.value_cache->data(), h_out.data(), filled * kv_dim * sizeof(float),
+                   cudaMemcpyHostToDevice);
 #endif
     } else {
         std::memcpy(kv.value_cache->data(), h_out.data(), filled * kv_dim * sizeof(float));
@@ -283,33 +307,40 @@ void KVCache::dequantize_layer(int layer) {
 }
 
 TensorPtr KVCache::get_key(int layer) const {
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return nullptr;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return nullptr;
     return layers_[layer].key_cache;
 }
 
 TensorPtr KVCache::get_value(int layer) const {
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return nullptr;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return nullptr;
     return layers_[layer].value_cache;
 }
 
 TensorPtr KVCache::get_key_filled(int layer) const {
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return nullptr;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return nullptr;
     const auto& kv = layers_[layer];
     int f = kv.filled;
-    if (f == max_seq_len_) return kv.key_cache;
+    if (f == max_seq_len_)
+        return kv.key_cache;
     return std::make_shared<Tensor>(kv.key_cache->slice(0, 0, f));
 }
 
 TensorPtr KVCache::get_value_filled(int layer) const {
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return nullptr;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return nullptr;
     const auto& kv = layers_[layer];
     int f = kv.filled;
-    if (f == max_seq_len_) return kv.value_cache;
+    if (f == max_seq_len_)
+        return kv.value_cache;
     return std::make_shared<Tensor>(kv.value_cache->slice(0, 0, f));
 }
 
 int KVCache::filled(int layer) const {
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return 0;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return 0;
     return layers_[layer].filled;
 }
 
@@ -327,22 +358,28 @@ size_t KVCache::nbytes() const {
 void KVCache::alloc_cuda_q_cache(int layer, size_t bytes) {
 #ifdef USE_CUDA
     auto& kv = layers_[layer];
-    if (kv.d_q_cache_bytes >= bytes) return;
-    if (kv.d_q_key_cache) cudaFree(kv.d_q_key_cache);
-    if (kv.d_q_value_cache) cudaFree(kv.d_q_value_cache);
+    if (kv.d_q_cache_bytes >= bytes)
+        return;
+    if (kv.d_q_key_cache)
+        cudaFree(kv.d_q_key_cache);
+    if (kv.d_q_value_cache)
+        cudaFree(kv.d_q_value_cache);
     cudaMalloc(&kv.d_q_key_cache, bytes);
     cudaMalloc(&kv.d_q_value_cache, bytes);
     kv.d_q_cache_bytes = bytes;
 #endif
 }
 
-int KVCache::update_quantized_cuda(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+int KVCache::update_quantized_cuda(int layer, const TensorPtr& new_key, const TensorPtr& new_value,
+                                   int seq_len) {
 #ifdef USE_CUDA
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return -1;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return -1;
 
     auto& kv = layers_[layer];
     int filled = kv.filled;
-    if (filled + seq_len > max_seq_len_) return -1;
+    if (filled + seq_len > max_seq_len_)
+        return -1;
 
     int kv_dim = num_kv_heads_ * head_dim_;
     size_t q_row_size = q4_0_block_nbytes(kv_dim);
@@ -366,7 +403,8 @@ int KVCache::update_quantized_cuda(int layer, const TensorPtr& new_key, const Te
         float* d_temp;
         cudaMalloc(&d_temp, seq_len * kv_dim * sizeof(float) * 2);
         cudaMemcpy(d_temp, h_key.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_temp + seq_len * kv_dim, h_value.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_temp + seq_len * kv_dim, h_value.data(), seq_len * kv_dim * sizeof(float),
+                   cudaMemcpyHostToDevice);
 
         // Quantize on GPU
         uint8_t* q_key_dst = static_cast<uint8_t*>(kv.d_q_key_cache) + filled * q_row_size;
@@ -392,25 +430,26 @@ int KVCache::update_quantized_cuda(int layer, const TensorPtr& new_key, const Te
 
 void KVCache::dequantize_layer_cuda(int layer) {
 #ifdef USE_CUDA
-    if (layer < 0 || layer >= static_cast<int>(layers_.size())) return;
-    if (kv_dtype_ != KVCacheDType::Q4_0) return;
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return;
+    if (kv_dtype_ != KVCacheDType::Q4_0)
+        return;
 
     auto& kv = layers_[layer];
     int filled = kv.filled;
     int kv_dim = num_kv_heads_ * head_dim_;
 
-    if (!kv.d_q_key_cache || filled == 0) return;
+    if (!kv.d_q_key_cache || filled == 0)
+        return;
 
     // Dequantize directly from CUDA quantized cache to CUDA FP32 cache
     float* k_out = static_cast<float*>(kv.key_cache->data());
     float* v_out = static_cast<float*>(kv.value_cache->data());
 
     // Dequantize all filled rows at once
-    cuda::launch_dequant_q4_0_matrix(
-        kv.d_q_key_cache, k_out, filled, kv_dim);
-    cuda::launch_dequant_q4_0_matrix(
-        kv.d_q_value_cache, v_out, filled, kv_dim);
+    cuda::launch_dequant_q4_0_matrix(kv.d_q_key_cache, k_out, filled, kv_dim);
+    cuda::launch_dequant_q4_0_matrix(kv.d_q_value_cache, v_out, filled, kv_dim);
 #endif
 }
 
-} // namespace forge
+}  // namespace forge

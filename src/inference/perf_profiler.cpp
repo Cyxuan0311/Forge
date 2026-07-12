@@ -7,4 +7,4 @@ PerfProfiler& PerfProfiler::instance() {
     return profiler;
 }
 
-} // namespace forge
+}  // namespace forge

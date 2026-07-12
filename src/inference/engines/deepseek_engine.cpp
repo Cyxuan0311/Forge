@@ -1,13 +1,15 @@
 #include "forge/engines/deepseek_engine.h"
-#include "forge/operators.h"
-#include "forge/cuda_kernels.h"
-#include "forge/logger.h"
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/operators.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -23,10 +25,8 @@ bool DeepSeekEngine::init_weights() {
     return weights_.init(model_.weights(), model_.config());
 }
 
-TensorPtr DeepSeekEngine::forward_layer(const TensorPtr& hidden,
-                                        int layer_idx,
-                                        int seq_len, int64_t start_pos,
-                                        DeviceType dev) {
+TensorPtr DeepSeekEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                        int64_t start_pos, DeviceType dev) {
     const auto& lw = weights_.layers[layer_idx];
     if (lw.layer_type == LayerType::MLA) {
         return forward_layer_mla(hidden, layer_idx, seq_len, start_pos, dev);
@@ -35,10 +35,8 @@ TensorPtr DeepSeekEngine::forward_layer(const TensorPtr& hidden,
     }
 }
 
-TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden,
-                                            int layer_idx,
-                                            int seq_len, int64_t start_pos,
-                                            DeviceType dev) {
+TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                            int64_t start_pos, DeviceType dev) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -57,19 +55,15 @@ TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden,
     if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
         cuda::launch_rope_gqa(
-            static_cast<const float*>(q->data()),
-            static_cast<const float*>(k->data()),
-            static_cast<float*>(q_rope->data()),
-            static_cast<float*>(k_rope->data()),
-            num_heads, num_kv_heads, head_dim, seq_len, start_pos, cfg.rope_theta);
+            static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+            static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), num_heads,
+            num_kv_heads, head_dim, seq_len, start_pos, cfg.rope_theta);
 #endif
     } else {
-        apply_rope_standard(static_cast<const float*>(q->data()),
-                            static_cast<const float*>(k->data()),
-                            static_cast<float*>(q_rope->data()),
-                            static_cast<float*>(k_rope->data()),
-                            seq_len, num_heads, num_kv_heads, head_dim,
-                            start_pos, cfg.rope_theta);
+        apply_rope_standard(
+            static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+            static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), seq_len,
+            num_heads, num_kv_heads, head_dim, start_pos, cfg.rope_theta);
     }
 
     kv_cache_.update(layer_idx, k_rope, v, seq_len);
@@ -102,8 +96,8 @@ TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden,
         v_expanded = v_sliced;
     }
 
-    auto attn_out = ops::scaled_dot_product_attention_2d(
-        q_rope, k_expanded, v_expanded, seq_len, total_len, num_heads, head_dim, true);
+    auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_expanded, v_expanded, seq_len,
+                                                         total_len, num_heads, head_dim, true);
 
     auto attn_proj = ops::matmul_transB(attn_out, lw.wo());
 
@@ -122,10 +116,8 @@ TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden,
     return output;
 }
 
-TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden,
-                                            int layer_idx,
-                                            int seq_len, int64_t start_pos,
-                                            DeviceType dev) {
+TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                            int64_t start_pos, DeviceType dev) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int head_dim = cfg.head_dim;
@@ -153,19 +145,15 @@ TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden,
     if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
         cuda::launch_rope_gqa(
-            static_cast<const float*>(q->data()),
-            static_cast<const float*>(k_latent->data()),
-            static_cast<float*>(q_rope->data()),
-            static_cast<float*>(k_rope->data()),
-            num_heads, 1, head_dim, seq_len, start_pos, cfg.rope_theta);
+            static_cast<const float*>(q->data()), static_cast<const float*>(k_latent->data()),
+            static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), num_heads, 1,
+            head_dim, seq_len, start_pos, cfg.rope_theta);
 #endif
     } else {
-        apply_rope_standard(static_cast<const float*>(q->data()),
-                            static_cast<const float*>(k_latent->data()),
-                            static_cast<float*>(q_rope->data()),
-                            static_cast<float*>(k_rope->data()),
-                            seq_len, num_heads, 1, head_dim,
-                            start_pos, cfg.rope_theta);
+        apply_rope_standard(
+            static_cast<const float*>(q->data()), static_cast<const float*>(k_latent->data()),
+            static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), seq_len,
+            num_heads, 1, head_dim, start_pos, cfg.rope_theta);
     }
 
     kv_cache_.update(layer_idx, k_rope, v_latent, seq_len);
@@ -198,8 +186,8 @@ TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden,
         v_sliced = v_cuda;
     }
 
-    auto attn_out = ops::scaled_dot_product_attention_2d(
-        q_rope, k_sliced, v_sliced, seq_len, total_len, num_heads, kv_lora_rank, true);
+    auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_sliced, v_sliced, seq_len,
+                                                         total_len, num_heads, kv_lora_rank, true);
 
     auto attn_proj = ops::matmul_transB(attn_out, lw.wo());
 
@@ -226,6 +214,6 @@ static EngineAutoRegister _reg_deepseek_v2("deepseek_v2", [](Model& model, Infer
 static EngineAutoRegister _reg_deepseek_v3("deepseek_v3", [](Model& model, InferenceContext& ctx) {
     return std::make_unique<DeepSeekEngine>(model, ctx);
 });
-}
+}  // namespace
 
-} // namespace forge
+}  // namespace forge

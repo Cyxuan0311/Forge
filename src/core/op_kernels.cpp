@@ -1,8 +1,9 @@
+#include <cmath>
+#include <cstring>
+
+#include "forge/cuda_kernels.h"
 #include "forge/op_dispatch.h"
 #include "forge/operators.h"
-#include "forge/cuda_kernels.h"
-#include <cstring>
-#include <cmath>
 
 namespace forge {
 namespace {
@@ -53,10 +54,11 @@ TensorPtr mul_mat_transb_kernel(const std::vector<TensorPtr>& inputs, const int3
 //   [9] = device_type (0=CPU, 1=CUDA)
 TensorPtr rope_kernel(const std::vector<TensorPtr>& inputs, const int32_t* params) {
     auto x = inputs[0];
-    if (!params) return nullptr;
+    if (!params)
+        return nullptr;
 
     int is_q = params[0];
-    int num_h = params[1];      // num_heads (Q) or num_kv_heads (K)
+    int num_h = params[1];  // num_heads (Q) or num_kv_heads (K)
     int head_dim = params[2];
     int seq_len = params[3];
     int64_t start_pos;
@@ -70,15 +72,13 @@ TensorPtr rope_kernel(const std::vector<TensorPtr>& inputs, const int32_t* param
     if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
         if (is_q) {
-            cuda::launch_rope_gqa(
-                static_cast<const float*>(x->data()), nullptr,
-                static_cast<float*>(out->data()), nullptr,
-                num_h, 0, head_dim, seq_len, start_pos, rope_theta);
+            cuda::launch_rope_gqa(static_cast<const float*>(x->data()), nullptr,
+                                  static_cast<float*>(out->data()), nullptr, num_h, 0, head_dim,
+                                  seq_len, start_pos, rope_theta);
         } else {
-            cuda::launch_rope_gqa(
-                nullptr, static_cast<const float*>(x->data()),
-                nullptr, static_cast<float*>(out->data()),
-                0, num_h, head_dim, seq_len, start_pos, rope_theta);
+            cuda::launch_rope_gqa(nullptr, static_cast<const float*>(x->data()), nullptr,
+                                  static_cast<float*>(out->data()), 0, num_h, head_dim, seq_len,
+                                  start_pos, rope_theta);
         }
 #endif
     } else {
@@ -117,7 +117,8 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
     auto q = inputs[0];
     auto k = inputs[1];
     auto v = inputs[2];
-    if (!params) return nullptr;
+    if (!params)
+        return nullptr;
 
     int num_heads = params[0];
     int num_kv_heads = params[1];
@@ -129,40 +130,37 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
     int total_len = static_cast<int>(k->shape()[0]);
 
     if (dev == DeviceType::CUDA && num_kv_heads < num_heads) {
-        auto attn_out = std::make_shared<Tensor>(DataType::FP32,
-            std::vector<int64_t>{seq_len_q, num_heads * head_dim}, DeviceType::CUDA);
+        auto attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len_q, num_heads * head_dim},
+            DeviceType::CUDA);
         if (seq_len_q == 1) {
 #ifdef USE_CUDA
             cuda::launch_flash_attention_gqa_decode(
-                static_cast<const float*>(q->data()),
-                static_cast<const float*>(k->data()),
-                static_cast<const float*>(v->data()),
-                static_cast<float*>(attn_out->data()),
+                static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+                static_cast<const float*>(v->data()), static_cast<float*>(attn_out->data()),
                 total_len, num_heads, num_kv_heads, head_dim);
 #endif
         } else {
 #ifdef USE_CUDA
             cuda::launch_flash_attention_gqa(
-                static_cast<const float*>(q->data()),
-                static_cast<const float*>(k->data()),
-                static_cast<const float*>(v->data()),
-                static_cast<float*>(attn_out->data()),
+                static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+                static_cast<const float*>(v->data()), static_cast<float*>(attn_out->data()),
                 seq_len_q, total_len, num_heads, num_kv_heads, head_dim, true);
 #endif
         }
         return attn_out;
     } else if (dev == DeviceType::CUDA) {
-        return ops::scaled_dot_product_attention_2d(
-            q, k, v, seq_len_q, total_len, num_heads, head_dim, causal);
+        return ops::scaled_dot_product_attention_2d(q, k, v, seq_len_q, total_len, num_heads,
+                                                    head_dim, causal);
     } else {
         // CPU path: GQA expand if needed
         TensorPtr k_expanded, v_expanded;
         if (num_kv_heads < num_heads) {
             int kv_groups = num_heads / num_kv_heads;
-            k_expanded = std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{total_len, num_heads * head_dim}, dev);
-            v_expanded = std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{total_len, num_heads * head_dim}, dev);
+            k_expanded = std::make_shared<Tensor>(
+                DataType::FP32, std::vector<int64_t>{total_len, num_heads * head_dim}, dev);
+            v_expanded = std::make_shared<Tensor>(
+                DataType::FP32, std::vector<int64_t>{total_len, num_heads * head_dim}, dev);
             const float* k_data = static_cast<const float*>(k->data());
             float* k_out = static_cast<float*>(k_expanded->data());
             const float* v_data = static_cast<const float*>(v->data());
@@ -182,8 +180,8 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
             k_expanded = k;
             v_expanded = v;
         }
-        return ops::scaled_dot_product_attention_2d(
-            q, k_expanded, v_expanded, seq_len_q, total_len, num_heads, head_dim, causal);
+        return ops::scaled_dot_product_attention_2d(q, k_expanded, v_expanded, seq_len_q, total_len,
+                                                    num_heads, head_dim, causal);
     }
 }
 
@@ -216,5 +214,5 @@ static bool register_all_kernels() {
 }
 static bool _kernels_registered = register_all_kernels();
 
-} // anonymous namespace
-} // namespace forge
+}  // anonymous namespace
+}  // namespace forge

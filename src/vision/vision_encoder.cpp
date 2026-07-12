@@ -1,17 +1,19 @@
 #include "forge/vision_encoder.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+
+#include "forge/logger.h"
 #include "forge/model.h"
 #include "forge/operators.h"
-#include "forge/logger.h"
 #include "forge/perf_profiler.h"
-#include <cmath>
-#include <cstring>
-#include <algorithm>
-#include <numeric>
-#include <chrono>
-#include <cstdlib>
 
 #ifdef _OPENMP
-#include <omp.h>
+#    include <omp.h>
 #endif
 
 namespace forge {
@@ -21,8 +23,10 @@ static TensorPtr dequant_to_fp32_cpu(const TensorPtr& w);
 
 // Helper: dequantize a weight tensor to FP32 on CPU
 static TensorPtr dequant_to_fp32_cpu(const TensorPtr& w) {
-    if (!w) return nullptr;
-    if (w->dtype() == DataType::FP32 && w->device() == DeviceType::CPU) return w;
+    if (!w)
+        return nullptr;
+    if (w->dtype() == DataType::FP32 && w->device() == DeviceType::CPU)
+        return w;
 
     auto out = std::make_shared<Tensor>(DataType::FP32, w->shape(), DeviceType::CPU);
     if (w->dtype() == DataType::FP32) {
@@ -37,9 +41,13 @@ static TensorPtr dequant_to_fp32_cpu(const TensorPtr& w) {
             uint32_t exp = (h >> 10) & 0x1f;
             uint32_t mant = h & 0x3ff;
             float f;
-            if (exp == 0) f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
-            else if (exp == 31) f = mant == 0 ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::quiet_NaN();
-            else f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
+            if (exp == 0)
+                f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
+            else if (exp == 31)
+                f = mant == 0 ? std::numeric_limits<float>::infinity()
+                              : std::numeric_limits<float>::quiet_NaN();
+            else
+                f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
             dst[i] = sign ? -f : f;
         }
     }
@@ -48,7 +56,8 @@ static TensorPtr dequant_to_fp32_cpu(const TensorPtr& w) {
 
 // Helper: move tensor to device
 static TensorPtr to_device(const TensorPtr& t, DeviceType dev) {
-    if (!t || t->device() == dev) return t;
+    if (!t || t->device() == dev)
+        return t;
     auto out = std::make_shared<Tensor>(t->dtype(), t->shape(), dev);
     out->copy_from(*t);
     return out;
@@ -127,7 +136,8 @@ bool VisionEncoder::init(const WeightStore& store, const VisionConfig& config) {
 }
 
 void VisionEncoder::prepare_weights(DeviceType dev) {
-    if (weights_prepared_ && weights_device_ == dev) return;
+    if (weights_prepared_ && weights_device_ == dev)
+        return;
 
     auto to_dev = [dev](const TensorPtr& t) -> TensorPtr {
         auto fp32 = dequant_to_fp32_cpu(t);
@@ -195,10 +205,10 @@ void VisionEncoder::prepare_weights(DeviceType dev) {
 }
 
 TensorPtr VisionEncoder::preprocess(const float* rgb_data, int width, int height,
-                                     int channels) const {
+                                    int channels) const {
     int img_size = config_.image_size;
-    auto pixels = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{3, img_size, img_size}, DeviceType::CPU);
+    auto pixels = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{3, img_size, img_size}, DeviceType::CPU);
     float* out = static_cast<float*>(pixels->data());
 
     for (int c = 0; c < 3; ++c) {
@@ -218,8 +228,8 @@ TensorPtr VisionEncoder::preprocess(const float* rgb_data, int width, int height
                     float v01 = rgb_data[(y0 * width + x1) * 3 + c];
                     float v10 = rgb_data[(y1 * width + x0) * 3 + c];
                     float v11 = rgb_data[(y1 * width + x1) * 3 + c];
-                    val = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy) +
-                          v10 * (1 - fx) * fy + v11 * fx * fy;
+                    val = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy) + v10 * (1 - fx) * fy +
+                          v11 * fx * fy;
                 }
                 val = val / 255.0f;
                 val = (val - config_.image_mean[c]) / config_.image_std[c];
@@ -238,8 +248,8 @@ TensorPtr VisionEncoder::patch_embedding(const TensorPtr& pixel_values) {
     int num_patches_w = img_size / ps;
     int num_patches = num_patches_h * num_patches_w;
 
-    auto output = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{num_patches, embed_dim}, DeviceType::CPU);
+    auto output = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{num_patches, embed_dim}, DeviceType::CPU);
 
     const float* px = static_cast<const float*>(pixel_values->data());
     float* out = static_cast<float*>(output->data());
@@ -253,7 +263,7 @@ TensorPtr VisionEncoder::patch_embedding(const TensorPtr& pixel_values) {
         std::memcpy(bias.data(), b->data(), embed_dim * sizeof(float));
     }
 
-    #pragma omp parallel for schedule(dynamic) if(num_patches > 4)
+#pragma omp parallel for schedule(dynamic) if (num_patches > 4)
     for (int patch_idx = 0; patch_idx < num_patches; ++patch_idx) {
         int ph = patch_idx / num_patches_w;
         int pw = patch_idx % num_patches_w;
@@ -267,10 +277,11 @@ TensorPtr VisionEncoder::patch_embedding(const TensorPtr& pixel_values) {
                     float pixel_val = px[c * img_size * img_size + img_y * img_size + img_x];
                     // GGUF stores conv weight as [KW, KH, IC, OC] in column-major.
                     // After shape reversal, logical shape is [OC, IC, KH, KW] = [1152, 3, 14, 14].
-                    // Data layout in memory (column-major equivalent to row-major of reversed shape):
-                    // w_data[d_out * (IC*KH*KW) + c * (KH*KW) + dy * KW + dx]
+                    // Data layout in memory (column-major equivalent to row-major of reversed
+                    // shape): w_data[d_out * (IC*KH*KW) + c * (KH*KW) + dy * KW + dx]
                     for (int d = 0; d < embed_dim; ++d) {
-                        patch_out[d] += pixel_val * w_data[d * 3 * ps * ps + c * ps * ps + dy * ps + dx];
+                        patch_out[d] +=
+                            pixel_val * w_data[d * 3 * ps * ps + c * ps * ps + dy * ps + dx];
                     }
                 }
             }
@@ -280,7 +291,7 @@ TensorPtr VisionEncoder::patch_embedding(const TensorPtr& pixel_values) {
 }
 
 TensorPtr VisionEncoder::forward_vit_block(const TensorPtr& hidden, const ViTLayerWeights& lw,
-                                            int num_heads, int head_dim) {
+                                           int num_heads, int head_dim) {
     int num_patches = static_cast<int>(hidden->shape()[0]);
 
     // LayerNorm 1
@@ -292,7 +303,8 @@ TensorPtr VisionEncoder::forward_vit_block(const TensorPtr& hidden, const ViTLay
     auto v = ops::matmul_transB(normed, lw.attn_v_weight, lw.attn_v_bias);
 
     // Self-attention (non-causal for ViT)
-    auto attn_out = ops::scaled_dot_product_attention_2d(q, k, v, num_patches, num_heads, head_dim, false);
+    auto attn_out =
+        ops::scaled_dot_product_attention_2d(q, k, v, num_patches, num_heads, head_dim, false);
 
     // Output projection
     auto attn_proj = ops::matmul_transB(attn_out, lw.attn_out_weight, lw.attn_out_bias);
@@ -323,7 +335,8 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
     auto normed = hidden;
 
     if (m_ln1_w_) {
-        auto merger_normed = ops::layer_norm(hidden, m_ln1_w_, m_ln1_b_, config_.layer_norm_epsilon);
+        auto merger_normed =
+            ops::layer_norm(hidden, m_ln1_w_, m_ln1_b_, config_.layer_norm_epsilon);
 
         int num_heads = config_.head_count;
         int head_dim = dim / num_heads;
@@ -334,12 +347,16 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
         auto v = ops::matmul_transB(merger_normed, m_v_w_, m_v_b_);
 
         // Window attention: reorder tokens into 2x2 windows, apply block-diagonal mask
-        auto q_cpu = q; auto k_cpu = k; auto v_cpu = v;
+        auto q_cpu = q;
+        auto k_cpu = k;
+        auto v_cpu = v;
         if (dev == DeviceType::CUDA) {
             q_cpu = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
             k_cpu = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
             v_cpu = std::make_shared<Tensor>(DataType::FP32, v->shape(), DeviceType::CPU);
-            q_cpu->copy_from(*q); k_cpu->copy_from(*k); v_cpu->copy_from(*v);
+            q_cpu->copy_from(*q);
+            k_cpu->copy_from(*k);
+            v_cpu->copy_from(*v);
         }
 
         // Build window reorder indices
@@ -360,9 +377,12 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
         }
 
         // Reorder Q, K, V according to window indices
-        auto q_reordered = std::make_shared<Tensor>(DataType::FP32, q_cpu->shape(), DeviceType::CPU);
-        auto k_reordered = std::make_shared<Tensor>(DataType::FP32, k_cpu->shape(), DeviceType::CPU);
-        auto v_reordered = std::make_shared<Tensor>(DataType::FP32, v_cpu->shape(), DeviceType::CPU);
+        auto q_reordered =
+            std::make_shared<Tensor>(DataType::FP32, q_cpu->shape(), DeviceType::CPU);
+        auto k_reordered =
+            std::make_shared<Tensor>(DataType::FP32, k_cpu->shape(), DeviceType::CPU);
+        auto v_reordered =
+            std::make_shared<Tensor>(DataType::FP32, v_cpu->shape(), DeviceType::CPU);
         const float* q_data = static_cast<const float*>(q_cpu->data());
         const float* k_data = static_cast<const float*>(k_cpu->data());
         const float* v_data = static_cast<const float*>(v_cpu->data());
@@ -370,17 +390,20 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
         float* kr_data = static_cast<float*>(k_reordered->data());
         float* vr_data = static_cast<float*>(v_reordered->data());
 
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (int i = 0; i < num_patches; ++i) {
             int src = window_idx[i];
-            std::memcpy(qr_data + i * num_heads * head_dim, q_data + src * num_heads * head_dim, num_heads * head_dim * sizeof(float));
-            std::memcpy(kr_data + i * num_heads * head_dim, k_data + src * num_heads * head_dim, num_heads * head_dim * sizeof(float));
-            std::memcpy(vr_data + i * num_heads * head_dim, v_data + src * num_heads * head_dim, num_heads * head_dim * sizeof(float));
+            std::memcpy(qr_data + i * num_heads * head_dim, q_data + src * num_heads * head_dim,
+                        num_heads * head_dim * sizeof(float));
+            std::memcpy(kr_data + i * num_heads * head_dim, k_data + src * num_heads * head_dim,
+                        num_heads * head_dim * sizeof(float));
+            std::memcpy(vr_data + i * num_heads * head_dim, v_data + src * num_heads * head_dim,
+                        num_heads * head_dim * sizeof(float));
         }
 
         // Build block-diagonal mask
-        auto mask = std::make_shared<Tensor>(DataType::FP32,
-            std::vector<int64_t>{num_patches, num_patches}, DeviceType::CPU);
+        auto mask = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{num_patches, num_patches}, DeviceType::CPU);
         float* mask_data = static_cast<float*>(mask->data());
         std::fill(mask_data, mask_data + num_patches * num_patches, -INFINITY);
         for (int w = 0; w < num_patches; w += 4) {
@@ -396,19 +419,23 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
             q_reordered, k_reordered, v_reordered, num_patches, num_heads, head_dim, mask);
 
         // Inverse reorder: restore original token order
-        auto attn_restored = std::make_shared<Tensor>(DataType::FP32, attn_out->shape(), DeviceType::CPU);
+        auto attn_restored =
+            std::make_shared<Tensor>(DataType::FP32, attn_out->shape(), DeviceType::CPU);
         const float* ao_data = static_cast<const float*>(attn_out->data());
         float* ar_data = static_cast<float*>(attn_restored->data());
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (int i = 0; i < num_patches; ++i) {
             int dst = window_idx[i];
-            std::memcpy(ar_data + dst * num_heads * head_dim, ao_data + i * num_heads * head_dim, num_heads * head_dim * sizeof(float));
+            std::memcpy(ar_data + dst * num_heads * head_dim, ao_data + i * num_heads * head_dim,
+                        num_heads * head_dim * sizeof(float));
         }
 
         // Output projection (using cached weight m_o_w_)
         if (dev == DeviceType::CUDA) {
-            auto tmp = std::make_shared<Tensor>(DataType::FP32, attn_restored->shape(), DeviceType::CUDA);
-            tmp->copy_from(*attn_restored); attn_restored = tmp;
+            auto tmp =
+                std::make_shared<Tensor>(DataType::FP32, attn_restored->shape(), DeviceType::CUDA);
+            tmp->copy_from(*attn_restored);
+            attn_restored = tmp;
         }
         auto attn_proj = ops::matmul_transB(attn_restored, m_o_w_, m_o_b_);
 
@@ -428,15 +455,15 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
     int new_num_patches = new_grid * new_grid;
     int concat_dim = dim * 4;
 
-    auto concat_tokens = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{new_num_patches, concat_dim}, DeviceType::CPU);
-    auto mean_res = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{new_num_patches, dim}, DeviceType::CPU);
+    auto concat_tokens = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{new_num_patches, concat_dim}, DeviceType::CPU);
+    auto mean_res = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{new_num_patches, dim}, DeviceType::CPU);
     float* concat_data = static_cast<float*>(concat_tokens->data());
     float* mean_data = static_cast<float*>(mean_res->data());
     const float* norm_data = static_cast<const float*>(normed_cpu->data());
 
-    #pragma omp parallel for schedule(dynamic) if(new_num_patches > 4)
+#pragma omp parallel for schedule(dynamic) if (new_num_patches > 4)
     for (int new_idx = 0; new_idx < new_num_patches; ++new_idx) {
         int gh = new_idx / new_grid;
         int gw = new_idx % new_grid;
@@ -464,7 +491,8 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
         concat_tokens = to_device(concat_tokens, dev);
         mean_res = to_device(mean_res, dev);
 
-        auto ds_normed = ops::layer_norm(concat_tokens, m_ds_ln_w_, m_ds_ln_b_, config_.layer_norm_epsilon);
+        auto ds_normed =
+            ops::layer_norm(concat_tokens, m_ds_ln_w_, m_ds_ln_b_, config_.layer_norm_epsilon);
 
         auto ffn_up = ops::matmul_transB(ds_normed, m_ds_up_w_, m_ds_up_b_);
         ffn_up = ops::gelu_tanh(ffn_up);
@@ -493,12 +521,12 @@ TensorPtr VisionEncoder::project(const TensorPtr& hidden, DeviceType dev) {
     int new_num = new_grid * new_grid;
     int concat_dim = dim * 4;
 
-    auto concat_tokens = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{new_num, concat_dim}, DeviceType::CPU);
+    auto concat_tokens = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{new_num, concat_dim}, DeviceType::CPU);
     float* concat_data = static_cast<float*>(concat_tokens->data());
     const float* h_data = static_cast<const float*>(hidden_cpu->data());
 
-    #pragma omp parallel for schedule(dynamic) if(new_num > 4)
+#pragma omp parallel for schedule(dynamic) if (new_num > 4)
     for (int idx = 0; idx < new_num; ++idx) {
         int gh = idx / new_grid;
         int gw = idx % new_grid;
@@ -524,7 +552,8 @@ TensorPtr VisionEncoder::project(const TensorPtr& hidden, DeviceType dev) {
     return ops::matmul_transB(up, p_down_w_, p_down_b_);
 }
 
-std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int height, int channels) {
+std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int height,
+                                         int channels) {
     if (!initialized_) {
         LOG_ERROR("VisionEncoder: not initialized");
         return {};
@@ -558,12 +587,14 @@ std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int h
             const float* pd = static_cast<const float*>(pos->data());
             int grid_size = config_.image_size / config_.patch_size;
             int n_embd_buckets = 70;
-            #pragma omp parallel for schedule(static) if(num_patches > 4)
+#pragma omp parallel for schedule(static) if (num_patches > 4)
             for (int i = 0; i < num_patches; ++i) {
                 int patch_h = i / grid_size;
                 int patch_w = i % grid_size;
-                int bucket_h = static_cast<int>(std::floor(static_cast<double>(n_embd_buckets) * patch_h / grid_size));
-                int bucket_w = static_cast<int>(std::floor(static_cast<double>(n_embd_buckets) * patch_w / grid_size));
+                int bucket_h = static_cast<int>(
+                    std::floor(static_cast<double>(n_embd_buckets) * patch_h / grid_size));
+                int bucket_w = static_cast<int>(
+                    std::floor(static_cast<double>(n_embd_buckets) * patch_w / grid_size));
                 int bucket_idx = bucket_h * n_embd_buckets + bucket_w;
                 for (int d = 0; d < dim; ++d) {
                     h_data[i * dim + d] += pd[bucket_idx * dim + d];
@@ -622,7 +653,8 @@ std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int h
         // Return as flat vector
         auto proj_cpu = projected;
         if (proj_cpu->device() == DeviceType::CUDA) {
-            proj_cpu = std::make_shared<Tensor>(DataType::FP32, projected->shape(), DeviceType::CPU);
+            proj_cpu =
+                std::make_shared<Tensor>(DataType::FP32, projected->shape(), DeviceType::CPU);
             proj_cpu->copy_from(*projected);
         }
         int num_tokens = static_cast<int>(proj_cpu->shape()[0]);
@@ -678,4 +710,4 @@ std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int h
     return std::vector<float>(proj_data, proj_data + num_tokens * proj_dim);
 }
 
-} // namespace forge
+}  // namespace forge

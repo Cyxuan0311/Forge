@@ -3,13 +3,9 @@
 void register_scheduler(py::module_& m) {
     py::class_<SamplerConfig>(m, "SamplerConfig")
         .def(py::init<>())
-        .def(py::init<float, int, float, float, bool, uint64_t>(),
-             py::arg("temperature") = 1.0f,
-             py::arg("top_k") = 0,
-             py::arg("top_p") = 1.0f,
-             py::arg("repeat_penalty") = 1.0f,
-             py::arg("do_sample") = true,
-             py::arg("seed") = 0)
+        .def(py::init<float, int, float, float, bool, uint64_t>(), py::arg("temperature") = 1.0f,
+             py::arg("top_k") = 0, py::arg("top_p") = 1.0f, py::arg("repeat_penalty") = 1.0f,
+             py::arg("do_sample") = true, py::arg("seed") = 0)
         .def_readwrite("temperature", &SamplerConfig::temperature)
         .def_readwrite("top_k", &SamplerConfig::top_k)
         .def_readwrite("top_p", &SamplerConfig::top_p)
@@ -32,14 +28,10 @@ void register_scheduler(py::module_& m) {
         .def_readonly("finish_reason", &GenerateRequest::finish_reason);
 
     py::class_<PyRequestScheduler>(m, "RequestScheduler")
-        .def(py::init<PyModel&, int, int>(),
-             py::arg("model"),
-             py::arg("block_size") = 16,
+        .def(py::init<PyModel&, int, int>(), py::arg("model"), py::arg("block_size") = 16,
              py::arg("max_num_seqs") = 4)
-        .def("submit", &PyRequestScheduler::submit,
-             py::arg("prompt_tokens"),
-             py::arg("max_new_tokens") = 256,
-             py::arg("eos_token_id") = -1,
+        .def("submit", &PyRequestScheduler::submit, py::arg("prompt_tokens"),
+             py::arg("max_new_tokens") = 256, py::arg("eos_token_id") = -1,
              py::arg("sampler_config") = SamplerConfig{})
         .def("step", &PyRequestScheduler::step)
         .def("get_finished", &PyRequestScheduler::get_finished)

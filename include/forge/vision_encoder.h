@@ -1,10 +1,11 @@
 #pragma once
 
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "forge/tensor.h"
 #include "forge/types.h"
-#include <memory>
-#include <vector>
-#include <string>
 
 namespace forge {
 
@@ -12,20 +13,20 @@ class WeightStore;
 
 // Configuration for CLIP vision encoder (from mmproj GGUF metadata)
 struct VisionConfig {
-    int image_size = 448;           // input image size
-    int patch_size = 14;            // patch size
-    int embedding_length = 1152;    // hidden dim of vision encoder
-    int feed_forward_length = 4304; // FFN intermediate dim
-    int block_count = 27;           // number of ViT blocks
-    int head_count = 16;            // number of attention heads
+    int image_size = 448;            // input image size
+    int patch_size = 14;             // patch size
+    int embedding_length = 1152;     // hidden dim of vision encoder
+    int feed_forward_length = 4304;  // FFN intermediate dim
+    int block_count = 27;            // number of ViT blocks
+    int head_count = 16;             // number of attention heads
     float layer_norm_epsilon = 1e-6;
     std::vector<float> image_mean = {0.5f, 0.5f, 0.5f};
     std::vector<float> image_std = {0.5f, 0.5f, 0.5f};
-    int projection_dim = 1024;      // output projection dim (LLM hidden dim)
-    int scale_factor = 4;           // vit merger scale factor
-    bool use_gelu = true;           // use GELU activation
+    int projection_dim = 1024;  // output projection dim (LLM hidden dim)
+    int scale_factor = 4;       // vit merger scale factor
+    bool use_gelu = true;       // use GELU activation
     std::string projector_type = "minicpmv4_6";
-    int insert_layer_id = -1;       // ViT merger insertion layer (-1 = after all layers)
+    int insert_layer_id = -1;  // ViT merger insertion layer (-1 = after all layers)
 };
 
 // Per-layer weights for CLIP ViT
@@ -109,8 +110,8 @@ private:
     TensorPtr patch_embedding(const TensorPtr& pixel_values);
 
     // Single ViT block (uses cached device weights in cached_layers_)
-    TensorPtr forward_vit_block(const TensorPtr& hidden, const ViTLayerWeights& lw,
-                                int num_heads, int head_dim);
+    TensorPtr forward_vit_block(const TensorPtr& hidden, const ViTLayerWeights& lw, int num_heads,
+                                int head_dim);
 
     // Vision token merger (downsample) — uses cached merger weights
     TensorPtr merge_tokens(const TensorPtr& hidden, DeviceType dev);
@@ -142,4 +143,4 @@ private:
     TensorPtr pst_ln_w_, pst_ln_b_;
 };
 
-} // namespace forge
+}  // namespace forge

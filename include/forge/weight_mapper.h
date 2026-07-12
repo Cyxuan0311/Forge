@@ -1,12 +1,13 @@
 #pragma once
 
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
+
+#include "model_config.h"
 #include "tensor.h"
 #include "types.h"
 #include "weight_store.h"
-#include "model_config.h"
 
 namespace forge {
 
@@ -71,4 +72,4 @@ public:
                              const std::string& prefix = "");
 };
 
-} // namespace forge
+}  // namespace forge

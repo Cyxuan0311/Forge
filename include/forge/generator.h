@@ -1,12 +1,13 @@
 #pragma once
 
-#include <vector>
 #include <cstdint>
-#include <string>
-#include <memory>
 #include <functional>
-#include "model.h"
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "context.h"
+#include "model.h"
 #include "sampler.h"
 
 namespace forge {
@@ -37,13 +38,12 @@ public:
     ~Generator();
 
     GenerationResult generate(const std::vector<int32_t>& prompt_tokens,
-                               const GenerationConfig& config);
+                              const GenerationConfig& config);
 
     using TokenCallback = std::function<void(int32_t token_id, int step)>;
 
     GenerationResult generate(const std::vector<int32_t>& prompt_tokens,
-                               const GenerationConfig& config,
-                               const TokenCallback& callback);
+                              const GenerationConfig& config, const TokenCallback& callback);
 
 private:
     InferenceContext& ctx_;
@@ -52,4 +52,4 @@ private:
     void* decode_token_buf_ = nullptr;
 };
 
-} // namespace forge
+}  // namespace forge

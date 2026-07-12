@@ -58,10 +58,16 @@ void register_core_types(py::module_& m) {
         .def("numel", &Tensor::numel)
         .def("nbytes", &Tensor::nbytes)
         .def("zero_", &Tensor::zero_)
-        .def("copy_from", [](Tensor& self, const Tensor& other) { self.copy_from(other); },
-             py::arg("other"))
-        .def("to_device", [](Tensor& t, DeviceType dev) { t.to_device(dev); return &t; },
-             py::return_value_policy::reference_internal)
+        .def(
+            "copy_from", [](Tensor& self, const Tensor& other) { self.copy_from(other); },
+            py::arg("other"))
+        .def(
+            "to_device",
+            [](Tensor& t, DeviceType dev) {
+                t.to_device(dev);
+                return &t;
+            },
+            py::return_value_policy::reference_internal)
         .def("numpy", [](TensorPtr& t) { return tensor_to_numpy(t); });
 
     // ---- ModelConfig ----

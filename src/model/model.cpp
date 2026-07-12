@@ -1,25 +1,29 @@
 #include "forge/model.h"
-#include "forge/ninf_model.h"
-#include "forge/gguf_model.h"
-#include "forge/logger.h"
-#include "forge/types.h"
-#include "forge/operator_matmul.h"
-#include <stdexcept>
-#include <cstring>
-#include <cstdio>
+
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+
+#include "forge/gguf_model.h"
+#include "forge/logger.h"
+#include "forge/ninf_model.h"
+#include "forge/operator_matmul.h"
+#include "forge/types.h"
 
 namespace forge {
 
 static TensorPtr inverse_neox_permute_rows(const TensorPtr& tensor, int num_heads, int head_dim) {
-    if (!tensor || tensor->ndim() != 2) return tensor;
+    if (!tensor || tensor->ndim() != 2)
+        return tensor;
 
     int64_t nrows = tensor->shape()[0];
     int64_t ncols = tensor->shape()[1];
     int half_dim = head_dim / 2;
 
-    if (nrows != num_heads * head_dim) return tensor;
+    if (nrows != num_heads * head_dim)
+        return tensor;
 
     bool was_cuda = (tensor->device() == DeviceType::CUDA);
     TensorPtr work = tensor;
@@ -59,7 +63,8 @@ void WeightStore::set(const std::string& name, TensorPtr tensor) {
 
 TensorPtr WeightStore::get(const std::string& name) const {
     auto it = weights_.find(name);
-    if (it == weights_.end()) return nullptr;
+    if (it == weights_.end())
+        return nullptr;
     return it->second;
 }
 
@@ -86,7 +91,8 @@ void WeightStore::clear() {
 size_t WeightStore::total_bytes() const {
     size_t total = 0;
     for (const auto& [_, t] : weights_) {
-        if (t) total += t->nbytes();
+        if (t)
+            total += t->nbytes();
     }
     return total;
 }
@@ -102,11 +108,13 @@ std::vector<std::string> WeightStore::weight_names() const {
 
 void WeightStore::to_device(DeviceType device) {
     for (auto& [_, t] : weights_) {
-        if (t) t->to_device(device);
+        if (t)
+            t->to_device(device);
     }
 }
 
-void WeightStore::to_device_layer(int layer_idx, DeviceType device, const std::string& prefix_pattern) {
+void WeightStore::to_device_layer(int layer_idx, DeviceType device,
+                                  const std::string& prefix_pattern) {
     std::string prefix = WeightMapper::format_layer_prefix(prefix_pattern, layer_idx);
     std::string base = "layers." + std::to_string(layer_idx);
     for (auto& [name, t] : weights_) {
@@ -150,15 +158,14 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     //   - Q6_K/Q4_K/other: no fused kernel, quantize to Q8_0 for ~3x speedup over dequant+gemv
     //   - FP32/FP16: quantize to Q8_0 for ~3x memory bandwidth reduction
     if (output_weight && output_weight->device() == DeviceType::CPU) {
-        bool has_fused_kernel = (output_weight->dtype() == DataType::Q4_0 ||
-                                 output_weight->dtype() == DataType::Q8_0 ||
-                                 output_weight->dtype() == DataType::Q4_1 ||
-                                 output_weight->dtype() == DataType::Q4_K);
+        bool has_fused_kernel =
+            (output_weight->dtype() == DataType::Q4_0 || output_weight->dtype() == DataType::Q8_0 ||
+             output_weight->dtype() == DataType::Q4_1 || output_weight->dtype() == DataType::Q4_K);
         if (has_fused_kernel) {
-            LOG_INFO("Output_weight is " + std::to_string(static_cast<int>(output_weight->dtype())) +
-                     " (" + std::to_string(output_weight->shape()[0]) +
-                     "x" + std::to_string(output_weight->shape()[1]) +
-                     "), using fused GEMV directly");
+            LOG_INFO("Output_weight is " +
+                     std::to_string(static_cast<int>(output_weight->dtype())) + " (" +
+                     std::to_string(output_weight->shape()[0]) + "x" +
+                     std::to_string(output_weight->shape()[1]) + "), using fused GEMV directly");
         } else {
             // No fused GEMV kernel for this dtype — quantize to Q8_0
             // First dequantize to FP32 if quantized, then quantize to Q8_0
@@ -173,9 +180,9 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             if (q8) {
                 output_weight = q8;
                 LOG_INFO("Quantized output_weight to Q8_0 (" +
-                         std::to_string(output_weight->shape()[0]) +
-                         "x" + std::to_string(output_weight->shape()[1]) +
-                         "), size=" + std::to_string(q8->nbytes() / (1024*1024)) +
+                         std::to_string(output_weight->shape()[0]) + "x" +
+                         std::to_string(output_weight->shape()[1]) +
+                         "), size=" + std::to_string(q8->nbytes() / (1024 * 1024)) +
                          " MB, time=" + std::to_string(ms / 1000.0) + "s");
             }
         }
@@ -184,7 +191,8 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     // Pre-dequantize token_embedding to FP32 for CPU inference (transposed layout)
     // Transposed embedding [embed_dim, vocab_size] requires full dequant for row lookup,
     // which is very expensive per decode step. Cache the FP32 version once.
-    if (token_embedding && is_quantized_type(token_embedding->dtype()) && token_embedding->device() == DeviceType::CPU) {
+    if (token_embedding && is_quantized_type(token_embedding->dtype()) &&
+        token_embedding->device() == DeviceType::CPU) {
         bool transposed = (token_embedding->shape().size() >= 2 &&
                            token_embedding->shape()[0] < token_embedding->shape()[1]);
         if (transposed) {
@@ -193,9 +201,10 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             auto t_end = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
             if (token_embedding_fp32) {
-                LOG_INFO("Pre-dequantized token_embedding (" + std::to_string(token_embedding->shape()[0]) +
-                         "x" + std::to_string(token_embedding->shape()[1]) +
-                         ") to FP32, size=" + std::to_string(token_embedding_fp32->nbytes() / (1024*1024)) +
+                LOG_INFO("Pre-dequantized token_embedding (" +
+                         std::to_string(token_embedding->shape()[0]) + "x" +
+                         std::to_string(token_embedding->shape()[1]) + ") to FP32, size=" +
+                         std::to_string(token_embedding_fp32->nbytes() / (1024 * 1024)) +
                          " MB, time=" + std::to_string(ms / 1000.0) + "s");
             }
         }
@@ -205,7 +214,8 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
 
     // Determine layer types based on architecture
     bool is_qwen35 = (config.arch_type == "qwen35");
-    int full_attn_interval = config.full_attention_interval > 0 ? config.full_attention_interval : 4;
+    int full_attn_interval =
+        config.full_attention_interval > 0 ? config.full_attention_interval : 4;
 
     auto& weight_init_registry = WeightInitRegistry::instance();
     bool has_registered_init = weight_init_registry.has(config.arch_type);
@@ -237,7 +247,8 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             std::string base = "layers." + std::to_string(i);
             auto load_if = [&](const std::string& canonical, const std::string& store_name) {
                 auto t = store.get(store_name);
-                if (t) lw.set(canonical, t);
+                if (t)
+                    lw.set(canonical, t);
             };
 
             load_if("attn_norm", base + ".attn_norm");
@@ -253,8 +264,9 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             load_if("bk", base + ".bk");
             load_if("bv", base + ".bv");
 
-            LOG_WARN("No registered weight init for arch '" + config.arch_type +
-                     "', using default GQA init. Consider registering via FORGE_REGISTER_WEIGHT_INIT.");
+            LOG_WARN(
+                "No registered weight init for arch '" + config.arch_type +
+                "', using default GQA init. Consider registering via FORGE_REGISTER_WEIGHT_INIT.");
         }
 
         // Validate required weights
@@ -292,7 +304,8 @@ void ModelWeights::move_layer_weights(int layer_idx, DeviceType target_dev) {
 
 std::string Model::detect_format(const std::string& path) {
     auto loader = ModelLoaderRegistry::instance().create_loader(path);
-    if (loader) return loader->format_name();
+    if (loader)
+        return loader->format_name();
     return "";
 }
 
@@ -330,14 +343,15 @@ bool Model::load(const std::string& model_path, DeviceType device) {
     }
 
     auto t_total_end = std::chrono::high_resolution_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+    double total_ms =
+        std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
     LOG_INFO("Model loaded in " + std::to_string(total_ms / 1000.0) + "s");
 
     return result;
 }
 
 bool Model::load_with_config(const std::string& model_path, const ModelConfig& config,
-                              DeviceType device) {
+                             DeviceType device) {
     config_ = config;
 
     loader_ = ModelLoaderRegistry::instance().create_loader(model_path);
@@ -379,31 +393,35 @@ ModelConfig Model::parse_config_from_gguf(ModelLoader& loader) {
     // Fallback: parse common fields for unregistered architectures
     auto cfg = parse_common_gguf_config(loader, arch);
     LOG_WARN("No registered config parser for arch '" + arch +
-             "', using default parsing. Consider registering a parser via FORGE_REGISTER_CONFIG_PARSER.");
+             "', using default parsing. Consider registering a parser via "
+             "FORGE_REGISTER_CONFIG_PARSER.");
     return cfg;
 }
 
 ModelConfig Model::parse_config_from_ninf(ModelLoader& loader) {
-    std::string arch = loader.get_metadata_str("model_type",
-                          loader.get_metadata_str("architecture", "llama"));
+    std::string arch =
+        loader.get_metadata_str("model_type", loader.get_metadata_str("architecture", "llama"));
 
     ModelConfig cfg;
 
     auto meta_int = [&](const std::string& key, int64_t def) -> int64_t {
         int64_t v = loader.get_metadata_int(arch + "." + key, -1);
-        if (v >= 0) return v;
+        if (v >= 0)
+            return v;
         return loader.get_metadata_int(key, def);
     };
 
     auto meta_float = [&](const std::string& key, double def) -> double {
         std::string v = loader.get_metadata_str(arch + "." + key, "");
-        if (!v.empty()) return std::strtod(v.c_str(), nullptr);
+        if (!v.empty())
+            return std::strtod(v.c_str(), nullptr);
         return loader.get_metadata_float(key, def);
     };
 
     auto meta_str = [&](const std::string& key, const std::string& def) -> std::string {
         std::string v = loader.get_metadata_str(arch + "." + key, "");
-        if (!v.empty()) return v;
+        if (!v.empty())
+            return v;
         return loader.get_metadata_str(key, def);
     };
 
@@ -414,7 +432,8 @@ ModelConfig Model::parse_config_from_ninf(ModelLoader& loader) {
     cfg.num_heads = static_cast<int>(meta_int("num_heads", 32));
     cfg.num_kv_heads = static_cast<int>(meta_int("num_kv_heads", cfg.num_heads));
     cfg.head_dim = static_cast<int>(meta_int("head_dim", 0));
-    if (cfg.head_dim == 0) cfg.head_dim = cfg.hidden_dim / cfg.num_heads;
+    if (cfg.head_dim == 0)
+        cfg.head_dim = cfg.hidden_dim / cfg.num_heads;
     cfg.rope_theta = static_cast<float>(meta_float("rope_theta", 10000.0));
     cfg.rms_norm_eps = static_cast<float>(meta_float("rms_norm_eps", 1e-6));
     cfg.max_seq_len = static_cast<int>(meta_int("max_seq_len", 4096));
@@ -436,15 +455,15 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
 
     LOG_INFO("Model::load_from_loader: arch=" + config_.arch_type +
              ", num_layers=" + std::to_string(config_.num_layers) +
-             ", hidden_dim=" + std::to_string(config_.hidden_dim) +
-             ", num_heads=" + std::to_string(config_.num_heads) +
-             ", head_dim=" + std::to_string(config_.head_dim) +
+             ", hidden_dim=" + std::to_string(config_.hidden_dim) + ", num_heads=" +
+             std::to_string(config_.num_heads) + ", head_dim=" + std::to_string(config_.head_dim) +
              ", use_ssm=" + std::to_string(config_.use_ssm) +
              ", use_mrope=" + std::to_string(config_.use_mrope) +
              ", rope_dimension_count=" + std::to_string(config_.rope_dimension_count));
 
     auto load_tensor = [&](const std::string& name) -> TensorPtr {
-        if (!loader.has_tensor(name)) return nullptr;
+        if (!loader.has_tensor(name))
+            return nullptr;
         return loader.get_tensor(name, device);
     };
 
@@ -475,7 +494,8 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
         weight_store_.set("token_embedding", te);
 
         auto on = load_tensor("output_norm.weight");
-        if (on) weight_store_.set("output_norm", on);
+        if (on)
+            weight_store_.set("output_norm", on);
 
         auto ow = load_tensor("output.weight");
         if (ow) {
@@ -492,7 +512,8 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
 
             auto set_if = [&](const std::string& canonical, const std::string& gguf_name) {
                 auto t = load_tensor(gguf_name);
-                if (t) weight_store_.set(canonical, t);
+                if (t)
+                    weight_store_.set(canonical, t);
             };
 
             // Common weights (same for all architectures)
@@ -544,12 +565,15 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
             // so that both CPU and GPU RoPE use (x[d], x[d+half_dim]) indexing
             if (config_.use_neox_rope) {
                 auto wq = weight_store_.get(base + ".wq");
-                if (wq) weight_store_.set(base + ".wq",
-                    inverse_neox_permute_rows(wq, config_.num_heads, config_.head_dim));
+                if (wq)
+                    weight_store_.set(base + ".wq", inverse_neox_permute_rows(wq, config_.num_heads,
+                                                                              config_.head_dim));
 
                 auto wk = weight_store_.get(base + ".wk");
-                if (wk) weight_store_.set(base + ".wk",
-                    inverse_neox_permute_rows(wk, config_.num_kv_heads, config_.head_dim));
+                if (wk)
+                    weight_store_.set(
+                        base + ".wk",
+                        inverse_neox_permute_rows(wk, config_.num_kv_heads, config_.head_dim));
             }
         }
 
@@ -557,9 +581,11 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
         // Auto-scan all tensors with v.* or mm.* prefixes
         {
             for (const auto& name : loader.tensor_names()) {
-                if (name.size() >= 2 && (name.compare(0, 2, "v.") == 0 || name.compare(0, 3, "mm.") == 0)) {
+                if (name.size() >= 2 &&
+                    (name.compare(0, 2, "v.") == 0 || name.compare(0, 3, "mm.") == 0)) {
                     auto t = load_tensor(name);
-                    if (t) weight_store_.set(name, t);
+                    if (t)
+                        weight_store_.set(name, t);
                 }
             }
         }
@@ -572,20 +598,22 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
         weight_store_.set("token_embedding", te);
 
         auto on = resolve_weight(mapping.output_norm);
-        if (on) weight_store_.set("output_norm", on);
+        if (on)
+            weight_store_.set("output_norm", on);
 
         if (!mapping.tie_embeddings) {
             auto ow = resolve_weight(mapping.output_weight);
-            if (ow) weight_store_.set("output_weight", ow);
+            if (ow)
+                weight_store_.set("output_weight", ow);
         }
 
         for (int i = 0; i < config_.num_layers; ++i) {
-            std::string prefix = WeightMapper::format_layer_prefix(
-                mapping.layer_prefix_pattern, i);
+            std::string prefix = WeightMapper::format_layer_prefix(mapping.layer_prefix_pattern, i);
 
             auto set_if = [&](const std::string& canonical, const WeightAlias& alias) {
                 auto t = resolve_weight(alias, prefix);
-                if (t) weight_store_.set(canonical, t);
+                if (t)
+                    weight_store_.set(canonical, t);
             };
 
             std::string base = "layers." + std::to_string(i);
@@ -631,8 +659,8 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
         }
     }
 
-    LOG_INFO("Loaded " + std::to_string(weight_store_.size()) +
-             " weights from " + format_name_ + " for arch: " + config_.arch_type);
+    LOG_INFO("Loaded " + std::to_string(weight_store_.size()) + " weights from " + format_name_ +
+             " for arch: " + config_.arch_type);
     return true;
 }
 
@@ -677,8 +705,8 @@ bool Model::load_vision_weights(const std::string& mmproj_path, DeviceType devic
 
     // Don't close vision_loader_ - keep mmap alive for zero-copy tensor references
 
-    LOG_INFO("Loaded " + std::to_string(loaded_count) + " vision/mmproj weights from " + mmproj_path +
-             " (total weights: " + std::to_string(weight_store_.size()) + ")");
+    LOG_INFO("Loaded " + std::to_string(loaded_count) + " vision/mmproj weights from " +
+             mmproj_path + " (total weights: " + std::to_string(weight_store_.size()) + ")");
     return true;
 }
 
@@ -686,17 +714,18 @@ static const ArchWeightMapping llama_mapping = {
     .token_embedding = {{"model.embed_tokens.weight", "model.embedding.weight"}},
     .output_norm = {{"model.norm.weight", "model.ln_f.weight"}},
     .output_weight = {{"lm_head.weight", "model.output.weight"}},
-    .layer = {
-        .attn_norm = {{"input_layernorm.weight", "attention_norm.weight"}},
-        .ffn_norm = {{"post_attention_layernorm.weight", "ffn_norm.weight"}},
-        .wo = {{"self_attn.o_proj.weight", "attention.wo.weight"}},
-        .gate_proj = {{"mlp.gate_proj.weight", "feed_forward.w1.weight"}},
-        .down_proj = {{"mlp.down_proj.weight", "feed_forward.w2.weight"}},
-        .up_proj = {{"mlp.up_proj.weight", "feed_forward.w3.weight"}},
-        .wq = {{"self_attn.q_proj.weight", "attention.wq.weight"}},
-        .wk = {{"self_attn.k_proj.weight", "attention.wk.weight"}},
-        .wv = {{"self_attn.v_proj.weight", "attention.wv.weight"}},
-    },
+    .layer =
+        {
+            .attn_norm = {{"input_layernorm.weight", "attention_norm.weight"}},
+            .ffn_norm = {{"post_attention_layernorm.weight", "ffn_norm.weight"}},
+            .wo = {{"self_attn.o_proj.weight", "attention.wo.weight"}},
+            .gate_proj = {{"mlp.gate_proj.weight", "feed_forward.w1.weight"}},
+            .down_proj = {{"mlp.down_proj.weight", "feed_forward.w2.weight"}},
+            .up_proj = {{"mlp.up_proj.weight", "feed_forward.w3.weight"}},
+            .wq = {{"self_attn.q_proj.weight", "attention.wq.weight"}},
+            .wk = {{"self_attn.k_proj.weight", "attention.wk.weight"}},
+            .wv = {{"self_attn.v_proj.weight", "attention.wv.weight"}},
+        },
     .layer_prefix_pattern = "model.layers.{}",
     .tie_embeddings = false,
 };
@@ -705,17 +734,18 @@ static const ArchWeightMapping mistral_mapping = {
     .token_embedding = {{"model.embed_tokens.weight"}},
     .output_norm = {{"model.norm.weight"}},
     .output_weight = {{"lm_head.weight"}},
-    .layer = {
-        .attn_norm = {{"input_layernorm.weight"}},
-        .ffn_norm = {{"post_attention_layernorm.weight"}},
-        .wo = {{"self_attn.o_proj.weight"}},
-        .gate_proj = {{"mlp.gate_proj.weight"}},
-        .down_proj = {{"mlp.down_proj.weight"}},
-        .up_proj = {{"mlp.up_proj.weight"}},
-        .wq = {{"self_attn.q_proj.weight"}},
-        .wk = {{"self_attn.k_proj.weight"}},
-        .wv = {{"self_attn.v_proj.weight"}},
-    },
+    .layer =
+        {
+            .attn_norm = {{"input_layernorm.weight"}},
+            .ffn_norm = {{"post_attention_layernorm.weight"}},
+            .wo = {{"self_attn.o_proj.weight"}},
+            .gate_proj = {{"mlp.gate_proj.weight"}},
+            .down_proj = {{"mlp.down_proj.weight"}},
+            .up_proj = {{"mlp.up_proj.weight"}},
+            .wq = {{"self_attn.q_proj.weight"}},
+            .wk = {{"self_attn.k_proj.weight"}},
+            .wv = {{"self_attn.v_proj.weight"}},
+        },
     .layer_prefix_pattern = "model.layers.{}",
     .tie_embeddings = false,
 };
@@ -724,17 +754,18 @@ static const ArchWeightMapping qwen_mapping = {
     .token_embedding = {{"model.embed_tokens.weight"}},
     .output_norm = {{"model.norm.weight"}},
     .output_weight = {{"lm_head.weight"}},
-    .layer = {
-        .attn_norm = {{"input_layernorm.weight"}},
-        .ffn_norm = {{"post_attention_layernorm.weight"}},
-        .wo = {{"self_attn.o_proj.weight"}},
-        .gate_proj = {{"mlp.gate_proj.weight"}},
-        .down_proj = {{"mlp.down_proj.weight"}},
-        .up_proj = {{"mlp.up_proj.weight"}},
-        .wq = {{"self_attn.q_proj.weight"}},
-        .wk = {{"self_attn.k_proj.weight"}},
-        .wv = {{"self_attn.v_proj.weight"}},
-    },
+    .layer =
+        {
+            .attn_norm = {{"input_layernorm.weight"}},
+            .ffn_norm = {{"post_attention_layernorm.weight"}},
+            .wo = {{"self_attn.o_proj.weight"}},
+            .gate_proj = {{"mlp.gate_proj.weight"}},
+            .down_proj = {{"mlp.down_proj.weight"}},
+            .up_proj = {{"mlp.up_proj.weight"}},
+            .wq = {{"self_attn.q_proj.weight"}},
+            .wk = {{"self_attn.k_proj.weight"}},
+            .wv = {{"self_attn.v_proj.weight"}},
+        },
     .layer_prefix_pattern = "model.layers.{}",
     .tie_embeddings = false,
 };
@@ -743,18 +774,19 @@ static const ArchWeightMapping deepseek_v2_mapping = {
     .token_embedding = {{"model.embed_tokens.weight"}},
     .output_norm = {{"model.norm.weight"}},
     .output_weight = {{"lm_head.weight"}},
-    .layer = {
-        .attn_norm = {{"input_layernorm.weight"}},
-        .ffn_norm = {{"post_attention_layernorm.weight"}},
-        .wo = {{"self_attn.o_proj.weight"}},
-        .gate_proj = {{"mlp.gate_proj.weight"}},
-        .down_proj = {{"mlp.down_proj.weight"}},
-        .up_proj = {{"mlp.up_proj.weight"}},
-        .wq_a = {{"self_attn.q_a_proj.weight"}},
-        .wq_b = {{"self_attn.q_b_proj.weight"}},
-        .kv_a_proj = {{"self_attn.kv_a_proj_with_mqa.weight"}},
-        .kv_b_proj = {{"self_attn.kv_b_proj.weight"}},
-    },
+    .layer =
+        {
+            .attn_norm = {{"input_layernorm.weight"}},
+            .ffn_norm = {{"post_attention_layernorm.weight"}},
+            .wo = {{"self_attn.o_proj.weight"}},
+            .gate_proj = {{"mlp.gate_proj.weight"}},
+            .down_proj = {{"mlp.down_proj.weight"}},
+            .up_proj = {{"mlp.up_proj.weight"}},
+            .wq_a = {{"self_attn.q_a_proj.weight"}},
+            .wq_b = {{"self_attn.q_b_proj.weight"}},
+            .kv_a_proj = {{"self_attn.kv_a_proj_with_mqa.weight"}},
+            .kv_b_proj = {{"self_attn.kv_b_proj.weight"}},
+        },
     .layer_prefix_pattern = "model.layers.{}",
     .tie_embeddings = false,
 };
@@ -763,30 +795,31 @@ static const ArchWeightMapping qwen35_mapping = {
     .token_embedding = {{"model.embed_tokens.weight"}},
     .output_norm = {{"model.norm.weight"}},
     .output_weight = {{"lm_head.weight"}},
-    .layer = {
-        .attn_norm = {{"input_layernorm.weight"}},
-        .ffn_norm = {{"post_attention_layernorm.weight"}},
-        .wo = {{"self_attn.o_proj.weight"}},
-        .gate_proj = {{"mlp.gate_proj.weight"}},
-        .down_proj = {{"mlp.down_proj.weight"}},
-        .up_proj = {{"mlp.up_proj.weight"}},
-        .attn_q = {{"self_attn.q_proj.weight"}},
-        .attn_k = {{"self_attn.k_proj.weight"}},
-        .attn_v = {{"self_attn.v_proj.weight"}},
-        .attn_output = {{"self_attn.o_proj.weight"}},
-        .attn_q_norm = {{"self_attn.q_norm.weight"}},
-        .attn_k_norm = {{"self_attn.k_norm.weight"}},
-        .post_attention_norm = {{"post_attention_layernorm.weight"}},
-        .attn_qkv = {{"self_attn.qkv_proj.weight"}},
-        .attn_gate = {{"self_attn.gate.weight"}},
-        .ssm_conv1d = {{"ssm.conv1d.weight"}},
-        .ssm_dt = {{"ssm.dt.bias"}},
-        .ssm_a = {{"ssm.a"}},
-        .ssm_alpha = {{"ssm.alpha.weight"}},
-        .ssm_beta = {{"ssm.beta.weight"}},
-        .ssm_norm = {{"ssm.norm.weight"}},
-        .ssm_out = {{"ssm.output.weight"}},
-    },
+    .layer =
+        {
+            .attn_norm = {{"input_layernorm.weight"}},
+            .ffn_norm = {{"post_attention_layernorm.weight"}},
+            .wo = {{"self_attn.o_proj.weight"}},
+            .gate_proj = {{"mlp.gate_proj.weight"}},
+            .down_proj = {{"mlp.down_proj.weight"}},
+            .up_proj = {{"mlp.up_proj.weight"}},
+            .attn_q = {{"self_attn.q_proj.weight"}},
+            .attn_k = {{"self_attn.k_proj.weight"}},
+            .attn_v = {{"self_attn.v_proj.weight"}},
+            .attn_output = {{"self_attn.o_proj.weight"}},
+            .attn_q_norm = {{"self_attn.q_norm.weight"}},
+            .attn_k_norm = {{"self_attn.k_norm.weight"}},
+            .post_attention_norm = {{"post_attention_layernorm.weight"}},
+            .attn_qkv = {{"self_attn.qkv_proj.weight"}},
+            .attn_gate = {{"self_attn.gate.weight"}},
+            .ssm_conv1d = {{"ssm.conv1d.weight"}},
+            .ssm_dt = {{"ssm.dt.bias"}},
+            .ssm_a = {{"ssm.a"}},
+            .ssm_alpha = {{"ssm.alpha.weight"}},
+            .ssm_beta = {{"ssm.beta.weight"}},
+            .ssm_norm = {{"ssm.norm.weight"}},
+            .ssm_out = {{"ssm.output.weight"}},
+        },
     .layer_prefix_pattern = "model.layers.{}",
     .tie_embeddings = false,
 };
@@ -805,7 +838,8 @@ static const std::unordered_map<std::string, const ArchWeightMapping*> arch_mapp
 
 const ArchWeightMapping& WeightMapper::get_mapping(const std::string& arch_type) {
     auto it = arch_mappings.find(arch_type);
-    if (it != arch_mappings.end()) return *it->second;
+    if (it != arch_mappings.end())
+        return *it->second;
     return llama_mapping;
 }
 
@@ -819,11 +853,12 @@ std::string WeightMapper::format_layer_prefix(const std::string& pattern, int la
 }
 
 TensorPtr WeightMapper::resolve(const WeightStore& store, const WeightAlias& alias,
-                                 const std::string& prefix) {
+                                const std::string& prefix) {
     for (const auto& name : alias.names) {
         std::string full_name = prefix.empty() ? name : (prefix + "." + name);
         auto t = store.get(full_name);
-        if (t) return t;
+        if (t)
+            return t;
     }
     return nullptr;
 }
@@ -847,7 +882,8 @@ bool ConfigParserRegistry::has(const std::string& arch) const {
 
 ModelConfig ConfigParserRegistry::parse(ModelLoader& loader, const std::string& arch) const {
     auto it = parsers_.find(arch);
-    if (it != parsers_.end()) return it->second(loader, arch);
+    if (it != parsers_.end())
+        return it->second(loader, arch);
     return ModelConfig{};
 }
 
@@ -863,14 +899,19 @@ static ModelConfig parse_common_gguf_config(ModelLoader& loader, const std::stri
     ModelConfig cfg;
     cfg.vocab_size = static_cast<int>(loader.get_metadata_int(arch + ".vocab_size", 0));
     cfg.hidden_dim = static_cast<int>(loader.get_metadata_int(arch + ".embedding_length", 4096));
-    cfg.intermediate_dim = static_cast<int>(loader.get_metadata_int(arch + ".feed_forward_length", 11008));
+    cfg.intermediate_dim =
+        static_cast<int>(loader.get_metadata_int(arch + ".feed_forward_length", 11008));
     cfg.num_layers = static_cast<int>(loader.get_metadata_int(arch + ".block_count", 32));
     cfg.num_heads = static_cast<int>(loader.get_metadata_int(arch + ".attention.head_count", 32));
-    cfg.num_kv_heads = static_cast<int>(loader.get_metadata_int(arch + ".attention.head_count_kv", cfg.num_heads));
+    cfg.num_kv_heads =
+        static_cast<int>(loader.get_metadata_int(arch + ".attention.head_count_kv", cfg.num_heads));
     cfg.head_dim = static_cast<int>(loader.get_metadata_int(arch + ".attention.key_length", 0));
-    if (cfg.head_dim == 0) cfg.head_dim = cfg.hidden_dim / cfg.num_heads;
-    cfg.rope_theta = static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base", 10000.0));
-    cfg.rms_norm_eps = static_cast<float>(loader.get_metadata_float(arch + ".attention.layer_norm_rms_epsilon", 1e-6));
+    if (cfg.head_dim == 0)
+        cfg.head_dim = cfg.hidden_dim / cfg.num_heads;
+    cfg.rope_theta =
+        static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base", 10000.0));
+    cfg.rms_norm_eps = static_cast<float>(
+        loader.get_metadata_float(arch + ".attention.layer_norm_rms_epsilon", 1e-6));
     cfg.max_seq_len = static_cast<int>(loader.get_metadata_int(arch + ".context_length", 4096));
     cfg.arch_type = arch;
     cfg.norm_type = NormType::RMSNorm;
@@ -884,7 +925,8 @@ static ModelConfig parse_common_gguf_config(ModelLoader& loader, const std::stri
         } else if (loader.has_tensor("token_embd.weight")) {
             cfg.vocab_size = 32000;
         }
-        if (cfg.vocab_size == 0) cfg.vocab_size = 32000;
+        if (cfg.vocab_size == 0)
+            cfg.vocab_size = 32000;
     }
 
     return cfg;
@@ -896,95 +938,120 @@ static ModelConfig parse_common_gguf_config(ModelLoader& loader, const std::stri
 
 // LLaMA config parser
 namespace {
-static ConfigParserAutoRegister _reg_cfg_llama("llama", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    cfg.use_neox_rope = true;
-    return cfg;
-});
+static ConfigParserAutoRegister _reg_cfg_llama(
+    "llama", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        cfg.use_neox_rope = true;
+        return cfg;
+    });
 
-static ConfigParserAutoRegister _reg_cfg_mistral("mistral", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    cfg.use_neox_rope = true;
-    return cfg;
-});
+static ConfigParserAutoRegister _reg_cfg_mistral(
+    "mistral", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        cfg.use_neox_rope = true;
+        return cfg;
+    });
 
-static ConfigParserAutoRegister _reg_cfg_qwen("qwen", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    if (cfg.rope_theta == 10000.0f) cfg.rope_theta = 1000000.0f;
-    cfg.tie_embeddings = true;
-    return cfg;
-});
+static ConfigParserAutoRegister _reg_cfg_qwen("qwen",
+                                              [](ModelLoader& loader,
+                                                 const std::string& arch) -> ModelConfig {
+                                                  auto cfg = parse_common_gguf_config(loader, arch);
+                                                  if (cfg.rope_theta == 10000.0f)
+                                                      cfg.rope_theta = 1000000.0f;
+                                                  cfg.tie_embeddings = true;
+                                                  return cfg;
+                                              });
 
-static ConfigParserAutoRegister _reg_cfg_qwen2("qwen2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    if (cfg.rope_theta == 10000.0f) cfg.rope_theta = 1000000.0f;
-    cfg.tie_embeddings = true;
-    return cfg;
-});
+static ConfigParserAutoRegister _reg_cfg_qwen2(
+    "qwen2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        if (cfg.rope_theta == 10000.0f)
+            cfg.rope_theta = 1000000.0f;
+        cfg.tie_embeddings = true;
+        return cfg;
+    });
 
-static ConfigParserAutoRegister _reg_cfg_yi("yi", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    cfg.use_neox_rope = true;
-    return cfg;
-});
+static ConfigParserAutoRegister _reg_cfg_yi("yi",
+                                            [](ModelLoader& loader,
+                                               const std::string& arch) -> ModelConfig {
+                                                auto cfg = parse_common_gguf_config(loader, arch);
+                                                cfg.use_neox_rope = true;
+                                                return cfg;
+                                            });
 
-static ConfigParserAutoRegister _reg_cfg_deepseek("deepseek", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    return parse_common_gguf_config(loader, arch);
-});
+static ConfigParserAutoRegister _reg_cfg_deepseek("deepseek",
+                                                  [](ModelLoader& loader,
+                                                     const std::string& arch) -> ModelConfig {
+                                                      return parse_common_gguf_config(loader, arch);
+                                                  });
 
-static ConfigParserAutoRegister _reg_cfg_deepseek_v2("deepseek_v2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
-    cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
-    cfg.use_mla = (cfg.kv_lora_rank > 0);
-    cfg.n_routed_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-    cfg.n_shared_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
-    cfg.num_expert_per_tok = static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
-    if (cfg.kv_lora_rank > 0) {
-        cfg.num_kv_heads = 1;
-        cfg.head_dim = cfg.kv_lora_rank;
-    }
-    return cfg;
-});
-
-static ConfigParserAutoRegister _reg_cfg_deepseek_v3("deepseek_v3", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
-    cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
-    cfg.use_mla = (cfg.kv_lora_rank > 0);
-    cfg.n_routed_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-    cfg.n_shared_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
-    cfg.num_expert_per_tok = static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
-    if (cfg.kv_lora_rank > 0) {
-        cfg.num_kv_heads = 1;
-        cfg.head_dim = cfg.kv_lora_rank;
-    }
-    return cfg;
-});
-
-static ConfigParserAutoRegister _reg_cfg_qwen35("qwen35", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-    auto cfg = parse_common_gguf_config(loader, arch);
-    cfg.tie_embeddings = true;
-    cfg.use_ssm = true;
-    cfg.ssm_group_count = static_cast<int>(loader.get_metadata_int(arch + ".ssm.group_count", 0));
-    cfg.ssm_time_step_rank = static_cast<int>(loader.get_metadata_int(arch + ".ssm.time_step_rank", 0));
-    cfg.ssm_inner_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.inner_size", 0));
-    cfg.ssm_state_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.state_size", 0));
-    cfg.ssm_conv_kernel = static_cast<int>(loader.get_metadata_int(arch + ".ssm.conv_kernel", 0));
-    cfg.full_attention_interval = static_cast<int>(loader.get_metadata_int(arch + ".full_attention_interval", 0));
-
-    // MRoPE (Multi-dimensional RoPE) for Qwen3.5
-    cfg.rope_dimension_count = static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
-    auto sections = loader.get_metadata_int_array(arch + ".rope.dimension_sections", {});
-    if (!sections.empty() && cfg.rope_dimension_count > 0) {
-        cfg.use_mrope = true;
-        for (size_t i = 0; i < sections.size() && i < 4; ++i) {
-            cfg.rope_dimension_sections[i] = sections[i];
+static ConfigParserAutoRegister _reg_cfg_deepseek_v2(
+    "deepseek_v2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
+        cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
+        cfg.use_mla = (cfg.kv_lora_rank > 0);
+        cfg.n_routed_experts =
+            static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
+        cfg.n_shared_experts =
+            static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
+        cfg.num_expert_per_tok =
+            static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
+        if (cfg.kv_lora_rank > 0) {
+            cfg.num_kv_heads = 1;
+            cfg.head_dim = cfg.kv_lora_rank;
         }
-    }
-    return cfg;
-});
-} // anonymous namespace for config parsers
+        return cfg;
+    });
+
+static ConfigParserAutoRegister _reg_cfg_deepseek_v3(
+    "deepseek_v3", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
+        cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
+        cfg.use_mla = (cfg.kv_lora_rank > 0);
+        cfg.n_routed_experts =
+            static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
+        cfg.n_shared_experts =
+            static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
+        cfg.num_expert_per_tok =
+            static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
+        if (cfg.kv_lora_rank > 0) {
+            cfg.num_kv_heads = 1;
+            cfg.head_dim = cfg.kv_lora_rank;
+        }
+        return cfg;
+    });
+
+static ConfigParserAutoRegister _reg_cfg_qwen35(
+    "qwen35", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        cfg.tie_embeddings = true;
+        cfg.use_ssm = true;
+        cfg.ssm_group_count =
+            static_cast<int>(loader.get_metadata_int(arch + ".ssm.group_count", 0));
+        cfg.ssm_time_step_rank =
+            static_cast<int>(loader.get_metadata_int(arch + ".ssm.time_step_rank", 0));
+        cfg.ssm_inner_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.inner_size", 0));
+        cfg.ssm_state_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.state_size", 0));
+        cfg.ssm_conv_kernel =
+            static_cast<int>(loader.get_metadata_int(arch + ".ssm.conv_kernel", 0));
+        cfg.full_attention_interval =
+            static_cast<int>(loader.get_metadata_int(arch + ".full_attention_interval", 0));
+
+        // MRoPE (Multi-dimensional RoPE) for Qwen3.5
+        cfg.rope_dimension_count =
+            static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+        auto sections = loader.get_metadata_int_array(arch + ".rope.dimension_sections", {});
+        if (!sections.empty() && cfg.rope_dimension_count > 0) {
+            cfg.use_mrope = true;
+            for (size_t i = 0; i < sections.size() && i < 4; ++i) {
+                cfg.rope_dimension_sections[i] = sections[i];
+            }
+        }
+        return cfg;
+    });
+}  // namespace
 
 // ============================================================================
 // WeightInitRegistry implementation
@@ -1024,7 +1091,8 @@ namespace {
 static void load_if_present(const WeightStore& store, LayerWeights& lw,
                             const std::string& canonical, const std::string& store_name) {
     auto t = store.get(store_name);
-    if (t) lw.set(canonical, t);
+    if (t)
+        lw.set(canonical, t);
 }
 
 // Standard GQA attention weight init (LLaMA, Mistral, Qwen2, Yi, DeepSeek)
@@ -1109,7 +1177,7 @@ static WeightInitAutoRegister _reg_winit_deepseek_v2("deepseek_v2", init_mla_lay
 static WeightInitAutoRegister _reg_winit_deepseek_v3("deepseek_v3", init_mla_layer_weights);
 static WeightInitAutoRegister _reg_winit_qwen35("qwen35", init_qwen35_layer_weights);
 
-} // anonymous namespace for weight init
+}  // namespace
 
 // ============================================================================
 // ArchCapabilityRegistry implementation
@@ -1120,7 +1188,8 @@ ArchCapabilityRegistry& ArchCapabilityRegistry::instance() {
     return registry;
 }
 
-void ArchCapabilityRegistry::register_capability(const std::string& arch, const ArchCapability& cap) {
+void ArchCapabilityRegistry::register_capability(const std::string& arch,
+                                                 const ArchCapability& cap) {
     capabilities_[arch] = cap;
 }
 
@@ -1130,11 +1199,13 @@ bool ArchCapabilityRegistry::has(const std::string& arch) const {
 
 ArchCapability ArchCapabilityRegistry::get(const std::string& arch) const {
     auto it = capabilities_.find(arch);
-    if (it != capabilities_.end()) return it->second;
+    if (it != capabilities_.end())
+        return it->second;
     return ArchCapability{};
 }
 
-ArchCapabilityAutoRegister::ArchCapabilityAutoRegister(const std::string& arch, const ArchCapability& cap) {
+ArchCapabilityAutoRegister::ArchCapabilityAutoRegister(const std::string& arch,
+                                                       const ArchCapability& cap) {
     ArchCapabilityRegistry::instance().register_capability(arch, cap);
 }
 
@@ -1144,28 +1215,26 @@ ArchCapabilityAutoRegister::ArchCapabilityAutoRegister(const std::string& arch, 
 
 namespace {
 // GQA architectures (use LlamaEngine)
-static ArchCapabilityAutoRegister _reg_cap_llama("llama",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true});
+static ArchCapabilityAutoRegister _reg_cap_llama("llama", ArchCapability{.use_gqa = true,
+                                                                         .use_neox_rope = true});
 static ArchCapabilityAutoRegister _reg_cap_mistral("mistral",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true});
-static ArchCapabilityAutoRegister _reg_cap_qwen("qwen",
-    ArchCapability{.use_gqa = true});
-static ArchCapabilityAutoRegister _reg_cap_qwen2("qwen2",
-    ArchCapability{.use_gqa = true});
-static ArchCapabilityAutoRegister _reg_cap_yi("yi",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true});
-static ArchCapabilityAutoRegister _reg_cap_deepseek("deepseek",
-    ArchCapability{.use_gqa = true});
+                                                   ArchCapability{.use_gqa = true,
+                                                                  .use_neox_rope = true});
+static ArchCapabilityAutoRegister _reg_cap_qwen("qwen", ArchCapability{.use_gqa = true});
+static ArchCapabilityAutoRegister _reg_cap_qwen2("qwen2", ArchCapability{.use_gqa = true});
+static ArchCapabilityAutoRegister _reg_cap_yi("yi", ArchCapability{.use_gqa = true,
+                                                                   .use_neox_rope = true});
+static ArchCapabilityAutoRegister _reg_cap_deepseek("deepseek", ArchCapability{.use_gqa = true});
 
 // MLA architectures (use DeepSeekEngine)
 static ArchCapabilityAutoRegister _reg_cap_deepseek_v2("deepseek_v2",
-    ArchCapability{.use_mla = true});
+                                                       ArchCapability{.use_mla = true});
 static ArchCapabilityAutoRegister _reg_cap_deepseek_v3("deepseek_v3",
-    ArchCapability{.use_mla = true});
+                                                       ArchCapability{.use_mla = true});
 
 // SSM architectures (use Qwen35Engine)
-static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35",
-    ArchCapability{.use_ssm = true, .use_mrope = true});
-} // anonymous namespace for arch capabilities
+static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35", ArchCapability{.use_ssm = true,
+                                                                           .use_mrope = true});
+}  // namespace
 
-} // namespace forge
+}  // namespace forge

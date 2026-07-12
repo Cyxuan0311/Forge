@@ -4,10 +4,8 @@ namespace forge {
 namespace cuda {
 
 template <int T>
-__global__ void gemm_tiled_kernel(const float* __restrict__ A,
-                                   const float* __restrict__ B,
-                                   float* __restrict__ C,
-                                   int M, int N, int K, bool transB) {
+__global__ void gemm_tiled_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                                  float* __restrict__ C, int M, int N, int K, bool transB) {
     int ty = threadIdx.y;
     int tx = threadIdx.x;
     int row = blockIdx.y * T + ty;
@@ -48,14 +46,12 @@ __global__ void gemm_tiled_kernel(const float* __restrict__ A,
 
 constexpr int TILE_SIZE = 16;
 
-void launch_gemm_tiled(const float* A, const float* B, float* C,
-                        int M, int N, int K, bool transB,
-                        cudaStream_t stream) {
+void launch_gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K, bool transB,
+                       cudaStream_t stream) {
     dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE,
-              (M + TILE_SIZE - 1) / TILE_SIZE);
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
     gemm_tiled_kernel<TILE_SIZE><<<grid, block, 0, stream>>>(A, B, C, M, N, K, transB);
 }
 
-} // namespace cuda
-} // namespace forge
+}  // namespace cuda
+}  // namespace forge

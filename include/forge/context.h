@@ -1,12 +1,13 @@
 #pragma once
 
-#include <memory>
-#include <vector>
-#include <string>
 #include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "kv_cache.h"
 #include "tensor.h"
 #include "types.h"
-#include "kv_cache.h"
 
 namespace forge {
 
@@ -33,8 +34,7 @@ public:
     void reset();
     void reset_kv_cache();
 
-    int generate(int start_token, int max_tokens,
-                 std::function<int(float*, int)> sampler_fn);
+    int generate(int start_token, int max_tokens, std::function<int(float*, int)> sampler_fn);
 
     const Model& model() const { return model_; }
     const KVCache& kv_cache() const { return *kv_cache_; }
@@ -70,4 +70,4 @@ private:
     bool kv_cache_initialized_ = false;
 };
 
-} // namespace forge
+}  // namespace forge

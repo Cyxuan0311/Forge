@@ -1,19 +1,20 @@
-#include "forge/operator_attention.h"
-#include "forge/cuda_kernels.h"
-#include "forge/perf_profiler.h"
 #include <cmath>
 #include <cstring>
 
+#include "forge/cuda_kernels.h"
+#include "forge/operator_attention.h"
+#include "forge/perf_profiler.h"
+
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 #ifdef _OPENMP
-#include <omp.h>
+#    include <omp.h>
 #endif
 
 namespace forge {
@@ -48,13 +49,14 @@ static inline float dot_avx2(const float* a, const float* b, int n) {
         acc = _mm256_fmadd_ps(av, bv, acc);
     }
     float sum = hsum_avx2(acc);
-    for (; i < n; ++i) sum += a[i] * b[i];
+    for (; i < n; ++i)
+        sum += a[i] * b[i];
     return sum;
 }
 #endif
 
-TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k,
-                                        const TensorPtr& v, bool causal) {
+TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v,
+                                       bool causal) {
     int seq_len = static_cast<int>(q->shape()[0]);
     int num_heads = static_cast<int>(q->shape()[1]);
     int head_dim = static_cast<int>(q->shape()[2]);
@@ -65,18 +67,19 @@ TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k,
 
     if (q->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        auto q_2d = std::make_shared<Tensor>(q->view(std::vector<int64_t>{seq_len, num_heads * head_dim}));
-        auto k_2d = std::make_shared<Tensor>(k->view(std::vector<int64_t>{seq_len, num_heads * head_dim}));
-        auto v_2d = std::make_shared<Tensor>(v->view(std::vector<int64_t>{seq_len, num_heads * head_dim}));
-        auto out_2d = std::make_shared<Tensor>(DataType::FP32,
-            std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        auto q_2d =
+            std::make_shared<Tensor>(q->view(std::vector<int64_t>{seq_len, num_heads * head_dim}));
+        auto k_2d =
+            std::make_shared<Tensor>(k->view(std::vector<int64_t>{seq_len, num_heads * head_dim}));
+        auto v_2d =
+            std::make_shared<Tensor>(v->view(std::vector<int64_t>{seq_len, num_heads * head_dim}));
+        auto out_2d = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
 
         cuda::launch_flash_attention(
-            static_cast<const float*>(q_2d->data()),
-            static_cast<const float*>(k_2d->data()),
-            static_cast<const float*>(v_2d->data()),
-            static_cast<float*>(out_2d->data()),
-            seq_len, seq_len, num_heads, head_dim, causal);
+            static_cast<const float*>(q_2d->data()), static_cast<const float*>(k_2d->data()),
+            static_cast<const float*>(v_2d->data()), static_cast<float*>(out_2d->data()), seq_len,
+            seq_len, num_heads, head_dim, causal);
 
         auto out_3d = out_2d->view(std::vector<int64_t>{seq_len, num_heads, head_dim});
         *out = std::move(out_3d);
@@ -88,7 +91,7 @@ TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k,
 
         std::vector<float> host_out(q->numel());
 
-        #pragma omp parallel for schedule(dynamic) collapse(2) if(seq_len * num_heads > 4)
+#pragma omp parallel for schedule(dynamic) collapse(2) if (seq_len * num_heads > 4)
         for (int h = 0; h < num_heads; ++h) {
             for (int i = 0; i < seq_len; ++i) {
                 std::vector<float> scores(seq_len);
@@ -100,8 +103,8 @@ TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k,
                     }
                     float dot = 0.0f;
                     for (int d = 0; d < head_dim; ++d) {
-                        dot += q_data[i * num_heads * head_dim + h * head_dim + d]
-                             * k_data[j * num_heads * head_dim + h * head_dim + d];
+                        dot += q_data[i * num_heads * head_dim + h * head_dim + d] *
+                               k_data[j * num_heads * head_dim + h * head_dim + d];
                     }
                     scores[j] = dot * scale;
                     max_val = std::max(max_val, scores[j]);
@@ -129,27 +132,25 @@ TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k,
 }
 
 TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k,
-                                           const TensorPtr& v, int seq_len, int num_heads,
-                                           int head_dim, bool causal) {
+                                          const TensorPtr& v, int seq_len, int num_heads,
+                                          int head_dim, bool causal) {
     return scaled_dot_product_attention_2d(q, k, v, seq_len, seq_len, num_heads, head_dim, causal);
 }
 
 TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k,
-                                           const TensorPtr& v, int q_len, int kv_len,
-                                           int num_heads, int head_dim, bool causal) {
+                                          const TensorPtr& v, int q_len, int kv_len, int num_heads,
+                                          int head_dim, bool causal) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{q_len, num_heads * head_dim}, q->device());
+    auto out = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{q_len, num_heads * head_dim}, q->device());
 
     if (q->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         cuda::launch_flash_attention(
-            static_cast<const float*>(q->data()),
-            static_cast<const float*>(k->data()),
-            static_cast<const float*>(v->data()),
-            static_cast<float*>(out->data()),
-            q_len, kv_len, num_heads, head_dim, causal);
+            static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+            static_cast<const float*>(v->data()), static_cast<float*>(out->data()), q_len, kv_len,
+            num_heads, head_dim, causal);
 #endif
     } else {
         const float* q_data = static_cast<const float*>(q->data());
@@ -163,7 +164,7 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
         // per head and reduce memory traffic.
         if (q_len == 1) {
             PERF_SCOPE("attention/qk_dot");
-            #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
             for (int h = 0; h < num_heads; ++h) {
                 const float* q_row = q_data + h * head_dim;
                 float* out_row = host_out.data() + h * head_dim;
@@ -172,7 +173,7 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                 float max_val = -1e30f;
                 float sum_exp = 0.0f;
 #ifdef USE_AVX2
-                const int NV = head_dim / 8; // number of __m256 vectors per head
+                const int NV = head_dim / 8;  // number of __m256 vectors per head
 #endif
                 std::memset(out_row, 0, head_dim * sizeof(float));
 
@@ -182,7 +183,8 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                     float dot = dot_avx2(q_row, k_row, head_dim);
 #else
                     float dot = 0.0f;
-                    for (int d = 0; d < head_dim; ++d) dot += q_row[d] * k_row[d];
+                    for (int d = 0; d < head_dim; ++d)
+                        dot += q_row[d] * k_row[d];
 #endif
                     float score = dot * scale;
                     float new_max = std::max(max_val, score);
@@ -198,7 +200,8 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                             _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, r));
                         }
 #else
-                        for (int d = 0; d < head_dim; ++d) out_row[d] *= rescale;
+                        for (int d = 0; d < head_dim; ++d)
+                            out_row[d] *= rescale;
 #endif
                     }
 
@@ -214,7 +217,8 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                         _mm256_storeu_ps(out_row + v * 8, _mm256_fmadd_ps(w_vec, vr, a));
                     }
 #else
-                    for (int d = 0; d < head_dim; ++d) out_row[d] += exp_score * v_row[d];
+                    for (int d = 0; d < head_dim; ++d)
+                        out_row[d] += exp_score * v_row[d];
 #endif
                     max_val = new_max;
                 }
@@ -228,18 +232,19 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                     _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, inv_vec));
                 }
 #else
-                for (int d = 0; d < head_dim; ++d) out_row[d] *= inv_sum;
+                for (int d = 0; d < head_dim; ++d)
+                    out_row[d] *= inv_sum;
 #endif
             }
         } else {
             // General path: prefill or causal attention
             PERF_SCOPE("attention/qk_dot");
-            // Pre-allocate scores buffer per thread to avoid heap allocation per iteration
-            #pragma omp parallel
+// Pre-allocate scores buffer per thread to avoid heap allocation per iteration
+#pragma omp parallel
             {
                 std::vector<float> scores_buf(kv_len);
 
-                #pragma omp for schedule(dynamic) collapse(2)
+#pragma omp for schedule(dynamic) collapse(2)
                 for (int h = 0; h < num_heads; ++h) {
                     for (int i = 0; i < q_len; ++i) {
                         int q_pos = kv_len - q_len + i;
@@ -305,19 +310,24 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
 }
 
 TensorPtr scaled_dot_product_attention_2d_masked(const TensorPtr& q, const TensorPtr& k,
-                                                  const TensorPtr& v, int seq_len,
-                                                  int num_heads, int head_dim,
-                                                  const TensorPtr& mask) {
+                                                 const TensorPtr& v, int seq_len, int num_heads,
+                                                 int head_dim, const TensorPtr& mask) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     // For masked attention, we must use CPU path (flash attention doesn't support custom masks)
-    auto q_cpu = q; auto k_cpu = k; auto v_cpu = v; auto mask_cpu = mask;
+    auto q_cpu = q;
+    auto k_cpu = k;
+    auto v_cpu = v;
+    auto mask_cpu = mask;
     if (q->device() == DeviceType::CUDA) {
         q_cpu = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
         k_cpu = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
         v_cpu = std::make_shared<Tensor>(DataType::FP32, v->shape(), DeviceType::CPU);
         mask_cpu = std::make_shared<Tensor>(DataType::FP32, mask->shape(), DeviceType::CPU);
-        q_cpu->copy_from(*q); k_cpu->copy_from(*k); v_cpu->copy_from(*v); mask_cpu->copy_from(*mask);
+        q_cpu->copy_from(*q);
+        k_cpu->copy_from(*k);
+        v_cpu->copy_from(*v);
+        mask_cpu->copy_from(*mask);
     }
 
     const float* q_data = static_cast<const float*>(q_cpu->data());
@@ -325,11 +335,11 @@ TensorPtr scaled_dot_product_attention_2d_masked(const TensorPtr& q, const Tenso
     const float* v_data = static_cast<const float*>(v_cpu->data());
     const float* mask_data = static_cast<const float*>(mask_cpu->data());
 
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CPU);
+    auto out = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CPU);
     float* out_data = static_cast<float*>(out->data());
 
-    #pragma omp parallel for schedule(dynamic) collapse(2) if(seq_len * num_heads > 4)
+#pragma omp parallel for schedule(dynamic) collapse(2) if (seq_len * num_heads > 4)
     for (int h = 0; h < num_heads; ++h) {
         for (int i = 0; i < seq_len; ++i) {
             std::vector<float> scores(seq_len);
@@ -342,8 +352,8 @@ TensorPtr scaled_dot_product_attention_2d_masked(const TensorPtr& q, const Tenso
                 }
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
-                    dot += q_data[i * num_heads * head_dim + h * head_dim + d]
-                         * k_data[j * num_heads * head_dim + h * head_dim + d];
+                    dot += q_data[i * num_heads * head_dim + h * head_dim + d] *
+                           k_data[j * num_heads * head_dim + h * head_dim + d];
                 }
                 scores[j] = dot * scale + m;
                 max_val = std::max(max_val, scores[j]);
@@ -368,13 +378,13 @@ TensorPtr scaled_dot_product_attention_2d_masked(const TensorPtr& q, const Tenso
 }
 
 TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPtr& k,
-                                               const TensorPtr& v, int q_len, int kv_len,
-                                               int num_heads, int num_kv_heads,
-                                               int head_dim, bool causal) {
+                                              const TensorPtr& v, int q_len, int kv_len,
+                                              int num_heads, int num_kv_heads, int head_dim,
+                                              bool causal) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{q_len, num_heads * head_dim}, q->device());
+    auto out = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{q_len, num_heads * head_dim}, q->device());
 
     // This function is CPU-only; CUDA uses flash attention kernels directly
     const float* q_data = static_cast<const float*>(q->data());
@@ -389,7 +399,7 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
         // Decode path: online softmax with direct GQA head mapping
         // No need to physically expand K/V
         PERF_SCOPE("attention/qk_dot");
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
         for (int h = 0; h < num_heads; ++h) {
             const float* q_row = q_data + h * head_dim;
             float* out_row = host_out.data() + h * head_dim;
@@ -411,7 +421,8 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                 float dot = dot_avx2(q_row, k_row, head_dim);
 #else
                 float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d) dot += q_row[d] * k_row[d];
+                for (int d = 0; d < head_dim; ++d)
+                    dot += q_row[d] * k_row[d];
 #endif
                 float score = dot * scale;
                 float new_max = std::max(max_val, score);
@@ -426,7 +437,8 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                         _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, r));
                     }
 #else
-                    for (int d = 0; d < head_dim; ++d) out_row[d] *= rescale;
+                    for (int d = 0; d < head_dim; ++d)
+                        out_row[d] *= rescale;
 #endif
                 }
 
@@ -442,7 +454,8 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                     _mm256_storeu_ps(out_row + v * 8, _mm256_fmadd_ps(w_vec, vr, a));
                 }
 #else
-                for (int d = 0; d < head_dim; ++d) out_row[d] += exp_score * v_row[d];
+                for (int d = 0; d < head_dim; ++d)
+                    out_row[d] += exp_score * v_row[d];
 #endif
                 max_val = new_max;
             }
@@ -455,16 +468,17 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                 _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, inv_vec));
             }
 #else
-            for (int d = 0; d < head_dim; ++d) out_row[d] *= inv_sum;
+            for (int d = 0; d < head_dim; ++d)
+                out_row[d] *= inv_sum;
 #endif
         }
     } else {
         // Prefill path with GQA
         PERF_SCOPE("attention/qk_dot");
-        #pragma omp parallel
+#pragma omp parallel
         {
             std::vector<float> scores_buf(kv_len);
-            #pragma omp for schedule(dynamic) collapse(2)
+#pragma omp for schedule(dynamic) collapse(2)
             for (int h = 0; h < num_heads; ++h) {
                 for (int i = 0; i < q_len; ++i) {
                     int kv_h = h / kv_group_size;
@@ -528,5 +542,5 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
     return out;
 }
 
-} // namespace ops
-} // namespace forge
+}  // namespace ops
+}  // namespace forge

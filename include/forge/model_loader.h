@@ -1,10 +1,11 @@
 #pragma once
 
-#include <string>
-#include <vector>
-#include <memory>
-#include <unordered_map>
 #include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "tensor.h"
 #include "types.h"
 
@@ -18,12 +19,15 @@ public:
     virtual void close() = 0;
 
     virtual bool has_tensor(const std::string& name) const = 0;
-    virtual TensorPtr get_tensor(const std::string& name, DeviceType device = DeviceType::CPU) const = 0;
+    virtual TensorPtr get_tensor(const std::string& name,
+                                 DeviceType device = DeviceType::CPU) const = 0;
 
-    virtual std::string get_metadata_str(const std::string& key, const std::string& default_val = "") const = 0;
+    virtual std::string get_metadata_str(const std::string& key,
+                                         const std::string& default_val = "") const = 0;
     virtual int64_t get_metadata_int(const std::string& key, int64_t default_val = 0) const = 0;
     virtual double get_metadata_float(const std::string& key, double default_val = 0.0) const = 0;
-    virtual std::vector<int32_t> get_metadata_int_array(const std::string& key, const std::vector<int32_t>& default_val = {}) const = 0;
+    virtual std::vector<int32_t> get_metadata_int_array(
+        const std::string& key, const std::vector<int32_t>& default_val = {}) const = 0;
 
     virtual bool supports_format(const std::string& path) const = 0;
     virtual std::string format_name() const = 0;
@@ -62,7 +66,6 @@ struct LoaderAutoRegister {
 #define FORGE_REGISTER_LOADER_IMPL(line, name, creator) \
     FORGE_REGISTER_LOADER_IMPL2(line, name, creator)
 
-#define FORGE_REGISTER_LOADER(name, creator) \
-    FORGE_REGISTER_LOADER_IMPL(__LINE__, name, creator)
+#define FORGE_REGISTER_LOADER(name, creator) FORGE_REGISTER_LOADER_IMPL(__LINE__, name, creator)
 
-} // namespace forge
+}  // namespace forge

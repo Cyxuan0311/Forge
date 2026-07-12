@@ -1,16 +1,18 @@
-#include "forge/cuda_kernels.h"
-#include "cuda_common.h"
 #include <cmath>
+
+#include "cuda_common.h"
+#include "forge/cuda_kernels.h"
 
 namespace forge {
 namespace cuda {
 
 // ---- RMS Norm ----
 
-__global__ void rms_norm_kernel(const float* x, const float* weight, float* out,
-                                 int rows, int cols, float eps) {
+__global__ void rms_norm_kernel(const float* x, const float* weight, float* out, int rows, int cols,
+                                float eps) {
     int row = blockIdx.x;
-    if (row >= rows) return;
+    if (row >= rows)
+        return;
 
     const float* x_row = x + row * cols;
     float* out_row = out + row * cols;
@@ -34,14 +36,14 @@ __global__ void rms_norm_kernel(const float* x, const float* weight, float* out,
     }
 }
 
-void launch_rms_norm(const float* x, const float* weight, float* out,
-                     int rows, int cols, float eps, cudaStream_t stream) {
+void launch_rms_norm(const float* x, const float* weight, float* out, int rows, int cols, float eps,
+                     cudaStream_t stream) {
     int threads = std::min(cols, 1024);
     rms_norm_kernel<<<rows, threads, 0, stream>>>(x, weight, out, rows, cols, eps);
 }
 
-void launch_rms_norm_fp16(const void* x, const void* weight, void* out,
-                           int rows, int cols, float eps, cudaStream_t stream) {
+void launch_rms_norm_fp16(const void* x, const void* weight, void* out, int rows, int cols,
+                          float eps, cudaStream_t stream) {
     launch_rms_norm(static_cast<const float*>(x), static_cast<const float*>(weight),
                     static_cast<float*>(out), rows, cols, eps, stream);
 }
@@ -109,8 +111,7 @@ __global__ void add_bias_kernel(const float* data, const float* bias, float* out
     }
 }
 
-void launch_add_bias(const float* data, const float* bias, float* out,
-                      int n, cudaStream_t stream) {
+void launch_add_bias(const float* data, const float* bias, float* out, int n, cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     add_bias_kernel<<<blocks, threads, 0, stream>>>(data, bias, out, n);
@@ -125,8 +126,7 @@ __global__ void multiply_kernel(const float* a, const float* b, float* out, int 
     }
 }
 
-void launch_multiply(const float* a, const float* b, float* out,
-                      int n, cudaStream_t stream) {
+void launch_multiply(const float* a, const float* b, float* out, int n, cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     multiply_kernel<<<blocks, threads, 0, stream>>>(a, b, out, n);
@@ -143,12 +143,12 @@ __global__ void silu_multiply_kernel(const float* gate, const float* up, float* 
     }
 }
 
-void launch_silu_multiply(const float* gate, const float* up, float* out,
-                           int n, cudaStream_t stream) {
+void launch_silu_multiply(const float* gate, const float* up, float* out, int n,
+                          cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     silu_multiply_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n);
 }
 
-} // namespace cuda
-} // namespace forge
+}  // namespace cuda
+}  // namespace forge

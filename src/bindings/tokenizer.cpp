@@ -8,19 +8,21 @@ void register_tokenizer(py::module_& m) {
     py::class_<Tokenizer>(m, "Tokenizer")
         .def(py::init<>())
         .def("load_from_gguf", &Tokenizer::load_from_gguf, py::arg("path"))
-        .def("encode", [](const Tokenizer& tok, const std::string& text,
-                          bool add_bos, bool add_eos, bool add_dummy_prefix) {
-            return tok.encode(text, add_bos, add_eos, add_dummy_prefix);
-        }, py::arg("text"),
-           py::arg("add_bos") = true,
-           py::arg("add_eos") = false,
-           py::arg("add_dummy_prefix") = true)
-        .def("decode", [](const Tokenizer& tok, const std::vector<int32_t>& ids,
-                          bool skip_special, bool strip_leading_space) {
-            return tok.decode(ids, skip_special, strip_leading_space);
-        }, py::arg("ids"),
-           py::arg("skip_special") = true,
-           py::arg("strip_leading_space") = true)
+        .def(
+            "encode",
+            [](const Tokenizer& tok, const std::string& text, bool add_bos, bool add_eos,
+               bool add_dummy_prefix) {
+                return tok.encode(text, add_bos, add_eos, add_dummy_prefix);
+            },
+            py::arg("text"), py::arg("add_bos") = true, py::arg("add_eos") = false,
+            py::arg("add_dummy_prefix") = true)
+        .def(
+            "decode",
+            [](const Tokenizer& tok, const std::vector<int32_t>& ids, bool skip_special,
+               bool strip_leading_space) {
+                return tok.decode(ids, skip_special, strip_leading_space);
+            },
+            py::arg("ids"), py::arg("skip_special") = true, py::arg("strip_leading_space") = true)
         .def("decode_token", &Tokenizer::decode_token, py::arg("id"))
         .def("token_to_id", &Tokenizer::token_to_id, py::arg("token"))
         .def("id_to_token", &Tokenizer::id_to_token, py::arg("id"))

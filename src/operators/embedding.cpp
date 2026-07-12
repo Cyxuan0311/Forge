@@ -1,12 +1,13 @@
-#include "forge/operator_embedding.h"
-#include "forge/operator_matmul.h"
-#include "forge/cuda_kernels.h"
-#include "forge/perf_profiler.h"
 #include <cmath>
 #include <cstring>
 #include <vector>
+
+#include "forge/cuda_kernels.h"
+#include "forge/operator_embedding.h"
+#include "forge/operator_matmul.h"
+#include "forge/perf_profiler.h"
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -17,25 +18,26 @@ static inline float fp16_to_fp32_embed(uint16_t bits) {
     uint32_t exponent = (bits >> 10) & 0x1F;
     uint32_t mantissa = bits & 0x3FF;
     if (exponent == 0) {
-        if (mantissa == 0) return 0.0f;
+        if (mantissa == 0)
+            return 0.0f;
         float v = std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
         return sign ? -v : v;
     }
     float v = std::ldexp((1.0f + static_cast<float>(mantissa) / 1024.0f),
-                          static_cast<int>(exponent) - 15);
+                         static_cast<int>(exponent) - 15);
     return sign ? -v : v;
 }
 
-static void dequant_q4_0_rows(const uint8_t* q_data, float* out,
-                               const int32_t* indices, int num_indices,
-                               int vocab_size, int embed_dim) {
+static void dequant_q4_0_rows(const uint8_t* q_data, float* out, const int32_t* indices,
+                              int num_indices, int vocab_size, int embed_dim) {
     const int Q4_0_BLOCK_SIZE = 18;
     int blocks_per_row = (embed_dim + 31) / 32;
     size_t row_bytes = blocks_per_row * Q4_0_BLOCK_SIZE;
 
     for (int i = 0; i < num_indices; ++i) {
         int vocab_idx = indices[i];
-        if (vocab_idx < 0 || vocab_idx >= vocab_size) continue;
+        if (vocab_idx < 0 || vocab_idx >= vocab_size)
+            continue;
 
         const uint8_t* row_ptr = q_data + vocab_idx * row_bytes;
         float* out_row = out + i * embed_dim;
@@ -55,16 +57,16 @@ static void dequant_q4_0_rows(const uint8_t* q_data, float* out,
     }
 }
 
-static void dequant_q4_1_rows(const uint8_t* q_data, float* out,
-                               const int32_t* indices, int num_indices,
-                               int vocab_size, int embed_dim) {
+static void dequant_q4_1_rows(const uint8_t* q_data, float* out, const int32_t* indices,
+                              int num_indices, int vocab_size, int embed_dim) {
     const int Q4_1_BLOCK_SIZE = 20;
     int blocks_per_row = (embed_dim + 31) / 32;
     size_t row_bytes = blocks_per_row * Q4_1_BLOCK_SIZE;
 
     for (int i = 0; i < num_indices; ++i) {
         int vocab_idx = indices[i];
-        if (vocab_idx < 0 || vocab_idx >= vocab_size) continue;
+        if (vocab_idx < 0 || vocab_idx >= vocab_size)
+            continue;
 
         const uint8_t* row_ptr = q_data + vocab_idx * row_bytes;
         float* out_row = out + i * embed_dim;
@@ -85,16 +87,16 @@ static void dequant_q4_1_rows(const uint8_t* q_data, float* out,
     }
 }
 
-static void dequant_q8_0_rows(const uint8_t* q_data, float* out,
-                               const int32_t* indices, int num_indices,
-                               int vocab_size, int embed_dim) {
+static void dequant_q8_0_rows(const uint8_t* q_data, float* out, const int32_t* indices,
+                              int num_indices, int vocab_size, int embed_dim) {
     const int Q8_0_BLOCK_SIZE = 34;
     int blocks_per_row = (embed_dim + 31) / 32;
     size_t row_bytes = blocks_per_row * Q8_0_BLOCK_SIZE;
 
     for (int i = 0; i < num_indices; ++i) {
         int vocab_idx = indices[i];
-        if (vocab_idx < 0 || vocab_idx >= vocab_size) continue;
+        if (vocab_idx < 0 || vocab_idx >= vocab_size)
+            continue;
 
         const uint8_t* row_ptr = q_data + vocab_idx * row_bytes;
         float* out_row = out + i * embed_dim;
@@ -123,16 +125,16 @@ static void get_scale_min_k4_emb(int j, const uint8_t* q, uint8_t* d, uint8_t* m
     }
 }
 
-static void dequant_q4_k_rows(const uint8_t* q_data, float* out,
-                               const int32_t* indices, int num_indices,
-                               int vocab_size, int embed_dim) {
+static void dequant_q4_k_rows(const uint8_t* q_data, float* out, const int32_t* indices,
+                              int num_indices, int vocab_size, int embed_dim) {
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (embed_dim + QK_K_EMB - 1) / QK_K_EMB;
     size_t row_bytes = blocks_per_row * Q4_K_BLOCK_SIZE;
 
     for (int i = 0; i < num_indices; ++i) {
         int vocab_idx = indices[i];
-        if (vocab_idx < 0 || vocab_idx >= vocab_size) continue;
+        if (vocab_idx < 0 || vocab_idx >= vocab_size)
+            continue;
 
         const uint8_t* row_ptr = q_data + vocab_idx * row_bytes;
         float* out_row = out + i * embed_dim;
@@ -172,16 +174,16 @@ static void dequant_q4_k_rows(const uint8_t* q_data, float* out,
     }
 }
 
-static void dequant_q6_k_rows(const uint8_t* q_data, float* out,
-                               const int32_t* indices, int num_indices,
-                               int vocab_size, int embed_dim) {
+static void dequant_q6_k_rows(const uint8_t* q_data, float* out, const int32_t* indices,
+                              int num_indices, int vocab_size, int embed_dim) {
     const int Q6_K_BLOCK_SIZE = 210;
     int blocks_per_row = (embed_dim + QK_K_EMB - 1) / QK_K_EMB;
     size_t row_bytes = blocks_per_row * Q6_K_BLOCK_SIZE;
 
     for (int i = 0; i < num_indices; ++i) {
         int vocab_idx = indices[i];
-        if (vocab_idx < 0 || vocab_idx >= vocab_size) continue;
+        if (vocab_idx < 0 || vocab_idx >= vocab_size)
+            continue;
 
         const uint8_t* row_ptr = q_data + vocab_idx * row_bytes;
         float* out_row = out + i * embed_dim;
@@ -203,11 +205,14 @@ static void dequant_q6_k_rows(const uint8_t* q_data, float* out,
             for (int n = 0; n < QK_K_EMB; n += 128) {
                 for (int l = 0; l < 32; ++l) {
                     int is = l / 16;
-                    int8_t q1 = (int8_t)((ql_cur[l +  0] & 0xF) | (((qh_cur[l] >> 0) & 3) << 4)) - 32;
-                    int8_t q2 = (int8_t)((ql_cur[l + 32] & 0xF) | (((qh_cur[l] >> 2) & 3) << 4)) - 32;
-                    int8_t q3 = (int8_t)((ql_cur[l +  0] >> 4) | (((qh_cur[l] >> 4) & 3) << 4)) - 32;
-                    int8_t q4 = (int8_t)((ql_cur[l + 32] >> 4) | (((qh_cur[l] >> 6) & 3) << 4)) - 32;
-                    y[l +  0] = d * static_cast<float>(sc_cur[is + 0]) * static_cast<float>(q1);
+                    int8_t q1 =
+                        (int8_t)((ql_cur[l + 0] & 0xF) | (((qh_cur[l] >> 0) & 3) << 4)) - 32;
+                    int8_t q2 =
+                        (int8_t)((ql_cur[l + 32] & 0xF) | (((qh_cur[l] >> 2) & 3) << 4)) - 32;
+                    int8_t q3 = (int8_t)((ql_cur[l + 0] >> 4) | (((qh_cur[l] >> 4) & 3) << 4)) - 32;
+                    int8_t q4 =
+                        (int8_t)((ql_cur[l + 32] >> 4) | (((qh_cur[l] >> 6) & 3) << 4)) - 32;
+                    y[l + 0] = d * static_cast<float>(sc_cur[is + 0]) * static_cast<float>(q1);
                     y[l + 32] = d * static_cast<float>(sc_cur[is + 2]) * static_cast<float>(q2);
                     y[l + 64] = d * static_cast<float>(sc_cur[is + 4]) * static_cast<float>(q3);
                     y[l + 96] = d * static_cast<float>(sc_cur[is + 6]) * static_cast<float>(q4);
@@ -221,16 +226,22 @@ static void dequant_q6_k_rows(const uint8_t* q_data, float* out,
     }
 }
 
-using DequantEmbFn = void(*)(const uint8_t*, float*, const int32_t*, int, int, int);
+using DequantEmbFn = void (*)(const uint8_t*, float*, const int32_t*, int, int, int);
 
 static DequantEmbFn get_dequant_emb_fn(DataType dt) {
     switch (dt) {
-        case DataType::Q4_0: return dequant_q4_0_rows;
-        case DataType::Q4_1: return dequant_q4_1_rows;
-        case DataType::Q8_0: return dequant_q8_0_rows;
-        case DataType::Q4_K: return dequant_q4_k_rows;
-        case DataType::Q6_K: return dequant_q6_k_rows;
-        default: return nullptr;
+    case DataType::Q4_0:
+        return dequant_q4_0_rows;
+    case DataType::Q4_1:
+        return dequant_q4_1_rows;
+    case DataType::Q8_0:
+        return dequant_q8_0_rows;
+    case DataType::Q4_K:
+        return dequant_q4_k_rows;
+    case DataType::Q6_K:
+        return dequant_q6_k_rows;
+    default:
+        return nullptr;
     }
 }
 
@@ -247,42 +258,33 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
         embed_dim = static_cast<int>(weight->shape()[1]);
     }
 
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{num_indices, embed_dim}, weight->device());
+    auto out = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{num_indices, embed_dim}, weight->device());
 
     if (weight->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        bool transposed = (weight->shape().size() >= 2 &&
-                           weight->shape()[0] < weight->shape()[1]);
+        bool transposed = (weight->shape().size() >= 2 && weight->shape()[0] < weight->shape()[1]);
         if (weight->dtype() == DataType::Q4_0) {
             cuda::launch_embedding_q4_0(
-                weight->data(),
-                static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()),
-                num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), static_cast<const int32_t*>(indices->data()),
+                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q4_1) {
             cuda::launch_embedding_q4_1(
-                weight->data(),
-                static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()),
-                num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), static_cast<const int32_t*>(indices->data()),
+                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q4_K) {
             cuda::launch_embedding_q4_k(
-                weight->data(),
-                static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()),
-                num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), static_cast<const int32_t*>(indices->data()),
+                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q6_K) {
             cuda::launch_embedding_q6_k(
-                weight->data(),
-                static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()),
-                num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), static_cast<const int32_t*>(indices->data()),
+                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
         } else if (is_quantized_type(weight->dtype())) {
             auto dequant_fn = get_dequant_emb_fn(weight->dtype());
             if (dequant_fn) {
-                auto out_cpu = std::make_shared<Tensor>(DataType::FP32,
-                    std::vector<int64_t>{num_indices, embed_dim}, DeviceType::CPU);
+                auto out_cpu = std::make_shared<Tensor>(
+                    DataType::FP32, std::vector<int64_t>{num_indices, embed_dim}, DeviceType::CPU);
                 const uint8_t* q_data = static_cast<const uint8_t*>(weight->data());
                 std::vector<uint8_t> host_q;
                 if (weight->device() == DeviceType::CUDA) {
@@ -295,7 +297,8 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                 std::vector<int32_t> host_idx;
                 if (indices->device() == DeviceType::CUDA) {
                     host_idx.resize(num_indices);
-                    cudaMemcpy(host_idx.data(), idx_data, num_indices * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(host_idx.data(), idx_data, num_indices * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost);
                     idx_data = host_idx.data();
                 }
                 float* o_data = static_cast<float*>(out_cpu->data());
@@ -305,11 +308,10 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                 out->zero_();
             }
         } else {
-            cuda::launch_embedding_fp32(
-                static_cast<const float*>(weight->data()),
-                static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()),
-                num_indices, embed_dim, vocab_size, transposed);
+            cuda::launch_embedding_fp32(static_cast<const float*>(weight->data()),
+                                        static_cast<const int32_t*>(indices->data()),
+                                        static_cast<float*>(out->data()), num_indices, embed_dim,
+                                        vocab_size, transposed);
         }
 #endif
     } else {
@@ -317,8 +319,8 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
         float* o_data = static_cast<float*>(out->data());
 
         if (is_quantized_type(weight->dtype())) {
-            bool transposed = (weight->shape().size() >= 2 &&
-                               weight->shape()[0] < weight->shape()[1]);
+            bool transposed =
+                (weight->shape().size() >= 2 && weight->shape()[0] < weight->shape()[1]);
             if (transposed) {
                 PERF_SCOPE("embedding/dequant_lookup");
                 // Use pre-dequantized FP32 cache if available (avoids full dequant per call)
@@ -336,7 +338,8 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                 const float* w_data = static_cast<const float*>(fp32_weight->data());
                 for (int i = 0; i < num_indices; ++i) {
                     int vocab_idx = idx_data[i];
-                    if (vocab_idx < 0 || vocab_idx >= vocab_size) continue;
+                    if (vocab_idx < 0 || vocab_idx >= vocab_size)
+                        continue;
                     for (int d = 0; d < embed_dim; ++d) {
                         o_data[i * embed_dim + d] = w_data[d * vocab_size + vocab_idx];
                     }
@@ -344,8 +347,8 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
             } else {
                 auto dequant_fn = get_dequant_emb_fn(weight->dtype());
                 if (dequant_fn) {
-                    dequant_fn(static_cast<const uint8_t*>(weight->data()),
-                               o_data, idx_data, num_indices, vocab_size, embed_dim);
+                    dequant_fn(static_cast<const uint8_t*>(weight->data()), o_data, idx_data,
+                               num_indices, vocab_size, embed_dim);
                 } else {
                     std::memset(o_data, 0, num_indices * embed_dim * sizeof(float));
                 }
@@ -354,9 +357,9 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
             const float* w_data = static_cast<const float*>(weight->data());
             for (int i = 0; i < num_indices; ++i) {
                 int vocab_idx = idx_data[i];
-                if (vocab_idx < 0 || vocab_idx >= vocab_size) continue;
-                std::memcpy(o_data + i * embed_dim,
-                            w_data + vocab_idx * embed_dim,
+                if (vocab_idx < 0 || vocab_idx >= vocab_size)
+                    continue;
+                std::memcpy(o_data + i * embed_dim, w_data + vocab_idx * embed_dim,
                             embed_dim * sizeof(float));
             }
         }
@@ -364,5 +367,5 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
     return out;
 }
 
-} // namespace ops
-} // namespace forge
+}  // namespace ops
+}  // namespace forge

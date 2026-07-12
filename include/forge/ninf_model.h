@@ -1,7 +1,8 @@
 #pragma once
 
-#include "model_loader.h"
 #include <cstdint>
+
+#include "model_loader.h"
 
 namespace forge {
 
@@ -42,12 +43,15 @@ public:
     void close() override;
 
     bool has_tensor(const std::string& name) const override;
-    TensorPtr get_tensor(const std::string& name, DeviceType device = DeviceType::CPU) const override;
+    TensorPtr get_tensor(const std::string& name,
+                         DeviceType device = DeviceType::CPU) const override;
 
-    std::string get_metadata_str(const std::string& key, const std::string& default_val = "") const override;
+    std::string get_metadata_str(const std::string& key,
+                                 const std::string& default_val = "") const override;
     int64_t get_metadata_int(const std::string& key, int64_t default_val = 0) const override;
     double get_metadata_float(const std::string& key, double default_val = 0.0) const override;
-    std::vector<int32_t> get_metadata_int_array(const std::string& key, const std::vector<int32_t>& default_val = {}) const override;
+    std::vector<int32_t> get_metadata_int_array(
+        const std::string& key, const std::vector<int32_t>& default_val = {}) const override;
 
     bool supports_format(const std::string& path) const override;
     std::string format_name() const override { return "ninf"; }
@@ -71,4 +75,4 @@ private:
     mutable std::unordered_map<std::string, std::string> parsed_meta_;
 };
 
-} // namespace forge
+}  // namespace forge

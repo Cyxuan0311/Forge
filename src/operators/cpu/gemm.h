@@ -1,15 +1,16 @@
 #pragma once
 
-#include "vec.h"
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <cmath>
-#include <algorithm>
+
+#include "vec.h"
 #ifdef _OPENMP
-#include <omp.h>
+#    include <omp.h>
 #endif
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 namespace forge {
@@ -19,16 +20,13 @@ namespace cpu {
 // Tiled for better cache utilization
 
 #ifdef USE_AVX2
-static void gemm_fp32_avx2(
-    const float* a, const float* b, float* out,
-    int M, int K, int N)
-{
+static void gemm_fp32_avx2(const float* a, const float* b, float* out, int M, int K, int N) {
     std::memset(out, 0, (size_t)M * N * sizeof(float));
 
     constexpr int MR = 6;
     constexpr int NR = 4;
 
-    #pragma omp parallel for schedule(dynamic) if(M * N > 64)
+#    pragma omp parallel for schedule(dynamic) if (M * N > 64)
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + m * K;
         float* o_row = out + m * N;
@@ -48,23 +46,20 @@ static void gemm_fp32_avx2(
         }
     }
 }
-#endif // USE_AVX2
+#endif  // USE_AVX2
 
 // ---- Q4_0 GEMM (non-transB) ----
 // a[M,K] @ dequant(w[K,N]) -> out[M,N], w is Q4_0 quantized
 
 #ifdef USE_AVX2
-static void gemm_q4_0_avx2(
-    const float* a, const uint8_t* w, float* out,
-    int M, int K, int N)
-{
+static void gemm_q4_0_avx2(const float* a, const uint8_t* w, float* out, int M, int K, int N) {
     constexpr int BLOCK_SIZE = 32;
     constexpr int BLOCK_BYTES = 18;
     const int blocks_per_row = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     std::memset(out, 0, (size_t)M * N * sizeof(float));
 
-    #pragma omp parallel for schedule(dynamic) if(M * K > 64)
+#    pragma omp parallel for schedule(dynamic) if (M * K > 64)
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + m * K;
         float* o_row = out + m * N;
@@ -130,26 +125,29 @@ static void gemm_q4_0_avx2(
                     uint32_t exponent = (scale_bits >> 10) & 0x1F;
                     uint32_t mantissa = scale_bits & 0x3FF;
                     if (exponent == 0) {
-                        scale_f = mantissa == 0 ? 0.0f :
-                            (sign ? -1 : 1) * std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
+                        scale_f = mantissa == 0
+                                      ? 0.0f
+                                      : (sign ? -1 : 1) *
+                                            std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
                     } else {
-                        scale_f = (sign ? -1 : 1) * std::ldexp(
-                            1.0f + static_cast<float>(mantissa) / 1024.0f,
-                            static_cast<int>(exponent) - 15);
+                        scale_f = (sign ? -1 : 1) *
+                                  std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
+                                             static_cast<int>(exponent) - 15);
                     }
 
                     for (int j = 0; j < 16 && base + j < N; ++j) {
                         o_row[base + j] += a_val * static_cast<float>((qs[j] & 0x0F) - 8) * scale_f;
                     }
                     for (int j = 0; j < 16 && base + 16 + j < N; ++j) {
-                        o_row[base + 16 + j] += a_val * static_cast<float>(((qs[j] >> 4) & 0x0F) - 8) * scale_f;
+                        o_row[base + 16 + j] +=
+                            a_val * static_cast<float>(((qs[j] >> 4) & 0x0F) - 8) * scale_f;
                     }
                 }
             }
         }
     }
 }
-#endif // USE_AVX2
+#endif  // USE_AVX2
 
-} // namespace cpu
-} // namespace forge
+}  // namespace cpu
+}  // namespace forge

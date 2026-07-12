@@ -1,7 +1,7 @@
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <string>
 
 namespace forge {
 
@@ -64,4 +64,4 @@ struct ModelConfig {
     float f_final_logit_softcapping = 0.0f;
 };
 
-} // namespace forge
+}  // namespace forge

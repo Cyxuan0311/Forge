@@ -1,8 +1,9 @@
 #pragma once
 
 #include <cstdint>
-#include <vector>
 #include <memory>
+#include <vector>
+
 #include "types.h"
 
 namespace forge {
@@ -44,7 +45,7 @@ public:
     void* replace_data(void* new_data, size_t new_nbytes);
 
     static Tensor from_buffer(void* ptr, DataType dtype, const std::vector<int64_t>& shape,
-                               DeviceType device = DeviceType::CPU, bool own = false);
+                              DeviceType device = DeviceType::CPU, bool own = false);
 
 private:
     void compute_strides();
@@ -63,4 +64,4 @@ private:
 
 using TensorPtr = std::shared_ptr<Tensor>;
 
-} // namespace forge
+}  // namespace forge

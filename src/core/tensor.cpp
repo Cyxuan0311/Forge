@@ -1,11 +1,13 @@
 #include "forge/tensor.h"
-#include "forge/memory_pool.h"
+
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
-#include <algorithm>
+
+#include "forge/memory_pool.h"
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -13,15 +15,21 @@ namespace forge {
 Tensor::Tensor(DataType dtype, const std::vector<int64_t>& shape, DeviceType device)
     : shape_(shape), dtype_(dtype), device_(device) {
     numel_ = 1;
-    for (auto d : shape_) numel_ *= d;
+    for (auto d : shape_)
+        numel_ *= d;
     compute_strides();
-    if (numel_ > 0) allocate();
+    if (numel_ > 0)
+        allocate();
 }
 
 Tensor::Tensor(Tensor&& other) noexcept
-    : data_(other.data_), shape_(std::move(other.shape_)),
-      strides_(std::move(other.strides_)), dtype_(other.dtype_),
-      device_(other.device_), numel_(other.numel_), nbytes_(other.nbytes_),
+    : data_(other.data_),
+      shape_(std::move(other.shape_)),
+      strides_(std::move(other.strides_)),
+      dtype_(other.dtype_),
+      device_(other.device_),
+      numel_(other.numel_),
+      nbytes_(other.nbytes_),
       owns_data_(other.owns_data_) {
     other.data_ = nullptr;
     other.numel_ = 0;
@@ -69,11 +77,13 @@ void Tensor::allocate() {
         nbytes_ = numel_ * dtype_size(dtype_);
     }
 
-    if (nbytes_ == 0) return;
+    if (nbytes_ == 0)
+        return;
 
     if (device_ == DeviceType::CPU) {
         data_ = std::malloc(nbytes_);
-        if (!data_) throw std::runtime_error("CPU malloc failed");
+        if (!data_)
+            throw std::runtime_error("CPU malloc failed");
     } else {
 #ifdef USE_CUDA
         cudaError_t err = cudaMalloc(&data_, nbytes_);
@@ -103,7 +113,8 @@ void Tensor::release() {
 }
 
 void Tensor::zero_() {
-    if (!data_ || nbytes_ == 0) return;
+    if (!data_ || nbytes_ == 0)
+        return;
     if (device_ == DeviceType::CPU) {
         std::memset(data_, 0, nbytes_);
     } else {
@@ -114,8 +125,10 @@ void Tensor::zero_() {
 }
 
 void Tensor::copy_from(const Tensor& src) {
-    if (numel_ != src.numel_) throw std::runtime_error("Tensor size mismatch in copy_from");
-    if (dtype_ != src.dtype_) throw std::runtime_error("dtype mismatch in copy_from");
+    if (numel_ != src.numel_)
+        throw std::runtime_error("Tensor size mismatch in copy_from");
+    if (dtype_ != src.dtype_)
+        throw std::runtime_error("dtype mismatch in copy_from");
 
     if (device_ == DeviceType::CPU && src.device_ == DeviceType::CPU) {
         std::memcpy(data_, src.data_, nbytes_);
@@ -135,7 +148,8 @@ void Tensor::copy_from(const Tensor& src) {
 }
 
 void Tensor::to_device(DeviceType target) {
-    if (device_ == target) return;
+    if (device_ == target)
+        return;
 
     Tensor new_tensor(dtype_, shape_, target);
     new_tensor.copy_from(*this);
@@ -176,7 +190,8 @@ Tensor Tensor::view(const std::vector<int64_t>& new_shape) const {
     t.dtype_ = dtype_;
     t.device_ = device_;
     t.numel_ = 1;
-    for (auto d : new_shape) t.numel_ *= d;
+    for (auto d : new_shape)
+        t.numel_ *= d;
     t.compute_strides();
     t.nbytes_ = nbytes_;
     t.owns_data_ = false;
@@ -217,7 +232,7 @@ Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end) const {
 }
 
 Tensor Tensor::from_buffer(void* ptr, DataType dtype, const std::vector<int64_t>& shape,
-                            DeviceType device, bool own) {
+                           DeviceType device, bool own) {
     Tensor t;
     t.data_ = ptr;
     t.dtype_ = dtype;
@@ -225,7 +240,8 @@ Tensor Tensor::from_buffer(void* ptr, DataType dtype, const std::vector<int64_t>
     t.device_ = device;
     t.owns_data_ = own;
     t.numel_ = 1;
-    for (auto d : shape) t.numel_ *= d;
+    for (auto d : shape)
+        t.numel_ *= d;
     t.compute_strides();
     if (is_quantized_type(dtype)) {
         t.nbytes_ = compute_quantized_bytes(t.numel_, dtype);
@@ -235,4 +251,4 @@ Tensor Tensor::from_buffer(void* ptr, DataType dtype, const std::vector<int64_t>
     return t;
 }
 
-} // namespace forge
+}  // namespace forge

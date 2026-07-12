@@ -1,10 +1,11 @@
 #pragma once
 
-#include "forge/compute_graph.h"
-#include "forge/model.h"
-#include "forge/kv_cache.h"
-#include <string>
 #include <memory>
+#include <string>
+
+#include "forge/compute_graph.h"
+#include "forge/kv_cache.h"
+#include "forge/model.h"
 
 namespace forge {
 
@@ -39,15 +40,9 @@ public:
      * @param kv_cache   KV cache for attention
      * @return Index of the output node in the graph
      */
-    virtual int build_layer_graph(ComputeGraph& graph,
-                                  int hidden_idx,
-                                  const LayerWeights& lw,
-                                  const ModelConfig& cfg,
-                                  int layer_idx,
-                                  int seq_len,
-                                  int64_t start_pos,
-                                  DeviceType dev,
-                                  KVCache& kv_cache) = 0;
+    virtual int build_layer_graph(ComputeGraph& graph, int hidden_idx, const LayerWeights& lw,
+                                  const ModelConfig& cfg, int layer_idx, int seq_len,
+                                  int64_t start_pos, DeviceType dev, KVCache& kv_cache) = 0;
 
     /**
      * Build the output head graph (output norm + projection).
@@ -58,9 +53,7 @@ public:
      * @param cfg         Model configuration
      * @return Index of the output node
      */
-    virtual int build_output_graph(ComputeGraph& graph,
-                                   int hidden_idx,
-                                   const ModelWeights& weights,
+    virtual int build_output_graph(ComputeGraph& graph, int hidden_idx, const ModelWeights& weights,
                                    const ModelConfig& cfg) = 0;
 };
 
@@ -89,4 +82,4 @@ struct GraphBuilderAutoRegister {
 #define FORGE_REGISTER_GRAPH_BUILDER(arch, creator) \
     static ::forge::GraphBuilderAutoRegister _graph_reg_##arch(#arch, creator)
 
-} // namespace forge
+}  // namespace forge

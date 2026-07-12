@@ -39,7 +39,9 @@ void register_backend(py::module_& m) {
         .def("backend_info_list", &BackendManager::backend_info_list)
         .def("available_devices", &BackendManager::available_devices)
         .def("has_backend", &BackendManager::has_backend, py::arg("name"))
-        .def("get_backend", (std::shared_ptr<Backend>(BackendManager::*)(const std::string&, int)) &BackendManager::get_backend,
+        .def("get_backend",
+             (std::shared_ptr<Backend>(BackendManager::*)(const std::string&, int)) &
+                 BackendManager::get_backend,
              py::arg("name"), py::arg("device_id") = 0)
         .def("has_cuda", &BackendManager::has_cuda)
         .def("cuda_device_count", &BackendManager::cuda_device_count);

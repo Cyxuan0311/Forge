@@ -1,18 +1,19 @@
-#include "forge/operator_elementwise.h"
-#include "forge/cuda_kernels.h"
-#include "forge/perf_profiler.h"
-#include "forge/op_dispatch.h"
-#include <stdexcept>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <algorithm>
+#include <stdexcept>
+
+#include "forge/cuda_kernels.h"
+#include "forge/op_dispatch.h"
+#include "forge/operator_elementwise.h"
+#include "forge/perf_profiler.h"
 
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -25,8 +26,8 @@ TensorPtr add(const TensorPtr& a, const TensorPtr& b) {
     if (a->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         cuda::launch_add_bias(static_cast<const float*>(a->data()),
-                               static_cast<const float*>(b->data()),
-                               static_cast<float*>(out->data()), n);
+                              static_cast<const float*>(b->data()),
+                              static_cast<float*>(out->data()), n);
 #endif
     } else {
         PERF_SCOPE("add/cpu");
@@ -40,7 +41,8 @@ TensorPtr add(const TensorPtr& a, const TensorPtr& b) {
             __m256 bv = _mm256_loadu_ps(b_data + i);
             _mm256_storeu_ps(o_data + i, _mm256_add_ps(av, bv));
         }
-        for (; i < n; ++i) o_data[i] = a_data[i] + b_data[i];
+        for (; i < n; ++i)
+            o_data[i] = a_data[i] + b_data[i];
 #else
         for (int i = 0; i < n; ++i) {
             o_data[i] = a_data[i] + b_data[i];
@@ -57,8 +59,8 @@ TensorPtr multiply(const TensorPtr& a, const TensorPtr& b) {
     if (a->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         cuda::launch_multiply(static_cast<const float*>(a->data()),
-                               static_cast<const float*>(b->data()),
-                               static_cast<float*>(out->data()), n);
+                              static_cast<const float*>(b->data()),
+                              static_cast<float*>(out->data()), n);
 #endif
     } else {
         PERF_SCOPE("multiply/cpu");
@@ -72,7 +74,8 @@ TensorPtr multiply(const TensorPtr& a, const TensorPtr& b) {
             __m256 bv = _mm256_loadu_ps(b_data + i);
             _mm256_storeu_ps(o_data + i, _mm256_mul_ps(av, bv));
         }
-        for (; i < n; ++i) o_data[i] = a_data[i] * b_data[i];
+        for (; i < n; ++i)
+            o_data[i] = a_data[i] * b_data[i];
 #else
         for (int i = 0; i < n; ++i) {
             o_data[i] = a_data[i] * b_data[i];
@@ -89,8 +92,8 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
     if (gate->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         cuda::launch_silu_multiply(static_cast<const float*>(gate->data()),
-                                    static_cast<const float*>(up->data()),
-                                    static_cast<float*>(out->data()), n);
+                                   static_cast<const float*>(up->data()),
+                                   static_cast<float*>(out->data()), n);
 #endif
     } else {
         PERF_SCOPE("silu_multiply/cpu");
@@ -108,7 +111,7 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
 
             // Cephes-style exp: exp(x) = 2^(x/ln2)
             // Split x/ln2 into integer (n) and fractional (f) parts
-            __m256 x = _mm256_mul_ps(neg_gv, _mm256_set1_ps(1.4426950408889634f)); // 1/ln2
+            __m256 x = _mm256_mul_ps(neg_gv, _mm256_set1_ps(1.4426950408889634f));  // 1/ln2
             // floor using cvtt + compare trick (AVX2 compatible)
             __m256i emm0 = _mm256_cvttps_epi32(x);
             __m256 z = _mm256_cvtepi32_ps(emm0);
@@ -116,7 +119,7 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
             __m256 mask = _mm256_cmp_ps(x, z, _MM_CMPINT_LT);
             z = _mm256_sub_ps(z, _mm256_and_ps(mask, _mm256_set1_ps(1.0f)));
             emm0 = _mm256_cvttps_epi32(z);
-            __m256 f = _mm256_sub_ps(x, z); // f in [0, 1)
+            __m256 f = _mm256_sub_ps(x, z);  // f in [0, 1)
 
             // Build 2^n from integer exponent
             emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(127));
@@ -126,12 +129,12 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
             // Cephes 6th-order polynomial for 2^f, f in [0, 1)
             // Coefficients from Cephes exp.c / cephes-pow2f
             __m256 P0 = _mm256_set1_ps(1.0f);
-            __m256 P1 = _mm256_set1_ps(0.6931471805599453f);   // ln2
-            __m256 P2 = _mm256_set1_ps(0.2402265069591007f);    // ln2^2/2
-            __m256 P3 = _mm256_set1_ps(0.05549525927235975f);   // ln2^3/6
-            __m256 P4 = _mm256_set1_ps(0.009608917886916534f);  // ln2^4/24
-            __m256 P5 = _mm256_set1_ps(0.001333355814681543f);  // ln2^5/120
-            __m256 P6 = _mm256_set1_ps(0.0001540353039338152f); // ln2^6/720
+            __m256 P1 = _mm256_set1_ps(0.6931471805599453f);     // ln2
+            __m256 P2 = _mm256_set1_ps(0.2402265069591007f);     // ln2^2/2
+            __m256 P3 = _mm256_set1_ps(0.05549525927235975f);    // ln2^3/6
+            __m256 P4 = _mm256_set1_ps(0.009608917886916534f);   // ln2^4/24
+            __m256 P5 = _mm256_set1_ps(0.001333355814681543f);   // ln2^5/120
+            __m256 P6 = _mm256_set1_ps(0.0001540353039338152f);  // ln2^6/720
 
             // Horner's method: P0 + f*(P1 + f*(P2 + f*(P3 + f*(P4 + f*(P5 + f*P6)))))
             __m256 poly = _mm256_add_ps(P5, _mm256_mul_ps(f, P6));
@@ -165,7 +168,8 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
 TensorPtr softmax(const TensorPtr& x, float temperature) {
     auto out = std::make_shared<Tensor>(DataType::FP32, x->shape(), x->device());
 
-    if (x->ndim() != 2) throw std::runtime_error("softmax expects 2D input");
+    if (x->ndim() != 2)
+        throw std::runtime_error("softmax expects 2D input");
     int rows = static_cast<int>(x->shape()[0]);
     int cols = static_cast<int>(x->shape()[1]);
 
@@ -200,15 +204,15 @@ TensorPtr softmax(const TensorPtr& x, float temperature) {
 
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cudaMemcpy(static_cast<float*>(out->data()), o_data,
-                   x->numel() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<float*>(out->data()), o_data, x->numel() * sizeof(float),
+                   cudaMemcpyHostToDevice);
 #endif
     }
 
     return out;
 }
 
-} // namespace ops
+}  // namespace ops
 
 namespace {
 __attribute__((constructor)) void register_elementwise_ops() {
@@ -216,34 +220,36 @@ __attribute__((constructor)) void register_elementwise_ops() {
 
     // ADD: inputs[0] = a, inputs[1] = b
     dispatch.register_kernel(OpType::ADD, DeviceType::CPU,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::add(inputs[0], inputs[1]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::add(inputs[0], inputs[1]);
+                             });
 
     dispatch.register_kernel(OpType::ADD, DeviceType::CUDA,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::add(inputs[0], inputs[1]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::add(inputs[0], inputs[1]);
+                             });
 
     // MUL: inputs[0] = a, inputs[1] = b
     dispatch.register_kernel(OpType::MUL, DeviceType::CPU,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::multiply(inputs[0], inputs[1]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::multiply(inputs[0], inputs[1]);
+                             });
 
     dispatch.register_kernel(OpType::MUL, DeviceType::CUDA,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::multiply(inputs[0], inputs[1]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::multiply(inputs[0], inputs[1]);
+                             });
 
     // SOFT_MAX: inputs[0] = x, op_params[0] = float temperature (bit-cast)
-    dispatch.register_kernel(OpType::SOFT_MAX, DeviceType::CPU,
+    dispatch.register_kernel(
+        OpType::SOFT_MAX, DeviceType::CPU,
         [](const std::vector<TensorPtr>& inputs, const int32_t* params) -> TensorPtr {
             float temp = 1.0f;
-            if (params) std::memcpy(&temp, params, sizeof(temp));
+            if (params)
+                std::memcpy(&temp, params, sizeof(temp));
             return ops::softmax(inputs[0], temp);
         });
 }
-}
+}  // namespace
 
-} // namespace forge
+}  // namespace forge

@@ -1,29 +1,30 @@
 #include "forge/engines/transformer_engine.h"
-#include "forge/operators.h"
-#include "forge/cuda_kernels.h"
-#include "forge/logger.h"
-#include "forge/perf_profiler.h"
-#include "forge/backend_scheduler.h"
-#include <cmath>
-#include <cstring>
-#include <cstdio>
+
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
+#include "forge/backend_scheduler.h"
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/operators.h"
+#include "forge/perf_profiler.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 namespace forge {
 
 TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
-    : model_(model), ctx_(ctx), workspace_pool_(model.device()) {
-}
+    : model_(model), ctx_(ctx), workspace_pool_(model.device()) {}
 
 void TransformerEngine::reset() {
     kv_cache_.reset();
@@ -48,18 +49,21 @@ void TransformerEngine::set_gpu_layers(int gpu_layers) {
     DeviceType last_dev = layer_device(num_layers - 1);
     weights_.move_output_weights(last_dev);
 
-    LOG_INFO("CPU offload configured: gpu_layers=" + std::to_string(gpu_layers) +
-             "/" + std::to_string(num_layers));
+    LOG_INFO("CPU offload configured: gpu_layers=" + std::to_string(gpu_layers) + "/" +
+             std::to_string(num_layers));
 }
 
 DeviceType TransformerEngine::layer_device(int layer_idx) const {
-    if (gpu_layers_ < 0) return model_.device();
-    if (layer_idx < gpu_layers_) return DeviceType::CUDA;
+    if (gpu_layers_ < 0)
+        return model_.device();
+    if (layer_idx < gpu_layers_)
+        return DeviceType::CUDA;
     return DeviceType::CPU;
 }
 
 TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceType target) const {
-    if (hidden->device() == target) return hidden;
+    if (hidden->device() == target)
+        return hidden;
     auto transferred = std::make_shared<Tensor>(hidden->dtype(), hidden->shape(), target);
     transferred->copy_from(*hidden);
     return transferred;
@@ -105,33 +109,34 @@ TensorPtr TransformerEngine::forward_from_hidden(const TensorPtr& hidden, int64_
 }
 
 void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
-    if (kv_cache_initialized_) return;
+    if (kv_cache_initialized_)
+        return;
 
     int kv_max_seq = cfg.max_seq_len;
     const int KV_MAX_SEQ_CAP = 4096;
     if (kv_max_seq > KV_MAX_SEQ_CAP) {
-        LOG_INFO("Capping KV cache max_seq_len from " + std::to_string(kv_max_seq) +
-                 " to " + std::to_string(KV_MAX_SEQ_CAP) + " to avoid OOM");
+        LOG_INFO("Capping KV cache max_seq_len from " + std::to_string(kv_max_seq) + " to " +
+                 std::to_string(KV_MAX_SEQ_CAP) + " to avoid OOM");
         kv_max_seq = KV_MAX_SEQ_CAP;
     }
 
     DeviceType kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
-    LOG_INFO("KV cache init: layers=" + std::to_string(cfg.num_layers) +
-             ", kv_heads=" + std::to_string(cfg.num_kv_heads) +
-             ", head_dim=" + std::to_string(cfg.head_dim) +
+    LOG_INFO("KV cache init: layers=" + std::to_string(cfg.num_layers) + ", kv_heads=" +
+             std::to_string(cfg.num_kv_heads) + ", head_dim=" + std::to_string(cfg.head_dim) +
              ", max_seq_len=" + std::to_string(kv_max_seq) +
              ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU"));
-    size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq *
-                      cfg.num_kv_heads * cfg.head_dim * sizeof(float);
-    LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024*1024)) + " MB");
-    kv_cache_.init_quantized(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim,
-                             kv_max_seq, kv_dev, kv_cache_dtype_);
+    size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
+                      cfg.head_dim * sizeof(float);
+    LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024 * 1024)) + " MB");
+    kv_cache_.init_quantized(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq, kv_dev,
+                             kv_cache_dtype_);
     kv_cache_initialized_ = true;
     LOG_INFO("KV cache initialized successfully, actual size: " +
-             std::to_string(kv_cache_.nbytes() / (1024*1024)) + " MB");
+             std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
 }
 
-TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len, int64_t start_pos) {
+TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len,
+                                            int64_t start_pos) {
     // Try graph-based execution if a graph builder is available
     if (use_graph_ && graph_builder_) {
         return forward_layers_graph(hidden, seq_len, start_pos);
@@ -146,7 +151,8 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
             LOG_INFO("Using graph-based execution for arch: " + cfg.arch_type);
             return forward_layers_graph(hidden, seq_len, start_pos);
         } else {
-            LOG_WARN("No graph builder for arch: " + cfg.arch_type + ", falling back to imperative mode");
+            LOG_WARN("No graph builder for arch: " + cfg.arch_type +
+                     ", falling back to imperative mode");
             use_graph_ = false;
         }
     }
@@ -195,13 +201,11 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
             output_weight->dtype() == DataType::Q4_0 && seq_len == 1) {
             int K = static_cast<int>(output_weight->shape()[1]);
             int N = static_cast<int>(output_weight->shape()[0]);
-            logits = std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{1, N}, DeviceType::CUDA);
-            cuda::launch_output_proj_q4_0(
-                static_cast<const float*>(cur_hidden->data()),
-                output_weight->data(),
-                static_cast<float*>(logits->data()),
-                K, N);
+            logits = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N},
+                                              DeviceType::CUDA);
+            cuda::launch_output_proj_q4_0(static_cast<const float*>(cur_hidden->data()),
+                                          output_weight->data(),
+                                          static_cast<float*>(logits->data()), K, N);
         } else {
             logits = ops::matmul_transB(cur_hidden, output_weight);
         }
@@ -215,7 +219,8 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
     return logits;
 }
 
-TensorPtr TransformerEngine::forward_layers_graph(const TensorPtr& hidden, int seq_len, int64_t start_pos) {
+TensorPtr TransformerEngine::forward_layers_graph(const TensorPtr& hidden, int seq_len,
+                                                  int64_t start_pos) {
     const auto& cfg = model_.config();
     auto t0 = std::chrono::steady_clock::now();
 
@@ -229,8 +234,8 @@ TensorPtr TransformerEngine::forward_layers_graph(const TensorPtr& hidden, int s
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
         DeviceType layer_dev = layer_device(layer);
         const auto& lw = weights_.layers[layer];
-        cur_idx = graph_builder_->build_layer_graph(
-            graph, cur_idx, lw, cfg, layer, seq_len, start_pos, layer_dev, kv_cache_);
+        cur_idx = graph_builder_->build_layer_graph(graph, cur_idx, lw, cfg, layer, seq_len,
+                                                    start_pos, layer_dev, kv_cache_);
     }
 
     // Build output head graph
@@ -250,17 +255,17 @@ TensorPtr TransformerEngine::forward_layers_graph(const TensorPtr& hidden, int s
 
     auto t1 = std::chrono::steady_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    LOG_INFO("Forward (graph) total: " + std::to_string((int)total_ms) + "ms (seq_len=" +
-             std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos) +
+    LOG_INFO("Forward (graph) total: " + std::to_string((int)total_ms) +
+             "ms (seq_len=" + std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos) +
              ", nodes=" + std::to_string(graph.num_nodes()) + ")");
 
     return result;
 }
 
-void TransformerEngine::apply_rope_standard(const float* q_data, const float* k_data,
-                                            float* q_out, float* k_out,
-                                            int seq_len, int num_heads, int num_kv_heads,
-                                            int head_dim, int64_t start_pos, float theta) {
+void TransformerEngine::apply_rope_standard(const float* q_data, const float* k_data, float* q_out,
+                                            float* k_out, int seq_len, int num_heads,
+                                            int num_kv_heads, int head_dim, int64_t start_pos,
+                                            float theta) {
     int half_dim = head_dim / 2;
     int q_stride = num_heads * head_dim;
     int k_stride = num_kv_heads * head_dim;
@@ -293,24 +298,23 @@ void TransformerEngine::apply_rope_standard(const float* q_data, const float* k_
 TensorPtr TransformerEngine::expand_kv_heads(const TensorPtr& kv, int seq_len, int num_heads,
                                              int num_kv_heads, int head_dim, DeviceType dev) {
     int kv_groups = num_heads / num_kv_heads;
-    auto expanded = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{seq_len, num_heads * head_dim}, dev);
+    auto expanded = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, dev);
 
     if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cuda::launch_expand_kv(
-            static_cast<const float*>(kv->data()),
-            static_cast<float*>(expanded->data()),
-            seq_len, num_heads, num_kv_heads, head_dim);
+        cuda::launch_expand_kv(static_cast<const float*>(kv->data()),
+                               static_cast<float*>(expanded->data()), seq_len, num_heads,
+                               num_kv_heads, head_dim);
 #endif
     } else {
         const float* kv_data = static_cast<const float*>(kv->data());
         float* out_data = static_cast<float*>(expanded->data());
 #ifdef USE_AVX2
-        // Vectorized expand: copy each KV head to all query heads in its group.
-        // For TinyLlama: kv_groups=8, head_dim=64 (8 AVX2 vectors per head).
-        // Process all seq_len positions, each KV head is replicated kv_groups times.
-        #pragma omp parallel for schedule(static)
+// Vectorized expand: copy each KV head to all query heads in its group.
+// For TinyLlama: kv_groups=8, head_dim=64 (8 AVX2 vectors per head).
+// Process all seq_len positions, each KV head is replicated kv_groups times.
+#    pragma omp parallel for schedule(static)
         for (int s = 0; s < seq_len; ++s) {
             const float* kv_row = kv_data + s * num_kv_heads * head_dim;
             float* out_row = out_data + s * num_heads * head_dim;
@@ -348,4 +352,4 @@ TensorPtr TransformerEngine::expand_kv_heads(const TensorPtr& kv, int seq_len, i
     return expanded;
 }
 
-} // namespace forge
+}  // namespace forge

@@ -1,15 +1,18 @@
 #include "forge/memory_planner.h"
-#include "forge/compute_graph.h"
-#include "forge/types.h"
-#include "forge/logger.h"
+
 #include <algorithm>
 #include <cstring>
+
+#include "forge/compute_graph.h"
+#include "forge/logger.h"
+#include "forge/types.h"
 
 namespace forge {
 
 size_t MemoryPlanner::estimate_output_size(const GraphNode& node,
-                                            const std::vector<TensorPtr>& graph_inputs) {
-    if (node.input_indices.empty()) return 0;
+                                           const std::vector<TensorPtr>& graph_inputs) {
+    if (node.input_indices.empty())
+        return 0;
 
     if (node.compute_fn) {
         // Legacy compute_fn closures: can't estimate; allocate dynamically
@@ -19,7 +22,8 @@ size_t MemoryPlanner::estimate_output_size(const GraphNode& node,
     // For OpDispatch nodes, try to resolve first input's size
     TensorPtr first_input;
     int first_idx = node.input_indices[0];
-    if (first_idx >= 0 && first_idx < static_cast<int>(graph_inputs.size()) && graph_inputs[first_idx]) {
+    if (first_idx >= 0 && first_idx < static_cast<int>(graph_inputs.size()) &&
+        graph_inputs[first_idx]) {
         first_input = graph_inputs[first_idx];
     }
 
@@ -33,43 +37,46 @@ size_t MemoryPlanner::estimate_output_size(const GraphNode& node,
     size_t input_size = first_input->nbytes();
 
     switch (node.op_type) {
-        case OpType::ADD:
-        case OpType::MUL:
-        case OpType::SILU:
-        case OpType::RMS_NORM:
-        case OpType::ROPE:
-            return input_size;
+    case OpType::ADD:
+    case OpType::MUL:
+    case OpType::SILU:
+    case OpType::RMS_NORM:
+    case OpType::ROPE:
+        return input_size;
 
-        case OpType::MUL_MAT_TRANSB: {
-            // Output = (rows, N) where N = weight shape[0], rows = input[0] rows
-            if (node.input_indices.size() < 2) return 0;
-            int w_idx = node.input_indices[1];
-            if (w_idx >= 0 && w_idx < static_cast<int>(graph_inputs.size()) && graph_inputs[w_idx]) {
-                auto weight = graph_inputs[w_idx];
-                int64_t rows = first_input->shape()[0];
-                int64_t cols = weight->shape()[0];
-                return static_cast<size_t>(rows * cols * sizeof(float));
-            }
+    case OpType::MUL_MAT_TRANSB: {
+        // Output = (rows, N) where N = weight shape[0], rows = input[0] rows
+        if (node.input_indices.size() < 2)
             return 0;
+        int w_idx = node.input_indices[1];
+        if (w_idx >= 0 && w_idx < static_cast<int>(graph_inputs.size()) && graph_inputs[w_idx]) {
+            auto weight = graph_inputs[w_idx];
+            int64_t rows = first_input->shape()[0];
+            int64_t cols = weight->shape()[0];
+            return static_cast<size_t>(rows * cols * sizeof(float));
         }
+        return 0;
+    }
 
-        case OpType::FLASH_ATTN_GQA: {
-            // Need Q shape + num_heads/head_dim from params
-            if (!node.op_params) return 0;
-            int num_heads = node.op_params[0];
-            int head_dim = node.op_params[2];
-            int64_t seq_len_q = first_input->shape()[0];
-            return static_cast<size_t>(seq_len_q * num_heads * head_dim * sizeof(float));
-        }
+    case OpType::FLASH_ATTN_GQA: {
+        // Need Q shape + num_heads/head_dim from params
+        if (!node.op_params)
+            return 0;
+        int num_heads = node.op_params[0];
+        int head_dim = node.op_params[2];
+        int64_t seq_len_q = first_input->shape()[0];
+        return static_cast<size_t>(seq_len_q * num_heads * head_dim * sizeof(float));
+    }
 
-        default:
-            return input_size;
+    default:
+        return input_size;
     }
 }
 
 void MemoryPlanner::plan(const ComputeGraph& graph, bool release_intermediates) {
     int n_nodes = graph.num_nodes();
-    if (n_nodes == 0) return;
+    if (n_nodes == 0)
+        return;
 
     // Step 1: Collect output sizes and build consumer lists
     struct NodeAllocInfo {
@@ -118,8 +125,7 @@ void MemoryPlanner::plan(const ComputeGraph& graph, bool release_intermediates) 
             // No consumers: either graph output or dead node
             info.lifetime_end = info.is_output ? n_nodes - 1 : i;
         } else {
-            info.lifetime_end = *std::max_element(
-                info.consumers.begin(), info.consumers.end());
+            info.lifetime_end = *std::max_element(info.consumers.begin(), info.consumers.end());
         }
     }
 
@@ -146,9 +152,11 @@ void MemoryPlanner::plan(const ComputeGraph& graph, bool release_intermediates) 
 
     for (int i = 0; i < n_nodes; ++i) {
         const auto& info = node_info[i];
-        if (info.size == 0) continue;
+        if (info.size == 0)
+            continue;
         // Skip nodes that are just compute_fn wrappers (OpType::CUSTOM with size 0)
-        if (info.lifetime_begin < 0) continue;
+        if (info.lifetime_begin < 0)
+            continue;
 
         PlannedAllocation alloc;
         alloc.node_idx = i;
@@ -164,10 +172,11 @@ void MemoryPlanner::plan(const ComputeGraph& graph, bool release_intermediates) 
     // Step 6: Sort by size descending, then lifetime_begin ascending
     // This is a simple heuristic: allocate largest tensors first to minimize fragmentation.
     std::sort(allocations_.begin(), allocations_.end(),
-        [](const PlannedAllocation& a, const PlannedAllocation& b) {
-            if (a.size != b.size) return a.size > b.size;
-            return a.lifetime_begin < b.lifetime_begin;
-        });
+              [](const PlannedAllocation& a, const PlannedAllocation& b) {
+                  if (a.size != b.size)
+                      return a.size > b.size;
+                  return a.lifetime_begin < b.lifetime_begin;
+              });
 
     // Step 7: Interval allocation
     free_regions_.clear();
@@ -181,8 +190,8 @@ void MemoryPlanner::plan(const ComputeGraph& graph, bool release_intermediates) 
     }
 
     LOG_INFO("MemoryPlanner: planned " + std::to_string(allocations_.size()) +
-             " allocations, total buffer = " + std::to_string(total_size_) +
-             " bytes (" + std::to_string(total_size_ / (1024*1024)) + " MB)");
+             " allocations, total buffer = " + std::to_string(total_size_) + " bytes (" +
+             std::to_string(total_size_ / (1024 * 1024)) + " MB)");
 }
 
 size_t MemoryPlanner::allocate_offset(size_t size) {
@@ -223,7 +232,8 @@ size_t MemoryPlanner::allocate_offset(size_t size) {
 
 const PlannedAllocation* MemoryPlanner::get_allocation(int node_idx) const {
     for (const auto& alloc : allocations_) {
-        if (alloc.node_idx == node_idx) return &alloc;
+        if (alloc.node_idx == node_idx)
+            return &alloc;
     }
     return nullptr;
 }
@@ -247,9 +257,7 @@ GraphBuffer::~GraphBuffer() {
 }
 
 GraphBuffer::GraphBuffer(GraphBuffer&& other) noexcept
-    : backend_(std::move(other.backend_)),
-      data_(other.data_),
-      size_(other.size_) {
+    : backend_(std::move(other.backend_)), data_(other.data_), size_(other.size_) {
     other.data_ = nullptr;
     other.size_ = 0;
 }
@@ -268,4 +276,4 @@ GraphBuffer& GraphBuffer::operator=(GraphBuffer&& other) noexcept {
     return *this;
 }
 
-} // namespace forge
+}  // namespace forge

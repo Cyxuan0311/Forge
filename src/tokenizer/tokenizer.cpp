@@ -1,13 +1,15 @@
 #include "forge/tokenizer.h"
-#include "forge/logger.h"
-#include <cstring>
+
 #include <algorithm>
-#include <sstream>
 #include <cctype>
-#include <regex>
+#include <cstring>
 #include <limits>
-#include <queue>
 #include <map>
+#include <queue>
+#include <regex>
+#include <sstream>
+
+#include "forge/logger.h"
 
 namespace forge {
 
@@ -20,20 +22,29 @@ uint32_t Tokenizer::utf8_to_unicode(const std::string& text, size_t& offset) {
         offset += 1;
         return b0;
     } else if ((b0 & 0xE0) == 0xC0) {
-        if (offset + 1 >= text.size()) { offset = text.size(); return 0xFFFD; }
+        if (offset + 1 >= text.size()) {
+            offset = text.size();
+            return 0xFFFD;
+        }
         uint32_t cp = (b0 & 0x1F) << 6;
         cp |= (static_cast<uint8_t>(text[offset + 1]) & 0x3F);
         offset += 2;
         return cp;
     } else if ((b0 & 0xF0) == 0xE0) {
-        if (offset + 2 >= text.size()) { offset = text.size(); return 0xFFFD; }
+        if (offset + 2 >= text.size()) {
+            offset = text.size();
+            return 0xFFFD;
+        }
         uint32_t cp = (b0 & 0x0F) << 12;
         cp |= (static_cast<uint8_t>(text[offset + 1]) & 0x3F) << 6;
         cp |= (static_cast<uint8_t>(text[offset + 2]) & 0x3F);
         offset += 3;
         return cp;
     } else if ((b0 & 0xF8) == 0xF0) {
-        if (offset + 3 >= text.size()) { offset = text.size(); return 0xFFFD; }
+        if (offset + 3 >= text.size()) {
+            offset = text.size();
+            return 0xFFFD;
+        }
         uint32_t cp = (b0 & 0x07) << 18;
         cp |= (static_cast<uint8_t>(text[offset + 1]) & 0x3F) << 12;
         cp |= (static_cast<uint8_t>(text[offset + 2]) & 0x3F) << 6;
@@ -67,13 +78,13 @@ std::string Tokenizer::unicode_to_utf8(uint32_t cp) {
 }
 
 bool Tokenizer::is_word_char(uint32_t cp) {
-    return (cp >= 0x4E00 && cp <= 0x9FFF) ||   // CJK Unified Ideographs
-           (cp >= 0x3400 && cp <= 0x4DBF) ||   // CJK Extension A
-           (cp >= 0x20000 && cp <= 0x2A6DF) || // CJK Extension B
-           (cp >= 0x3000 && cp <= 0x303F) ||   // CJK Symbols
-           (cp >= 0x3040 && cp <= 0x309F) ||   // Hiragana
-           (cp >= 0x30A0 && cp <= 0x30FF) ||   // Katakana
-           (cp >= 0xAC00 && cp <= 0xD7AF);     // Hangul
+    return (cp >= 0x4E00 && cp <= 0x9FFF) ||    // CJK Unified Ideographs
+           (cp >= 0x3400 && cp <= 0x4DBF) ||    // CJK Extension A
+           (cp >= 0x20000 && cp <= 0x2A6DF) ||  // CJK Extension B
+           (cp >= 0x3000 && cp <= 0x303F) ||    // CJK Symbols
+           (cp >= 0x3040 && cp <= 0x309F) ||    // Hiragana
+           (cp >= 0x30A0 && cp <= 0x30FF) ||    // Katakana
+           (cp >= 0xAC00 && cp <= 0xD7AF);      // Hangul
 }
 
 // ===== GGUF metadata reader =====
@@ -83,15 +94,15 @@ struct GgufMetaReader {
     size_t size;
     size_t offset;
 
-    bool check(size_t n) const {
-        return offset + n <= size;
-    }
+    bool check(size_t n) const { return offset + n <= size; }
 
     std::string read_str() {
-        if (!check(8)) return "";
+        if (!check(8))
+            return "";
         uint64_t len;
         std::memcpy(&len, data + offset, 8);
-        if (len > size - offset - 8) return "";
+        if (len > size - offset - 8)
+            return "";
         offset += 8;
         std::string s(reinterpret_cast<const char*>(data + offset), len);
         offset += len;
@@ -99,54 +110,81 @@ struct GgufMetaReader {
     }
 
     uint32_t read_u32() {
-        if (!check(4)) return 0;
+        if (!check(4))
+            return 0;
         uint32_t v;
-        std::memcpy(&v, data + offset, 4); offset += 4;
+        std::memcpy(&v, data + offset, 4);
+        offset += 4;
         return v;
     }
 
     int32_t read_i32() {
-        if (!check(4)) return 0;
+        if (!check(4))
+            return 0;
         int32_t v;
-        std::memcpy(&v, data + offset, 4); offset += 4;
+        std::memcpy(&v, data + offset, 4);
+        offset += 4;
         return v;
     }
 
     uint64_t read_u64() {
-        if (!check(8)) return 0;
+        if (!check(8))
+            return 0;
         uint64_t v;
-        std::memcpy(&v, data + offset, 8); offset += 8;
+        std::memcpy(&v, data + offset, 8);
+        offset += 8;
         return v;
     }
 
     float read_f32() {
-        if (!check(4)) return 0.0f;
+        if (!check(4))
+            return 0.0f;
         float v;
-        std::memcpy(&v, data + offset, 4); offset += 4;
+        std::memcpy(&v, data + offset, 4);
+        offset += 4;
         return v;
     }
 
     void skip_value(uint32_t vtype) {
         switch (vtype) {
-            case 0: case 1: case 7: offset += 1; break;
-            case 2: case 3: offset += 2; break;
-            case 4: case 5: case 6: offset += 4; break;
-            case 10: case 12: offset += 8; break;
-            case 8: read_str(); break;
-            case 9: {
-                uint32_t arr_type = read_u32();
-                uint64_t arr_len = read_u64();
-                static const int type_sizes[] = {1,1,2,2,4,4,4,1,0,0,8,4,8};
-                if (arr_type == 8) {
-                    for (uint64_t j = 0; j < arr_len; ++j) read_str();
-                } else if (arr_type < 13) {
-                    offset += arr_len * type_sizes[arr_type];
-                } else {
-                    offset += arr_len * 4;
-                }
-                break;
+        case 0:
+        case 1:
+        case 7:
+            offset += 1;
+            break;
+        case 2:
+        case 3:
+            offset += 2;
+            break;
+        case 4:
+        case 5:
+        case 6:
+            offset += 4;
+            break;
+        case 10:
+        case 12:
+            offset += 8;
+            break;
+        case 8:
+            read_str();
+            break;
+        case 9: {
+            uint32_t arr_type = read_u32();
+            uint64_t arr_len = read_u64();
+            static const int type_sizes[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 4, 8};
+            if (arr_type == 8) {
+                for (uint64_t j = 0; j < arr_len; ++j)
+                    read_str();
+            } else if (arr_type < 13) {
+                offset += arr_len * type_sizes[arr_type];
+            } else {
+                offset += arr_len * 4;
             }
-            default: offset += 8; break;
+            break;
+        }
+        default:
+            offset += 8;
+            break;
         }
     }
 };
@@ -318,22 +356,23 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
     // Set default special token IDs if not found
     if (bos_id_ < 0) {
         auto it = vocab_.token_to_id.find("<s>");
-        if (it != vocab_.token_to_id.end()) bos_id_ = it->second;
+        if (it != vocab_.token_to_id.end())
+            bos_id_ = it->second;
     }
     if (eos_id_ < 0) {
         auto it = vocab_.token_to_id.find("</s>");
-        if (it != vocab_.token_to_id.end()) eos_id_ = it->second;
+        if (it != vocab_.token_to_id.end())
+            eos_id_ = it->second;
     }
     if (unk_id_ < 0) {
         auto it = vocab_.token_to_id.find("<unk>");
-        if (it != vocab_.token_to_id.end()) unk_id_ = it->second;
+        if (it != vocab_.token_to_id.end())
+            unk_id_ = it->second;
     }
 
-    LOG_INFO("Tokenizer loaded: model=" + tok_model +
-             " vocab_size=" + std::to_string(vocab_.tokens.size()) +
-             " bos=" + std::to_string(bos_id_) +
-             " eos=" + std::to_string(eos_id_) +
-             " merges=" + std::to_string(tok_merges.size()));
+    LOG_INFO("Tokenizer loaded: model=" + tok_model + " vocab_size=" +
+             std::to_string(vocab_.tokens.size()) + " bos=" + std::to_string(bos_id_) +
+             " eos=" + std::to_string(eos_id_) + " merges=" + std::to_string(tok_merges.size()));
 
     loaded_ = true;
     return true;
@@ -342,8 +381,9 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
 // ===== Encode =====
 
 std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_bos, bool add_eos,
-                                        bool add_dummy_prefix) const {
-    if (!loaded_) return {};
+                                       bool add_dummy_prefix) const {
+    if (!loaded_)
+        return {};
 
     std::vector<int32_t> result;
 
@@ -357,7 +397,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_bos, bo
 }
 
 std::vector<int32_t> Tokenizer::encode_spm(const std::string& text, bool add_bos, bool add_eos,
-                                            bool add_dummy_prefix) const {
+                                           bool add_dummy_prefix) const {
     std::vector<int32_t> result;
 
     if (add_bos && bos_id_ >= 0) {
@@ -390,7 +430,7 @@ std::vector<int32_t> Tokenizer::encode_spm(const std::string& text, bool add_bos
         spm_text += spm_space;
     }
 
-    for (size_t i = 0; i < text.size(); ) {
+    for (size_t i = 0; i < text.size();) {
         uint8_t b = static_cast<uint8_t>(text[i]);
 
         if (b == ' ') {
@@ -403,9 +443,12 @@ std::vector<int32_t> Tokenizer::encode_spm(const std::string& text, bool add_bos
             // - If a control char matches a vocab token (e.g., \r -> ▁\r or \r), it's used
             // - If not, it falls back to <0xHH> byte token
             int char_len = 1;
-            if (b >= 0xF0) char_len = 4;
-            else if (b >= 0xE0) char_len = 3;
-            else if (b >= 0xC0) char_len = 2;
+            if (b >= 0xF0)
+                char_len = 4;
+            else if (b >= 0xE0)
+                char_len = 3;
+            else if (b >= 0xC0)
+                char_len = 2;
             spm_text.append(text, i, char_len);
             i += char_len;
         }
@@ -428,14 +471,15 @@ std::vector<int32_t> Tokenizer::encode_spm(const std::string& text, bool add_bos
 // 2. Repeatedly merge the highest-scoring adjacent pair
 // 3. Fallback to byte tokens for unmatched characters
 std::vector<int32_t> Tokenizer::encode_spm_greedy(const std::string& spm_text) const {
-    if (spm_text.empty()) return {};
+    if (spm_text.empty())
+        return {};
 
     // Symbol: a node in the linked list of text segments
     struct Symbol {
-        int prev;       // index of previous symbol, -1 if none
-        int next;       // index of next symbol, -1 if none
+        int prev;  // index of previous symbol, -1 if none
+        int next;  // index of next symbol, -1 if none
         const char* text;
-        size_t n;       // length of this symbol's text
+        size_t n;  // length of this symbol's text
     };
 
     // Bigram: a candidate merge of two adjacent symbols
@@ -459,9 +503,12 @@ std::vector<int32_t> Tokenizer::encode_spm_greedy(const std::string& spm_text) c
         Symbol sym;
         size_t len = 1;
         auto b = static_cast<uint8_t>(spm_text[offs]);
-        if (b >= 0xF0) len = 4;
-        else if (b >= 0xE0) len = 3;
-        else if (b >= 0xC0) len = 2;
+        if (b >= 0xF0)
+            len = 4;
+        else if (b >= 0xE0)
+            len = 3;
+        else if (b >= 0xC0)
+            len = 2;
         len = std::min(len, spm_text.size() - offs);
 
         sym.text = spm_text.c_str() + offs;
@@ -490,15 +537,19 @@ std::vector<int32_t> Tokenizer::encode_spm_greedy(const std::string& spm_text) c
     Queue work_queue;
 
     auto try_add_bigram = [&](int left, int right) {
-        if (left < 0 || right < 0 || left >= (int)symbols.size() || right >= (int)symbols.size()) return;
-        if (symbols[left].n == 0 || symbols[right].n == 0) return;
+        if (left < 0 || right < 0 || left >= (int)symbols.size() || right >= (int)symbols.size())
+            return;
+        if (symbols[left].n == 0 || symbols[right].n == 0)
+            return;
 
         std::string text(symbols[left].text, symbols[left].n + symbols[right].n);
         auto it = vocab_.token_to_id.find(text);
-        if (it == vocab_.token_to_id.end()) return;
+        if (it == vocab_.token_to_id.end())
+            return;
 
         int32_t tid = it->second;
-        if (tid < 0 || tid >= static_cast<int32_t>(vocab_.tokens.size())) return;
+        if (tid < 0 || tid >= static_cast<int32_t>(vocab_.tokens.size()))
+            return;
 
         Bigram bigram;
         bigram.left = left;
@@ -510,11 +561,10 @@ std::vector<int32_t> Tokenizer::encode_spm_greedy(const std::string& spm_text) c
         if (scores_all_zero) {
             bool is_space_only = true;
             const uint8_t SPM_SPACE_UTF8[] = {0xE2, 0x96, 0x81};
-            for (size_t k = 0; k < text.size(); ) {
-                if (k + 2 < text.size() &&
-                    static_cast<uint8_t>(text[k]) == SPM_SPACE_UTF8[0] &&
-                    static_cast<uint8_t>(text[k+1]) == SPM_SPACE_UTF8[1] &&
-                    static_cast<uint8_t>(text[k+2]) == SPM_SPACE_UTF8[2]) {
+            for (size_t k = 0; k < text.size();) {
+                if (k + 2 < text.size() && static_cast<uint8_t>(text[k]) == SPM_SPACE_UTF8[0] &&
+                    static_cast<uint8_t>(text[k + 1]) == SPM_SPACE_UTF8[1] &&
+                    static_cast<uint8_t>(text[k + 2]) == SPM_SPACE_UTF8[2]) {
                     k += 3;
                 } else {
                     is_space_only = false;
@@ -543,8 +593,7 @@ std::vector<int32_t> Tokenizer::encode_spm_greedy(const std::string& spm_text) c
         auto& right_sym = symbols[bigram.right];
 
         // Skip if already merged or size mismatch
-        if (left_sym.n == 0 || right_sym.n == 0 ||
-            left_sym.n + right_sym.n != bigram.size) {
+        if (left_sym.n == 0 || right_sym.n == 0 || left_sym.n + right_sym.n != bigram.size) {
             continue;
         }
 
@@ -567,7 +616,8 @@ std::vector<int32_t> Tokenizer::encode_spm_greedy(const std::string& spm_text) c
     std::vector<int32_t> output;
     for (int i = 0; i != -1; i = symbols[i].next) {
         auto& sym = symbols[i];
-        if (sym.n == 0) continue;
+        if (sym.n == 0)
+            continue;
 
         std::string text(sym.text, sym.n);
         auto it = vocab_.token_to_id.find(text);
@@ -612,13 +662,16 @@ std::vector<int32_t> Tokenizer::encode_spm_greedy(const std::string& spm_text) c
 
 std::string Tokenizer::text_to_byte_level(const std::string& text) const {
     std::string result;
-    for (size_t i = 0; i < text.size(); ) {
+    for (size_t i = 0; i < text.size();) {
         uint8_t b = static_cast<uint8_t>(text[i]);
         // Check if this is a multi-byte UTF-8 character
         int char_len = 1;
-        if (b >= 0xF0) char_len = 4;
-        else if (b >= 0xE0) char_len = 3;
-        else if (b >= 0xC0) char_len = 2;
+        if (b >= 0xF0)
+            char_len = 4;
+        else if (b >= 0xE0)
+            char_len = 3;
+        else if (b >= 0xC0)
+            char_len = 2;
 
         // For each byte of the character, map to unicode char
         for (int j = 0; j < char_len && (i + j) < text.size(); ++j) {
@@ -669,8 +722,7 @@ std::vector<std::string> Tokenizer::bpe_pre_tokenize(const std::string& text) co
     // punctuation, whitespace
     static const std::regex gpt2_pattern(
         R"('s|'t|'re|'ve|'m|'ll|'d| ?[^\W\d_]+| ?\d+| ?[^\s\w]+|\s+(?!\S)|\s+)",
-        std::regex::icase | std::regex::optimize
-    );
+        std::regex::icase | std::regex::optimize);
 
     auto it = std::sregex_iterator(text.begin(), text.end(), gpt2_pattern);
     auto end = std::sregex_iterator();
@@ -683,7 +735,8 @@ std::vector<std::string> Tokenizer::bpe_pre_tokenize(const std::string& text) co
 }
 
 std::vector<std::string> Tokenizer::bpe_apply(const std::vector<std::string>& word) const {
-    if (word.size() <= 1) return word;
+    if (word.size() <= 1)
+        return word;
 
     std::vector<std::string> tokens = word;
 
@@ -701,7 +754,8 @@ std::vector<std::string> Tokenizer::bpe_apply(const std::vector<std::string>& wo
             }
         }
 
-        if (best_rank == std::numeric_limits<int>::max()) break;
+        if (best_rank == std::numeric_limits<int>::max())
+            break;
 
         // Merge the best pair
         std::vector<std::string> new_tokens;
@@ -721,7 +775,8 @@ std::vector<std::string> Tokenizer::bpe_apply(const std::vector<std::string>& wo
     return tokens;
 }
 
-std::vector<int32_t> Tokenizer::encode_bpe(const std::string& text, bool add_bos, bool add_eos) const {
+std::vector<int32_t> Tokenizer::encode_bpe(const std::string& text, bool add_bos,
+                                           bool add_eos) const {
     std::vector<int32_t> result;
 
     if (add_bos && bos_id_ >= 0) {
@@ -741,9 +796,12 @@ std::vector<int32_t> Tokenizer::encode_bpe(const std::string& text, bool add_bos
         while (pos < byte_level.size()) {
             uint8_t b = static_cast<uint8_t>(byte_level[pos]);
             int char_len = 1;
-            if (b >= 0xF0) char_len = 4;
-            else if (b >= 0xE0) char_len = 3;
-            else if (b >= 0xC0) char_len = 2;
+            if (b >= 0xF0)
+                char_len = 4;
+            else if (b >= 0xE0)
+                char_len = 3;
+            else if (b >= 0xC0)
+                char_len = 2;
 
             if (pos + char_len <= byte_level.size()) {
                 chars.push_back(byte_level.substr(pos, char_len));
@@ -779,20 +837,24 @@ std::vector<int32_t> Tokenizer::encode_bpe(const std::string& text, bool add_bos
 
 std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special,
                               bool strip_leading_space) const {
-    if (!loaded_) return "";
+    if (!loaded_)
+        return "";
 
     std::string result;
     for (int32_t id : ids) {
-        if (id < 0 || id >= static_cast<int32_t>(vocab_.tokens.size())) continue;
+        if (id < 0 || id >= static_cast<int32_t>(vocab_.tokens.size()))
+            continue;
 
         if (skip_special) {
             // Skip BOS, EOS, PAD tokens
-            if (id == bos_id_ || id == eos_id_ || id == pad_id_) continue;
+            if (id == bos_id_ || id == eos_id_ || id == pad_id_)
+                continue;
             // Skip control tokens (token_type == 3 in GGUF: <s>, </s>, etc.)
             // But NOT byte tokens (token_type == 6: <0xHH>) — they represent actual text content
             if (id < static_cast<int32_t>(vocab_.token_types.size())) {
                 int tt = vocab_.token_types[id];
-                if (tt == 3) continue;  // CONTROL token type
+                if (tt == 3)
+                    continue;  // CONTROL token type
             }
         }
 
@@ -803,22 +865,25 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special
     if (model_type_ == TokenizerModelType::SPM) {
         std::string decoded;
         decoded.reserve(result.size());
-        for (size_t i = 0; i < result.size(); ) {
+        for (size_t i = 0; i < result.size();) {
             // Check for ▁ (U+2581, encoded as E2 96 81 in UTF-8)
-            if (i + 2 < result.size() &&
-                static_cast<uint8_t>(result[i]) == 0xE2 &&
+            if (i + 2 < result.size() && static_cast<uint8_t>(result[i]) == 0xE2 &&
                 static_cast<uint8_t>(result[i + 1]) == 0x96 &&
                 static_cast<uint8_t>(result[i + 2]) == 0x81) {
                 decoded += ' ';
                 i += 3;
             }
             // Check for <0xHH> byte tokens
-            else if (i + 5 <= result.size() && result[i] == '<' && result[i+1] == '0' && result[i+2] == 'x') {
+            else if (i + 5 <= result.size() && result[i] == '<' && result[i + 1] == '0' &&
+                     result[i + 2] == 'x') {
                 // Parse hex
                 auto hex_val = [](char c) -> int {
-                    if (c >= '0' && c <= '9') return c - '0';
-                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= '0' && c <= '9')
+                        return c - '0';
+                    if (c >= 'A' && c <= 'F')
+                        return c - 'A' + 10;
+                    if (c >= 'a' && c <= 'f')
+                        return c - 'a' + 10;
                     return -1;
                 };
                 int hi = hex_val(result[i + 3]);
@@ -852,7 +917,8 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special
 }
 
 std::string Tokenizer::decode_token(int32_t id) const {
-    if (!loaded_ || id < 0 || id >= static_cast<int32_t>(vocab_.tokens.size())) return "";
+    if (!loaded_ || id < 0 || id >= static_cast<int32_t>(vocab_.tokens.size()))
+        return "";
     return decode({id}, false);
 }
 
@@ -864,18 +930,21 @@ int32_t Tokenizer::token_to_id(const std::string& token) const {
 }
 
 std::string Tokenizer::id_to_token(int32_t id) const {
-    if (id < 0 || id >= static_cast<int32_t>(vocab_.tokens.size())) return "";
+    if (id < 0 || id >= static_cast<int32_t>(vocab_.tokens.size()))
+        return "";
     return vocab_.tokens[id];
 }
 
 float Tokenizer::token_score(int32_t id) const {
-    if (id < 0 || id >= static_cast<int32_t>(vocab_.scores.size())) return 0.0f;
+    if (id < 0 || id >= static_cast<int32_t>(vocab_.scores.size()))
+        return 0.0f;
     return vocab_.scores[id];
 }
 
 int32_t Tokenizer::token_type(int32_t id) const {
-    if (id < 0 || id >= static_cast<int32_t>(vocab_.token_types.size())) return 0;
+    if (id < 0 || id >= static_cast<int32_t>(vocab_.token_types.size()))
+        return 0;
     return vocab_.token_types[id];
 }
 
-} // namespace forge
+}  // namespace forge

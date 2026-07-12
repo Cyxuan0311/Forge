@@ -1,9 +1,10 @@
 #pragma once
 
-#include <vector>
+#include <cstddef>
 #include <memory>
 #include <string>
-#include <cstddef>
+#include <vector>
+
 #include "backend.h"
 #include "op_enum.h"
 
@@ -15,15 +16,15 @@ struct GraphNode;
 // Per-node scheduling decision
 struct NodeAssignment {
     int node_idx;
-    int device_index;               // Index into SchedulingPlan::devices
+    int device_index;  // Index into SchedulingPlan::devices
     size_t estimated_bytes = 0;
 };
 
 // Result of scheduling: maps each graph node to a device
 struct SchedulingPlan {
     std::vector<DeviceInfo> devices;
-    std::vector<NodeAssignment> assignments;     // size == num_nodes, order matches node indices
-    std::vector<int> node_to_device;            // convenience: node_idx → device_index
+    std::vector<NodeAssignment> assignments;  // size == num_nodes, order matches node indices
+    std::vector<int> node_to_device;          // convenience: node_idx → device_index
     size_t total_gpu_bytes = 0;
     size_t total_cpu_bytes = 0;
     bool valid = false;
@@ -61,10 +62,8 @@ private:
                                    std::vector<size_t>& node_sizes);
 
     // Find the best device for a node given its predecessors' devices
-    int pick_device(int node_idx,
-                    const std::vector<int>& current_assignments,
-                    const std::vector<size_t>& node_sizes,
-                    const std::vector<DeviceInfo>& devices,
+    int pick_device(int node_idx, const std::vector<int>& current_assignments,
+                    const std::vector<size_t>& node_sizes, const std::vector<DeviceInfo>& devices,
                     std::vector<size_t>& device_used_bytes,
                     const std::vector<std::vector<int>>& pred_indices) const;
 
@@ -73,4 +72,4 @@ private:
     bool hints_enabled_ = false;
 };
 
-} // namespace forge
+}  // namespace forge

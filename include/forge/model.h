@@ -1,13 +1,14 @@
 #pragma once
 
-#include <memory>
-#include <vector>
 #include <cstdint>
-#include <unordered_map>
+#include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "model_loader.h"
 #include "tensor.h"
 #include "types.h"
-#include "model_loader.h"
 
 namespace forge {
 
@@ -47,18 +48,18 @@ struct ModelConfig {
     int num_expert_per_tok = 0;
 
     // SSM/Mamba hybrid layer support (e.g., Qwen3.5, MiniCPM-V 4.6)
-    int ssm_group_count = 0;           // number of SSM groups (n_group)
-    int ssm_time_step_rank = 0;        // rank of SSM time step (dt_rank)
-    int ssm_inner_size = 0;            // SSM inner size (d_inner)
-    int ssm_state_size = 0;            // SSM state size (d_state = head_k_dim)
-    int ssm_conv_kernel = 0;           // SSM conv kernel size (d_conv)
-    int full_attention_interval = 0;    // attention layer interval in hybrid arch
-    bool use_ssm = false;              // whether model has SSM layers
+    int ssm_group_count = 0;          // number of SSM groups (n_group)
+    int ssm_time_step_rank = 0;       // rank of SSM time step (dt_rank)
+    int ssm_inner_size = 0;           // SSM inner size (d_inner)
+    int ssm_state_size = 0;           // SSM state size (d_state = head_k_dim)
+    int ssm_conv_kernel = 0;          // SSM conv kernel size (d_conv)
+    int full_attention_interval = 0;  // attention layer interval in hybrid arch
+    bool use_ssm = false;             // whether model has SSM layers
 
     // MRoPE (Multi-dimensional RoPE) support for Qwen3.5
-    int rope_dimension_count = 0;      // number of dimensions to apply RoPE (e.g., 64)
-    int rope_dimension_sections[4] = {0, 0, 0, 0}; // sections for MRoPE [t, h, w, extra]
-    bool use_mrope = false;            // whether to use MRoPE instead of standard RoPE
+    int rope_dimension_count = 0;                   // number of dimensions to apply RoPE (e.g., 64)
+    int rope_dimension_sections[4] = {0, 0, 0, 0};  // sections for MRoPE [t, h, w, extra]
+    bool use_mrope = false;                         // whether to use MRoPE instead of standard RoPE
 };
 
 class WeightStore {
@@ -75,7 +76,8 @@ public:
     std::vector<std::string> weight_names() const;
 
     void to_device(DeviceType device);
-    void to_device_layer(int layer_idx, DeviceType device, const std::string& prefix_pattern = "model.layers.{}");
+    void to_device_layer(int layer_idx, DeviceType device,
+                         const std::string& prefix_pattern = "model.layers.{}");
 
 private:
     std::unordered_map<std::string, TensorPtr> weights_;
@@ -100,9 +102,9 @@ private:
 
 // Layer type classification for hybrid architectures (e.g., Qwen3.5)
 enum class LayerType : int {
-    FullAttention = 0,   // Standard full attention layer
-    LinearAttention = 1, // Linear/recurrent attention (e.g., Gated Delta Net)
-    MLA = 2,             // Multi-head Latent Attention (DeepSeek V2/V3)
+    FullAttention = 0,    // Standard full attention layer
+    LinearAttention = 1,  // Linear/recurrent attention (e.g., Gated Delta Net)
+    MLA = 2,              // Multi-head Latent Attention (DeepSeek V2/V3)
 };
 
 // Per-layer weight container using canonical names
@@ -119,13 +121,9 @@ struct LayerWeights {
         return it != weights.end() ? it->second : nullptr;
     }
 
-    void set(const std::string& name, TensorPtr tensor) {
-        weights[name] = std::move(tensor);
-    }
+    void set(const std::string& name, TensorPtr tensor) { weights[name] = std::move(tensor); }
 
-    bool has(const std::string& name) const {
-        return weights.find(name) != weights.end();
-    }
+    bool has(const std::string& name) const { return weights.find(name) != weights.end(); }
 
     // Move all weights to target device
     void to_device(DeviceType device);
@@ -292,8 +290,7 @@ struct ConfigParserAutoRegister {
 #define FORGE_REGISTER_CONFIG_PARSER_IMPL(line, arch, fn) \
     FORGE_REGISTER_CONFIG_PARSER_IMPL2(line, arch, fn)
 
-#define FORGE_REGISTER_CONFIG_PARSER(arch, fn) \
-    FORGE_REGISTER_CONFIG_PARSER_IMPL(__LINE__, arch, fn)
+#define FORGE_REGISTER_CONFIG_PARSER(arch, fn) FORGE_REGISTER_CONFIG_PARSER_IMPL(__LINE__, arch, fn)
 
 // ============================================================================
 // Weight Init Registry
@@ -334,8 +331,7 @@ struct WeightInitAutoRegister {
 #define FORGE_REGISTER_WEIGHT_INIT_IMPL(line, arch, fn) \
     FORGE_REGISTER_WEIGHT_INIT_IMPL2(line, arch, fn)
 
-#define FORGE_REGISTER_WEIGHT_INIT(arch, fn) \
-    FORGE_REGISTER_WEIGHT_INIT_IMPL(__LINE__, arch, fn)
+#define FORGE_REGISTER_WEIGHT_INIT(arch, fn) FORGE_REGISTER_WEIGHT_INIT_IMPL(__LINE__, arch, fn)
 
 // ============================================================================
 // Architecture Capability Description
@@ -388,7 +384,8 @@ struct ArchCapabilityAutoRegister {
 //
 // Usage example (in a single .cpp file):
 //   FORGE_REGISTER_ARCH("gemma",
-//       /*engine=*/[](Model& m, InferenceContext& ctx) { return std::make_unique<LlamaEngine>(m, ctx); },
+//       /*engine=*/[](Model& m, InferenceContext& ctx) { return std::make_unique<LlamaEngine>(m,
+//       ctx); },
 //       /*config_parser=*/[](ModelLoader& loader, const std::string& arch) -> ModelConfig { ... },
 //       /*weight_init=*/[](LayerWeightInitContext& ctx) { ... },
 //       /*capability=*/ArchCapability{.use_gqa = true, .use_neox_rope = true}
@@ -396,9 +393,9 @@ struct ArchCapabilityAutoRegister {
 // ============================================================================
 
 #define FORGE_REGISTER_ARCH_IMPL2(line, arch, engine_creator, config_fn, weight_init_fn, cap) \
-    static ::forge::EngineAutoRegister _engine_reg_##line(arch, engine_creator); \
-    static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn); \
-    static ::forge::WeightInitAutoRegister _weight_init_reg_##line(arch, weight_init_fn); \
+    static ::forge::EngineAutoRegister _engine_reg_##line(arch, engine_creator);              \
+    static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn);      \
+    static ::forge::WeightInitAutoRegister _weight_init_reg_##line(arch, weight_init_fn);     \
     static ::forge::ArchCapabilityAutoRegister _arch_cap_reg_##line(arch, cap)
 
 #define FORGE_REGISTER_ARCH_IMPL(line, arch, engine_creator, config_fn, weight_init_fn, cap) \
@@ -451,4 +448,4 @@ private:
     ModelLoaderPtr vision_loader_;  // For mmproj/vision weights
 };
 
-} // namespace forge
+}  // namespace forge

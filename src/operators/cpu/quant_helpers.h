@@ -1,13 +1,13 @@
 #pragma once
 
-#include <cstdint>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #ifdef _OPENMP
-#include <omp.h>
+#    include <omp.h>
 #endif
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 namespace forge {
@@ -24,7 +24,7 @@ struct block_q8_K {
 struct block_q6_K {
     uint8_t ql[128];
     uint8_t qh[64];
-    int8_t  scales[16];
+    int8_t scales[16];
     uint16_t d;
 };
 
@@ -38,7 +38,8 @@ static void quantize_row_q8_K(const float* src, block_q8_K* dst, int k) {
         float amax = 0.0f;
         for (int j = 0; j < n_el; ++j) {
             float v = std::abs(src[base + j]);
-            if (v > amax) amax = v;
+            if (v > amax)
+                amax = v;
         }
         float d = amax / 127.0f;
         float id = d > 0.0f ? 1.0f / d : 0.0f;
@@ -46,8 +47,10 @@ static void quantize_row_q8_K(const float* src, block_q8_K* dst, int k) {
         int sum[16] = {0};
         for (int j = 0; j < n_el; ++j) {
             int q = (int)(src[base + j] * id + (src[base + j] >= 0 ? 0.5f : -0.5f));
-            if (q < -128) q = -128;
-            if (q > 127) q = 127;
+            if (q < -128)
+                q = -128;
+            if (q > 127)
+                q = 127;
             dst[bi].qs[j] = (int8_t)q;
             sum[j / 16] += q;
         }
@@ -59,19 +62,21 @@ static void quantize_row_q8_K(const float* src, block_q8_K* dst, int k) {
 }
 
 // Round-robin parallel_for
-template<typename Fn>
+template <typename Fn>
 static void parallel_for_steal(int total, int chunk_size, Fn&& fn) {
-    if (total <= 0) return;
+    if (total <= 0)
+        return;
     int n_chunks = (total + chunk_size - 1) / chunk_size;
 #ifdef _OPENMP
-    #pragma omp parallel
+#    pragma omp parallel
     {
         int tid = omp_get_thread_num();
         int n_threads = omp_get_num_threads();
         for (int c = tid; c < n_chunks; c += n_threads) {
             int start = c * chunk_size;
             int end = start + chunk_size;
-            if (end > total) end = total;
+            if (end > total)
+                end = total;
             fn(start, end);
         }
     }
@@ -95,18 +100,15 @@ static inline void decode_q4_k_scales(const uint8_t* scales, uint8_t* sc, uint8_
 // Duplicates scale[i*2] into lower 8 bytes, scale[i*2+1] into upper 8 bytes
 static inline __m128i get_scale_shuffle(int i) {
     static const uint8_t k_shuffle[128] = {
-         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
-         2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
-         4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
-         6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
-         8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
-        10,10,10,10,10,10,10,10, 11,11,11,11,11,11,11,11,
-        12,12,12,12,12,12,12,12, 13,13,13,13,13,13,13,13,
-        14,14,14,14,14,14,14,14, 15,15,15,15,15,15,15,15
-    };
+        0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,
+        2,  2,  3,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,
+        5,  5,  5,  5,  6,  6,  6,  6,  6,  6,  6,  6,  7,  7,  7,  7,  7,  7,  7,  7,  8,  8,
+        8,  8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9,  10, 10, 10, 10, 10, 10, 10, 10,
+        11, 11, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13,
+        13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15};
     return _mm_loadu_si128((const __m128i*)k_shuffle + i);
 }
-#endif // USE_AVX2
+#endif  // USE_AVX2
 
-} // namespace cpu
-} // namespace forge
+}  // namespace cpu
+}  // namespace forge

@@ -1,11 +1,12 @@
-#include "forge/operator_activation.h"
-#include "forge/cuda_kernels.h"
-#include "forge/perf_profiler.h"
-#include "forge/op_dispatch.h"
 #include <cmath>
 
+#include "forge/cuda_kernels.h"
+#include "forge/op_dispatch.h"
+#include "forge/operator_activation.h"
+#include "forge/perf_profiler.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -17,10 +18,8 @@ TensorPtr silu(const TensorPtr& x) {
 
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cuda::launch_silu(
-            static_cast<const float*>(x->data()),
-            static_cast<float*>(out->data()), n
-        );
+        cuda::launch_silu(static_cast<const float*>(x->data()), static_cast<float*>(out->data()),
+                          n);
 #endif
     } else {
         PERF_SCOPE("silu/cpu");
@@ -40,10 +39,8 @@ TensorPtr gelu(const TensorPtr& x) {
 
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cuda::launch_gelu(
-            static_cast<const float*>(x->data()),
-            static_cast<float*>(out->data()), n
-        );
+        cuda::launch_gelu(static_cast<const float*>(x->data()), static_cast<float*>(out->data()),
+                          n);
 #endif
     } else {
         PERF_SCOPE("gelu/cpu");
@@ -63,10 +60,8 @@ TensorPtr gelu_tanh(const TensorPtr& x) {
 
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cuda::launch_gelu_tanh(
-            static_cast<const float*>(x->data()),
-            static_cast<float*>(out->data()), n
-        );
+        cuda::launch_gelu_tanh(static_cast<const float*>(x->data()),
+                               static_cast<float*>(out->data()), n);
 #endif
     } else {
         PERF_SCOPE("gelu_tanh/cpu");
@@ -75,49 +70,50 @@ TensorPtr gelu_tanh(const TensorPtr& x) {
         for (int i = 0; i < n; ++i) {
             float v = x_data[i];
             // tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-            float cdf = 0.5f * (1.0f + std::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+            float cdf =
+                0.5f * (1.0f + std::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
             o_data[i] = v * cdf;
         }
     }
     return out;
 }
 
-} // namespace ops
+}  // namespace ops
 
 namespace {
 __attribute__((constructor)) void register_activation_ops() {
     auto& dispatch = OpDispatch::instance();
 
     dispatch.register_kernel(OpType::SILU, DeviceType::CPU,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::silu(inputs[0]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::silu(inputs[0]);
+                             });
 
     dispatch.register_kernel(OpType::SILU, DeviceType::CUDA,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::silu(inputs[0]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::silu(inputs[0]);
+                             });
 
     dispatch.register_kernel(OpType::GELU, DeviceType::CPU,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::gelu(inputs[0]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::gelu(inputs[0]);
+                             });
 
     dispatch.register_kernel(OpType::GELU, DeviceType::CUDA,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::gelu(inputs[0]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::gelu(inputs[0]);
+                             });
 
     dispatch.register_kernel(OpType::GELU_TANH, DeviceType::CPU,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::gelu_tanh(inputs[0]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::gelu_tanh(inputs[0]);
+                             });
 
     dispatch.register_kernel(OpType::GELU_TANH, DeviceType::CUDA,
-        [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
-            return ops::gelu_tanh(inputs[0]);
-        });
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                                 return ops::gelu_tanh(inputs[0]);
+                             });
 }
-}
+}  // namespace
 
-} // namespace forge
+}  // namespace forge

@@ -1,10 +1,11 @@
 #pragma once
 
 #include <cstddef>
-#include <vector>
-#include <unordered_map>
 #include <mutex>
 #include <set>
+#include <unordered_map>
+#include <vector>
+
 #include "types.h"
 
 namespace forge {
@@ -41,4 +42,4 @@ private:
     std::unordered_map<size_t, std::vector<void*>> free_lists_;
 };
 
-} // namespace forge
+}  // namespace forge

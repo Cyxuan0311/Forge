@@ -1,11 +1,11 @@
 #pragma once
 
-#include "forge/engine.h"
-#include "forge/model.h"
 #include "forge/context.h"
+#include "forge/engine.h"
+#include "forge/engines/layer_graph_builder.h"
 #include "forge/kv_cache.h"
 #include "forge/memory_pool.h"
-#include "forge/engines/layer_graph_builder.h"
+#include "forge/model.h"
 
 namespace forge {
 
@@ -33,8 +33,8 @@ public:
     bool use_graph() const { return use_graph_; }
 
 protected:
-    virtual TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx,
-                                    int seq_len, int64_t start_pos, DeviceType dev) = 0;
+    virtual TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                    int64_t start_pos, DeviceType dev) = 0;
     virtual bool init_weights() = 0;
 
     void init_kv_cache(const ModelConfig& cfg);
@@ -44,13 +44,12 @@ protected:
     DeviceType layer_device(int layer_idx) const;
     TensorPtr transfer_hidden(const TensorPtr& hidden, DeviceType target) const;
 
-    void apply_rope_standard(const float* q_data, const float* k_data,
-                             float* q_out, float* k_out,
-                             int seq_len, int num_heads, int num_kv_heads,
-                             int head_dim, int64_t start_pos, float theta);
+    void apply_rope_standard(const float* q_data, const float* k_data, float* q_out, float* k_out,
+                             int seq_len, int num_heads, int num_kv_heads, int head_dim,
+                             int64_t start_pos, float theta);
 
-    TensorPtr expand_kv_heads(const TensorPtr& kv, int seq_len, int num_heads,
-                              int num_kv_heads, int head_dim, DeviceType dev);
+    TensorPtr expand_kv_heads(const TensorPtr& kv, int seq_len, int num_heads, int num_kv_heads,
+                              int head_dim, DeviceType dev);
 
     Model& model_;
     InferenceContext& ctx_;
@@ -64,4 +63,4 @@ protected:
     std::unique_ptr<LayerGraphBuilder> graph_builder_;
 };
 
-} // namespace forge
+}  // namespace forge

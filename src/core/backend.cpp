@@ -1,11 +1,13 @@
 #include "forge/backend.h"
-#include "forge/logger.h"
+
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
+#include "forge/logger.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -39,32 +41,35 @@ public:
     }
 
     void deallocate(void* ptr, size_t) override {
-        if (ptr) std::free(ptr);
+        if (ptr)
+            std::free(ptr);
     }
 
     void copy(void* dst, const void* src, size_t size, CopyKind) override {
-        if (dst && src && size > 0) std::memcpy(dst, src, size);
+        if (dst && src && size > 0)
+            std::memcpy(dst, src, size);
     }
 
     void memset(void* ptr, int value, size_t size) override {
-        if (ptr && size > 0) std::memset(ptr, value, size);
+        if (ptr && size > 0)
+            std::memset(ptr, value, size);
     }
 
     void synchronize() override {}
 
     BackendCapability capabilities() const override {
-        return BackendCapability::FP32 | BackendCapability::FP16 |
-               BackendCapability::Quantized | BackendCapability::UnifiedMemory;
+        return BackendCapability::FP32 | BackendCapability::FP16 | BackendCapability::Quantized |
+               BackendCapability::UnifiedMemory;
     }
 
     size_t device_memory_total() const override {
         // Return a reasonable estimate for system RAM
-        return static_cast<size_t>(16) * 1024 * 1024 * 1024; // 16 GB placeholder
+        return static_cast<size_t>(16) * 1024 * 1024 * 1024;  // 16 GB placeholder
     }
 
     size_t device_memory_free() const override {
         // On CPU, we don't track free memory precisely
-        return device_memory_total() / 2; // placeholder
+        return device_memory_total() / 2;  // placeholder
     }
 };
 
@@ -74,9 +79,7 @@ public:
 #ifdef USE_CUDA
 class CUDABackend : public Backend {
 public:
-    explicit CUDABackend(int device_id = 0) : device_id_(device_id) {
-        cudaSetDevice(device_id);
-    }
+    explicit CUDABackend(int device_id = 0) : device_id_(device_id) { cudaSetDevice(device_id); }
 
     DeviceType device_type() const override { return DeviceType::CUDA; }
     std::string name() const override { return "cuda:" + std::to_string(device_id_); }
@@ -103,11 +106,21 @@ public:
         cudaSetDevice(device_id_);
         cudaMemcpyKind cuda_kind;
         switch (kind) {
-            case CopyKind::HostToHost:     cuda_kind = cudaMemcpyHostToHost; break;
-            case CopyKind::HostToDevice:   cuda_kind = cudaMemcpyHostToDevice; break;
-            case CopyKind::DeviceToHost:   cuda_kind = cudaMemcpyDeviceToHost; break;
-            case CopyKind::DeviceToDevice: cuda_kind = cudaMemcpyDeviceToDevice; break;
-            default:                       cuda_kind = cudaMemcpyDefault; break;
+        case CopyKind::HostToHost:
+            cuda_kind = cudaMemcpyHostToHost;
+            break;
+        case CopyKind::HostToDevice:
+            cuda_kind = cudaMemcpyHostToDevice;
+            break;
+        case CopyKind::DeviceToHost:
+            cuda_kind = cudaMemcpyDeviceToHost;
+            break;
+        case CopyKind::DeviceToDevice:
+            cuda_kind = cudaMemcpyDeviceToDevice;
+            break;
+        default:
+            cuda_kind = cudaMemcpyDefault;
+            break;
         }
         cudaMemcpy(dst, src, size, cuda_kind);
     }
@@ -150,9 +163,8 @@ public:
     }
 
     BackendCapability capabilities() const override {
-        return BackendCapability::FP32 | BackendCapability::FP16 |
-               BackendCapability::INT8 | BackendCapability::Quantized |
-               BackendCapability::StreamAsync;
+        return BackendCapability::FP32 | BackendCapability::FP16 | BackendCapability::INT8 |
+               BackendCapability::Quantized | BackendCapability::StreamAsync;
     }
 
     size_t device_memory_total() const override {
@@ -179,12 +191,15 @@ private:
 // ============================================================================
 // Backend static factory methods
 // ============================================================================
-BackendStream Backend::create_stream() { return {}; }
+BackendStream Backend::create_stream() {
+    return {};
+}
 void Backend::synchronize_stream(BackendStream&) {}
 void Backend::destroy_stream(BackendStream&) {}
 
 std::shared_ptr<Backend> Backend::create(DeviceType device) {
-    if (device == DeviceType::CPU) return create_cpu();
+    if (device == DeviceType::CPU)
+        return create_cpu();
     return create_cuda();
 }
 
@@ -207,9 +222,8 @@ std::shared_ptr<Backend> Backend::create_cuda(int device_id) {
 // ============================================================================
 BackendManager::BackendManager() {
     // Register built-in backends
-    register_backend("cpu", DeviceType::CPU, [](int) -> std::shared_ptr<Backend> {
-        return Backend::create_cpu();
-    });
+    register_backend("cpu", DeviceType::CPU,
+                     [](int) -> std::shared_ptr<Backend> { return Backend::create_cpu(); });
 
 #ifdef USE_CUDA
     register_backend("cuda", DeviceType::CUDA, [](int device_id) -> std::shared_ptr<Backend> {
@@ -224,7 +238,8 @@ BackendManager& BackendManager::instance() {
 }
 
 std::shared_ptr<Backend> BackendManager::get_backend(DeviceType device) {
-    if (device == DeviceType::CPU) return get_cpu_backend();
+    if (device == DeviceType::CPU)
+        return get_cpu_backend();
     return get_cuda_backend();
 }
 
@@ -238,7 +253,8 @@ std::shared_ptr<Backend> BackendManager::get_cpu_backend() {
 std::shared_ptr<Backend> BackendManager::get_cuda_backend(int device_id) {
 #ifdef USE_CUDA
     auto it = cuda_backends_.find(device_id);
-    if (it != cuda_backends_.end()) return it->second;
+    if (it != cuda_backends_.end())
+        return it->second;
     auto backend = Backend::create_cuda(device_id);
     cuda_backends_[device_id] = backend;
     return backend;
@@ -249,7 +265,7 @@ std::shared_ptr<Backend> BackendManager::get_cuda_backend(int device_id) {
 }
 
 void BackendManager::register_backend(const std::string& name, DeviceType device_type,
-                                       BackendFactory factory) {
+                                      BackendFactory factory) {
     BackendInfo info;
     info.name = name;
     info.device_type = device_type;
@@ -264,8 +280,8 @@ void BackendManager::register_backend(const std::string& name, DeviceType device
     }
 
     registry_[name] = std::move(info);
-    LOG_INFO("Registered backend: " + name + " (available=" +
-             (registry_[name].available ? "true" : "false") + ")");
+    LOG_INFO("Registered backend: " + name +
+             " (available=" + (registry_[name].available ? "true" : "false") + ")");
 }
 
 void BackendManager::unregister_backend(const std::string& name) {
@@ -277,7 +293,8 @@ std::shared_ptr<Backend> BackendManager::get_backend(const std::string& name, in
     // Check cache first
     std::string cache_key = name + ":" + std::to_string(device_id);
     auto it = cached_backends_.find(cache_key);
-    if (it != cached_backends_.end()) return it->second;
+    if (it != cached_backends_.end())
+        return it->second;
 
     // Look up in registry
     auto reg_it = registry_.find(name);
@@ -384,4 +401,4 @@ std::vector<DeviceInfo> BackendManager::available_devices() {
     return devices;
 }
 
-} // namespace forge
+}  // namespace forge

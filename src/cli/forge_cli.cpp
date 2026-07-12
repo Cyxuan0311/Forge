@@ -12,43 +12,43 @@
  *   forge-cli -m model.gguf --info             # Model info
  */
 
-#include "cli_common.h"
-
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <cstring>
-#include <cstdlib>
 #include <chrono>
 #include <csignal>
-#include <sstream>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "cli_common.h"
 
 // Forge headers
-#include "forge/model.h"
-#include "forge/tokenizer.h"
 #include "forge/context.h"
 #include "forge/engine.h"
+#include "forge/kv_cache.h"
 #include "forge/logger.h"
+#include "forge/model.h"
+#include "forge/tensor.h"
+#include "forge/tokenizer.h"
 #include "forge/types.h"
 #include "forge/vision_encoder.h"
-#include "forge/kv_cache.h"
-#include "forge/tensor.h"
 
 // Engine headers
-#include "forge/engines/transformer_engine.h"
-#include "forge/engines/llama_engine.h"
 #include "forge/engines/deepseek_engine.h"
+#include "forge/engines/llama_engine.h"
 #include "forge/engines/qwen35_engine.h"
+#include "forge/engines/transformer_engine.h"
 
 // Model loader headers
+#include "forge/gguf_model.h"
 #include "forge/model_loader.h"
 #include "forge/ninf_model.h"
-#include "forge/gguf_model.h"
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 using namespace forge;
@@ -72,7 +72,8 @@ static void ensure_engines_registered() {
     // Static registration via EngineAutoRegister may not work in all link scenarios.
     // Explicitly register engines as a reliable fallback.
     static bool registered = false;
-    if (registered) return;
+    if (registered)
+        return;
     registered = true;
 
     auto& reg = EngineRegistry::instance();
@@ -127,16 +128,15 @@ static void ensure_engines_registered() {
 
 static void ensure_loaders_registered() {
     static bool registered = false;
-    if (registered) return;
+    if (registered)
+        return;
     registered = true;
 
     auto& reg = ModelLoaderRegistry::instance();
-    reg.register_loader("ninf", []() -> std::unique_ptr<ModelLoader> {
-        return std::make_unique<NinfModel>();
-    });
-    reg.register_loader("gguf", []() -> std::unique_ptr<ModelLoader> {
-        return std::make_unique<GgufModel>();
-    });
+    reg.register_loader(
+        "ninf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<NinfModel>(); });
+    reg.register_loader(
+        "gguf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<GgufModel>(); });
 }
 
 // ============================================================================
@@ -144,15 +144,19 @@ static void ensure_loaders_registered() {
 // ============================================================================
 
 std::string format_bytes(size_t bytes) {
-    if (bytes < 1024) return std::to_string(bytes) + " B";
-    if (bytes < 1024 * 1024) return std::to_string(bytes / 1024) + " KB";
-    if (bytes < 1024ULL * 1024 * 1024) return std::to_string(bytes / (1024 * 1024)) + " MB";
+    if (bytes < 1024)
+        return std::to_string(bytes) + " B";
+    if (bytes < 1024 * 1024)
+        return std::to_string(bytes / 1024) + " KB";
+    if (bytes < 1024ULL * 1024 * 1024)
+        return std::to_string(bytes / (1024 * 1024)) + " MB";
     return std::to_string(bytes / (1024ULL * 1024 * 1024)) + " GB";
 }
 
 std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "";
+    if (start == std::string::npos)
+        return "";
     size_t end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
 }
@@ -191,8 +195,7 @@ void print_model_info(const Model& model, const Tokenizer& tokenizer) {
     std::cout << "  Intermediate:    " << cfg.intermediate_dim << "\n";
     std::cout << "  Layers:          " << cfg.num_layers << "\n";
     std::cout << "  Attention heads: " << cfg.num_heads << "\n";
-    std::cout << "  KV heads:        " << cfg.num_kv_heads
-              << (cfg.use_gqa ? " (GQA)" : "") << "\n";
+    std::cout << "  KV heads:        " << cfg.num_kv_heads << (cfg.use_gqa ? " (GQA)" : "") << "\n";
     std::cout << "  Head dim:        " << cfg.head_dim << "\n";
     std::cout << "  Max seq length:  " << cfg.max_seq_len << "\n";
     std::cout << "\n";
@@ -201,10 +204,18 @@ void print_model_info(const Model& model, const Tokenizer& tokenizer) {
     std::cout << "  RoPE theta:      " << cfg.rope_theta << "\n";
     std::cout << "  RoPE type:       ";
     switch (cfg.rope_type) {
-        case RopeType::None: std::cout << "None"; break;
-        case RopeType::Standard: std::cout << "Standard"; break;
-        case RopeType::LinearScaling: std::cout << "Linear scaling (factor=" << cfg.rope_scaling_factor << ")"; break;
-        case RopeType::NTK_Scaled: std::cout << "NTK scaled"; break;
+    case RopeType::None:
+        std::cout << "None";
+        break;
+    case RopeType::Standard:
+        std::cout << "Standard";
+        break;
+    case RopeType::LinearScaling:
+        std::cout << "Linear scaling (factor=" << cfg.rope_scaling_factor << ")";
+        break;
+    case RopeType::NTK_Scaled:
+        std::cout << "NTK scaled";
+        break;
     }
     std::cout << "\n";
     if (cfg.use_mrope) {
@@ -213,13 +224,20 @@ void print_model_info(const Model& model, const Tokenizer& tokenizer) {
     std::cout << "\n";
 
     std::cout << "  ── Normalization & Activation ───────────────────\n";
-    std::cout << "  Norm:            " << (cfg.norm_type == NormType::RMSNorm ? "RMSNorm" : "LayerNorm")
+    std::cout << "  Norm:            "
+              << (cfg.norm_type == NormType::RMSNorm ? "RMSNorm" : "LayerNorm")
               << " (eps=" << cfg.rms_norm_eps << ")\n";
     std::cout << "  FFN activation:  ";
     switch (cfg.ffn_activation) {
-        case ActivationType::SiLU_GELU: std::cout << "SiLU+GELU (SwiGLU)"; break;
-        case ActivationType::GELU: std::cout << "GELU"; break;
-        case ActivationType::ReLU: std::cout << "ReLU"; break;
+    case ActivationType::SiLU_GELU:
+        std::cout << "SiLU+GELU (SwiGLU)";
+        break;
+    case ActivationType::GELU:
+        std::cout << "GELU";
+        break;
+    case ActivationType::ReLU:
+        std::cout << "ReLU";
+        break;
     }
     std::cout << "\n";
     std::cout << "  Tie embeddings:  " << (cfg.tie_embeddings ? "Yes" : "No") << "\n";
@@ -253,7 +271,8 @@ void print_model_info(const Model& model, const Tokenizer& tokenizer) {
 
     std::cout << "  ── Tokenizer ────────────────────────────────────\n";
     std::cout << "  Vocab size:      " << tokenizer.vocab_size() << "\n";
-    std::cout << "  Model type:      " << (tokenizer.model_type() == TokenizerModelType::SPM ? "SPM" : "BPE") << "\n";
+    std::cout << "  Model type:      "
+              << (tokenizer.model_type() == TokenizerModelType::SPM ? "SPM" : "BPE") << "\n";
     std::cout << "  BOS ID:          " << tokenizer.bos_token_id() << "\n";
     std::cout << "  EOS ID:          " << tokenizer.eos_token_id() << "\n";
     std::cout << "  PAD ID:          " << tokenizer.pad_token_id() << "\n";
@@ -278,8 +297,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
     std::cout << "╚══════════════════════════════════════════════════╝\n";
     std::cout << "\n";
 
-    std::cout << "  Model: " << cfg.arch_type
-              << " (" << cfg.num_layers << " layers, " << cfg.hidden_dim << "d)\n";
+    std::cout << "  Model: " << cfg.arch_type << " (" << cfg.num_layers << " layers, "
+              << cfg.hidden_dim << "d)\n";
     std::cout << "  GPU layers: " << n_gpu_layers << "\n";
     std::cout << "\n";
 
@@ -292,8 +311,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
         std::vector<int32_t> dummy_tokens(ps, 0);
         ctx.reset_kv_cache();
 
-        auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{ps}, DeviceType::CPU);
+        auto input_ids =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{ps}, DeviceType::CPU);
         std::memcpy(input_ids->data(), dummy_tokens.data(), ps * sizeof(int32_t));
         if (ctx.device() == DeviceType::CUDA) {
             input_ids->to_device(DeviceType::CUDA);
@@ -305,7 +324,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
             ctx.engine()->forward(input_ids, 0);
         }
 #ifdef USE_CUDA
-        if (ctx.device() == DeviceType::CUDA) cudaDeviceSynchronize();
+        if (ctx.device() == DeviceType::CUDA)
+            cudaDeviceSynchronize();
 #endif
         auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -316,8 +336,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
 
     ctx.reset_kv_cache();
     {
-        auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{1}, DeviceType::CPU);
+        auto input_ids =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CPU);
         *static_cast<int32_t*>(input_ids->data()) = 0;
         if (ctx.device() == DeviceType::CUDA) {
             input_ids->to_device(DeviceType::CUDA);
@@ -328,8 +348,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
     int num_decode_steps = 128;
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_decode_steps; ++i) {
-        auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{1}, DeviceType::CPU);
+        auto input_ids =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CPU);
         *static_cast<int32_t*>(input_ids->data()) = 0;
         if (ctx.device() == DeviceType::CUDA) {
             input_ids->to_device(DeviceType::CUDA);
@@ -337,7 +357,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
         ctx.engine()->forward(input_ids, i + 1);
     }
 #ifdef USE_CUDA
-    if (ctx.device() == DeviceType::CUDA) cudaDeviceSynchronize();
+    if (ctx.device() == DeviceType::CUDA)
+        cudaDeviceSynchronize();
 #endif
     auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -363,13 +384,15 @@ static std::vector<uint8_t> load_image_ppm(const std::string& path, int& width, 
     file >> magic;
 
     if (magic != "P6" && magic != "P3") {
-        std::cerr << "Error: Only PPM format (P3/P6) supported. Convert with: convert input.jpg output.ppm\n";
+        std::cerr << "Error: Only PPM format (P3/P6) supported. Convert with: convert input.jpg "
+                     "output.ppm\n";
         return {};
     }
 
     std::string line;
     while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty() || line[0] == '#')
+            continue;
         break;
     }
 
@@ -398,11 +421,8 @@ static std::vector<uint8_t> load_image_ppm(const std::string& path, int& width, 
     return pixels;
 }
 
-std::vector<float> encode_image(
-    VisionEncoder& vision,
-    const std::string& image_path,
-    int& num_tokens)
-{
+std::vector<float> encode_image(VisionEncoder& vision, const std::string& image_path,
+                                int& num_tokens) {
     int width, height;
     auto pixels = load_image_ppm(image_path, width, height);
     if (pixels.empty()) {
@@ -452,8 +472,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Tokenizer loaded: vocab_size=" << tokenizer.vocab_size()
               << ", type=" << (tokenizer.model_type() == TokenizerModelType::SPM ? "SPM" : "BPE")
-              << ", bos=" << tokenizer.bos_token_id()
-              << ", eos=" << tokenizer.eos_token_id()
+              << ", bos=" << tokenizer.bos_token_id() << ", eos=" << tokenizer.eos_token_id()
               << " [" << tok_ms << " ms]\n";
 
     // ---- Load model ----
@@ -470,11 +489,9 @@ int main(int argc, char** argv) {
     double model_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
     const auto& cfg = model.config();
-    std::cout << "Model loaded: arch=" << cfg.arch_type
-              << ", layers=" << cfg.num_layers
-              << ", hidden=" << cfg.hidden_dim
-              << ", heads=" << cfg.num_heads
-              << " [" << model_ms << " ms]\n";
+    std::cout << "Model loaded: arch=" << cfg.arch_type << ", layers=" << cfg.num_layers
+              << ", hidden=" << cfg.hidden_dim << ", heads=" << cfg.num_heads << " [" << model_ms
+              << " ms]\n";
 
     // ---- Model info only ----
     if (args.info_only) {
@@ -493,12 +510,18 @@ int main(int argc, char** argv) {
             VisionConfig vis_cfg;
             auto loader = ModelLoaderRegistry::instance().create_loader(args.mmproj_path);
             if (loader && loader->load(args.mmproj_path)) {
-                vis_cfg.image_size = static_cast<int>(loader->get_metadata_int("clip.vision.image_size", 448));
-                vis_cfg.patch_size = static_cast<int>(loader->get_metadata_int("clip.vision.patch_size", 14));
-                vis_cfg.embedding_length = static_cast<int>(loader->get_metadata_int("v.embedding_length", 1152));
-                vis_cfg.feed_forward_length = static_cast<int>(loader->get_metadata_int("v.feed_forward_length", 4304));
-                vis_cfg.block_count = static_cast<int>(loader->get_metadata_int("v.block_count", 27));
-                vis_cfg.head_count = static_cast<int>(loader->get_metadata_int("v.attention.head_count", 16));
+                vis_cfg.image_size =
+                    static_cast<int>(loader->get_metadata_int("clip.vision.image_size", 448));
+                vis_cfg.patch_size =
+                    static_cast<int>(loader->get_metadata_int("clip.vision.patch_size", 14));
+                vis_cfg.embedding_length =
+                    static_cast<int>(loader->get_metadata_int("v.embedding_length", 1152));
+                vis_cfg.feed_forward_length =
+                    static_cast<int>(loader->get_metadata_int("v.feed_forward_length", 4304));
+                vis_cfg.block_count =
+                    static_cast<int>(loader->get_metadata_int("v.block_count", 27));
+                vis_cfg.head_count =
+                    static_cast<int>(loader->get_metadata_int("v.attention.head_count", 16));
                 vis_cfg.projection_dim = cfg.hidden_dim;
                 loader->close();
             }
@@ -531,7 +554,8 @@ int main(int argc, char** argv) {
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
     if (tfm_eng) {
         KVCacheDType kv_dtype = KVCacheDType::FP32;
-        if (args.kv_cache_dtype == "q4_0") kv_dtype = KVCacheDType::Q4_0;
+        if (args.kv_cache_dtype == "q4_0")
+            kv_dtype = KVCacheDType::Q4_0;
         tfm_eng->set_kv_cache_dtype(kv_dtype);
         tfm_eng->set_gpu_layers(args.n_gpu_layers);
     }
@@ -540,7 +564,8 @@ int main(int argc, char** argv) {
     ctx.init_kv_cache();
     if (tfm_eng) {
         const auto& cache = tfm_eng->kv_cache();
-        std::cout << "KV Cache: dtype=" << (cache.kv_dtype() == KVCacheDType::Q4_0 ? "q4_0" : "fp32")
+        std::cout << "KV Cache: dtype="
+                  << (cache.kv_dtype() == KVCacheDType::Q4_0 ? "q4_0" : "fp32")
                   << ", size=" << format_bytes(cache.nbytes())
                   << ", max_seq=" << cache.max_seq_len() << "\n";
     }
@@ -559,7 +584,8 @@ int main(int argc, char** argv) {
     double ctx_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
     double total_ms = std::chrono::duration<double, std::milli>(t5 - t0).count();
     std::cout << "Startup total: " << total_ms << " ms"
-              << " (tokenizer=" << tok_ms << "ms, model=" << model_ms << "ms, ctx=" << ctx_ms << "ms)\n";
+              << " (tokenizer=" << tok_ms << "ms, model=" << model_ms << "ms, ctx=" << ctx_ms
+              << "ms)\n";
 
     // ---- Benchmark mode ----
     if (args.bench) {
@@ -574,15 +600,13 @@ int main(int argc, char** argv) {
 
         GenerationStats stats;
         if (args.no_stream) {
-            stats = generate_batch(ctx, tokenizer, prompt_ids,
-                args.n_predict, args.temperature, args.top_k, args.top_p,
-                args.repeat_penalty, !args.no_sample, args.seed,
-                tokenizer.eos_token_id());
+            stats = generate_batch(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
+                                   args.top_k, args.top_p, args.repeat_penalty, !args.no_sample,
+                                   args.seed, tokenizer.eos_token_id());
         } else {
-            stats = generate_streaming(ctx, tokenizer, prompt_ids,
-                args.n_predict, args.temperature, args.top_k, args.top_p,
-                args.repeat_penalty, !args.no_sample, args.seed,
-                tokenizer.eos_token_id());
+            stats = generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
+                                       args.top_k, args.top_p, args.repeat_penalty, !args.no_sample,
+                                       args.seed, tokenizer.eos_token_id());
         }
 
         std::cout << "\n\n";

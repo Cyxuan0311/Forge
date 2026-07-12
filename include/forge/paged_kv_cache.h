@@ -1,9 +1,10 @@
 #pragma once
 
-#include <vector>
 #include <memory>
-#include <unordered_map>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
+
 #include "tensor.h"
 
 namespace forge {
@@ -24,14 +25,14 @@ class PagedKVCache {
 public:
     PagedKVCache() = default;
 
-    bool init(int num_layers, int num_kv_heads, int head_dim,
-              int max_seq_len, int block_size, int max_num_seqs,
-              DeviceType device);
+    bool init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len, int block_size,
+              int max_num_seqs, DeviceType device);
 
     int allocate_seq(int seq_id);
     void release_seq(int seq_id);
 
-    int append(int seq_id, int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
+    int append(int seq_id, int layer, const TensorPtr& new_key, const TensorPtr& new_value,
+               int seq_len);
     TensorPtr get_key(int seq_id, int layer) const;
     TensorPtr get_value(int seq_id, int layer) const;
 
@@ -70,4 +71,4 @@ private:
     mutable std::mutex mutex_;
 };
 
-} // namespace forge
+}  // namespace forge

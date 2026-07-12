@@ -1,5 +1,6 @@
-#include "cuda_elementwise.h"
 #include <cmath>
+
+#include "cuda_elementwise.h"
 
 namespace forge {
 namespace cuda {
@@ -11,8 +12,7 @@ __global__ void add_bias_kernel(const float* data, const float* bias, float* out
     }
 }
 
-void launch_add_bias(const float* data, const float* bias, float* out,
-                     int n, cudaStream_t stream) {
+void launch_add_bias(const float* data, const float* bias, float* out, int n, cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     add_bias_kernel<<<blocks, threads, 0, stream>>>(data, bias, out, n);
@@ -25,8 +25,7 @@ __global__ void multiply_kernel(const float* a, const float* b, float* out, int 
     }
 }
 
-void launch_multiply(const float* a, const float* b, float* out,
-                     int n, cudaStream_t stream) {
+void launch_multiply(const float* a, const float* b, float* out, int n, cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     multiply_kernel<<<blocks, threads, 0, stream>>>(a, b, out, n);
@@ -41,8 +40,8 @@ __global__ void silu_multiply_kernel(const float* gate, const float* up, float* 
     }
 }
 
-void launch_silu_multiply(const float* gate, const float* up, float* out,
-                          int n, cudaStream_t stream) {
+void launch_silu_multiply(const float* gate, const float* up, float* out, int n,
+                          cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     silu_multiply_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n);
@@ -57,12 +56,12 @@ __global__ void gelu_multiply_kernel(const float* gate, const float* up, float* 
     }
 }
 
-void launch_gelu_multiply(const float* gate, const float* up, float* out,
-                           int n, cudaStream_t stream) {
+void launch_gelu_multiply(const float* gate, const float* up, float* out, int n,
+                          cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     gelu_multiply_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n);
 }
 
-} // namespace cuda
-} // namespace forge
+}  // namespace cuda
+}  // namespace forge

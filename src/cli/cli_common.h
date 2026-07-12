@@ -4,9 +4,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
-#include <cstdint>
 
 // Forward declarations
 namespace forge {
@@ -14,7 +14,7 @@ class Tokenizer;
 class InferenceContext;
 class Model;
 class VisionEncoder;
-}
+}  // namespace forge
 
 // ============================================================================
 // CLI arguments
@@ -62,24 +62,23 @@ CliArgs parse_args(int argc, char** argv);
 // ============================================================================
 
 enum class ChatTemplateType {
-    ChatML,       // Qwen, Yi: <|im_start|>...<|im_end|>
-    DeepSeek,     // DeepSeek: <｜User｜><｜Assistant｜>
-    Llama,        // Llama: [INST]...[/INST]
-    Plain,        // No template, plain text
+    ChatML,    // Qwen, Yi: <|im_start|>...<|im_end|>
+    DeepSeek,  // DeepSeek: <｜User｜><｜Assistant｜>
+    Llama,     // Llama: [INST]...[/INST]
+    Plain,     // No template, plain text
 };
 
 struct ChatMessage {
-    std::string role;     // "system", "user", "assistant"
+    std::string role;  // "system", "user", "assistant"
     std::string content;
 };
 
 ChatTemplateType detect_template_type(const forge::Tokenizer& tokenizer);
 
-std::vector<int32_t> apply_chat_template(
-    const forge::Tokenizer& tokenizer,
-    const std::vector<ChatMessage>& messages,
-    ChatTemplateType tmpl_type,
-    bool add_generation_prompt = true);
+std::vector<int32_t> apply_chat_template(const forge::Tokenizer& tokenizer,
+                                         const std::vector<ChatMessage>& messages,
+                                         ChatTemplateType tmpl_type,
+                                         bool add_generation_prompt = true);
 
 // ============================================================================
 // Generation stats
@@ -96,41 +95,22 @@ struct GenerationStats {
 // Generation functions
 // ============================================================================
 
-GenerationStats generate_streaming(
-    forge::InferenceContext& ctx,
-    const forge::Tokenizer& tokenizer,
-    const std::vector<int32_t>& prompt_tokens,
-    int max_new_tokens,
-    float temperature,
-    int top_k,
-    float top_p,
-    float repeat_penalty,
-    bool do_sample,
-    uint64_t seed,
-    int eos_token_id);
+GenerationStats generate_streaming(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
+                                   const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
+                                   float temperature, int top_k, float top_p, float repeat_penalty,
+                                   bool do_sample, uint64_t seed, int eos_token_id);
 
-GenerationStats generate_batch(
-    forge::InferenceContext& ctx,
-    const forge::Tokenizer& tokenizer,
-    const std::vector<int32_t>& prompt_tokens,
-    int max_new_tokens,
-    float temperature,
-    int top_k,
-    float top_p,
-    float repeat_penalty,
-    bool do_sample,
-    uint64_t seed,
-    int eos_token_id);
+GenerationStats generate_batch(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
+                               const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
+                               float temperature, int top_k, float top_p, float repeat_penalty,
+                               bool do_sample, uint64_t seed, int eos_token_id);
 
 // ============================================================================
 // Interactive chat
 // ============================================================================
 
-void interactive_chat(
-    forge::Model& model,
-    forge::Tokenizer& tokenizer,
-    forge::VisionEncoder* vision,
-    const CliArgs& args);
+void interactive_chat(forge::Model& model, forge::Tokenizer& tokenizer,
+                      forge::VisionEncoder* vision, const CliArgs& args);
 
 // ============================================================================
 // Utility
@@ -140,8 +120,10 @@ std::string format_bytes(size_t bytes);
 std::string trim(const std::string& s);
 void print_logo();
 void print_model_info(const forge::Model& model, const forge::Tokenizer& tokenizer);
-void run_benchmark(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer, int n_gpu_layers);
-std::vector<float> encode_image(forge::VisionEncoder& vision, const std::string& image_path, int& num_tokens);
+void run_benchmark(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
+                   int n_gpu_layers);
+std::vector<float> encode_image(forge::VisionEncoder& vision, const std::string& image_path,
+                                int& num_tokens);
 
 // Global interrupt flag
 extern volatile bool g_interrupted;

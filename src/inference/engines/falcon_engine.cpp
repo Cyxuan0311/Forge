@@ -1,20 +1,21 @@
 #include "forge/engines/falcon_engine.h"
-#include "forge/operators.h"
-#include "forge/cuda_kernels.h"
-#include "forge/logger.h"
-#include "forge/perf_profiler.h"
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/operators.h"
+#include "forge/perf_profiler.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
 
-FalconEngine::FalconEngine(Model& model, InferenceContext& ctx)
-    : TransformerEngine(model, ctx) {
+FalconEngine::FalconEngine(Model& model, InferenceContext& ctx) : TransformerEngine(model, ctx) {
     if (!init_weights()) {
         throw std::runtime_error("FalconEngine: failed to initialize weights");
     }
@@ -43,10 +44,8 @@ TensorPtr FalconEngine::forward(const TensorPtr& input_ids, int64_t start_pos) {
     return forward_layers(hidden, seq_len, start_pos);
 }
 
-TensorPtr FalconEngine::forward_layer(const TensorPtr& hidden,
-                                       int layer_idx,
-                                       int seq_len, int64_t start_pos,
-                                       DeviceType dev) {
+TensorPtr FalconEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                      int64_t start_pos, DeviceType dev) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -68,8 +67,7 @@ TensorPtr FalconEngine::forward_layer(const TensorPtr& hidden,
     if (attn_norm_2_w) {
         auto attn_norm_2_b = lw.get("attn_norm_2_bias");
         PERF_SCOPE("layer/attn_norm_2");
-        qkv_input = ops::layer_norm(normed, attn_norm_2_w, attn_norm_2_b,
-                                     cfg.layer_norm_eps);
+        qkv_input = ops::layer_norm(normed, attn_norm_2_w, attn_norm_2_b, cfg.layer_norm_eps);
     }
 
     // ---- QKV Projection ----
@@ -87,11 +85,9 @@ TensorPtr FalconEngine::forward_layer(const TensorPtr& hidden,
     {
         PERF_SCOPE("layer/rope");
         apply_rope_neox_cpu(
-            static_cast<const float*>(q->data()),
-            static_cast<const float*>(k->data()),
-            static_cast<float*>(q_rope->data()),
-            static_cast<float*>(k_rope->data()),
-            seq_len, num_heads, num_kv_heads, head_dim, start_pos, cfg.rope_theta);
+            static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+            static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), seq_len,
+            num_heads, num_kv_heads, head_dim, start_pos, cfg.rope_theta);
     }
 
     // ---- KV Cache ----
@@ -118,13 +114,12 @@ TensorPtr FalconEngine::forward_layer(const TensorPtr& hidden,
     {
         PERF_SCOPE("layer/attention");
         if (num_kv_heads < num_heads) {
-            attn_out = ops::scaled_dot_product_attention_2d_gqa(
-                q_rope, k_sliced, v_sliced, seq_len, total_len,
-                num_heads, num_kv_heads, head_dim, true);
+            attn_out = ops::scaled_dot_product_attention_2d_gqa(q_rope, k_sliced, v_sliced, seq_len,
+                                                                total_len, num_heads, num_kv_heads,
+                                                                head_dim, true);
         } else {
-            attn_out = ops::scaled_dot_product_attention_2d(
-                q_rope, k_sliced, v_sliced, seq_len, total_len,
-                num_heads, head_dim, true);
+            attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_sliced, v_sliced, seq_len,
+                                                            total_len, num_heads, head_dim, true);
         }
     }
 
@@ -156,10 +151,9 @@ TensorPtr FalconEngine::forward_layer(const TensorPtr& hidden,
     return output;
 }
 
-void FalconEngine::apply_rope_neox_cpu(const float* q_data, const float* k_data,
-                                        float* q_out, float* k_out,
-                                        int seq_len, int num_heads, int num_kv_heads,
-                                        int head_dim, int64_t start_pos, float theta) {
+void FalconEngine::apply_rope_neox_cpu(const float* q_data, const float* k_data, float* q_out,
+                                       float* k_out, int seq_len, int num_heads, int num_kv_heads,
+                                       int head_dim, int64_t start_pos, float theta) {
     ensure_rope_freqs(head_dim, theta);
     int half_dim = head_dim / 2;
     int q_stride = num_heads * head_dim;
@@ -195,6 +189,6 @@ namespace {
 EngineAutoRegister _reg_falcon("falcon", [](Model& model, InferenceContext& ctx) {
     return std::make_unique<FalconEngine>(model, ctx);
 });
-} // anonymous namespace
+}  // anonymous namespace
 
-} // namespace forge
+}  // namespace forge

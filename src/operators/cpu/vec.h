@@ -1,9 +1,9 @@
 #pragma once
 
-#include <cstdint>
 #include <cmath>
+#include <cstdint>
 #ifdef USE_AVX2
-#include <immintrin.h>
+#    include <immintrin.h>
 #endif
 
 namespace forge {
@@ -43,25 +43,27 @@ static inline float dot_product_avx2(const float* a, const float* b, int n) {
         acc = _mm256_fmadd_ps(av, bv, acc);
     }
     float sum = hsum_avx2(acc);
-    for (; i < n; ++i) sum += a[i] * b[i];
+    for (; i < n; ++i)
+        sum += a[i] * b[i];
     return sum;
 }
 
-#endif // USE_AVX2
+#endif  // USE_AVX2
 
 static inline float fp16_to_float_scalar(uint16_t bits) {
     uint32_t sign = (bits >> 15) & 1;
     uint32_t exponent = (bits >> 10) & 0x1F;
     uint32_t mantissa = bits & 0x3FF;
     if (exponent == 0) {
-        if (mantissa == 0) return 0.0f;
+        if (mantissa == 0)
+            return 0.0f;
         float v = std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
         return sign ? -v : v;
     }
-    float v = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                          static_cast<int>(exponent) - 15);
+    float v =
+        std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f, static_cast<int>(exponent) - 15);
     return sign ? -v : v;
 }
 
-} // namespace cpu
-} // namespace forge
+}  // namespace cpu
+}  // namespace forge

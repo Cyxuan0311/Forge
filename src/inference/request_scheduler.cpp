@@ -1,13 +1,15 @@
 #include "forge/request_scheduler.h"
+
+#include <algorithm>
+#include <cstring>
+#include <stdexcept>
+
 #include "forge/engine.h"
 #include "forge/engines/llama_engine.h"
 #include "forge/logger.h"
-#include <stdexcept>
-#include <cstring>
-#include <algorithm>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -16,8 +18,8 @@ RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seq
     : model_(model), ctx_(model), sampler_(SamplerConfig{}), max_num_seqs_(max_num_seqs) {
     const auto& cfg = model_.config();
     DeviceType dev = model_.device();
-    paged_cache_.init(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim,
-                      cfg.max_seq_len, block_size, max_num_seqs, dev);
+    paged_cache_.init(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len, block_size,
+                      max_num_seqs, dev);
 
     auto engine = EngineRegistry::instance().create(cfg.arch_type, model_, ctx_);
     if (engine) {
@@ -25,11 +27,9 @@ RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seq
     }
 }
 
-int RequestScheduler::submit(const std::vector<int32_t>& prompt_tokens,
-                              int max_new_tokens,
-                              int eos_token_id,
-                              const SamplerConfig& sampler_cfg,
-                              GenerateRequest::Callback callback) {
+int RequestScheduler::submit(const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
+                             int eos_token_id, const SamplerConfig& sampler_cfg,
+                             GenerateRequest::Callback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     int req_id = next_request_id_++;
@@ -46,8 +46,8 @@ int RequestScheduler::submit(const std::vector<int32_t>& prompt_tokens,
     requests_[req_id] = std::move(req);
     waiting_queue_.push(req_id);
 
-    LOG_DEBUG("RequestScheduler: submitted request " + std::to_string(req_id) +
-              " with " + std::to_string(prompt_tokens.size()) + " prompt tokens");
+    LOG_DEBUG("RequestScheduler: submitted request " + std::to_string(req_id) + " with " +
+              std::to_string(prompt_tokens.size()) + " prompt tokens");
 
     return req_id;
 }
@@ -57,12 +57,14 @@ bool RequestScheduler::step() {
 
     schedule();
 
-    if (active_ids_.empty()) return false;
+    if (active_ids_.empty())
+        return false;
 
     std::vector<int> still_active;
     for (int rid : active_ids_) {
         auto it = requests_.find(rid);
-        if (it == requests_.end()) continue;
+        if (it == requests_.end())
+            continue;
 
         auto& req = it->second;
         bool ok = true;
@@ -93,14 +95,14 @@ bool RequestScheduler::step() {
 }
 
 void RequestScheduler::schedule() {
-    while (!waiting_queue_.empty() &&
-           static_cast<int>(active_ids_.size()) < max_num_seqs_ &&
+    while (!waiting_queue_.empty() && static_cast<int>(active_ids_.size()) < max_num_seqs_ &&
            paged_cache_.num_free_blocks() > 0) {
         int rid = waiting_queue_.front();
         waiting_queue_.pop();
 
         auto it = requests_.find(rid);
-        if (it == requests_.end()) continue;
+        if (it == requests_.end())
+            continue;
 
         if (paged_cache_.allocate_seq(rid) < 0) {
             waiting_queue_.push(rid);
@@ -118,12 +120,13 @@ bool RequestScheduler::prefill_request(GenerateRequest& req) {
     const auto& cfg = model_.config();
     DeviceType dev = ctx_.device();
     auto* engine = ctx_.engine();
-    if (!engine) return false;
+    if (!engine)
+        return false;
 
     int prompt_len = static_cast<int>(req.prompt_tokens.size());
 
-    auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-        std::vector<int64_t>{prompt_len}, DeviceType::CPU);
+    auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{prompt_len},
+                                              DeviceType::CPU);
     std::memcpy(input_ids->data(), req.prompt_tokens.data(), prompt_len * sizeof(int32_t));
 
     if (dev == DeviceType::CUDA) {
@@ -157,12 +160,13 @@ bool RequestScheduler::prefill_request(GenerateRequest& req) {
 bool RequestScheduler::decode_step(GenerateRequest& req) {
     DeviceType dev = ctx_.device();
     auto* engine = ctx_.engine();
-    if (!engine) return false;
+    if (!engine)
+        return false;
 
     int32_t last_token = req.output_tokens.back();
 
-    auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-        std::vector<int64_t>{1}, DeviceType::CPU);
+    auto input_ids =
+        std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CPU);
     *static_cast<int32_t*>(input_ids->data()) = last_token;
 
     if (dev == DeviceType::CUDA) {
@@ -237,15 +241,15 @@ void RequestScheduler::abort(int request_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = requests_.find(request_id);
-    if (it == requests_.end()) return;
+    if (it == requests_.end())
+        return;
 
     it->second.status = RequestStatus::Failed;
     it->second.finish_reason = "aborted";
     paged_cache_.release_seq(request_id);
 
-    active_ids_.erase(
-        std::remove(active_ids_.begin(), active_ids_.end(), request_id),
-        active_ids_.end());
+    active_ids_.erase(std::remove(active_ids_.begin(), active_ids_.end(), request_id),
+                      active_ids_.end());
 }
 
 void RequestScheduler::reset() {
@@ -259,7 +263,8 @@ void RequestScheduler::reset() {
 
     requests_.clear();
     active_ids_.clear();
-    while (!waiting_queue_.empty()) waiting_queue_.pop();
+    while (!waiting_queue_.empty())
+        waiting_queue_.pop();
 }
 
-} // namespace forge
+}  // namespace forge

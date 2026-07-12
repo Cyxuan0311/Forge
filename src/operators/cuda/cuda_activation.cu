@@ -1,5 +1,6 @@
-#include "cuda_activation.h"
 #include <cmath>
+
+#include "cuda_activation.h"
 
 namespace forge {
 namespace cuda {
@@ -65,5 +66,5 @@ void launch_tanh(const float* x, float* out, int n, cudaStream_t stream) {
     tanh_kernel<<<blocks, threads, 0, stream>>>(x, out, n);
 }
 
-} // namespace cuda
-} // namespace forge
+}  // namespace cuda
+}  // namespace forge

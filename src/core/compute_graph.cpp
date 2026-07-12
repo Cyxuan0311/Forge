@@ -1,11 +1,13 @@
 #include "forge/compute_graph.h"
-#include "forge/memory_planner.h"
-#include "forge/backend.h"
-#include "forge/logger.h"
+
 #include <cstring>
 
+#include "forge/backend.h"
+#include "forge/logger.h"
+#include "forge/memory_planner.h"
+
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -16,11 +18,9 @@ int ComputeGraph::add_input(const TensorPtr& tensor) {
     return idx;
 }
 
-int ComputeGraph::add_node(const std::string& name,
-                            OpType op_type,
-                            const std::vector<int>& input_indices,
-                            const int32_t* op_params,
-                            DeviceType dev) {
+int ComputeGraph::add_node(const std::string& name, OpType op_type,
+                           const std::vector<int>& input_indices, const int32_t* op_params,
+                           DeviceType dev) {
     int node_idx = static_cast<int>(nodes_.size());
 
     GraphNode node;
@@ -29,19 +29,17 @@ int ComputeGraph::add_node(const std::string& name,
     node.input_indices = input_indices;
     node.device = dev;
     if (op_params) {
-        std::copy(op_params, op_params + OP_PARAMS_MAX_SIZE / sizeof(int32_t),
-                  node.op_params);
+        std::copy(op_params, op_params + OP_PARAMS_MAX_SIZE / sizeof(int32_t), node.op_params);
     }
 
     nodes_.push_back(std::move(node));
     return node_idx;
 }
 
-int ComputeGraph::add_node(const std::string& name,
-                            const std::string& op_type_str,
-                            const std::vector<int>& input_indices,
-                            std::function<TensorPtr(const std::vector<TensorPtr>&)> compute_fn,
-                            DeviceType dev) {
+int ComputeGraph::add_node(const std::string& name, const std::string& op_type_str,
+                           const std::vector<int>& input_indices,
+                           std::function<TensorPtr(const std::vector<TensorPtr>&)> compute_fn,
+                           DeviceType dev) {
     int node_idx = static_cast<int>(nodes_.size());
 
     GraphNode node;
@@ -56,7 +54,8 @@ int ComputeGraph::add_node(const std::string& name,
 }
 
 TensorPtr ComputeGraph::ensure_device(const TensorPtr& tensor, DeviceType target_dev) {
-    if (!tensor || tensor->device() == target_dev) return tensor;
+    if (!tensor || tensor->device() == target_dev)
+        return tensor;
     auto transferred = std::make_shared<Tensor>(tensor->dtype(), tensor->shape(), target_dev);
     transferred->copy_from(*tensor);
     return transferred;
@@ -75,7 +74,8 @@ std::unordered_set<int> ComputeGraph::find_consumers(int node_idx) const {
 }
 
 bool ComputeGraph::allocate_graph() {
-    if (graph_allocated_) return true;
+    if (graph_allocated_)
+        return true;
 
     planner_ = std::make_unique<MemoryPlanner>();
     planner_->plan(*this, release_intermediates_);
@@ -92,12 +92,11 @@ bool ComputeGraph::allocate_graph() {
     }
 
     graph_buffer_ = std::make_unique<GraphBuffer>(
-        BackendManager::instance().get_backend(backend->device_type()),
-        total_size);
+        BackendManager::instance().get_backend(backend->device_type()), total_size);
 
     if (!graph_buffer_->valid()) {
-        LOG_ERROR("ComputeGraph: failed to allocate graph buffer of " +
-                  std::to_string(total_size) + " bytes");
+        LOG_ERROR("ComputeGraph: failed to allocate graph buffer of " + std::to_string(total_size) +
+                  " bytes");
         return false;
     }
 
@@ -143,8 +142,10 @@ TensorPtr ComputeGraph::execute() {
     for (int i = 0; i < static_cast<int>(nodes_.size()); ++i) {
         auto& node = nodes_[i];
 
-        if (node.op_type == OpType::NONE && !node.compute_fn) continue;
-        if (node.op_type == OpType::CUSTOM && !node.compute_fn) continue;
+        if (node.op_type == OpType::NONE && !node.compute_fn)
+            continue;
+        if (node.op_type == OpType::CUSTOM && !node.compute_fn)
+            continue;
 
         node.resolved_inputs.clear();
 
@@ -170,15 +171,14 @@ TensorPtr ComputeGraph::execute() {
         if (node.compute_fn) {
             node.output = node.compute_fn(node.resolved_inputs);
         } else if (node.op_type != OpType::NONE) {
-            node.output = OpDispatch::instance().execute(
-                node.op_type, node.device, node.resolved_inputs, node.op_params);
+            node.output = OpDispatch::instance().execute(node.op_type, node.device,
+                                                         node.resolved_inputs, node.op_params);
         }
 
         // Copy to pre-allocated buffer and free temp memory
         if (node.output && graph_buffer_ && graph_buffer_->valid() && planner_) {
             const PlannedAllocation* alloc = planner_->get_allocation(i);
-            if (alloc && alloc->size > 0 &&
-                alloc->offset + alloc->size <= graph_buffer_->size()) {
+            if (alloc && alloc->size > 0 && alloc->offset + alloc->size <= graph_buffer_->size()) {
                 void* planned_ptr = static_cast<char*>(graph_buffer_->data()) + alloc->offset;
                 size_t copy_size = std::min(node.output->nbytes(), alloc->size);
 
@@ -188,8 +188,8 @@ TensorPtr ComputeGraph::execute() {
                     }
 #ifdef USE_CUDA
                     else if (node.output->device() == DeviceType::CUDA) {
-                        cudaMemcpyAsync(planned_ptr, node.output->data(),
-                                        copy_size, cudaMemcpyDeviceToDevice);
+                        cudaMemcpyAsync(planned_ptr, node.output->data(), copy_size,
+                                        cudaMemcpyDeviceToDevice);
                     }
 #endif
                     void* old_data = node.output->replace_data(planned_ptr, copy_size);
@@ -231,7 +231,8 @@ TensorPtr ComputeGraph::execute() {
 }
 
 TensorPtr ComputeGraph::execute_node(int node_idx) {
-    if (node_idx < 0 || node_idx >= static_cast<int>(nodes_.size())) return nullptr;
+    if (node_idx < 0 || node_idx >= static_cast<int>(nodes_.size()))
+        return nullptr;
 
     auto& node = nodes_[node_idx];
     node.resolved_inputs.clear();
@@ -258,8 +259,8 @@ TensorPtr ComputeGraph::execute_node(int node_idx) {
     if (node.compute_fn) {
         node.output = node.compute_fn(node.resolved_inputs);
     } else if (node.op_type != OpType::NONE) {
-        node.output = OpDispatch::instance().execute(
-            node.op_type, node.device, node.resolved_inputs, node.op_params);
+        node.output = OpDispatch::instance().execute(node.op_type, node.device,
+                                                     node.resolved_inputs, node.op_params);
     }
 
     return node.output;
@@ -273,14 +274,17 @@ void ComputeGraph::reset() {
 }
 
 TensorPtr ComputeGraph::get_output(int node_idx) const {
-    if (node_idx < 0 || node_idx >= static_cast<int>(nodes_.size())) return nullptr;
+    if (node_idx < 0 || node_idx >= static_cast<int>(nodes_.size()))
+        return nullptr;
     return nodes_[node_idx].output;
 }
 
 TensorPtr ComputeGraph::last_output() const {
-    if (nodes_.empty()) return nullptr;
+    if (nodes_.empty())
+        return nullptr;
     for (int i = static_cast<int>(nodes_.size()) - 1; i >= 0; --i) {
-        if (nodes_[i].output) return nodes_[i].output;
+        if (nodes_[i].output)
+            return nodes_[i].output;
     }
     return nullptr;
 }
@@ -294,7 +298,8 @@ Backend* ComputeGraph::workspace_backend() {
 }
 
 void ComputeGraph::apply_schedule(const SchedulingPlan& plan) {
-    if (!plan.valid) return;
+    if (!plan.valid)
+        return;
     schedule_ = std::make_unique<SchedulingPlan>(plan);
 
     // Override each node's device based on the plan
@@ -316,11 +321,9 @@ int ComputeGraph::optimize_fusion() {
 
         // Pattern: rms_norm followed by matmul_transB
         bool curr_is_norm = (curr.op_type == OpType::RMS_NORM) ||
-                            (curr.op_type == OpType::CUSTOM &&
-                             curr.compute_fn != nullptr);
+                            (curr.op_type == OpType::CUSTOM && curr.compute_fn != nullptr);
         bool next_is_matmul = (next.op_type == OpType::MUL_MAT_TRANSB) ||
-                               (next.op_type == OpType::CUSTOM &&
-                                next.compute_fn != nullptr);
+                              (next.op_type == OpType::CUSTOM && next.compute_fn != nullptr);
 
         // For string-based ops, check the name heuristic
         if (curr.op_type == OpType::CUSTOM && curr.compute_fn) {
@@ -340,7 +343,8 @@ int ComputeGraph::optimize_fusion() {
                 auto matmul_fn = next.compute_fn;
 
                 if (norm_fn && matmul_fn) {
-                    next.compute_fn = [norm_fn, matmul_fn](const std::vector<TensorPtr>& inputs) -> TensorPtr {
+                    next.compute_fn =
+                        [norm_fn, matmul_fn](const std::vector<TensorPtr>& inputs) -> TensorPtr {
                         auto normed = norm_fn(inputs);
                         return matmul_fn({normed});
                     };
@@ -372,10 +376,9 @@ GraphBuilder& GraphBuilder::input(const TensorPtr& tensor) {
     return *this;
 }
 
-GraphBuilder& GraphBuilder::op(const std::string& name,
-                                const std::string& op_type_str,
-                                const std::vector<int>& deps,
-                                std::function<TensorPtr(const std::vector<TensorPtr>&)> fn) {
+GraphBuilder& GraphBuilder::op(const std::string& name, const std::string& op_type_str,
+                               const std::vector<int>& deps,
+                               std::function<TensorPtr(const std::vector<TensorPtr>&)> fn) {
     PendingNode node;
     node.name = name;
     node.op_type_str = op_type_str;
@@ -400,4 +403,4 @@ std::unique_ptr<ComputeGraph> GraphBuilder::build() {
     return graph;
 }
 
-} // namespace forge
+}  // namespace forge

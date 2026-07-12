@@ -17,9 +17,11 @@ function(detect_cuda_architecture OUTPUT_VAR)
 #include <cuda_runtime.h>
 int main() {
     int device;
-    cudaGetDevice(&device);
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) return 1;
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
+    err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) return 1;
     printf(\"%d%d\", prop.major, prop.minor);
     return 0;
 }"
@@ -41,7 +43,11 @@ int main() {
     )
     if(_run_ret EQUAL 0 AND _arch)
         string(STRIP "${_arch}" _arch)
-        message(STATUS "Detected CUDA architecture: ${_arch}")
-        set("${OUTPUT_VAR}" "${_arch}" PARENT_SCOPE)
+        if(_arch MATCHES "^[89][0-9]$|^[5-9][0-9]$")
+            message(STATUS "Detected CUDA architecture: ${_arch}")
+            set("${OUTPUT_VAR}" "${_arch}" PARENT_SCOPE)
+        else()
+            message(STATUS "Invalid CUDA architecture output '${_arch}', using default")
+        endif()
     endif()
 endfunction()

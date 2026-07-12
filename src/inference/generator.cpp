@@ -1,29 +1,32 @@
 #include "forge/generator.h"
+
+#include <chrono>
+#include <cstring>
+#include <stdexcept>
+
 #include "forge/engine.h"
 #include "forge/engines/llama_engine.h"
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
-#include <stdexcept>
-#include <cstring>
-#include <chrono>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
 
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(
-        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+               std::chrono::high_resolution_clock::now().time_since_epoch())
+        .count();
 }
 
 Generator::Generator(InferenceContext& ctx, const SamplerConfig& sampler_cfg)
     : ctx_(ctx), sampler_(sampler_cfg) {
 #ifdef USE_CUDA
     if (ctx_.device() == DeviceType::CUDA) {
-        decode_input_gpu_ = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{1}, DeviceType::CUDA);
+        decode_input_gpu_ =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CUDA);
         cudaMalloc(&decode_token_buf_, sizeof(int32_t));
     }
 #endif
@@ -39,13 +42,13 @@ Generator::~Generator() {
 }
 
 GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
-                                      const GenerationConfig& config) {
+                                     const GenerationConfig& config) {
     return generate(prompt_tokens, config, nullptr);
 }
 
 GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
-                                      const GenerationConfig& config,
-                                      const TokenCallback& callback) {
+                                     const GenerationConfig& config,
+                                     const TokenCallback& callback) {
     GenerationResult result;
     result.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
 
@@ -75,8 +78,8 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     int token_id;
     {
         PERF_SCOPE("generator/prefill");
-        auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{prompt_len}, DeviceType::CPU);
+        auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{prompt_len},
+                                                  DeviceType::CPU);
         std::memcpy(input_ids->data(), prompt_tokens.data(), prompt_len * sizeof(int32_t));
 
         if (dev == DeviceType::CUDA) {
@@ -117,13 +120,13 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             PERF_SCOPE("decode/prepare_input");
             if (dev == DeviceType::CUDA && decode_input_gpu_) {
 #ifdef USE_CUDA
-                cudaMemcpyAsync(decode_input_gpu_->data(), &last_token,
-                               sizeof(int32_t), cudaMemcpyHostToDevice);
+                cudaMemcpyAsync(decode_input_gpu_->data(), &last_token, sizeof(int32_t),
+                                cudaMemcpyHostToDevice);
 #endif
                 input_ids = decode_input_gpu_;
             } else {
-                input_ids = std::make_shared<Tensor>(DataType::INT32,
-                    std::vector<int64_t>{1}, DeviceType::CPU);
+                input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1},
+                                                     DeviceType::CPU);
                 *static_cast<int32_t*>(input_ids->data()) = last_token;
             }
         }
@@ -163,4 +166,4 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     return result;
 }
 
-} // namespace forge
+}  // namespace forge

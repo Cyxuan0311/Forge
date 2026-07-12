@@ -1,39 +1,48 @@
 #include "forge/engines/qwen35_engine.h"
-#include "forge/operators.h"
-#include "forge/cuda_kernels.h"
-#include "forge/logger.h"
+
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <algorithm>
 #include <stdexcept>
 
+#include "forge/cuda_kernels.h"
+#include "forge/logger.h"
+#include "forge/operators.h"
+
 #ifdef _OPENMP
-#include <omp.h>
+#    include <omp.h>
 #endif
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 // Enable verbose debug logging (set to 0 to disable)
 #define QWEN35_DEBUG 0
 
 #if QWEN35_DEBUG
-#define QDEBUG(fmt, ...) do { fprintf(stderr, fmt, ##__VA_ARGS__); fflush(stderr); } while(0)
+#    define QDEBUG(fmt, ...)                     \
+        do {                                     \
+            fprintf(stderr, fmt, ##__VA_ARGS__); \
+            fflush(stderr);                      \
+        } while (0)
 #else
-#define QDEBUG(fmt, ...) ((void)0)
+#    define QDEBUG(fmt, ...) ((void)0)
 #endif
 
 // FATAL errors always print
-#define QFATAL(fmt, ...) do { fprintf(stderr, fmt, ##__VA_ARGS__); fflush(stderr); } while(0)
+#define QFATAL(fmt, ...)                     \
+    do {                                     \
+        fprintf(stderr, fmt, ##__VA_ARGS__); \
+        fflush(stderr);                      \
+    } while (0)
 
 namespace forge {
 
 // ============================================================================
 // Engine constructor
 // ============================================================================
-Qwen35Engine::Qwen35Engine(Model& model, InferenceContext& ctx)
-    : TransformerEngine(model, ctx) {
+Qwen35Engine::Qwen35Engine(Model& model, InferenceContext& ctx) : TransformerEngine(model, ctx) {
     if (!init_weights()) {
         throw std::runtime_error("Qwen35Engine: failed to initialize weights");
     }
@@ -49,7 +58,8 @@ bool Qwen35Engine::init_weights() {
 // ============================================================================
 void Qwen35Engine::init_recurrent_states() {
     const auto& cfg = model_.config();
-    if (!cfg.use_ssm) return;
+    if (!cfg.use_ssm)
+        return;
 
     // Parse SSM dimensions from config and weight shapes
     ssm_d_state_ = cfg.ssm_state_size;
@@ -73,24 +83,27 @@ void Qwen35Engine::init_recurrent_states() {
     }
 
     // Fallback defaults
-    if (ssm_d_state_ == 0) ssm_d_state_ = 128;
-    if (ssm_n_group_ == 0) ssm_n_group_ = 16;
-    if (ssm_dt_rank_ == 0) ssm_dt_rank_ = 16;
-    if (ssm_d_inner_ == 0) ssm_d_inner_ = 2 * cfg.hidden_dim;
-    if (ssm_d_conv_ == 0) ssm_d_conv_ = 4;
+    if (ssm_d_state_ == 0)
+        ssm_d_state_ = 128;
+    if (ssm_n_group_ == 0)
+        ssm_n_group_ = 16;
+    if (ssm_dt_rank_ == 0)
+        ssm_dt_rank_ = 16;
+    if (ssm_d_inner_ == 0)
+        ssm_d_inner_ = 2 * cfg.hidden_dim;
+    if (ssm_d_conv_ == 0)
+        ssm_d_conv_ = 4;
 
     // Compute derived dimensions
     ssm_head_v_dim_ = ssm_d_inner_ / ssm_dt_rank_;
     ssm_conv_channels_ = ssm_d_inner_ + 2 * ssm_n_group_ * ssm_d_state_;
 
     LOG_INFO("Qwen35Engine: Gated Delta Net params:");
-    LOG_INFO("  d_inner=" + std::to_string(ssm_d_inner_) +
-             ", d_state=" + std::to_string(ssm_d_state_) +
-             ", n_group=" + std::to_string(ssm_n_group_) +
-             ", dt_rank=" + std::to_string(ssm_dt_rank_));
-    LOG_INFO("  head_v_dim=" + std::to_string(ssm_head_v_dim_) +
-             ", conv_channels=" + std::to_string(ssm_conv_channels_) +
-             ", d_conv=" + std::to_string(ssm_d_conv_));
+    LOG_INFO(
+        "  d_inner=" + std::to_string(ssm_d_inner_) + ", d_state=" + std::to_string(ssm_d_state_) +
+        ", n_group=" + std::to_string(ssm_n_group_) + ", dt_rank=" + std::to_string(ssm_dt_rank_));
+    LOG_INFO("  head_v_dim=" + std::to_string(ssm_head_v_dim_) + ", conv_channels=" +
+             std::to_string(ssm_conv_channels_) + ", d_conv=" + std::to_string(ssm_d_conv_));
 
     // Allocate states
     int state_size = ssm_head_v_dim_ * ssm_head_v_dim_ * ssm_dt_rank_;
@@ -103,14 +116,15 @@ void Qwen35Engine::init_recurrent_states() {
         }
     }
 
-    size_t total_ssm_bytes = (size_t)num_linear_layers * (state_size + conv_state_size) * sizeof(float);
+    size_t total_ssm_bytes =
+        (size_t)num_linear_layers * (state_size + conv_state_size) * sizeof(float);
     LOG_INFO("Qwen35Engine: SSM state allocation:");
     LOG_INFO("  num_linear_layers=" + std::to_string(num_linear_layers) +
-             ", state_size_per_layer=" + std::to_string(state_size) +
-             " floats (" + std::to_string(state_size * sizeof(float) / (1024*1024)) + " MB)" +
-             ", conv_state_per_layer=" + std::to_string(conv_state_size) +
-             " floats (" + std::to_string(conv_state_size * sizeof(float) / 1024) + " KB)");
-    LOG_INFO("  Total SSM state: " + std::to_string(total_ssm_bytes / (1024*1024)) + " MB");
+             ", state_size_per_layer=" + std::to_string(state_size) + " floats (" +
+             std::to_string(state_size * sizeof(float) / (1024 * 1024)) + " MB)" +
+             ", conv_state_per_layer=" + std::to_string(conv_state_size) + " floats (" +
+             std::to_string(conv_state_size * sizeof(float) / 1024) + " KB)");
+    LOG_INFO("  Total SSM state: " + std::to_string(total_ssm_bytes / (1024 * 1024)) + " MB");
 
     recurrent_states_.resize(cfg.num_layers);
     for (int i = 0; i < cfg.num_layers; ++i) {
@@ -135,8 +149,8 @@ void Qwen35Engine::reset() {
 // ============================================================================
 // Layer dispatch
 // ============================================================================
-TensorPtr Qwen35Engine::forward_layer(const TensorPtr& hidden, int layer_idx,
-                                       int seq_len, int64_t start_pos, DeviceType dev) {
+TensorPtr Qwen35Engine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                      int64_t start_pos, DeviceType dev) {
     const auto& lw = weights_.layers[layer_idx];
 
     if (lw.layer_type == LayerType::FullAttention) {
@@ -149,9 +163,8 @@ TensorPtr Qwen35Engine::forward_layer(const TensorPtr& hidden, int layer_idx,
 // ============================================================================
 // Full Attention Layer (with gated Q, Q/K norm, MRoPE)
 // ============================================================================
-TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int layer_idx,
-                                                  int seq_len, int64_t start_pos,
-                                                  DeviceType dev) {
+TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                                int64_t start_pos, DeviceType dev) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -162,11 +175,26 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
               std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos));
 
     // Validate required weights
-    if (!lw.attn_norm()) { QFATAL("[FATAL] Layer %d (FullAttn): missing attn_norm\n", layer_idx); return hidden; }
-    if (!lw.attn_q()) { QFATAL("[FATAL] Layer %d (FullAttn): missing attn_q\n", layer_idx); return hidden; }
-    if (!lw.attn_k()) { QFATAL("[FATAL] Layer %d (FullAttn): missing attn_k\n", layer_idx); return hidden; }
-    if (!lw.attn_v()) { QFATAL("[FATAL] Layer %d (FullAttn): missing attn_v\n", layer_idx); return hidden; }
-    if (!lw.attn_output()) { QFATAL("[FATAL] Layer %d (FullAttn): missing attn_output\n", layer_idx); return hidden; }
+    if (!lw.attn_norm()) {
+        QFATAL("[FATAL] Layer %d (FullAttn): missing attn_norm\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.attn_q()) {
+        QFATAL("[FATAL] Layer %d (FullAttn): missing attn_q\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.attn_k()) {
+        QFATAL("[FATAL] Layer %d (FullAttn): missing attn_k\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.attn_v()) {
+        QFATAL("[FATAL] Layer %d (FullAttn): missing attn_v\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.attn_output()) {
+        QFATAL("[FATAL] Layer %d (FullAttn): missing attn_output\n", layer_idx);
+        return hidden;
+    }
 
     // Norm
     auto normed = ops::rms_norm(hidden, lw.attn_norm(), cfg.rms_norm_eps);
@@ -184,17 +212,22 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
         q_full_cpu->copy_from(*q_full);
     }
 
-    auto q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim}, DeviceType::CPU);
-    auto gate = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim}, DeviceType::CPU);
+    auto q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim},
+                                      DeviceType::CPU);
+    auto gate = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim},
+                                         DeviceType::CPU);
 
     const float* qf_data = static_cast<const float*>(q_full_cpu->data());
     float* q_data = static_cast<float*>(q->data());
     float* g_data = static_cast<float*>(gate->data());
 
-    if (!qf_data) { QFATAL("[FATAL] Layer %d (FullAttn): qf_data is NULL!\n", layer_idx); return hidden; }
+    if (!qf_data) {
+        QFATAL("[FATAL] Layer %d (FullAttn): qf_data is NULL!\n", layer_idx);
+        return hidden;
+    }
 
-    // Split per head: each head has [head_dim Q | head_dim gate]
-    #pragma omp parallel for schedule(static) collapse(2) if(seq_len * num_heads > 4)
+// Split per head: each head has [head_dim Q | head_dim gate]
+#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_heads > 4)
     for (int s = 0; s < seq_len; ++s) {
         for (int h = 0; h < num_heads; ++h) {
             const float* src = qf_data + s * num_heads * head_dim * 2 + h * head_dim * 2;
@@ -228,7 +261,8 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
         std::vector<float> qn_w(head_dim);
         if (q_norm_w->dtype() == DataType::FP32) {
             if (q_norm_w->device() == DeviceType::CUDA) {
-                auto tmp = std::make_shared<Tensor>(DataType::FP32, q_norm_w->shape(), DeviceType::CPU);
+                auto tmp =
+                    std::make_shared<Tensor>(DataType::FP32, q_norm_w->shape(), DeviceType::CPU);
                 tmp->copy_from(*q_norm_w);
                 std::memcpy(qn_w.data(), tmp->data(), head_dim * sizeof(float));
             } else {
@@ -238,14 +272,16 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
             std::fill(qn_w.begin(), qn_w.end(), 1.0f);
         }
 
-        #pragma omp parallel for schedule(static) collapse(2) if(seq_len * num_heads > 4)
+#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_heads > 4)
         for (int s = 0; s < seq_len; ++s) {
             for (int h = 0; h < num_heads; ++h) {
                 float* head_ptr = qd + s * num_heads * head_dim + h * head_dim;
                 float norm_sq = 0.0f;
-                for (int d = 0; d < head_dim; ++d) norm_sq += head_ptr[d] * head_ptr[d];
+                for (int d = 0; d < head_dim; ++d)
+                    norm_sq += head_ptr[d] * head_ptr[d];
                 float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + cfg.rms_norm_eps);
-                for (int d = 0; d < head_dim; ++d) head_ptr[d] *= inv_rms * qn_w[d];
+                for (int d = 0; d < head_dim; ++d)
+                    head_ptr[d] *= inv_rms * qn_w[d];
             }
         }
     }
@@ -255,7 +291,8 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
         std::vector<float> kn_w(head_dim);
         if (k_norm_w->dtype() == DataType::FP32) {
             if (k_norm_w->device() == DeviceType::CUDA) {
-                auto tmp = std::make_shared<Tensor>(DataType::FP32, k_norm_w->shape(), DeviceType::CPU);
+                auto tmp =
+                    std::make_shared<Tensor>(DataType::FP32, k_norm_w->shape(), DeviceType::CPU);
                 tmp->copy_from(*k_norm_w);
                 std::memcpy(kn_w.data(), tmp->data(), head_dim * sizeof(float));
             } else {
@@ -265,31 +302,31 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
             std::fill(kn_w.begin(), kn_w.end(), 1.0f);
         }
 
-        #pragma omp parallel for schedule(static) collapse(2) if(seq_len * num_kv_heads > 4)
+#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_kv_heads > 4)
         for (int s = 0; s < seq_len; ++s) {
             for (int h = 0; h < num_kv_heads; ++h) {
                 float* head_ptr = kd + s * num_kv_heads * head_dim + h * head_dim;
                 float norm_sq = 0.0f;
-                for (int d = 0; d < head_dim; ++d) norm_sq += head_ptr[d] * head_ptr[d];
+                for (int d = 0; d < head_dim; ++d)
+                    norm_sq += head_ptr[d] * head_ptr[d];
                 float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + cfg.rms_norm_eps);
-                for (int d = 0; d < head_dim; ++d) head_ptr[d] *= inv_rms * kn_w[d];
+                for (int d = 0; d < head_dim; ++d)
+                    head_ptr[d] *= inv_rms * kn_w[d];
             }
         }
     }
 
     // Apply MRoPE
     int n_rot = cfg.use_mrope ? cfg.rope_dimension_count : head_dim;
-    if (n_rot <= 0) n_rot = head_dim;
+    if (n_rot <= 0)
+        n_rot = head_dim;
 
     auto q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
     auto k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
 
-    apply_rope_mrope(
-        static_cast<const float*>(q->data()),
-        static_cast<const float*>(k->data()),
-        static_cast<float*>(q_rope->data()),
-        static_cast<float*>(k_rope->data()),
-        seq_len, num_heads, num_kv_heads, head_dim, n_rot, start_pos, cfg.rope_theta);
+    apply_rope_mrope(static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+                     static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()),
+                     seq_len, num_heads, num_kv_heads, head_dim, n_rot, start_pos, cfg.rope_theta);
 
     // KV cache
     kv_cache_.update(layer_idx, k_rope, v, seq_len);
@@ -306,15 +343,18 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
     TensorPtr k_expanded, v_expanded;
     if (num_kv_heads < num_heads) {
         auto to_cpu = [](const TensorPtr& t) -> TensorPtr {
-            if (t->device() == DeviceType::CPU) return t;
+            if (t->device() == DeviceType::CPU)
+                return t;
             auto tmp = std::make_shared<Tensor>(DataType::FP32, t->shape(), DeviceType::CPU);
             tmp->copy_from(*t);
             return tmp;
         };
         auto k_cpu = to_cpu(k_sliced);
         auto v_cpu = to_cpu(v_sliced);
-        k_expanded = expand_kv_heads(k_cpu, total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
-        v_expanded = expand_kv_heads(v_cpu, total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
+        k_expanded =
+            expand_kv_heads(k_cpu, total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
+        v_expanded =
+            expand_kv_heads(v_cpu, total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
     } else {
         k_expanded = k_sliced;
         v_expanded = v_sliced;
@@ -323,7 +363,8 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
     // Move Q, K, V to target device for attention computation
     if (dev == DeviceType::CUDA) {
         auto to_dev = [dev](const TensorPtr& t) -> TensorPtr {
-            if (t->device() == dev) return t;
+            if (t->device() == dev)
+                return t;
             auto tmp = std::make_shared<Tensor>(DataType::FP32, t->shape(), dev);
             tmp->copy_from(*t);
             return tmp;
@@ -333,8 +374,8 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
         v_expanded = to_dev(v_expanded);
     }
 
-    auto attn_out = ops::scaled_dot_product_attention_2d(
-        q_rope, k_expanded, v_expanded, seq_len, total_len, num_heads, head_dim, true);
+    auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_expanded, v_expanded, seq_len,
+                                                         total_len, num_heads, head_dim, true);
 
     // Move attn_out to CPU for gating
     auto attn_out_cpu = attn_out;
@@ -353,7 +394,8 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
 
     // Output projection
     if (dev == DeviceType::CUDA) {
-        auto tmp = std::make_shared<Tensor>(DataType::FP32, attn_out_cpu->shape(), DeviceType::CUDA);
+        auto tmp =
+            std::make_shared<Tensor>(DataType::FP32, attn_out_cpu->shape(), DeviceType::CUDA);
         tmp->copy_from(*attn_out_cpu);
         attn_out_cpu = tmp;
     }
@@ -383,8 +425,7 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
 // Linear Attention Layer (Gated Delta Net)
 // ============================================================================
 TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int layer_idx,
-                                                    int seq_len, int64_t start_pos,
-                                                    DeviceType dev) {
+                                                  int seq_len, int64_t start_pos, DeviceType dev) {
     const auto& cfg = model_.config();
     const auto& lw = weights_.layers[layer_idx];
     int hidden_dim = cfg.hidden_dim;
@@ -396,20 +437,44 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
     int d_conv = ssm_d_conv_;
     int conv_channels = ssm_conv_channels_;
 
-    LOG_DEBUG("Layer " + std::to_string(layer_idx) + " (LinearAttn): seq_len=" +
-              std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos) +
-              ", hidden_dim=" + std::to_string(hidden_dim) +
-              ", conv_channels=" + std::to_string(conv_channels));
+    LOG_DEBUG(
+        "Layer " + std::to_string(layer_idx) + " (LinearAttn): seq_len=" + std::to_string(seq_len) +
+        ", start_pos=" + std::to_string(start_pos) + ", hidden_dim=" + std::to_string(hidden_dim) +
+        ", conv_channels=" + std::to_string(conv_channels));
 
     // Validate required weights
-    if (!lw.attn_norm()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing attn_norm\n", layer_idx); return hidden; }
-    if (!lw.attn_qkv()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing attn_qkv\n", layer_idx); return hidden; }
-    if (!lw.attn_gate()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing attn_gate\n", layer_idx); return hidden; }
-    if (!lw.ssm_conv1d()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_conv1d\n", layer_idx); return hidden; }
-    if (!lw.ssm_alpha()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_alpha\n", layer_idx); return hidden; }
-    if (!lw.ssm_beta()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_beta\n", layer_idx); return hidden; }
-    if (!lw.ssm_norm()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_norm\n", layer_idx); return hidden; }
-    if (!lw.ssm_out()) { QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_out\n", layer_idx); return hidden; }
+    if (!lw.attn_norm()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing attn_norm\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.attn_qkv()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing attn_qkv\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.attn_gate()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing attn_gate\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.ssm_conv1d()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_conv1d\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.ssm_alpha()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_alpha\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.ssm_beta()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_beta\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.ssm_norm()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_norm\n", layer_idx);
+        return hidden;
+    }
+    if (!lw.ssm_out()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn): missing ssm_out\n", layer_idx);
+        return hidden;
+    }
 
     // Step 1: Attention norm
     auto normed = ops::rms_norm(hidden, lw.attn_norm(), cfg.rms_norm_eps);
@@ -425,7 +490,8 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
 
     // Move results to CPU for recurrent computation
     auto to_cpu = [](const TensorPtr& t) -> TensorPtr {
-        if (!t || t->device() == DeviceType::CPU) return t;
+        if (!t || t->device() == DeviceType::CPU)
+            return t;
         auto cpu = std::make_shared<Tensor>(DataType::FP32, t->shape(), DeviceType::CPU);
         cpu->copy_from(*t);
         return cpu;
@@ -442,7 +508,8 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
     if (lw.ssm_dt()) {
         auto dt_cpu = lw.ssm_dt();
         if (dt_cpu->device() == DeviceType::CUDA) {
-            dt_cpu = std::make_shared<Tensor>(lw.ssm_dt()->dtype(), lw.ssm_dt()->shape(), DeviceType::CPU);
+            dt_cpu = std::make_shared<Tensor>(lw.ssm_dt()->dtype(), lw.ssm_dt()->shape(),
+                                              DeviceType::CPU);
             dt_cpu->copy_from(*lw.ssm_dt());
         }
         const float* dt_bias = static_cast<const float*>(dt_cpu->data());
@@ -463,7 +530,8 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
     if (lw.ssm_a()) {
         auto a_cpu = lw.ssm_a();
         if (a_cpu->device() == DeviceType::CUDA) {
-            a_cpu = std::make_shared<Tensor>(lw.ssm_a()->dtype(), lw.ssm_a()->shape(), DeviceType::CPU);
+            a_cpu =
+                std::make_shared<Tensor>(lw.ssm_a()->dtype(), lw.ssm_a()->shape(), DeviceType::CPU);
             a_cpu->copy_from(*lw.ssm_a());
         }
         const float* a_data = static_cast<const float*>(a_cpu->data());
@@ -485,7 +553,7 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
     auto conv_weight_cpu = lw.ssm_conv1d();
     if (conv_weight_cpu && conv_weight_cpu->device() == DeviceType::CUDA) {
         conv_weight_cpu = std::make_shared<Tensor>(lw.ssm_conv1d()->dtype(),
-            lw.ssm_conv1d()->shape(), DeviceType::CPU);
+                                                   lw.ssm_conv1d()->shape(), DeviceType::CPU);
         conv_weight_cpu->copy_from(*lw.ssm_conv1d());
     }
 
@@ -501,21 +569,23 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
                 uint32_t exp = (h >> 10) & 0x1f;
                 uint32_t mant = h & 0x3ff;
                 float f;
-                if (exp == 0) f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
-                else if (exp == 31) f = mant == 0 ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::quiet_NaN();
-                else f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
+                if (exp == 0)
+                    f = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
+                else if (exp == 31)
+                    f = mant == 0 ? std::numeric_limits<float>::infinity()
+                                  : std::numeric_limits<float>::quiet_NaN();
+                else
+                    f = std::ldexp(static_cast<float>(mant + 1024), static_cast<int>(exp) - 25);
                 conv_w[i] = sign ? -f : f;
             }
         }
     }
 
-    auto conv_out = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{seq_len, conv_channels}, DeviceType::CPU);
+    auto conv_out = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{seq_len, conv_channels}, DeviceType::CPU);
 
-    ssm_conv1d_cpu(qkv_data, conv_w.data(),
-                   static_cast<float*>(conv_out->data()),
-                   recurrent_states_[layer_idx].conv_state.data(),
-                   seq_len, conv_channels, d_conv);
+    ssm_conv1d_cpu(qkv_data, conv_w.data(), static_cast<float*>(conv_out->data()),
+                   recurrent_states_[layer_idx].conv_state.data(), seq_len, conv_channels, d_conv);
 
     // Step 5: SiLU on conv output
     float* conv_data = static_cast<float*>(conv_out->data());
@@ -525,12 +595,12 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
     }
 
     // Step 6: Split conv output into Q, K, V
-    auto q_conv = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{seq_len, key_dim}, DeviceType::CPU);
-    auto k_conv = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{seq_len, key_dim}, DeviceType::CPU);
-    auto v_conv = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{seq_len, value_dim}, DeviceType::CPU);
+    auto q_conv = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, key_dim},
+                                           DeviceType::CPU);
+    auto k_conv = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, key_dim},
+                                           DeviceType::CPU);
+    auto v_conv = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, value_dim},
+                                           DeviceType::CPU);
 
     float* q_conv_data = static_cast<float*>(q_conv->data());
     float* k_conv_data = static_cast<float*>(k_conv->data());
@@ -543,27 +613,31 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
         std::memcpy(v_conv_data + s * value_dim, src + 2 * key_dim, value_dim * sizeof(float));
     }
 
-    // Step 7: L2 normalize Q and K (per head)
-    #pragma omp parallel for schedule(static) collapse(2) if(seq_len * num_k_heads > 4)
+// Step 7: L2 normalize Q and K (per head)
+#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_k_heads > 4)
     for (int s = 0; s < seq_len; ++s) {
         for (int h = 0; h < num_k_heads; ++h) {
             float* q_head = q_conv_data + s * key_dim + h * head_k_dim;
             float norm = 0.0f;
-            for (int d = 0; d < head_k_dim; ++d) norm += q_head[d] * q_head[d];
+            for (int d = 0; d < head_k_dim; ++d)
+                norm += q_head[d] * q_head[d];
             float inv_norm = 1.0f / std::sqrt(norm + cfg.rms_norm_eps);
-            for (int d = 0; d < head_k_dim; ++d) q_head[d] *= inv_norm;
+            for (int d = 0; d < head_k_dim; ++d)
+                q_head[d] *= inv_norm;
 
             float* k_head = k_conv_data + s * key_dim + h * head_k_dim;
             norm = 0.0f;
-            for (int d = 0; d < head_k_dim; ++d) norm += k_head[d] * k_head[d];
+            for (int d = 0; d < head_k_dim; ++d)
+                norm += k_head[d] * k_head[d];
             inv_norm = 1.0f / std::sqrt(norm + cfg.rms_norm_eps);
-            for (int d = 0; d < head_k_dim; ++d) k_head[d] *= inv_norm;
+            for (int d = 0; d < head_k_dim; ++d)
+                k_head[d] *= inv_norm;
         }
     }
 
     // Step 8: Gated Delta Net - autoregressive processing
-    auto delta_net_out = std::make_shared<Tensor>(DataType::FP32,
-        std::vector<int64_t>{seq_len, value_dim}, DeviceType::CPU);
+    auto delta_net_out = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{seq_len, value_dim}, DeviceType::CPU);
     float* dn_out_data = static_cast<float*>(delta_net_out->data());
 
     for (int s = 0; s < seq_len; ++s) {
@@ -576,10 +650,8 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
         float* out_s = dn_out_data + s * value_dim;
         float* state = recurrent_states_[layer_idx].ssm_state.data();
 
-        gated_delta_net_ar_cpu(
-            q_s, k_s, v_s, gate_s, beta_s,
-            state, out_s,
-            head_k_dim, head_v_dim, num_k_heads, num_v_heads);
+        gated_delta_net_ar_cpu(q_s, k_s, v_s, gate_s, beta_s, state, out_s, head_k_dim, head_v_dim,
+                               num_k_heads, num_v_heads);
     }
 
     // Step 9: Gated normalization
@@ -590,7 +662,8 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
     if (lw.ssm_norm()) {
         auto norm_cpu = lw.ssm_norm();
         if (norm_cpu->device() == DeviceType::CUDA) {
-            norm_cpu = std::make_shared<Tensor>(lw.ssm_norm()->dtype(), lw.ssm_norm()->shape(), DeviceType::CPU);
+            norm_cpu = std::make_shared<Tensor>(lw.ssm_norm()->dtype(), lw.ssm_norm()->shape(),
+                                                DeviceType::CPU);
             norm_cpu->copy_from(*lw.ssm_norm());
         }
         if (norm_cpu->dtype() == DataType::FP32) {
@@ -598,16 +671,18 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
         }
     }
 
-    #pragma omp parallel for schedule(static) collapse(2) if(seq_len * num_v_heads > 4)
+#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_v_heads > 4)
     for (int s = 0; s < seq_len; ++s) {
         for (int h = 0; h < num_v_heads; ++h) {
             float* out_head = dn_out_data + s * value_dim + h * head_v_dim;
             const float* z_head = z_data + s * value_dim + h * head_v_dim;
 
             float norm_sq = 0.0f;
-            for (int d = 0; d < head_v_dim; ++d) norm_sq += out_head[d] * out_head[d];
+            for (int d = 0; d < head_v_dim; ++d)
+                norm_sq += out_head[d] * out_head[d];
             float inv_rms = 1.0f / std::sqrt(norm_sq / head_v_dim + cfg.rms_norm_eps);
-            for (int d = 0; d < head_v_dim; ++d) out_head[d] *= inv_rms * ssm_norm_w[d];
+            for (int d = 0; d < head_v_dim; ++d)
+                out_head[d] *= inv_rms * ssm_norm_w[d];
 
             for (int d = 0; d < head_v_dim; ++d) {
                 float gz = z_head[d] / (1.0f + std::exp(-z_head[d]));
@@ -621,7 +696,8 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
     if (lw.ssm_out()) {
         auto dn_on_dev = delta_net_out;
         if (dev == DeviceType::CUDA && dn_on_dev->device() == DeviceType::CPU) {
-            dn_on_dev = std::make_shared<Tensor>(DataType::FP32, delta_net_out->shape(), DeviceType::CUDA);
+            dn_on_dev =
+                std::make_shared<Tensor>(DataType::FP32, delta_net_out->shape(), DeviceType::CUDA);
             dn_on_dev->copy_from(*delta_net_out);
         }
         ssm_output = ops::matmul_transB(dn_on_dev, lw.ssm_out());
@@ -654,16 +730,14 @@ TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int l
 // ============================================================================
 // Gated Delta Net autoregressive step
 // ============================================================================
-void Qwen35Engine::gated_delta_net_ar_cpu(
-    const float* q, const float* k, const float* v,
-    const float* gate, const float* beta,
-    float* state, float* output,
-    int head_k_dim, int head_v_dim, int num_k_heads, int num_v_heads) {
-
+void Qwen35Engine::gated_delta_net_ar_cpu(const float* q, const float* k, const float* v,
+                                          const float* gate, const float* beta, float* state,
+                                          float* output, int head_k_dim, int head_v_dim,
+                                          int num_k_heads, int num_v_heads) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
     int head_repeat = num_v_heads / num_k_heads;
 
-    #pragma omp parallel for schedule(static) if(num_v_heads > 1)
+#pragma omp parallel for schedule(static) if (num_v_heads > 1)
     for (int hv = 0; hv < num_v_heads; ++hv) {
         int hk = hv / head_repeat;
 
@@ -713,17 +787,15 @@ void Qwen35Engine::gated_delta_net_ar_cpu(
 // ============================================================================
 // Causal conv1d (with persistent state)
 // ============================================================================
-void Qwen35Engine::ssm_conv1d_cpu(
-    const float* x_data, const float* weight_data, float* y_data,
-    float* conv_state, int seq_len, int conv_channels, int d_conv) {
-
+void Qwen35Engine::ssm_conv1d_cpu(const float* x_data, const float* weight_data, float* y_data,
+                                  float* conv_state, int seq_len, int conv_channels, int d_conv) {
     int state_len = d_conv - 1;
 
     for (int s = 0; s < seq_len; ++s) {
         const float* x_row = x_data + s * conv_channels;
         float* y_row = y_data + s * conv_channels;
 
-        #pragma omp parallel for schedule(static) if(conv_channels > 64)
+#pragma omp parallel for schedule(static) if (conv_channels > 64)
         for (int c = 0; c < conv_channels; ++c) {
             float val = 0.0f;
             for (int k = 0; k < d_conv; ++k) {
@@ -748,19 +820,16 @@ void Qwen35Engine::ssm_conv1d_cpu(
 // ============================================================================
 // MRoPE (Multi-dimensional RoPE) for Qwen3.5
 // ============================================================================
-void Qwen35Engine::apply_rope_mrope(
-    const float* q_data, const float* k_data,
-    float* q_out, float* k_out,
-    int seq_len, int num_heads, int num_kv_heads,
-    int head_dim, int n_rot, int64_t start_pos, float theta) {
-
+void Qwen35Engine::apply_rope_mrope(const float* q_data, const float* k_data, float* q_out,
+                                    float* k_out, int seq_len, int num_heads, int num_kv_heads,
+                                    int head_dim, int n_rot, int64_t start_pos, float theta) {
     int half_rot = n_rot / 2;
     float theta_scale = 1.0f / theta;
 
     int q_stride = num_heads * head_dim;
     int k_stride = num_kv_heads * head_dim;
 
-    #pragma omp parallel for schedule(static) if(seq_len > 1)
+#pragma omp parallel for schedule(static) if (seq_len > 1)
     for (int s = 0; s < seq_len; ++s) {
         int64_t pos = start_pos + s;
 
@@ -817,4 +886,4 @@ static EngineAutoRegister _reg_qwen35("qwen35", [](Model& model, InferenceContex
 });
 }
 
-} // namespace forge
+}  // namespace forge

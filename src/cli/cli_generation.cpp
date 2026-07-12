@@ -2,39 +2,29 @@
  * Forge CLI - Streaming and batch generation
  */
 
-#include "cli_common.h"
-
-#include <iostream>
-#include <cstring>
 #include <chrono>
+#include <cstring>
+#include <iostream>
 
-#include "forge/tokenizer.h"
+#include "cli_common.h"
 #include "forge/context.h"
+#include "forge/engine.h"
 #include "forge/generator.h"
 #include "forge/sampler.h"
-#include "forge/engine.h"
-#include "forge/types.h"
 #include "forge/tensor.h"
+#include "forge/tokenizer.h"
+#include "forge/types.h"
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 using namespace forge;
 
-GenerationStats generate_streaming(
-    InferenceContext& ctx,
-    const Tokenizer& tokenizer,
-    const std::vector<int32_t>& prompt_tokens,
-    int max_new_tokens,
-    float temperature,
-    int top_k,
-    float top_p,
-    float repeat_penalty,
-    bool do_sample,
-    uint64_t seed,
-    int eos_token_id)
-{
+GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& tokenizer,
+                                   const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
+                                   float temperature, int top_k, float top_p, float repeat_penalty,
+                                   bool do_sample, uint64_t seed, int eos_token_id) {
     GenerationStats stats;
     stats.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
 
@@ -62,8 +52,8 @@ GenerationStats generate_streaming(
     // ---- Prefill phase ----
     auto t_prefill_start = std::chrono::high_resolution_clock::now();
 
-    auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-        std::vector<int64_t>{prompt_len}, DeviceType::CPU);
+    auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{prompt_len},
+                                              DeviceType::CPU);
     std::memcpy(input_ids->data(), prompt_tokens.data(), prompt_len * sizeof(int32_t));
     if (dev == DeviceType::CUDA) {
         input_ids->to_device(DeviceType::CUDA);
@@ -72,7 +62,8 @@ GenerationStats generate_streaming(
     auto logits = engine->forward(input_ids, 0);
 
     auto t_prefill_end = std::chrono::high_resolution_clock::now();
-    stats.prompt_eval_ms = std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+    stats.prompt_eval_ms =
+        std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
 
     auto last_logits = std::make_shared<Tensor>(logits->slice(0, prompt_len - 1, prompt_len));
     int token_id = sampler.sample(last_logits, prompt_len - 1);
@@ -86,7 +77,8 @@ GenerationStats generate_streaming(
         std::cout << text;
         std::cout.flush();
         stats.elapsed_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t_prefill_start).count();
+                               std::chrono::high_resolution_clock::now() - t_prefill_start)
+                               .count();
         return stats;
     }
 
@@ -96,8 +88,8 @@ GenerationStats generate_streaming(
     TensorPtr decode_input_gpu;
     if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        decode_input_gpu = std::make_shared<Tensor>(DataType::INT32,
-            std::vector<int64_t>{1}, DeviceType::CUDA);
+        decode_input_gpu =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CUDA);
 #endif
     }
 
@@ -109,13 +101,13 @@ GenerationStats generate_streaming(
         TensorPtr next_input;
         if (dev == DeviceType::CUDA && decode_input_gpu) {
 #ifdef USE_CUDA
-            cudaMemcpyAsync(decode_input_gpu->data(), &last_token,
-                           sizeof(int32_t), cudaMemcpyHostToDevice);
+            cudaMemcpyAsync(decode_input_gpu->data(), &last_token, sizeof(int32_t),
+                            cudaMemcpyHostToDevice);
 #endif
             next_input = decode_input_gpu;
         } else {
-            next_input = std::make_shared<Tensor>(DataType::INT32,
-                std::vector<int64_t>{1}, DeviceType::CPU);
+            next_input =
+                std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CPU);
             *static_cast<int32_t*>(next_input->data()) = last_token;
         }
 
@@ -145,24 +137,16 @@ GenerationStats generate_streaming(
     }
 
     auto t_decode_end = std::chrono::high_resolution_clock::now();
-    stats.elapsed_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+    stats.elapsed_ms =
+        std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
 
     return stats;
 }
 
-GenerationStats generate_batch(
-    InferenceContext& ctx,
-    const Tokenizer& tokenizer,
-    const std::vector<int32_t>& prompt_tokens,
-    int max_new_tokens,
-    float temperature,
-    int top_k,
-    float top_p,
-    float repeat_penalty,
-    bool do_sample,
-    uint64_t seed,
-    int eos_token_id)
-{
+GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer,
+                               const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
+                               float temperature, int top_k, float top_p, float repeat_penalty,
+                               bool do_sample, uint64_t seed, int eos_token_id) {
     GenerationConfig gen_cfg;
     gen_cfg.max_new_tokens = max_new_tokens;
     gen_cfg.temperature = temperature;

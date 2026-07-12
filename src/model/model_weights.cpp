@@ -1,10 +1,12 @@
 #include "forge/model_weights.h"
-#include "forge/model_config.h"
-#include "forge/arch_registry.h"
-#include "forge/weight_mapper.h"
-#include "forge/operator_matmul.h"
-#include "forge/logger.h"
+
 #include <chrono>
+
+#include "forge/arch_registry.h"
+#include "forge/logger.h"
+#include "forge/model_config.h"
+#include "forge/operator_matmul.h"
+#include "forge/weight_mapper.h"
 
 namespace forge {
 
@@ -31,15 +33,14 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     }
 
     if (output_weight && output_weight->device() == DeviceType::CPU) {
-        bool has_fused_kernel = (output_weight->dtype() == DataType::Q4_0 ||
-                                 output_weight->dtype() == DataType::Q8_0 ||
-                                 output_weight->dtype() == DataType::Q4_1 ||
-                                 output_weight->dtype() == DataType::Q4_K);
+        bool has_fused_kernel =
+            (output_weight->dtype() == DataType::Q4_0 || output_weight->dtype() == DataType::Q8_0 ||
+             output_weight->dtype() == DataType::Q4_1 || output_weight->dtype() == DataType::Q4_K);
         if (has_fused_kernel) {
-            LOG_INFO("Output_weight is " + std::to_string(static_cast<int>(output_weight->dtype())) +
-                     " (" + std::to_string(output_weight->shape()[0]) +
-                     "x" + std::to_string(output_weight->shape()[1]) +
-                     "), using fused GEMV directly");
+            LOG_INFO("Output_weight is " +
+                     std::to_string(static_cast<int>(output_weight->dtype())) + " (" +
+                     std::to_string(output_weight->shape()[0]) + "x" +
+                     std::to_string(output_weight->shape()[1]) + "), using fused GEMV directly");
         } else {
             TensorPtr fp32_weight = output_weight;
             if (is_quantized_type(output_weight->dtype())) {
@@ -52,15 +53,16 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             if (q8) {
                 output_weight = q8;
                 LOG_INFO("Quantized output_weight to Q8_0 (" +
-                         std::to_string(output_weight->shape()[0]) +
-                         "x" + std::to_string(output_weight->shape()[1]) +
-                         "), size=" + std::to_string(q8->nbytes() / (1024*1024)) +
+                         std::to_string(output_weight->shape()[0]) + "x" +
+                         std::to_string(output_weight->shape()[1]) +
+                         "), size=" + std::to_string(q8->nbytes() / (1024 * 1024)) +
                          " MB, time=" + std::to_string(ms / 1000.0) + "s");
             }
         }
     }
 
-    if (token_embedding && is_quantized_type(token_embedding->dtype()) && token_embedding->device() == DeviceType::CPU) {
+    if (token_embedding && is_quantized_type(token_embedding->dtype()) &&
+        token_embedding->device() == DeviceType::CPU) {
         bool transposed = (token_embedding->shape().size() >= 2 &&
                            token_embedding->shape()[0] < token_embedding->shape()[1]);
         if (transposed) {
@@ -69,9 +71,10 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             auto t_end = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
             if (token_embedding_fp32) {
-                LOG_INFO("Pre-dequantized token_embedding (" + std::to_string(token_embedding->shape()[0]) +
-                         "x" + std::to_string(token_embedding->shape()[1]) +
-                         ") to FP32, size=" + std::to_string(token_embedding_fp32->nbytes() / (1024*1024)) +
+                LOG_INFO("Pre-dequantized token_embedding (" +
+                         std::to_string(token_embedding->shape()[0]) + "x" +
+                         std::to_string(token_embedding->shape()[1]) + ") to FP32, size=" +
+                         std::to_string(token_embedding_fp32->nbytes() / (1024 * 1024)) +
                          " MB, time=" + std::to_string(ms / 1000.0) + "s");
             }
         }
@@ -80,7 +83,8 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     layers.resize(config.num_layers);
 
     bool is_qwen35 = (config.arch_type == "qwen35");
-    int full_attn_interval = config.full_attention_interval > 0 ? config.full_attention_interval : 4;
+    int full_attn_interval =
+        config.full_attention_interval > 0 ? config.full_attention_interval : 4;
 
     auto& weight_init_registry = WeightInitRegistry::instance();
     bool has_registered_init = weight_init_registry.has(config.arch_type);
@@ -108,7 +112,8 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             std::string base = "layers." + std::to_string(i);
             auto load_if = [&](const std::string& canonical, const std::string& store_name) {
                 auto t = store.get(store_name);
-                if (t) lw.set(canonical, t);
+                if (t)
+                    lw.set(canonical, t);
             };
 
             load_if("attn_norm", base + ".attn_norm");
@@ -124,8 +129,9 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             load_if("bk", base + ".bk");
             load_if("bv", base + ".bv");
 
-            LOG_WARN("No registered weight init for arch '" + config.arch_type +
-                     "', using default GQA init. Consider registering via FORGE_REGISTER_WEIGHT_INIT.");
+            LOG_WARN(
+                "No registered weight init for arch '" + config.arch_type +
+                "', using default GQA init. Consider registering via FORGE_REGISTER_WEIGHT_INIT.");
         }
 
         if (lw.layer_type == LayerType::FullAttention && !is_qwen35) {
@@ -159,4 +165,4 @@ void ModelWeights::move_layer_weights(int layer_idx, DeviceType target_dev) {
     layers[layer_idx].to_device(target_dev);
 }
 
-} // namespace forge
+}  // namespace forge

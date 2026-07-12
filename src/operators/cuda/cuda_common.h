@@ -1,9 +1,9 @@
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #if FORGE_USE_CUBLAS
-#include <cublas_v2.h>
+#    include <cublas_v2.h>
 #endif
 #include <cstdint>
 
@@ -15,10 +15,14 @@ namespace cuda {
 struct CudaScratchPool {
     void* ptr = nullptr;
     size_t capacity = 0;
-    ~CudaScratchPool() { if (ptr) cudaFree(ptr); }
+    ~CudaScratchPool() {
+        if (ptr)
+            cudaFree(ptr);
+    }
     void* ensure(size_t bytes) {
         if (bytes > capacity) {
-            if (ptr) cudaFree(ptr);
+            if (ptr)
+                cudaFree(ptr);
             cudaMalloc(&ptr, bytes);
             capacity = bytes;
         }
@@ -74,5 +78,5 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
     }
 }
 
-} // namespace cuda
-} // namespace forge
+}  // namespace cuda
+}  // namespace forge

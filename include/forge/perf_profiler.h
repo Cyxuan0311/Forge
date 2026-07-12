@@ -1,17 +1,17 @@
 #pragma once
 
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <chrono>
-#include <mutex>
-#include <cstdio>
 #include <algorithm>
-#include <numeric>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <mutex>
+#include <numeric>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -34,15 +34,22 @@ public:
     bool enabled() const { return enabled_; }
 
 #ifdef USE_CUDA
-    void set_use_cuda_events(bool use_cuda) { use_cuda_events_ = use_cuda; }
-    bool use_cuda_events() const { return use_cuda_events_; }
+    void set_use_cuda_events(bool use_cuda) {
+        use_cuda_events_ = use_cuda;
+    }
+    bool use_cuda_events() const {
+        return use_cuda_events_;
+    }
 #else
     void set_use_cuda_events(bool) {}
-    bool use_cuda_events() const { return false; }
+    bool use_cuda_events() const {
+        return false;
+    }
 #endif
 
     void record(const std::string& name, double ms) {
-        if (!enabled_) return;
+        if (!enabled_)
+            return;
         // Use thread-local buffer to avoid mutex contention in parallel regions.
         // Each thread accumulates into its own map; merge on summary/reset.
         auto& local = thread_local_records();
@@ -58,7 +65,8 @@ public:
 #ifdef USE_CUDA
     // Store deferred CUDA event pairs for later resolution
     void record_deferred(const std::string& name, cudaEvent_t start, cudaEvent_t end) {
-        if (!enabled_) return;
+        if (!enabled_)
+            return;
         std::lock_guard<std::mutex> lock(mutex_);
         deferred_events_.push_back({name, start, end});
     }
@@ -66,7 +74,8 @@ public:
     // Resolve all deferred CUDA events: synchronize once, then compute all times
     void flush_deferred() {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (deferred_events_.empty()) return;
+        if (deferred_events_.empty())
+            return;
         // Single synchronization point for all events
         cudaEventSynchronize(deferred_events_.back().end);
         for (auto& ev : deferred_events_) {
@@ -119,24 +128,24 @@ public:
         const_cast<PerfProfiler*>(this)->flush_deferred();
 #endif
         auto data = summary();
-        if (data.empty()) return;
+        if (data.empty())
+            return;
 
         printf("\n========== Performance Profile ==========\n");
-        printf("%-45s %8s %10s %10s %10s %10s\n",
-               "Operation", "Count", "Total(ms)", "Avg(ms)", "Min(ms)", "Max(ms)");
-        printf("%-45s %8s %10s %10s %10s %10s\n",
-               "---------------------------------------------", "--------",
-               "----------", "----------", "----------", "----------");
+        printf("%-45s %8s %10s %10s %10s %10s\n", "Operation", "Count", "Total(ms)", "Avg(ms)",
+               "Min(ms)", "Max(ms)");
+        printf("%-45s %8s %10s %10s %10s %10s\n", "---------------------------------------------",
+               "--------", "----------", "----------", "----------", "----------");
 
         // Sort by total_ms descending
-        std::sort(data.begin(), data.end(),
-                  [](const auto& a, const auto& b) { return a.second.total_ms > b.second.total_ms; });
+        std::sort(data.begin(), data.end(), [](const auto& a, const auto& b) {
+            return a.second.total_ms > b.second.total_ms;
+        });
 
         double grand_total = 0;
         for (const auto& [name, rec] : data) {
             double avg = rec.count > 0 ? rec.total_ms / rec.count : 0;
-            printf("%-45s %8lld %10.2f %10.3f %10.3f %10.3f\n",
-                   name.c_str(), (long long)rec.count,
+            printf("%-45s %8lld %10.2f %10.3f %10.3f %10.3f\n", name.c_str(), (long long)rec.count,
                    rec.total_ms, avg, rec.min_ms, rec.max_ms);
             grand_total += rec.total_ms;
         }
@@ -257,4 +266,4 @@ private:
 #define PERF_SCOPE(name) ::forge::PerfScopeTimer _perf_timer_##__LINE__(name)
 #define PERF_RECORD(name, ms) ::forge::PerfProfiler::instance().record(name, ms)
 
-} // namespace forge
+}  // namespace forge
