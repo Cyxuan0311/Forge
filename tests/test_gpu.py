@@ -12,6 +12,7 @@ import forge
 CUDA_AVAILABLE = False
 try:
     import ctypes
+
     cuda_rt = ctypes.CDLL("libcudart.so")
     device_count = ctypes.c_int(0)
     result = cuda_rt.cudaGetDeviceCount(ctypes.byref(device_count))
@@ -163,8 +164,12 @@ class TestCPUGPUConsistency:
         ctx_gpu.reset_kv()
         logits_gpu = ctx_gpu.forward(ids)
 
-        np.testing.assert_allclose(logits_cpu, logits_gpu, atol=0.5,
-                                   err_msg="CPU and GPU forward logits should match within 0.5")
+        np.testing.assert_allclose(
+            logits_cpu,
+            logits_gpu,
+            atol=0.5,
+            err_msg="CPU and GPU forward logits should match within 0.5",
+        )
 
     def test_forward_single_token_consistency(self, model_path, model_config):
         model_cpu = forge.Model()
@@ -181,8 +186,9 @@ class TestCPUGPUConsistency:
         ctx_gpu.reset_kv()
         logits_gpu = ctx_gpu.forward(ids)
 
-        np.testing.assert_allclose(logits_cpu, logits_gpu, atol=0.5,
-                                   err_msg="CPU and GPU single-token logits should match")
+        np.testing.assert_allclose(
+            logits_cpu, logits_gpu, atol=0.5, err_msg="CPU and GPU single-token logits should match"
+        )
 
     def test_generate_greedy_consistency(self, model_path, model_config):
         model_cpu = forge.Model()
@@ -194,8 +200,9 @@ class TestCPUGPUConsistency:
         result_cpu = model_cpu.generate(prompt, max_new_tokens=10, do_sample=False)
         result_gpu = model_gpu.generate(prompt, max_new_tokens=10, do_sample=False)
 
-        assert list(result_cpu["token_ids"]) == list(result_gpu["token_ids"]), \
+        assert list(result_cpu["token_ids"]) == list(result_gpu["token_ids"]), (
             f"CPU tokens: {result_cpu['token_ids']}, GPU tokens: {result_gpu['token_ids']}"
+        )
 
     def test_generate_longer_prompt_consistency(self, model_path, model_config):
         model_cpu = forge.Model()
@@ -207,8 +214,9 @@ class TestCPUGPUConsistency:
         result_cpu = model_cpu.generate(prompt, max_new_tokens=8, do_sample=False)
         result_gpu = model_gpu.generate(prompt, max_new_tokens=8, do_sample=False)
 
-        assert list(result_cpu["token_ids"]) == list(result_gpu["token_ids"]), \
+        assert list(result_cpu["token_ids"]) == list(result_gpu["token_ids"]), (
             f"CPU tokens: {result_cpu['token_ids']}, GPU tokens: {result_gpu['token_ids']}"
+        )
 
     def test_forward_different_seq_lens_consistency(self, model_path, model_config):
         model_cpu = forge.Model()
@@ -225,5 +233,6 @@ class TestCPUGPUConsistency:
             ctx_gpu.reset_kv()
             logits_cpu = ctx_cpu.forward(ids)
             logits_gpu = ctx_gpu.forward(ids)
-            np.testing.assert_allclose(logits_cpu, logits_gpu, atol=0.5,
-                                       err_msg=f"CPU/GPU mismatch at seq_len={sl}")
+            np.testing.assert_allclose(
+                logits_cpu, logits_gpu, atol=0.5, err_msg=f"CPU/GPU mismatch at seq_len={sl}"
+            )

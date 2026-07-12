@@ -15,15 +15,18 @@ from tools.convert import convert_gguf_to_ninf
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Convert GGUF model to Forge .ninf format')
-    parser.add_argument('input', help='Input GGUF file path')
-    parser.add_argument('output', help='Output .ninf file path')
-    parser.add_argument('--dtype', choices=['fp32', 'q4_0'], default='q4_0',
-                        help='Target dtype for quantized tensors (default: q4_0)')
+    parser = argparse.ArgumentParser(description="Convert GGUF model to Forge .ninf format")
+    parser.add_argument("input", help="Input GGUF file path")
+    parser.add_argument("output", help="Output .ninf file path")
+    parser.add_argument(
+        "--dtype",
+        choices=["fp32", "q4_0"],
+        default="q4_0",
+        help="Target dtype for quantized tensors (default: q4_0)",
+    )
     args = parser.parse_args()
     convert_gguf_to_ninf(args.input, args.output, args.dtype)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

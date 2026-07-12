@@ -24,14 +24,12 @@ class QwenBenchmark(BenchmarkBase):
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct Benchmark")
-    parser.add_argument("--skip-llama-cpp", action="store_true",
-                        help="Skip llama.cpp benchmark")
-    parser.add_argument("--skip-cpu", action="store_true",
-                        help="Skip CPU benchmarks (slow)")
-    parser.add_argument("--num-runs", type=int, default=None,
-                        help="Number of runs")
-    parser.add_argument("--output-dir", type=str, default=None,
-                        help="Output directory for results + charts")
+    parser.add_argument("--skip-llama-cpp", action="store_true", help="Skip llama.cpp benchmark")
+    parser.add_argument("--skip-cpu", action="store_true", help="Skip CPU benchmarks (slow)")
+    parser.add_argument("--num-runs", type=int, default=None, help="Number of runs")
+    parser.add_argument(
+        "--output-dir", type=str, default=None, help="Output directory for results + charts"
+    )
     args = parser.parse_args()
 
     bench = QwenBenchmark(

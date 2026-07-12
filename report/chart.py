@@ -10,6 +10,7 @@ import os
 import numpy as np
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -22,15 +23,17 @@ C_LC_CPU = "#FFCC80"
 C_BG = "#FAFAFA"
 C_GRID = "#E0E0E0"
 
-plt.rcParams.update({
-    "font.family": "sans-serif",
-    "font.size": 11,
-    "axes.facecolor": C_BG,
-    "figure.facecolor": "white",
-    "axes.grid": True,
-    "grid.color": C_GRID,
-    "grid.alpha": 0.5,
-})
+plt.rcParams.update(
+    {
+        "font.family": "sans-serif",
+        "font.size": 11,
+        "axes.facecolor": C_BG,
+        "figure.facecolor": "white",
+        "axes.grid": True,
+        "grid.color": C_GRID,
+        "grid.alpha": 0.5,
+    }
+)
 
 
 def safe_get(d, key, default=0):
@@ -55,23 +58,35 @@ def _plot_decode_bar(results, ax):
     n = 0
     bars_data = []
     if any(v > 0 for v in ni_gpu):
-        bars_data.append(("Forge GPU", ni_gpu, C_NI_GPU)); n += 1
+        bars_data.append(("Forge GPU", ni_gpu, C_NI_GPU))
+        n += 1
     if any(v > 0 for v in lc_gpu):
-        bars_data.append(("llama.cpp GPU", lc_gpu, C_LC_GPU)); n += 1
+        bars_data.append(("llama.cpp GPU", lc_gpu, C_LC_GPU))
+        n += 1
     if any(v > 0 for v in ni_cpu):
-        bars_data.append(("Forge CPU", ni_cpu, C_NI_CPU)); n += 1
+        bars_data.append(("Forge CPU", ni_cpu, C_NI_CPU))
+        n += 1
     if any(v > 0 for v in lc_cpu):
-        bars_data.append(("llama.cpp CPU", lc_cpu, C_LC_CPU)); n += 1
+        bars_data.append(("llama.cpp CPU", lc_cpu, C_LC_CPU))
+        n += 1
 
     width = 0.7 / max(n, 1)
     for i, (label, values, color) in enumerate(bars_data):
         offset = i * width - (n - 1) * width / 2
-        bars = ax.bar(x + offset, values, width, label=label, color=color,
-                      edgecolor="white", linewidth=0.5)
+        bars = ax.bar(
+            x + offset, values, width, label=label, color=color, edgecolor="white", linewidth=0.5
+        )
         for bar, val in zip(bars, values):
             if val > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                        f"{val:.1f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.3,
+                    f"{val:.1f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    fontweight="bold",
+                )
 
     ax.set_title("Decode Speed (tok/s)", fontsize=13, fontweight="bold")
     ax.set_xticks(x)
@@ -89,17 +104,40 @@ def _plot_prefill_lines(results, ax):
 
         if ni_pf:
             lengths = sorted([int(k) for k in ni_pf.keys()])
-            speeds = [ni_pf[str(l)]["mean"] if str(l) in ni_pf
-                      else ni_pf.get(l, {}).get("mean", 0) for l in lengths]
-            ax.plot(lengths, speeds, "o-", color=C_NI_GPU, label=f"{name} (Forge)",
-                    linewidth=2, markersize=5)
+            speeds = [
+                ni_pf[str(length)]["mean"]
+                if str(length) in ni_pf
+                else ni_pf.get(length, {}).get("mean", 0)
+                for length in lengths
+            ]
+            ax.plot(
+                lengths,
+                speeds,
+                "o-",
+                color=C_NI_GPU,
+                label=f"{name} (Forge)",
+                linewidth=2,
+                markersize=5,
+            )
 
         if lc_pf:
             common_lengths = sorted([int(k) for k in lc_pf.keys()])
-            speeds = [lc_pf[str(l)]["mean"] if str(l) in lc_pf
-                      else lc_pf.get(l, {}).get("mean", 0) for l in common_lengths]
-            ax.plot(common_lengths, speeds, "s--", color=C_LC_GPU, label=f"{name} (llama.cpp)",
-                    linewidth=2, markersize=5, alpha=0.8)
+            speeds = [
+                lc_pf[str(length)]["mean"]
+                if str(length) in lc_pf
+                else lc_pf.get(length, {}).get("mean", 0)
+                for length in common_lengths
+            ]
+            ax.plot(
+                common_lengths,
+                speeds,
+                "s--",
+                color=C_LC_GPU,
+                label=f"{name} (llama.cpp)",
+                linewidth=2,
+                markersize=5,
+                alpha=0.8,
+            )
 
     ax.set_title("Prefill Speed vs Prompt Length", fontsize=13, fontweight="bold")
     ax.set_xlabel("Prompt Length (tokens)")
@@ -126,27 +164,50 @@ def _plot_gpu_speedup(results, ax):
             lc_speedups.append(lc_gpu / lc_cpu if lc_cpu > 0 else 0)
 
     if not models:
-        ax.text(0.5, 0.5, "No CPU data available", ha="center", va="center",
-                transform=ax.transAxes, fontsize=12)
+        ax.text(
+            0.5,
+            0.5,
+            "No CPU data available",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+        )
         ax.set_title("GPU Acceleration Factor", fontsize=13, fontweight="bold")
         return
 
     x = np.arange(len(models))
     width = 0.35
 
-    bars1 = ax.bar(x - width / 2, ni_speedups, width, label="Forge",
-                   color=C_NI_GPU, edgecolor="white")
+    bars1 = ax.bar(
+        x - width / 2, ni_speedups, width, label="Forge", color=C_NI_GPU, edgecolor="white"
+    )
     for bar, val in zip(bars1, ni_speedups):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
-                f"{val:.1f}x", ha="center", va="bottom", fontsize=10, fontweight="bold")
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.05,
+            f"{val:.1f}x",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
 
     if any(v > 0 for v in lc_speedups):
-        bars2 = ax.bar(x + width / 2, lc_speedups, width, label="llama.cpp",
-                       color=C_LC_GPU, edgecolor="white")
+        bars2 = ax.bar(
+            x + width / 2, lc_speedups, width, label="llama.cpp", color=C_LC_GPU, edgecolor="white"
+        )
         for bar, val in zip(bars2, lc_speedups):
             if val > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
-                        f"{val:.1f}x", ha="center", va="bottom", fontsize=10, fontweight="bold")
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.05,
+                    f"{val:.1f}x",
+                    ha="center",
+                    va="bottom",
+                    fontsize=10,
+                    fontweight="bold",
+                )
 
     ax.set_title("GPU Acceleration Factor (vs CPU)", fontsize=13, fontweight="bold")
     ax.set_xticks(x)
@@ -168,8 +229,15 @@ def _plot_ratio_bar(results, ax):
             ratios.append(ni_gpu / lc_gpu * 100)
 
     if not models:
-        ax.text(0.5, 0.5, "No llama.cpp data", ha="center", va="center",
-                transform=ax.transAxes, fontsize=12)
+        ax.text(
+            0.5,
+            0.5,
+            "No llama.cpp data",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+        )
         ax.set_title("Forge / llama.cpp Ratio", fontsize=13, fontweight="bold")
         return
 
@@ -178,8 +246,15 @@ def _plot_ratio_bar(results, ax):
     ax.axvline(x=100, color="#333", linestyle="--", linewidth=1, alpha=0.7)
 
     for bar, val in zip(bars, ratios):
-        ax.text(val + 1, bar.get_y() + bar.get_height() / 2,
-                f"{val:.0f}%", ha="left", va="center", fontsize=11, fontweight="bold")
+        ax.text(
+            val + 1,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:.0f}%",
+            ha="left",
+            va="center",
+            fontsize=11,
+            fontweight="bold",
+        )
 
     ax.set_title("Forge / llama.cpp GPU Decode Ratio", fontsize=13, fontweight="bold")
     ax.set_xlabel("% of llama.cpp speed")
@@ -190,8 +265,15 @@ def _plot_ratio_bar(results, ax):
 def _plot_summary_table(results, ax):
     ax.axis("off")
 
-    headers = ["Model", "Forge\nGPU", "Forge\nCPU", "llama.cpp\nGPU", "llama.cpp\nCPU",
-               "NI/LC\nGPU Ratio", "GPU\nSpeedup"]
+    headers = [
+        "Model",
+        "Forge\nGPU",
+        "Forge\nCPU",
+        "llama.cpp\nGPU",
+        "llama.cpp\nCPU",
+        "NI/LC\nGPU Ratio",
+        "GPU\nSpeedup",
+    ]
 
     rows = []
     for r in results:
@@ -202,15 +284,17 @@ def _plot_summary_table(results, ax):
         ratio = ni_gpu / lc_gpu * 100 if lc_gpu > 0 else 0
         speedup = ni_gpu / ni_cpu if ni_cpu > 0 else 0
 
-        rows.append([
-            r["model_name"].replace(" Q4_0", ""),
-            f"{ni_gpu:.1f}" if ni_gpu > 0 else "-",
-            f"{ni_cpu:.1f}" if ni_cpu > 0 else "-",
-            f"{lc_gpu:.1f}" if lc_gpu > 0 else "-",
-            f"{lc_cpu:.1f}" if lc_cpu > 0 else "-",
-            f"{ratio:.0f}%" if ratio > 0 else "-",
-            f"{speedup:.1f}x" if speedup > 0 else "-",
-        ])
+        rows.append(
+            [
+                r["model_name"].replace(" Q4_0", ""),
+                f"{ni_gpu:.1f}" if ni_gpu > 0 else "-",
+                f"{ni_cpu:.1f}" if ni_cpu > 0 else "-",
+                f"{lc_gpu:.1f}" if lc_gpu > 0 else "-",
+                f"{lc_cpu:.1f}" if lc_cpu > 0 else "-",
+                f"{ratio:.0f}%" if ratio > 0 else "-",
+                f"{speedup:.1f}x" if speedup > 0 else "-",
+            ]
+        )
 
     table = ax.table(
         cellText=rows,
@@ -247,12 +331,20 @@ def _plot_model_breakdown(results, ax):
     ni_pct = [5, 26, 59, 10]
 
     x = np.arange(len(categories))
-    bars = ax.bar(x, ni_pct, color=[C_NI_GPU, "#42A5F5", "#1565C0", "#0D47A1"],
-                  edgecolor="white", width=0.6)
+    bars = ax.bar(
+        x, ni_pct, color=[C_NI_GPU, "#42A5F5", "#1565C0", "#0D47A1"], edgecolor="white", width=0.6
+    )
 
     for bar, val in zip(bars, ni_pct):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
-                f"{val}%", ha="center", va="bottom", fontsize=11, fontweight="bold")
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 1,
+            f"{val}%",
+            ha="center",
+            va="bottom",
+            fontsize=11,
+            fontweight="bold",
+        )
 
     ax.set_title("Forge Layer Time Breakdown (TinyLlama Decode)", fontsize=13, fontweight="bold")
     ax.set_xticks(x)
@@ -273,26 +365,41 @@ def _generate_individual_charts(results, output_dir):
         if ni_pf:
             fig, ax = plt.subplots(figsize=(8, 5))
             lengths = sorted([int(k) for k in ni_pf.keys()])
-            ni_speeds = [ni_pf[str(l)]["mean"] if str(l) in ni_pf
-                         else ni_pf.get(l, {}).get("mean", 0) for l in lengths]
+            ni_speeds = [
+                ni_pf[str(length)]["mean"]
+                if str(length) in ni_pf
+                else ni_pf.get(length, {}).get("mean", 0)
+                for length in lengths
+            ]
 
             ax.bar(range(len(lengths)), ni_speeds, color=C_NI_GPU, edgecolor="white", width=0.6)
             ax.set_xticks(range(len(lengths)))
-            ax.set_xticklabels([str(l) for l in lengths])
+            ax.set_xticklabels([str(length) for length in lengths])
             ax.set_xlabel("Prompt Length (tokens)")
             ax.set_ylabel("Prefill Speed (tok/s)")
             ax.set_title(f"Forge Prefill: {name}", fontweight="bold")
 
-            for i, (l, s) in enumerate(zip(lengths, ni_speeds)):
+            for i, (_, s) in enumerate(zip(lengths, ni_speeds)):
                 ax.text(i, s + 0.5, f"{s:.1f}", ha="center", fontsize=9, fontweight="bold")
 
             if lc_pf:
                 ax2 = ax.twinx()
                 lc_lengths = sorted([int(k) for k in lc_pf.keys()])
-                lc_speeds = [lc_pf[str(l)]["mean"] if str(l) in lc_pf
-                             else lc_pf.get(l, {}).get("mean", 0) for l in lc_lengths]
-                ax2.plot(range(len(lc_lengths)), lc_speeds, "s-", color=C_LC_GPU,
-                         linewidth=2, markersize=8, label="llama.cpp")
+                lc_speeds = [
+                    lc_pf[str(length)]["mean"]
+                    if str(length) in lc_pf
+                    else lc_pf.get(length, {}).get("mean", 0)
+                    for length in lc_lengths
+                ]
+                ax2.plot(
+                    range(len(lc_lengths)),
+                    lc_speeds,
+                    "s-",
+                    color=C_LC_GPU,
+                    linewidth=2,
+                    markersize=8,
+                    label="llama.cpp",
+                )
                 ax2.set_ylabel("llama.cpp Prefill (tok/s)", color=C_LC_GPU)
                 ax2.tick_params(axis="y", labelcolor=C_LC_GPU)
                 ax2.legend(loc="upper left")
@@ -315,7 +422,9 @@ def generate_full_report(results, output_dir):
 
     fig.suptitle(
         f"Forge Performance Report\n{gpu_name}  |  Q4_0 Quantization",
-        fontsize=18, fontweight="bold", y=0.98
+        fontsize=18,
+        fontweight="bold",
+        y=0.98,
     )
 
     _plot_decode_bar(results, fig.add_subplot(gs[0, 0]))

@@ -1,4 +1,5 @@
 """Tests for the ComputeGraph and graph-based inference mode."""
+
 import os
 import sys
 import pytest
@@ -93,8 +94,12 @@ class TestGraphModeAPI:
 
         # If graph builder is available, outputs should match
         # If not available, it falls back to imperative, so they should still match
-        np.testing.assert_allclose(logits_imp, logits_graph, atol=1e-5,
-                                   err_msg="Graph and imperative modes should produce same output")
+        np.testing.assert_allclose(
+            logits_imp,
+            logits_graph,
+            atol=1e-5,
+            err_msg="Graph and imperative modes should produce same output",
+        )
 
     def test_generate_with_graph_mode(self, model_path, model_config):
         model = forge.Model()
@@ -118,8 +123,7 @@ class TestGraphModeAPI:
         ctx2.set_use_graph(True)
         out2 = ctx2.forward(ids)
 
-        np.testing.assert_array_equal(out1, out2,
-                                       err_msg="Graph mode should be deterministic")
+        np.testing.assert_array_equal(out1, out2, err_msg="Graph mode should be deterministic")
 
     def test_graph_mode_incremental_forward(self, model_path, model_config):
         model = forge.Model()
@@ -138,9 +142,12 @@ class TestGraphModeAPI:
             step_logits = ctx.forward(np.array([tid], dtype=np.int32), start_pos=i)
 
         # Last token logits should match
-        np.testing.assert_allclose(full_logits[-1], step_logits[-1] if step_logits.ndim > 1 else step_logits[0],
-                                   atol=1e-3,
-                                   err_msg="Incremental forward should match full forward in graph mode")
+        np.testing.assert_allclose(
+            full_logits[-1],
+            step_logits[-1] if step_logits.ndim > 1 else step_logits[0],
+            atol=1e-3,
+            err_msg="Incremental forward should match full forward in graph mode",
+        )
 
 
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama GGUF model not found")
@@ -174,13 +181,18 @@ class TestGraphModeTinyLlama:
         ctx_graph.set_use_graph(True)
         logits_graph = ctx_graph.forward(ids)
 
-        np.testing.assert_allclose(logits_imp, logits_graph, atol=1e-3,
-                                   err_msg="Graph and imperative should match for TinyLlama")
+        np.testing.assert_allclose(
+            logits_imp,
+            logits_graph,
+            atol=1e-3,
+            err_msg="Graph and imperative should match for TinyLlama",
+        )
 
     def test_graph_mode_generate_tinyllama(self):
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=10, do_sample=False,
-                                gpu_layers=0, kv_cache_dtype="fp32")
+        result = model.generate(
+            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
+        )
         assert result["num_generated_tokens"] >= 1

@@ -9,10 +9,18 @@ iterates within a single block (32 or 256 elements).
 
 import numpy as np
 
-from tools.gguf_reader import GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, \
-    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, \
-    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, \
-    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K
+from tools.gguf_reader import (
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K,
+)
 
 Q4_0_BLOCK_SIZE = 18
 Q4_0_BLOCK_ELEMS = 32
@@ -44,13 +52,14 @@ def dequantize(data, offset, dtype, dims):
     }
     fn = dispatch.get(dtype)
     if fn is None:
-        raise ValueError(f'Unsupported dtype for dequant: {dtype}')
+        raise ValueError(f"Unsupported dtype for dequant: {dtype}")
     return fn(data, offset, numel)
 
 
 # ---------------------------------------------------------------------------
 # Helper: FP16 stored as 2 bytes → float32
 # ---------------------------------------------------------------------------
+
 
 def _f16(val):
     return float(np.frombuffer(val, dtype=np.float16)[0])
@@ -60,9 +69,10 @@ def _f16(val):
 # Q4_0  – 18 bytes/block, 32 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q4_0(data, offset, numel):
     n_blocks = (numel + Q4_0_BLOCK_ELEMS - 1) // Q4_0_BLOCK_ELEMS
-    raw = data[offset:offset + n_blocks * Q4_0_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q4_0_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q4_0_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q4_0_BLOCK_SIZE)
 
@@ -73,7 +83,7 @@ def dequant_q4_0(data, offset, numel):
 
     scale = np.where(
         exp == 0,
-        np.where(mant == 0, 0.0, mant.astype(np.float32) / 1024.0 * (2.0 ** -14)),
+        np.where(mant == 0, 0.0, mant.astype(np.float32) / 1024.0 * (2.0**-14)),
         (1.0 + mant.astype(np.float32) / 1024.0) * (2.0 ** (exp.astype(np.float32) - 15)),
     )
     scale = np.where(sign.astype(bool), -scale, scale)
@@ -95,9 +105,10 @@ def dequant_q4_0(data, offset, numel):
 # Q4_1  – 20 bytes/block, 32 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q4_1(data, offset, numel):
     n_blocks = (numel + Q4_0_BLOCK_ELEMS - 1) // Q4_0_BLOCK_ELEMS
-    raw = data[offset:offset + n_blocks * Q4_1_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q4_1_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q4_1_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q4_1_BLOCK_SIZE)
 
@@ -119,9 +130,10 @@ def dequant_q4_1(data, offset, numel):
 # Q5_0  – 22 bytes/block, 32 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q5_0(data, offset, numel):
     n_blocks = (numel + Q4_0_BLOCK_ELEMS - 1) // Q4_0_BLOCK_ELEMS
-    raw = data[offset:offset + n_blocks * Q5_0_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q5_0_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q5_0_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q5_0_BLOCK_SIZE)
 
@@ -131,7 +143,7 @@ def dequant_q5_0(data, offset, numel):
     mant = scale_bits & 0x3FF
     scale = np.where(
         exp == 0,
-        np.where(mant == 0, 0.0, mant.astype(np.float32) / 1024.0 * (2.0 ** -14)),
+        np.where(mant == 0, 0.0, mant.astype(np.float32) / 1024.0 * (2.0**-14)),
         (1.0 + mant.astype(np.float32) / 1024.0) * (2.0 ** (exp.astype(np.float32) - 15)),
     )
     scale = np.where(sign.astype(bool), -scale, scale)
@@ -152,9 +164,10 @@ def dequant_q5_0(data, offset, numel):
 # Q5_1  – 24 bytes/block, 32 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q5_1(data, offset, numel):
     n_blocks = (numel + Q4_0_BLOCK_ELEMS - 1) // Q4_0_BLOCK_ELEMS
-    raw = data[offset:offset + n_blocks * Q5_1_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q5_1_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q5_1_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q5_1_BLOCK_SIZE)
 
@@ -177,9 +190,10 @@ def dequant_q5_1(data, offset, numel):
 # Q8_0  – 34 bytes/block, 32 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q8_0(data, offset, numel):
     n_blocks = (numel + Q4_0_BLOCK_ELEMS - 1) // Q4_0_BLOCK_ELEMS
-    raw = data[offset:offset + n_blocks * Q8_0_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q8_0_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q8_0_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q8_0_BLOCK_SIZE)
 
@@ -189,7 +203,7 @@ def dequant_q8_0(data, offset, numel):
     mant = scale_bits & 0x3FF
     scale = np.where(
         exp == 0,
-        np.where(mant == 0, 0.0, mant.astype(np.float32) / 1024.0 * (2.0 ** -14)),
+        np.where(mant == 0, 0.0, mant.astype(np.float32) / 1024.0 * (2.0**-14)),
         (1.0 + mant.astype(np.float32) / 1024.0) * (2.0 ** (exp.astype(np.float32) - 15)),
     )
     scale = np.where(sign.astype(bool), -scale, scale)
@@ -202,9 +216,10 @@ def dequant_q8_0(data, offset, numel):
 # Q6_K  – 210 bytes/block, 256 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q6_k(data, offset, numel):
     n_blocks = (numel + QK_K - 1) // QK_K
-    raw = data[offset:offset + n_blocks * Q6_K_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q6_K_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q6_K_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q6_K_BLOCK_SIZE)
 
@@ -235,9 +250,10 @@ def dequant_q6_k(data, offset, numel):
 # Q5_K  – 176 bytes/block, 256 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q5_k(data, offset, numel):
     n_blocks = (numel + QK_K - 1) // QK_K
-    raw = data[offset:offset + n_blocks * Q5_K_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q5_K_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q5_K_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q5_K_BLOCK_SIZE)
 
@@ -266,9 +282,10 @@ def dequant_q5_k(data, offset, numel):
 # Q4_K  – 144 bytes/block, 256 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q4_k(data, offset, numel):
     n_blocks = (numel + QK_K - 1) // QK_K
-    raw = data[offset:offset + n_blocks * Q4_K_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q4_K_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q4_K_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q4_K_BLOCK_SIZE)
 
@@ -295,9 +312,10 @@ def dequant_q4_k(data, offset, numel):
 # Q3_K  – 110 bytes/block, 256 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q3_k(data, offset, numel):
     n_blocks = (numel + QK_K - 1) // QK_K
-    raw = data[offset:offset + n_blocks * Q3_K_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q3_K_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q3_K_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q3_K_BLOCK_SIZE)
 
@@ -323,9 +341,10 @@ def dequant_q3_k(data, offset, numel):
 # Q2_K  – 84 bytes/block, 256 elements
 # ---------------------------------------------------------------------------
 
+
 def dequant_q2_k(data, offset, numel):
     n_blocks = (numel + QK_K - 1) // QK_K
-    raw = data[offset:offset + n_blocks * Q2_K_BLOCK_SIZE]
+    raw = data[offset : offset + n_blocks * Q2_K_BLOCK_SIZE]
     blocks = np.frombuffer(raw, dtype=np.uint8, count=n_blocks * Q2_K_BLOCK_SIZE)
     blocks = blocks.reshape(n_blocks, Q2_K_BLOCK_SIZE)
 

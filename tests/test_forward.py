@@ -34,8 +34,12 @@ class TestForwardPass:
         loaded_context.reset_kv()
         ids_long = np.array([5, 10, 20], dtype=np.int32)
         out_long = loaded_context.forward(ids_long)
-        np.testing.assert_allclose(out_short[1], out_long[1], atol=1e-5,
-                                   err_msg="Causal: token at pos 1 should be invariant to tokens at pos >= 2")
+        np.testing.assert_allclose(
+            out_short[1],
+            out_long[1],
+            atol=1e-5,
+            err_msg="Causal: token at pos 1 should be invariant to tokens at pos >= 2",
+        )
 
     def test_determinism(self, loaded_model, loaded_context):
         ids = np.array([3, 7, 15], dtype=np.int32)

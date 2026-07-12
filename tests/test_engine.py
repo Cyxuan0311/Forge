@@ -117,8 +117,12 @@ class TestArchLoading:
         ids = np.array([5, 10, 15], dtype=np.int32)
         out_a = ctx_a.forward(ids)
         out_b = ctx_b.forward(ids)
-        np.testing.assert_allclose(out_a, out_b, atol=1e-5,
-                                   err_msg="Same weights with different arch names should produce same output")
+        np.testing.assert_allclose(
+            out_a,
+            out_b,
+            atol=1e-5,
+            err_msg="Same weights with different arch names should produce same output",
+        )
 
 
 class TestModelConfigEnums:
@@ -183,7 +187,9 @@ class TestGenerate:
 
     def test_generate_with_temperature(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = loaded_model.generate(prompt, max_new_tokens=5, temperature=0.8, do_sample=True, seed=42)
+        result = loaded_model.generate(
+            prompt, max_new_tokens=5, temperature=0.8, do_sample=True, seed=42
+        )
         assert result["num_generated_tokens"] >= 1
 
     def test_generate_max_tokens_limit(self, loaded_model):
@@ -212,5 +218,7 @@ class TestGenerate:
 
     def test_generate_with_top_p(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = loaded_model.generate(prompt, max_new_tokens=5, top_p=0.9, do_sample=True, seed=456)
+        result = loaded_model.generate(
+            prompt, max_new_tokens=5, top_p=0.9, do_sample=True, seed=456
+        )
         assert result["num_generated_tokens"] >= 1

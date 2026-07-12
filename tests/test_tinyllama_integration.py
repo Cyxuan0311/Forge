@@ -107,8 +107,9 @@ class TestTinyLlamaInference:
         self.ctx.reset_kv()
         out2 = self.ctx.forward(ids, start_pos=0)
 
-        np.testing.assert_array_equal(out1, out2,
-                                       err_msg="Same input should produce deterministic output")
+        np.testing.assert_array_equal(
+            out1, out2, err_msg="Same input should produce deterministic output"
+        )
 
     def test_incremental_matches_full(self):
         ids = np.array([1, 15043, 29892], dtype=np.int32)
@@ -122,9 +123,11 @@ class TestTinyLlamaInference:
 
         for i in range(len(ids)):
             np.testing.assert_allclose(
-                full_logits[i], step_logits[0] if i == len(ids) - 1 else full_logits[i],
+                full_logits[i],
+                step_logits[0] if i == len(ids) - 1 else full_logits[i],
                 atol=1e-3,
-                err_msg=f"Token {i} mismatch between full and incremental")
+                err_msg=f"Token {i} mismatch between full and incremental",
+            )
 
     def test_kv_cache_reset_consistency(self):
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -135,8 +138,9 @@ class TestTinyLlamaInference:
         self.ctx.reset_kv()
         out2 = self.ctx.forward(ids, start_pos=0)
 
-        np.testing.assert_array_equal(out1, out2,
-                                       err_msg="Output should be identical after KV cache reset")
+        np.testing.assert_array_equal(
+            out1, out2, err_msg="Output should be identical after KV cache reset"
+        )
 
 
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama-1.1B GGUF model not found")
@@ -207,8 +211,9 @@ class TestTinyLlamaQ6KWeights:
         out1 = ctx.forward(ids)
         ctx.reset_kv()
         out2 = ctx.forward(ids)
-        np.testing.assert_array_equal(out1, out2,
-                                      err_msg="Q6_K weight inference should be deterministic")
+        np.testing.assert_array_equal(
+            out1, out2, err_msg="Q6_K weight inference should be deterministic"
+        )
 
 
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama-1.1B GGUF model not found")
@@ -217,19 +222,27 @@ class TestTinyLlamaGeneration:
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=20, do_sample=False,
-                                gpu_layers=0, kv_cache_dtype="fp32")
+        result = model.generate(
+            prompt, max_new_tokens=20, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
+        )
         tokens = result["token_ids"]
         unique_ratio = len(set(tokens)) / len(tokens) if len(tokens) > 0 else 0
-        assert unique_ratio > 0.3, \
+        assert unique_ratio > 0.3, (
             f"Generated tokens should not be highly repetitive, unique_ratio={unique_ratio}"
+        )
 
     def test_generate_with_eos(self):
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=50, eos_token_id=2,
-                                do_sample=False, gpu_layers=0, kv_cache_dtype="fp32")
+        result = model.generate(
+            prompt,
+            max_new_tokens=50,
+            eos_token_id=2,
+            do_sample=False,
+            gpu_layers=0,
+            kv_cache_dtype="fp32",
+        )
         if result["finish_reason"] == "eos":
             assert result["token_ids"][-1] == 2
 
@@ -237,18 +250,29 @@ class TestTinyLlamaGeneration:
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result1 = model.generate(prompt, max_new_tokens=10, do_sample=False,
-                                 gpu_layers=0, kv_cache_dtype="fp32")
-        result2 = model.generate(prompt, max_new_tokens=10, do_sample=False,
-                                 gpu_layers=0, kv_cache_dtype="fp32")
-        assert list(result1["token_ids"]) == list(result2["token_ids"]), \
+        result1 = model.generate(
+            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
+        )
+        result2 = model.generate(
+            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
+        )
+        assert list(result1["token_ids"]) == list(result2["token_ids"]), (
             "Greedy generation should be deterministic"
+        )
 
     def test_generate_with_sampling(self):
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=10, temperature=0.8,
-                                top_k=40, top_p=0.9, do_sample=True, seed=42,
-                                gpu_layers=0, kv_cache_dtype="fp32")
+        result = model.generate(
+            prompt,
+            max_new_tokens=10,
+            temperature=0.8,
+            top_k=40,
+            top_p=0.9,
+            do_sample=True,
+            seed=42,
+            gpu_layers=0,
+            kv_cache_dtype="fp32",
+        )
         assert result["num_generated_tokens"] >= 1

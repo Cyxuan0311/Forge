@@ -43,8 +43,9 @@ class TestSamplerConfig:
         assert cfg.seed == 0
 
     def test_custom_config(self):
-        cfg = forge.SamplerConfig(temperature=0.7, top_k=50, top_p=0.9,
-                                       repeat_penalty=1.2, do_sample=True, seed=42)
+        cfg = forge.SamplerConfig(
+            temperature=0.7, top_k=50, top_p=0.9, repeat_penalty=1.2, do_sample=True, seed=42
+        )
         assert cfg.temperature == pytest.approx(0.7, abs=1e-5)
         assert cfg.top_k == 50
         assert cfg.top_p == pytest.approx(0.9, abs=1e-5)
@@ -80,8 +81,9 @@ class TestTopKTopPSampling:
         model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=10, top_k=10, top_p=0.9,
-                                do_sample=True, seed=42)
+        result = model.generate(
+            prompt, max_new_tokens=10, top_k=10, top_p=0.9, do_sample=True, seed=42
+        )
         assert result["num_generated_tokens"] >= 1
 
     def test_repeat_penalty(self, model_path, model_config):
@@ -89,10 +91,12 @@ class TestTopKTopPSampling:
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
 
-        result_no_penalty = model.generate(prompt, max_new_tokens=10,
-                                            repeat_penalty=1.0, do_sample=True, seed=42)
-        result_with_penalty = model.generate(prompt, max_new_tokens=10,
-                                              repeat_penalty=1.5, do_sample=True, seed=42)
+        result_no_penalty = model.generate(
+            prompt, max_new_tokens=10, repeat_penalty=1.0, do_sample=True, seed=42
+        )
+        result_with_penalty = model.generate(
+            prompt, max_new_tokens=10, repeat_penalty=1.5, do_sample=True, seed=42
+        )
 
         assert result_no_penalty["num_generated_tokens"] >= 1
         assert result_with_penalty["num_generated_tokens"] >= 1

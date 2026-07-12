@@ -1,6 +1,7 @@
 import pytest
 from forge import (
-    BackendManager, DeviceType,
+    BackendManager,
+    DeviceType,
 )
 
 

@@ -1,4 +1,5 @@
 """Tests for the BackendManager and Backend abstraction."""
+
 import os
 import sys
 import pytest
@@ -80,7 +81,6 @@ class TestCPUBackend:
         assert dt is not None
 
     def test_capabilities_fp32(self):
-        caps = self.backend.capabilities()
         assert self.backend.supports(forge.BackendCapability.FP32)
 
     def test_capabilities_quantized(self):
@@ -128,10 +128,7 @@ class TestBackendCapability:
         assert result
 
 
-@pytest.mark.skipif(
-    not forge.BackendManager.instance().has_cuda(),
-    reason="CUDA not available"
-)
+@pytest.mark.skipif(not forge.BackendManager.instance().has_cuda(), reason="CUDA not available")
 class TestCUDABackend:
     @pytest.fixture(autouse=True)
     def setup(self):

@@ -9,6 +9,7 @@ Usage:
     python3 benchmarks/bench_core.py --device cpu
     python3 benchmarks/bench_core.py --seq-lengths 1 8 32 128
 """
+
 import os
 import sys
 import time
@@ -21,7 +22,9 @@ if os.path.exists(build_dir):
 import forge
 import numpy as np
 
-FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures")
+FIXTURES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures"
+)
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 TINYLLAMA_Q4_PATH = os.path.join(MODELS_DIR, "tinyllama-1.1b-chat-v1.0.Q4_0.gguf")
 
@@ -29,6 +32,7 @@ TINYLLAMA_Q4_PATH = os.path.join(MODELS_DIR, "tinyllama-1.1b-chat-v1.0.Q4_0.gguf
 # ============================================================================
 # Utility
 # ============================================================================
+
 
 def fmt_time(seconds):
     """Format time with appropriate unit."""
@@ -71,12 +75,15 @@ def print_result(name, stats, unit="ms", extra=""):
     p50 = stats["p50"] * scale
     p99 = stats["p99"] * scale
     std = stats["std"] * scale
-    print(f"  {name:40s}  mean={mean:8.2f} {unit}  p50={p50:8.2f}  p99={p99:8.2f}  std={std:6.2f}  {extra}")
+    print(
+        f"  {name:40s}  mean={mean:8.2f} {unit}  p50={p50:8.2f}  p99={p99:8.2f}  std={std:6.2f}  {extra}"
+    )
 
 
 # ============================================================================
 # Model & Context Setup
 # ============================================================================
+
 
 def get_small_model_and_context(device="cpu"):
     """Load the small test model."""
@@ -84,8 +91,17 @@ def get_small_model_and_context(device="cpu"):
     if not os.path.exists(model_path):
         return None, None
     model = forge.Model()
-    model.load(model_path, vocab_size=100, hidden_dim=32, intermediate_dim=64,
-               num_layers=1, num_heads=2, num_kv_heads=1, head_dim=16, device=device)
+    model.load(
+        model_path,
+        vocab_size=100,
+        hidden_dim=32,
+        intermediate_dim=64,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=16,
+        device=device,
+    )
     ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=-1 if device != "cpu" else 0)
     return model, ctx
 
@@ -103,6 +119,7 @@ def get_tinyllama_model_and_context(device="cpu", gpu_layers=0):
 # ============================================================================
 # Benchmark: Forward Pass
 # ============================================================================
+
 
 def bench_forward(ctx, seq_len, warmup=5, iters=50):
     ids = np.arange(seq_len, dtype=np.int32) % 100
@@ -134,9 +151,11 @@ def bench_forward_incremental(ctx, prompt_len, gen_len, warmup=3, iters=20):
 # Benchmark: Tensor Operations
 # ============================================================================
 
+
 def bench_tensor_creation(shape, warmup=10, iters=200):
     def run():
         forge.Tensor(forge.DataType.FP32, shape, forge.DeviceType.CPU)
+
     return bench(run, warmup, iters)
 
 
@@ -146,12 +165,14 @@ def bench_tensor_copy(size, warmup=5, iters=50):
 
     def run():
         dst.copy_from(src)
+
     return bench(run, warmup, iters)
 
 
 # ============================================================================
 # Benchmark: Model Loading
 # ============================================================================
+
 
 def bench_model_loading_ninf(warmup=2, iters=10):
     model_path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
@@ -160,8 +181,18 @@ def bench_model_loading_ninf(warmup=2, iters=10):
 
     def run():
         model = forge.Model()
-        model.load(model_path, vocab_size=100, hidden_dim=32, intermediate_dim=64,
-                   num_layers=1, num_heads=2, num_kv_heads=1, head_dim=16, device="cpu")
+        model.load(
+            model_path,
+            vocab_size=100,
+            hidden_dim=32,
+            intermediate_dim=64,
+            num_layers=1,
+            num_heads=2,
+            num_kv_heads=1,
+            head_dim=16,
+            device="cpu",
+        )
+
     return bench(run, warmup, iters)
 
 
@@ -172,6 +203,7 @@ def bench_model_loading_gguf(warmup=1, iters=5):
     def run():
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
+
     return bench(run, warmup, iters)
 
 
@@ -179,21 +211,26 @@ def bench_model_loading_gguf(warmup=1, iters=5):
 # Benchmark: Graph Mode Overhead
 # ============================================================================
 
+
 def bench_graph_vs_imperative(ctx, seq_len, warmup=5, iters=50):
     ids = np.arange(seq_len, dtype=np.int32) % 100
 
     # Imperative
     ctx.set_use_graph(False)
+
     def run_imperative():
         ctx.reset_kv()
         ctx.forward(ids)
+
     stats_imp = bench(run_imperative, warmup, iters)
 
     # Graph
     ctx.set_use_graph(True)
+
     def run_graph():
         ctx.reset_kv()
         ctx.forward(ids)
+
     stats_graph = bench(run_graph, warmup, iters)
 
     ctx.set_use_graph(False)
@@ -204,15 +241,18 @@ def bench_graph_vs_imperative(ctx, seq_len, warmup=5, iters=50):
 # Benchmark: KV Cache
 # ============================================================================
 
+
 def bench_kv_cache_reset(ctx, warmup=10, iters=100):
     def run():
         ctx.reset_kv()
+
     return bench(run, warmup, iters)
 
 
 def bench_kv_cache_memory_stats(ctx, warmup=10, iters=200):
     def run():
         ctx.memory_stats()
+
     return bench(run, warmup, iters)
 
 
@@ -220,12 +260,19 @@ def bench_kv_cache_memory_stats(ctx, warmup=10, iters=200):
 # Main
 # ============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(description="Forge Core Micro-Benchmarks")
-    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"],
-                        help="Device for benchmarks")
-    parser.add_argument("--seq-lengths", type=int, nargs="+", default=[1, 4, 16, 32, 64],
-                        help="Sequence lengths to benchmark")
+    parser.add_argument(
+        "--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device for benchmarks"
+    )
+    parser.add_argument(
+        "--seq-lengths",
+        type=int,
+        nargs="+",
+        default=[1, 4, 16, 32, 64],
+        help="Sequence lengths to benchmark",
+    )
     parser.add_argument("--iters", type=int, default=50, help="Number of iterations")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations")
     parser.add_argument("--tinyllama", action="store_true", help="Include TinyLlama benchmarks")
@@ -254,7 +301,9 @@ def main():
         for gen_len in [8, 32]:
             stats = bench_forward_incremental(ctx, prompt_len, gen_len, 3, 20)
             total = prompt_len + gen_len
-            print_result(f"incremental(prompt={prompt_len}, gen={gen_len}, total={total})", stats, "ms")
+            print_result(
+                f"incremental(prompt={prompt_len}, gen={gen_len}, total={total})", stats, "ms"
+            )
 
     # Graph mode comparison
     print("\n--- Graph Mode vs Imperative (small model) ---")

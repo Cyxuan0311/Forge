@@ -33,6 +33,7 @@ Interactive commands:
   /clear  - Clear conversation history
   /help   - Show help message
 """
+
 import sys
 import os
 import time
@@ -60,7 +61,9 @@ class PerfTimer:
     """Lightweight hierarchical performance timer for Python-level profiling."""
 
     def __init__(self):
-        self._timings = defaultdict(lambda: {"total_ms": 0.0, "count": 0, "min_ms": float("inf"), "max_ms": 0.0})
+        self._timings = defaultdict(
+            lambda: {"total_ms": 0.0, "count": 0, "min_ms": float("inf"), "max_ms": 0.0}
+        )
         self._starts = {}
 
     def start(self, name):
@@ -94,7 +97,9 @@ class PerfTimer:
         print("\n" + "=" * 90)
         print("  Python-Level Performance Profile")
         print("=" * 90)
-        print(f"{'Stage':<40} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}")
+        print(
+            f"{'Stage':<40} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}"
+        )
         print("-" * 90)
 
         grand_total = sum(r["total_ms"] for r in self._timings.values())
@@ -103,10 +108,14 @@ class PerfTimer:
         for name, rec in sorted_items:
             avg = rec["total_ms"] / rec["count"] if rec["count"] > 0 else 0
             pct = (rec["total_ms"] / grand_total * 100) if grand_total > 0 else 0
-            print(f"{name:<40} {rec['count']:>6} {rec['total_ms']:>10.2f} {avg:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%")
+            print(
+                f"{name:<40} {rec['count']:>6} {rec['total_ms']:>10.2f} {avg:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%"
+            )
 
         print("-" * 90)
-        print(f"{'TOTAL':<40} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}")
+        print(
+            f"{'TOTAL':<40} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}"
+        )
         print("=" * 90)
 
 
@@ -124,7 +133,9 @@ def print_cpp_profiler_summary():
         print("\n" + "=" * 90)
         print("  C++ Operator-Level Performance Profile (from PerfProfiler)")
         print("=" * 90)
-        print(f"{'Operation':<45} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}")
+        print(
+            f"{'Operation':<45} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}"
+        )
         print("-" * 90)
 
         sorted_ops = sorted(summary.items(), key=lambda x: x[1]["total_ms"], reverse=True)
@@ -132,10 +143,14 @@ def print_cpp_profiler_summary():
 
         for name, rec in sorted_ops:
             pct = (rec["total_ms"] / grand_total * 100) if grand_total > 0 else 0
-            print(f"{name:<45} {rec['count']:>6} {rec['total_ms']:>10.2f} {rec['avg_ms']:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%")
+            print(
+                f"{name:<45} {rec['count']:>6} {rec['total_ms']:>10.2f} {rec['avg_ms']:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%"
+            )
 
         print("-" * 90)
-        print(f"{'TOTAL':<45} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}")
+        print(
+            f"{'TOTAL':<45} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}"
+        )
         print("=" * 90)
     except Exception as e:
         print(f"[Profiler] Could not retrieve C++ profile: {e}")
@@ -154,12 +169,14 @@ def download_model(model_path):
     print("Downloading model from hf-mirror.com ...")
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     ret = os.system(
-        f'wget -c https://hf-mirror.com/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf '
-        f'-O {model_path}'
+        f"wget -c https://hf-mirror.com/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf "
+        f"-O {model_path}"
     )
     if ret != 0:
         print("Failed to download model. Please download manually:")
-        print("  wget https://hf-mirror.com/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf")
+        print(
+            "  wget https://hf-mirror.com/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf"
+        )
         return False
     print("Model downloaded successfully!")
     return True
@@ -265,60 +282,46 @@ def apply_chat_template(tokenizer, messages, add_generation_prompt=True):
     template = tokenizer.chat_template
 
     # Determine template type from the template string
-    if 'user|' in template and 'assistant|' in template:
+    if "user|" in template and "assistant|" in template:
         # Zephyr format (TinyLlama)
         ids = []
         for i, msg in enumerate(messages):
             if msg["role"] == "system":
                 ids.extend(tokenizer.encode("<|system|>\n", add_bos=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
                 ids.append(tokenizer.eos_token_id)
-                ids.extend(tokenizer.encode("\n", add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode("\n", add_bos=False, add_dummy_prefix=False))
             elif msg["role"] == "user":
                 ids.extend(tokenizer.encode("<|user|>\n", add_bos=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
                 ids.append(tokenizer.eos_token_id)
-                ids.extend(tokenizer.encode("\n", add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode("\n", add_bos=False, add_dummy_prefix=False))
             elif msg["role"] == "assistant":
-                ids.extend(tokenizer.encode("<|assistant|", add_bos=False,
-                                            add_dummy_prefix=False))
-                ids.extend(tokenizer.encode(">\n", add_bos=False,
-                                            add_dummy_prefix=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode("<|assistant|", add_bos=False, add_dummy_prefix=False))
+                ids.extend(tokenizer.encode(">\n", add_bos=False, add_dummy_prefix=False))
+                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
                 ids.append(tokenizer.eos_token_id)
-                ids.extend(tokenizer.encode("\n", add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode("\n", add_bos=False, add_dummy_prefix=False))
 
         if add_generation_prompt:
-            ids.extend(tokenizer.encode("<|assistant|", add_bos=False,
-                                        add_dummy_prefix=False))
-            ids.extend(tokenizer.encode(">", add_bos=False,
-                                        add_dummy_prefix=False))
-            ids.extend(tokenizer.encode("\n", add_bos=False,
-                                        add_dummy_prefix=False))
+            ids.extend(tokenizer.encode("<|assistant|", add_bos=False, add_dummy_prefix=False))
+            ids.extend(tokenizer.encode(">", add_bos=False, add_dummy_prefix=False))
+            ids.extend(tokenizer.encode("\n", add_bos=False, add_dummy_prefix=False))
 
         return ids
 
-    elif '[INST]' in template:
+    elif "[INST]" in template:
         # Llama-2 format
         ids = []
         for i, msg in enumerate(messages):
             if msg["role"] == "user":
                 ids.append(tokenizer.bos_token_id)
                 ids.extend(tokenizer.encode("[INST] ", add_bos=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
                 ids.extend(tokenizer.encode(" [/INST]", add_bos=False))
             elif msg["role"] == "assistant":
-                ids.extend(tokenizer.encode(" ", add_bos=False,
-                                            add_dummy_prefix=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False,
-                                            add_dummy_prefix=False))
+                ids.extend(tokenizer.encode(" ", add_bos=False, add_dummy_prefix=False))
+                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
                 ids.append(tokenizer.eos_token_id)
 
         return ids
@@ -331,10 +334,20 @@ def apply_chat_template(tokenizer, messages, add_generation_prompt=True):
         return ids
 
 
-def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
-                       temperature=0.7, top_k=40, top_p=0.9,
-                       repeat_penalty=1.1, eos_token_id=TINYLLAMA_EOS_ID,
-                       kv_cache_dtype="fp32", gpu_layers=-1):
+def generate_streaming(
+    model,
+    ctx,
+    tokenizer,
+    input_ids,
+    max_new_tokens=256,
+    temperature=0.7,
+    top_k=40,
+    top_p=0.9,
+    repeat_penalty=1.1,
+    eos_token_id=TINYLLAMA_EOS_ID,
+    kv_cache_dtype="fp32",
+    gpu_layers=-1,
+):
     if eos_token_id is None:
         eos_token_id = tokenizer.eos_token_id
 
@@ -359,16 +372,15 @@ def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
         if len(token_buffer) >= 4 or token_id == eos_token_id:
             try:
                 perf.start("decode/tokenize") if profiling_enabled else None
-                text = tokenizer.decode(token_buffer, skip_special=True,
-                                        strip_leading_space=False)
+                text = tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
                 perf.stop("decode/tokenize") if profiling_enabled else None
                 print(text, end="", flush=True)
                 token_buffer.clear()
             except UnicodeDecodeError:
                 if token_id == eos_token_id:
-                    text = tokenizer.decode(token_buffer, skip_special=True,
-                                            strip_leading_space=False,
-                                            errors='replace')
+                    text = tokenizer.decode(
+                        token_buffer, skip_special=True, strip_leading_space=False, errors="replace"
+                    )
                     print(text, end="", flush=True)
                     token_buffer.clear()
 
@@ -394,8 +406,9 @@ def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
         perf.stop("generate_stream/total")
 
     if token_buffer:
-        text = tokenizer.decode(token_buffer, skip_special=True,
-                                strip_leading_space=False, errors='replace')
+        text = tokenizer.decode(
+            token_buffer, skip_special=True, strip_leading_space=False, errors="replace"
+        )
         print(text, end="", flush=True)
         token_buffer.clear()
 
@@ -464,8 +477,7 @@ def interactive_chat(model, tokenizer, args):
 
         if profiling_enabled:
             perf.start("template/encode")
-        input_ids = apply_chat_template(tokenizer, conversation,
-                                        add_generation_prompt=True)
+        input_ids = apply_chat_template(tokenizer, conversation, add_generation_prompt=True)
         if profiling_enabled:
             perf.stop("template/encode")
 
@@ -495,8 +507,9 @@ def interactive_chat(model, tokenizer, args):
             new_tokens = list(result["token_ids"])
             if profiling_enabled:
                 perf.start("decode/tokenize")
-            assistant_text = tokenizer.decode(new_tokens, skip_special=True,
-                                              strip_leading_space=False)
+            assistant_text = tokenizer.decode(
+                new_tokens, skip_special=True, strip_leading_space=False
+            )
             if profiling_enabled:
                 perf.stop("decode/tokenize")
             print(assistant_text, end="", flush=True)
@@ -509,7 +522,10 @@ def interactive_chat(model, tokenizer, args):
                 gpu_layers=args.gpu_layers,
             )
             generated_tokens, elapsed = generate_streaming(
-                model, ctx, tokenizer, input_ids,
+                model,
+                ctx,
+                tokenizer,
+                input_ids,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
@@ -521,7 +537,8 @@ def interactive_chat(model, tokenizer, args):
             )
             num_generated = len(generated_tokens)
             assistant_text = tokenizer.decode(
-                generated_tokens, skip_special=True, strip_leading_space=False)
+                generated_tokens, skip_special=True, strip_leading_space=False
+            )
 
         print()
         if num_generated > 0 and elapsed > 0:
@@ -539,32 +556,43 @@ def interactive_chat(model, tokenizer, args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TinyLlama-1.1B-Chat inference with Forge")
-    parser.add_argument("--model-path", type=str, default=None,
-                        help="Path to .gguf model file")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
-                        help="Device for inference")
-    parser.add_argument("--gpu-layers", type=int, default=22,
-                        help="Number of layers to place on GPU (-1 for all)")
-    parser.add_argument("--kv-cache-dtype", type=str, default="fp32",
-                        choices=["fp32", "q4_0"], help="KV cache data type")
-    parser.add_argument("--max-new-tokens", type=int, default=256,
-                        help="Maximum number of tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                        help="Sampling temperature (0 for greedy)")
-    parser.add_argument("--top-k", type=int, default=40,
-                        help="Top-k sampling parameter (0 to disable)")
-    parser.add_argument("--top-p", type=float, default=0.9,
-                        help="Top-p sampling parameter")
-    parser.add_argument("--repeat-penalty", type=float, default=1.1,
-                        help="Repetition penalty")
-    parser.add_argument("--no-stream", action="store_true",
-                        help="Disable streaming output")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose logging")
-    parser.add_argument("--profile", action="store_true",
-                        help="Enable performance profiling (Python + C++ PerfProfiler)")
-    parser.add_argument("--verify-tokenizer", action="store_true",
-                        help="Verify tokenizer against transformers and exit")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to .gguf model file")
+    parser.add_argument(
+        "--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for inference"
+    )
+    parser.add_argument(
+        "--gpu-layers", type=int, default=22, help="Number of layers to place on GPU (-1 for all)"
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "q4_0"],
+        help="KV cache data type",
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=256, help="Maximum number of tokens to generate"
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.7, help="Sampling temperature (0 for greedy)"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=40, help="Top-k sampling parameter (0 to disable)"
+    )
+    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling parameter")
+    parser.add_argument("--repeat-penalty", type=float, default=1.1, help="Repetition penalty")
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming output")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable performance profiling (Python + C++ PerfProfiler)",
+    )
+    parser.add_argument(
+        "--verify-tokenizer",
+        action="store_true",
+        help="Verify tokenizer against transformers and exit",
+    )
     return parser.parse_args()
 
 
@@ -586,9 +614,11 @@ def main():
 
     print("Loading tokenizer from GGUF...")
     tokenizer = load_tokenizer(model_path)
-    print(f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
-          f"model_type={tokenizer.model_type}, "
-          f"bos_id={tokenizer.bos_token_id}, eos_id={tokenizer.eos_token_id}")
+    print(
+        f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
+        f"model_type={tokenizer.model_type}, "
+        f"bos_id={tokenizer.bos_token_id}, eos_id={tokenizer.eos_token_id}"
+    )
 
     if args.verify_tokenizer:
         verify_tokenizer(tokenizer, TOKENIZER_DIR)
@@ -601,9 +631,11 @@ def main():
     model.load_gguf(model_path, device=args.device)
 
     cfg = model.config
-    print(f"Model loaded! arch={cfg.arch_type}, layers={cfg.num_layers}, "
-          f"hidden={cfg.hidden_dim}, heads={cfg.num_heads}, "
-          f"kv_heads={cfg.num_kv_heads}, vocab={cfg.vocab_size}")
+    print(
+        f"Model loaded! arch={cfg.arch_type}, layers={cfg.num_layers}, "
+        f"hidden={cfg.hidden_dim}, heads={cfg.num_heads}, "
+        f"kv_heads={cfg.num_kv_heads}, vocab={cfg.vocab_size}"
+    )
 
     if profiling_enabled:
         forge.profiler_enable()
@@ -618,8 +650,10 @@ def main():
         gpu_layers=args.gpu_layers,
     )
     stats = ctx.memory_stats()
-    print(f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
-          f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB")
+    print(
+        f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
+        f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB"
+    )
 
     # Warmup to trigger CUDA kernel JIT compilation
     if args.device == "cuda":

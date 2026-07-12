@@ -23,7 +23,9 @@ def get_gpu_info():
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0:
             parts = result.stdout.strip().split(",")
@@ -64,7 +66,13 @@ class BenchmarkBase(ABC):
         return resolve_path(self.MODEL_PATH)
 
     def _default_output_dir(self):
-        safe = self.MODEL_NAME.replace(" ", "_").replace("/", "_").replace("Q4_0", "").strip("_").lower()
+        safe = (
+            self.MODEL_NAME.replace(" ", "_")
+            .replace("/", "_")
+            .replace("Q4_0", "")
+            .strip("_")
+            .lower()
+        )
         return os.path.join(PROJECT_DIR, "resource", "reports", safe)
 
     # ── Benchmark 方法 ───────────────────────────
@@ -72,6 +80,7 @@ class BenchmarkBase(ABC):
     @staticmethod
     def bench_forge_decode(model_path, device, gpu_layers, num_tokens, num_runs):
         import forge
+
         forge.Logger.set_level(0)
 
         model = forge.Model()
@@ -79,14 +88,16 @@ class BenchmarkBase(ABC):
 
         ids = np.array([1], dtype=np.int32)
 
-        model.generate(ids, max_new_tokens=BenchmarkBase.WARMUP_TOKENS,
-                       do_sample=False, gpu_layers=gpu_layers)
+        model.generate(
+            ids, max_new_tokens=BenchmarkBase.WARMUP_TOKENS, do_sample=False, gpu_layers=gpu_layers
+        )
 
         speeds = []
         for _ in range(num_runs):
             start = time.time()
-            result = model.generate(ids, max_new_tokens=num_tokens,
-                                    do_sample=False, gpu_layers=gpu_layers)
+            result = model.generate(
+                ids, max_new_tokens=num_tokens, do_sample=False, gpu_layers=gpu_layers
+            )
             elapsed = time.time() - start
             actual = result.get("num_generated_tokens", num_tokens)
             speeds.append(actual / elapsed)
@@ -95,13 +106,12 @@ class BenchmarkBase(ABC):
 
     @staticmethod
     def bench_forge_cpu_decode(model_path, num_tokens, num_runs):
-        return BenchmarkBase.bench_forge_decode(
-            model_path, "cpu", 0, num_tokens, num_runs)
+        return BenchmarkBase.bench_forge_decode(model_path, "cpu", 0, num_tokens, num_runs)
 
     @staticmethod
-    def bench_forge_prefill(model_path, device, gpu_layers,
-                                 prompt_lengths, num_runs):
+    def bench_forge_prefill(model_path, device, gpu_layers, prompt_lengths, num_runs):
         import forge
+
         forge.Logger.set_level(0)
 
         model = forge.Model()
@@ -182,10 +192,10 @@ class BenchmarkBase(ABC):
         plens = self.PREFILL_LENGTHS
         gl = self.GPU_LAYERS
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  {model_name}")
         print(f"  {model_path}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         if not os.path.exists(model_path):
             print(f"  Model not found: {model_path}")
@@ -307,6 +317,7 @@ class BenchmarkBase(ABC):
     def save_report(self):
         """生成图表并保存到 output_dir。"""
         from chart import generate_report
+
         generate_report([self.results], self.output_dir)
 
     def save(self):

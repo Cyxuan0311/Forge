@@ -39,10 +39,17 @@ class TestNinfModelLoading:
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
         model = forge.Model()
-        model.load(path,
-                   vocab_size=100, hidden_dim=32, intermediate_dim=64,
-                   num_layers=1, num_heads=2, num_kv_heads=1, head_dim=16,
-                   device="cpu")
+        model.load(
+            path,
+            vocab_size=100,
+            hidden_dim=32,
+            intermediate_dim=64,
+            num_layers=1,
+            num_heads=2,
+            num_kv_heads=1,
+            head_dim=16,
+            device="cpu",
+        )
         assert model.config.vocab_size == 100
         assert model.config.hidden_dim == 32
         assert model.config.num_layers == 1
@@ -147,14 +154,20 @@ class TestModelErrors:
     def test_load_nonexistent_path(self):
         model = forge.Model()
         with pytest.raises(RuntimeError):
-            model.load("/nonexistent/model.ninf",
-                       vocab_size=100, hidden_dim=32, intermediate_dim=64,
-                       num_layers=1, num_heads=2, device="cpu")
+            model.load(
+                "/nonexistent/model.ninf",
+                vocab_size=100,
+                hidden_dim=32,
+                intermediate_dim=64,
+                num_layers=1,
+                num_heads=2,
+                device="cpu",
+            )
 
     def test_forward_without_load(self):
         model = forge.Model()
         with pytest.raises(Exception):
-            ctx = model.create_context()
+            model.create_context()
 
 
 class TestModelCreateContext:

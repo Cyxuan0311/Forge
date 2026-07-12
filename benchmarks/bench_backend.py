@@ -7,6 +7,7 @@ and CPU vs CUDA performance comparison.
 Usage:
     python3 benchmarks/bench_backend.py
 """
+
 import os
 import sys
 import time
@@ -21,6 +22,7 @@ import numpy as np
 
 def bench_tensor_alloc_dealloc(dtype, shape, device, iters=100, warmup=10):
     """Benchmark tensor creation + deallocation (as a proxy for backend allocation)."""
+
     def run():
         t = forge.Tensor(dtype, shape, device)
         del t
@@ -98,7 +100,6 @@ def main():
     print("\n--- Available Backends ---")
     for name in mgr.available_backends():
         backend = mgr.get_backend(name)
-        caps = backend.capabilities()
         cap_strs = []
         for cap_name, cap_val in [
             ("FP32", forge.BackendCapability.FP32),
@@ -116,8 +117,10 @@ def main():
         total_gb = total_mem / (1024**3)
         free_gb = free_mem / (1024**3)
 
-        print(f"  {name:8s}: caps=[{', '.join(cap_strs)}]  "
-              f"mem={free_gb:.1f}/{total_gb:.1f} GB  device_id={backend.device_id()}")
+        print(
+            f"  {name:8s}: caps=[{', '.join(cap_strs)}]  "
+            f"mem={free_gb:.1f}/{total_gb:.1f} GB  device_id={backend.device_id()}"
+        )
 
     # --- CPU Backend Allocation ---
     print("\n--- CPU Backend Memory Allocation (via Tensor) ---")
@@ -129,8 +132,10 @@ def main():
         ("16 MB", [4194304]),
     ]:
         stats = bench_tensor_alloc_dealloc(forge.DataType.FP32, shape, forge.DeviceType.CPU)
-        print(f"  alloc+dealloc({size_name:8s}): {stats['mean_us']:8.1f} us  "
-              f"p50={stats['p50_us']:8.1f} us")
+        print(
+            f"  alloc+dealloc({size_name:8s}): {stats['mean_us']:8.1f} us  "
+            f"p50={stats['p50_us']:8.1f} us"
+        )
 
     # --- CUDA Backend ---
     if mgr.has_cuda():
@@ -143,8 +148,10 @@ def main():
             ("16 MB", [4194304]),
         ]:
             stats = bench_tensor_alloc_dealloc(forge.DataType.FP32, shape, forge.DeviceType.CUDA)
-            print(f"  alloc+dealloc({size_name:8s}): {stats['mean_us']:8.1f} us  "
-                  f"p50={stats['p50_us']:8.1f} us")
+            print(
+                f"  alloc+dealloc({size_name:8s}): {stats['mean_us']:8.1f} us  "
+                f"p50={stats['p50_us']:8.1f} us"
+            )
 
         # --- Device Transfer ---
         print("\n--- Device Transfer Bandwidth ---")
@@ -157,9 +164,11 @@ def main():
         ]:
             stats = bench_tensor_device_transfer(size)
             if stats:
-                print(f"  {size_name:6s} ({stats['size_mb']:6.2f} MB):  "
-                      f"H2D={stats['h2d_mean_ms']:6.2f} ms ({stats['h2d_bandwidth_gbps']:.2f} GB/s)  "
-                      f"D2H={stats['d2h_mean_ms']:6.2f} ms ({stats['d2h_bandwidth_gbps']:.2f} GB/s)")
+                print(
+                    f"  {size_name:6s} ({stats['size_mb']:6.2f} MB):  "
+                    f"H2D={stats['h2d_mean_ms']:6.2f} ms ({stats['h2d_bandwidth_gbps']:.2f} GB/s)  "
+                    f"D2H={stats['d2h_mean_ms']:6.2f} ms ({stats['d2h_bandwidth_gbps']:.2f} GB/s)"
+                )
     else:
         print("\n  CUDA not available, skipping CUDA benchmarks")
 

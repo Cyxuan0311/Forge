@@ -25,7 +25,8 @@ def discover_benchmarks():
     """自动发现 report/ 下所有 BenchmarkBase 子类。"""
     benchmarks = []
     for importer, modname, ispkg in pkgutil.iter_modules(
-            [os.path.dirname(os.path.abspath(__file__))]):
+        [os.path.dirname(os.path.abspath(__file__))]
+    ):
         if modname in ("base", "chart", "runner", "benchmark", "generate_report", "__init__"):
             continue
         if modname.endswith("_benchmark") or modname in ("tinyllama", "qwen"):
@@ -33,7 +34,11 @@ def discover_benchmarks():
                 mod = importlib.import_module(modname)
                 for attr in dir(mod):
                     obj = getattr(mod, attr)
-                    if isinstance(obj, type) and issubclass(obj, BenchmarkBase) and obj is not BenchmarkBase:
+                    if (
+                        isinstance(obj, type)
+                        and issubclass(obj, BenchmarkBase)
+                        and obj is not BenchmarkBase
+                    ):
                         benchmarks.append(obj)
             except Exception:
                 pass
@@ -42,16 +47,18 @@ def discover_benchmarks():
 
 def main():
     parser = argparse.ArgumentParser(description="Forge Benchmark Runner")
-    parser.add_argument("--models", type=str, default=None,
-                        help="Comma-separated list of model names to benchmark")
-    parser.add_argument("--skip-llama-cpp", action="store_true",
-                        help="Skip llama.cpp benchmark")
-    parser.add_argument("--skip-cpu", action="store_true",
-                        help="Skip CPU benchmarks (slow)")
-    parser.add_argument("--num-runs", type=int, default=None,
-                        help="Number of benchmark runs")
-    parser.add_argument("--output-dir", type=str, default=None,
-                        help="Base output directory (default: resource/reports)")
+    parser.add_argument(
+        "--models", type=str, default=None, help="Comma-separated list of model names to benchmark"
+    )
+    parser.add_argument("--skip-llama-cpp", action="store_true", help="Skip llama.cpp benchmark")
+    parser.add_argument("--skip-cpu", action="store_true", help="Skip CPU benchmarks (slow)")
+    parser.add_argument("--num-runs", type=int, default=None, help="Number of benchmark runs")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Base output directory (default: resource/reports)",
+    )
     args = parser.parse_args()
 
     gpu_name, gpu_mem = get_gpu_info()
@@ -64,9 +71,12 @@ def main():
 
     if args.models:
         selected_names = [n.strip().lower() for n in args.models.split(",")]
-        all_benchmarks = [b for b in all_benchmarks
-                          if b.MODEL_NAME.lower() in selected_names
-                          or b.__module__.split(".")[-1].lower() in selected_names]
+        all_benchmarks = [
+            b
+            for b in all_benchmarks
+            if b.MODEL_NAME.lower() in selected_names
+            or b.__module__.split(".")[-1].lower() in selected_names
+        ]
 
     if not all_benchmarks:
         print("No benchmarks found.")
@@ -74,9 +84,9 @@ def main():
 
     for bench_cls in all_benchmarks:
         name = getattr(bench_cls, "MODEL_NAME", bench_cls.__name__)
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Found: {name}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         bench = bench_cls(
             output_dir=args.output_dir,

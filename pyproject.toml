@@ -24,3 +24,16 @@ include = ["forge*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"benchmarks/*" = ["E402", "E501"]
+"examples/*" = ["E402", "E501"]
+"tests/*" = ["E402", "E501"]
+"report/*" = ["E402", "E501"]
+"setup.py" = ["E501"]

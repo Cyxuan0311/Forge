@@ -10,6 +10,7 @@ class TestLogger:
 
     def test_python_sink(self, loaded_context):
         logs = []
+
         def capture(level, msg):
             logs.append((level, msg))
 
@@ -25,6 +26,7 @@ class TestLogger:
 
     def test_log_level_filtering(self, loaded_context):
         logs = []
+
         def capture(level, msg):
             logs.append((level, msg))
 

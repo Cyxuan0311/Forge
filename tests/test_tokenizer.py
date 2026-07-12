@@ -4,6 +4,7 @@ Tests are split into:
 - Basic tests that don't require a GGUF model file
 - Integration tests that require TinyLlama GGUF model
 """
+
 import os
 import sys
 import pytest
@@ -25,6 +26,7 @@ def tinyllama_available():
 # ============================================================================
 # Basic tests (no GGUF model required)
 # ============================================================================
+
 
 class TestTokenizerBasic:
     def test_create_tokenizer(self):
@@ -61,6 +63,7 @@ class TestTokenizerBasic:
 # ============================================================================
 # TinyLlama SPM tokenizer tests
 # ============================================================================
+
 
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama GGUF model not found")
 class TestTokenizerSPM:
@@ -298,7 +301,9 @@ class TestTokenizerSPMAdvanced:
     def test_long_text_token_count(self):
         # Longer text should generally produce more tokens
         short_ids = self.tok.encode("Hello", add_bos=False)
-        long_ids = self.tok.encode("Hello world, this is a longer sentence with more words.", add_bos=False)
+        long_ids = self.tok.encode(
+            "Hello world, this is a longer sentence with more words.", add_bos=False
+        )
         assert len(long_ids) >= len(short_ids)
 
     def test_encode_whitespace_only(self):

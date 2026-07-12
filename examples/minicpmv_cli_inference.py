@@ -42,12 +42,13 @@ MMPROJ_FILE = "mmproj-model-f16.gguf"
 
 def _sanitize_utf8(text: str) -> str:
     """Remove lone surrogate characters that cannot be encoded as UTF-8."""
-    return text.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace')
+    return text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
 
 
 def _extract_frames(video_path, num_frames=8):
     """Uniformly sample N frames from a video using decord."""
     import decord
+
     vr = decord.VideoReader(video_path)
     total = len(vr)
     indices = [int(total * i / num_frames) for i in range(num_frames)]
@@ -94,11 +95,16 @@ def build_multimodal_prompt(tokenizer, prompt_text, num_img_tokens_list, enable_
         for nt in num_img_tokens_list:
             frame_blocks += [img_start_id] + [0] * nt + [img_end_id]
         full_ids = (
-            [im_start_id] + user_text_ids + newline_ids +
-            frame_blocks +
-            prompt_ids +
-            [im_end_id] + newline_ids +
-            [im_start_id] + assistant_text_ids + newline_ids
+            [im_start_id]
+            + user_text_ids
+            + newline_ids
+            + frame_blocks
+            + prompt_ids
+            + [im_end_id]
+            + newline_ids
+            + [im_start_id]
+            + assistant_text_ids
+            + newline_ids
         )
         # Compute insert spans: position of first dummy token in each block
         insert_spans = []
@@ -109,10 +115,15 @@ def build_multimodal_prompt(tokenizer, prompt_text, num_img_tokens_list, enable_
     else:
         # Text-only: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
         full_ids = (
-            [im_start_id] + user_text_ids + newline_ids +
-            prompt_ids +
-            [im_end_id] + newline_ids +
-            [im_start_id] + assistant_text_ids + newline_ids
+            [im_start_id]
+            + user_text_ids
+            + newline_ids
+            + prompt_ids
+            + [im_end_id]
+            + newline_ids
+            + [im_start_id]
+            + assistant_text_ids
+            + newline_ids
         )
         insert_spans = []
 
@@ -132,16 +143,24 @@ def build_multimodal_embeddings(ctx, prompt_ids, image_embeddings, image_insert_
         offset = 0
         for start, length in image_insert_spans:
             end = start + length
-            text_embeddings[start:end] = image_embeddings[offset:offset + length]
+            text_embeddings[start:end] = image_embeddings[offset : offset + length]
             offset += length
 
     return text_embeddings
 
 
-def generate_response(ctx, tokenizer, prompt_ids, image_embeddings,
-                      image_insert_spans,
-                      max_new_tokens=256, temperature=0.7,
-                      top_k=40, top_p=0.9, repeat_penalty=1.1):
+def generate_response(
+    ctx,
+    tokenizer,
+    prompt_ids,
+    image_embeddings,
+    image_insert_spans,
+    max_new_tokens=256,
+    temperature=0.7,
+    top_k=40,
+    top_p=0.9,
+    repeat_penalty=1.1,
+):
     """Generate a response for a single turn.
 
     Handles the full forward + decode loop, returns generated text and timing.
@@ -151,7 +170,8 @@ def generate_response(ctx, tokenizer, prompt_ids, image_embeddings,
     # Forward the prompt
     if image_insert_spans and image_embeddings is not None:
         combined_emb = build_multimodal_embeddings(
-            ctx, prompt_ids, image_embeddings, image_insert_spans)
+            ctx, prompt_ids, image_embeddings, image_insert_spans
+        )
         logits = ctx.forward_with_embeddings(combined_emb, 0)
     else:
         prompt_array = np.array(prompt_ids, dtype=np.int32)
@@ -232,8 +252,7 @@ def generate_response(ctx, tokenizer, prompt_ids, image_embeddings,
         # Decode and print (buffered for smoother output)
         token_buffer.append(next_token)
         if len(token_buffer) >= 4:
-            text = tokenizer.decode(token_buffer, skip_special=True,
-                                    strip_leading_space=False)
+            text = tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
             if in_thinking:
                 thinking_text += text
             else:
@@ -252,8 +271,7 @@ def generate_response(ctx, tokenizer, prompt_ids, image_embeddings,
 
     # Flush remaining buffer
     if token_buffer:
-        text = tokenizer.decode(token_buffer, skip_special=True,
-                                strip_leading_space=False)
+        text = tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
         if in_thinking:
             thinking_text += text
             if thinking_text:
@@ -317,6 +335,7 @@ def interactive_chat(mm_model, tokenizer, args):
                 continue
             try:
                 from PIL import Image
+
                 print(f"  Encoding image: {img_path}...")
                 t0 = time.time()
                 img = Image.open(img_path).convert("RGB")
@@ -324,7 +343,9 @@ def interactive_chat(mm_model, tokenizer, args):
                 emb = mm_model.encode_image(pixels)
                 image_embeddings = emb
                 num_img_tokens_list = [emb.shape[0]]
-                print(f"  Image loaded: {img.size}, {emb.shape[0]} tokens, took {time.time()-t0:.2f}s")
+                print(
+                    f"  Image loaded: {img.size}, {emb.shape[0]} tokens, took {time.time() - t0:.2f}s"
+                )
                 if forge.profiler_enabled():
                     forge.profiler_print()
                     forge.profiler_reset()
@@ -351,11 +372,13 @@ def interactive_chat(mm_model, tokenizer, args):
                     emb = mm_model.encode_image(frame)
                     frame_embs.append(emb)
                     dt = time.time() - t1
-                    print(f"    frame {i+1}/{len(frames)} encoded ({dt:.2f}s)")
+                    print(f"    frame {i + 1}/{len(frames)} encoded ({dt:.2f}s)")
                 image_embeddings = np.concatenate(frame_embs, axis=0)
                 num_img_tokens_list = [emb.shape[0] for emb in frame_embs]
                 total_tok = image_embeddings.shape[0]
-                print(f"  Video loaded: {len(frames)} frames, {total_tok} tokens, took {time.time()-t0:.2f}s\n")
+                print(
+                    f"  Video loaded: {len(frames)} frames, {total_tok} tokens, took {time.time() - t0:.2f}s\n"
+                )
                 if forge.profiler_enabled():
                     forge.profiler_print()
                     forge.profiler_reset()
@@ -372,7 +395,8 @@ def interactive_chat(mm_model, tokenizer, args):
         # Build prompt for this turn
         conversation.append({"role": "user", "content": user_input})
         prompt_ids, insert_spans, total_img = build_multimodal_prompt(
-            tokenizer, user_input, num_img_tokens_list)
+            tokenizer, user_input, num_img_tokens_list
+        )
 
         # Free old context before creating a new one to release GPU memory
         if ctx is not None:
@@ -384,7 +408,10 @@ def interactive_chat(mm_model, tokenizer, args):
 
         try:
             response_text, num_generated, elapsed = generate_response(
-                ctx, tokenizer, prompt_ids, image_embeddings,
+                ctx,
+                tokenizer,
+                prompt_ids,
+                image_embeddings,
                 insert_spans,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
@@ -395,6 +422,7 @@ def interactive_chat(mm_model, tokenizer, args):
         except Exception as e:
             print(f"\nERROR: {e}")
             import traceback
+
             traceback.print_exc()
             # Remove the failed user message from history
             conversation.pop()
@@ -415,36 +443,47 @@ def interactive_chat(mm_model, tokenizer, args):
 
 def main():
     parser = argparse.ArgumentParser(description="MiniCPM-V 4.6 Interactive Chat")
-    parser.add_argument("--model-path", type=str, default=MODEL_PATH,
-                        help="Model directory path")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
-                        help="Device for inference")
-    parser.add_argument("--gpu-layers", type=int, default=99,
-                        help="Number of layers to place on GPU (-1 for all)")
-    parser.add_argument("--kv-cache-dtype", type=str, default="fp16",
-                        choices=["fp32", "fp16", "q4_0"], help="KV cache data type")
-    parser.add_argument("--max-new-tokens", type=int, default=256,
-                        help="Maximum number of tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                        help="Sampling temperature (0 for greedy)")
-    parser.add_argument("--top-k", type=int, default=40,
-                        help="Top-k sampling parameter (0 to disable)")
-    parser.add_argument("--top-p", type=float, default=0.9,
-                        help="Top-p sampling parameter")
-    parser.add_argument("--repeat-penalty", type=float, default=1.1,
-                        help="Repetition penalty")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose logging")
-    parser.add_argument("--profile", action="store_true",
-                        help="Enable performance profiler (uses chrono for CPU stages)")
-    parser.add_argument("--profile-cuda", action="store_true",
-                        help="Enable profiler with CUDA events (for GPU stages only)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable DEBUG logging")
-    parser.add_argument("--trace", action="store_true",
-                        help="Enable TRACE logging (most verbose)")
-    parser.add_argument("--video-frames", type=int, default=8,
-                        help="Number of frames to sample for video input")
+    parser.add_argument("--model-path", type=str, default=MODEL_PATH, help="Model directory path")
+    parser.add_argument(
+        "--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for inference"
+    )
+    parser.add_argument(
+        "--gpu-layers", type=int, default=99, help="Number of layers to place on GPU (-1 for all)"
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default="fp16",
+        choices=["fp32", "fp16", "q4_0"],
+        help="KV cache data type",
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=256, help="Maximum number of tokens to generate"
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.7, help="Sampling temperature (0 for greedy)"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=40, help="Top-k sampling parameter (0 to disable)"
+    )
+    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling parameter")
+    parser.add_argument("--repeat-penalty", type=float, default=1.1, help="Repetition penalty")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable performance profiler (uses chrono for CPU stages)",
+    )
+    parser.add_argument(
+        "--profile-cuda",
+        action="store_true",
+        help="Enable profiler with CUDA events (for GPU stages only)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument("--trace", action="store_true", help="Enable TRACE logging (most verbose)")
+    parser.add_argument(
+        "--video-frames", type=int, default=8, help="Number of frames to sample for video input"
+    )
     args = parser.parse_args()
 
     print("Loading tokenizer from GGUF...")
@@ -453,8 +492,10 @@ def main():
 
     tokenizer = forge.Tokenizer()
     tokenizer.load_from_gguf(llm_path)
-    print(f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
-          f"bos_id={tokenizer.bos_token_id}, eos_id={tokenizer.eos_token_id}")
+    print(
+        f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
+        f"bos_id={tokenizer.bos_token_id}, eos_id={tokenizer.eos_token_id}"
+    )
 
     if args.trace:
         forge.Logger.set_level(5)  # TRACE
@@ -481,20 +522,26 @@ def main():
         mm_model.load_with_mmproj(llm_path, mmproj_path, args.device)
 
     cfg = mm_model.config
-    print(f"Model loaded! arch={cfg.arch_type}, hidden_dim={cfg.hidden_dim}, "
-          f"num_layers={cfg.num_layers}, num_heads={cfg.num_heads}, use_ssm={cfg.use_ssm}")
+    print(
+        f"Model loaded! arch={cfg.arch_type}, hidden_dim={cfg.hidden_dim}, "
+        f"num_layers={cfg.num_layers}, num_heads={cfg.num_heads}, use_ssm={cfg.use_ssm}"
+    )
     if cfg.use_ssm:
-        print(f"  SSM: inner_size={cfg.ssm_inner_size}, state_size={cfg.ssm_state_size}, "
-              f"group_count={cfg.ssm_group_count}, dt_rank={cfg.ssm_time_step_rank}, "
-              f"conv_kernel={cfg.ssm_conv_kernel}, full_attn_interval={cfg.full_attention_interval}")
+        print(
+            f"  SSM: inner_size={cfg.ssm_inner_size}, state_size={cfg.ssm_state_size}, "
+            f"group_count={cfg.ssm_group_count}, dt_rank={cfg.ssm_time_step_rank}, "
+            f"conv_kernel={cfg.ssm_conv_kernel}, full_attn_interval={cfg.full_attention_interval}"
+        )
 
     # Print context info
     cuda_ok = True
     try:
         ctx = mm_model.create_context(args.kv_cache_dtype, args.gpu_layers)
         stats = ctx.memory_stats()
-        print(f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
-              f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB")
+        print(
+            f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
+            f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB"
+        )
 
         # Warmup to trigger CUDA kernel JIT compilation
         if args.device == "cuda":

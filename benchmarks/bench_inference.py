@@ -9,6 +9,7 @@ Usage:
     python3 benchmarks/bench_inference.py --device cpu --max-tokens 64
     python3 benchmarks/bench_inference.py --tinyllama
 """
+
 import os
 import sys
 import time
@@ -27,6 +28,7 @@ TINYLLAMA_Q4_PATH = os.path.join(MODELS_DIR, "tinyllama-1.1b-chat-v1.0.Q4_0.gguf
 
 def bench_generate(model, prompt_ids, max_new_tokens, do_sample=False, iters=5, warmup=2):
     """Benchmark full generate() call."""
+
     def run():
         model.generate(prompt_ids, max_new_tokens=max_new_tokens, do_sample=do_sample)
 
@@ -52,12 +54,17 @@ def bench_generate(model, prompt_ids, max_new_tokens, do_sample=False, iters=5, 
 
 def bench_generate_stream(model, prompt_ids, max_new_tokens, do_sample=False, iters=3, warmup=1):
     """Benchmark streaming generation."""
+
     def run():
         tokens = []
+
         def callback(token_id, logits):
             tokens.append(token_id)
             return True
-        model.generate_stream(prompt_ids, callback, max_new_tokens=max_new_tokens, do_sample=do_sample)
+
+        model.generate_stream(
+            prompt_ids, callback, max_new_tokens=max_new_tokens, do_sample=do_sample
+        )
         return len(tokens)
 
     for _ in range(warmup):
@@ -176,16 +183,21 @@ def main():
     print("\n--- Prompt Processing (Prefill) Speed ---")
     for prompt_len in [8, 32, 64, 128, 256]:
         stats = bench_prompt_processing(ctx, prompt_len, iters=args.iters, warmup=args.warmup)
-        print(f"  prompt_len={prompt_len:4d}: {stats['mean_ms']:8.2f} ms  "
-              f"({stats['tokens_per_sec']:8.1f} tokens/sec)")
+        print(
+            f"  prompt_len={prompt_len:4d}: {stats['mean_ms']:8.2f} ms  "
+            f"({stats['tokens_per_sec']:8.1f} tokens/sec)"
+        )
 
     # --- Decode Speed ---
     print("\n--- Decode Speed (Token-by-Token Generation) ---")
     for gen_len in [8, 16, 32, 64]:
-        stats = bench_decode_speed(ctx, prompt_len=8, gen_len=gen_len,
-                                    iters=args.iters, warmup=args.warmup)
-        print(f"  gen_len={gen_len:3d}: {stats['mean_ms']:8.2f} ms  "
-              f"({stats['decode_tokens_per_sec']:8.1f} decode tokens/sec)")
+        stats = bench_decode_speed(
+            ctx, prompt_len=8, gen_len=gen_len, iters=args.iters, warmup=args.warmup
+        )
+        print(
+            f"  gen_len={gen_len:3d}: {stats['mean_ms']:8.2f} ms  "
+            f"({stats['decode_tokens_per_sec']:8.1f} decode tokens/sec)"
+        )
 
     # --- Full Generate ---
     print("\n--- Full generate() Benchmark ---")
@@ -196,29 +208,43 @@ def main():
     ]
     for name, text in prompts:
         prompt_ids = np.array(tok.encode(text, add_bos=True), dtype=np.int32)
-        stats = bench_generate(model, prompt_ids, args.max_tokens,
-                               do_sample=False, iters=args.iters, warmup=args.warmup)
-        print(f"  {name:10s}: {stats['mean_ms']:8.1f} ms  "
-              f"({stats['tokens_per_sec']:6.1f} tok/s,  "
-              f"{stats['num_tokens']} tokens generated)")
+        stats = bench_generate(
+            model,
+            prompt_ids,
+            args.max_tokens,
+            do_sample=False,
+            iters=args.iters,
+            warmup=args.warmup,
+        )
+        print(
+            f"  {name:10s}: {stats['mean_ms']:8.1f} ms  "
+            f"({stats['tokens_per_sec']:6.1f} tok/s,  "
+            f"{stats['num_tokens']} tokens generated)"
+        )
 
     # --- Streaming Generate ---
     print("\n--- Streaming generate_stream() Benchmark ---")
     prompt_ids = np.array(tok.encode("Hello, how are you?", add_bos=True), dtype=np.int32)
-    stats = bench_generate_stream(model, prompt_ids, args.max_tokens,
-                                   do_sample=False, iters=args.iters, warmup=args.warmup)
-    print(f"  stream:    {stats['mean_ms']:8.1f} ms  "
-          f"({stats['tokens_per_sec']:6.1f} tok/s,  "
-          f"{stats['num_tokens']} tokens)")
+    stats = bench_generate_stream(
+        model, prompt_ids, args.max_tokens, do_sample=False, iters=args.iters, warmup=args.warmup
+    )
+    print(
+        f"  stream:    {stats['mean_ms']:8.1f} ms  "
+        f"({stats['tokens_per_sec']:6.1f} tok/s,  "
+        f"{stats['num_tokens']} tokens)"
+    )
 
     # --- Graph Mode Comparison ---
     print("\n--- Graph Mode vs Imperative (Decode Speed) ---")
     for mode_name, use_graph in [("imperative", False), ("graph", True)]:
         ctx.set_use_graph(use_graph)
-        stats = bench_decode_speed(ctx, prompt_len=8, gen_len=32,
-                                    iters=args.iters, warmup=args.warmup)
-        print(f"  {mode_name:12s}: {stats['mean_ms']:8.2f} ms  "
-              f"({stats['decode_tokens_per_sec']:8.1f} tok/s)")
+        stats = bench_decode_speed(
+            ctx, prompt_len=8, gen_len=32, iters=args.iters, warmup=args.warmup
+        )
+        print(
+            f"  {mode_name:12s}: {stats['mean_ms']:8.2f} ms  "
+            f"({stats['decode_tokens_per_sec']:8.1f} tok/s)"
+        )
     ctx.set_use_graph(False)
 
     # --- KV Cache Memory ---

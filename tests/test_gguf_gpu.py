@@ -13,6 +13,7 @@ import forge
 CUDA_AVAILABLE = False
 try:
     import ctypes
+
     cuda_rt = ctypes.CDLL("libcudart.so")
     device_count = ctypes.c_int(0)
     result = cuda_rt.cudaGetDeviceCount(ctypes.byref(device_count))
@@ -31,7 +32,9 @@ def tinyllama_available():
     return os.path.exists(TINYLLAMA_Q4_PATH)
 
 
-tinyllama_skip = pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama GGUF model not found")
+tinyllama_skip = pytest.mark.skipif(
+    not tinyllama_available(), reason="TinyLlama GGUF model not found"
+)
 
 
 @pytest.fixture(scope="module")
@@ -76,8 +79,12 @@ class TestGGUFGPUInference:
         out1 = ctx.forward(ids)
         ctx.reset_kv()
         out2 = ctx.forward(ids)
-        np.testing.assert_allclose(out1, out2, atol=1e-2,
-                                   err_msg="GPU forward should be deterministic within float precision")
+        np.testing.assert_allclose(
+            out1,
+            out2,
+            atol=1e-2,
+            err_msg="GPU forward should be deterministic within float precision",
+        )
 
 
 @skip_no_cuda
@@ -124,8 +131,9 @@ class TestGGUFCPUGPUConsistency:
         ctx_gpu.reset_kv()
         logits_gpu = ctx_gpu.forward(ids)
 
-        assert np.argmax(logits_cpu[-1]) == np.argmax(logits_gpu[-1]), \
+        assert np.argmax(logits_cpu[-1]) == np.argmax(logits_gpu[-1]), (
             "CPU and GPU should predict same top token"
+        )
 
     def test_logits_close(self):
         ids = np.array([1, 450, 4996, 29901], dtype=np.int32)
@@ -153,19 +161,22 @@ class TestGGUFCPUGPUConsistency:
 
         model_cpu = forge.Model()
         model_cpu.load_gguf(TINYLLAMA_Q4_PATH, device="cpu")
-        result_cpu = model_cpu.generate(prompt, max_new_tokens=10, do_sample=False,
-                                        gpu_layers=0, kv_cache_dtype="fp32")
+        result_cpu = model_cpu.generate(
+            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
+        )
         del model_cpu
         gc.collect()
 
         model_gpu = forge.Model()
         model_gpu.load_gguf(TINYLLAMA_Q4_PATH, device="cuda")
-        result_gpu = model_gpu.generate(prompt, max_new_tokens=10, do_sample=False,
-                                        gpu_layers=-1, kv_cache_dtype="fp32")
+        result_gpu = model_gpu.generate(
+            prompt, max_new_tokens=10, do_sample=False, gpu_layers=-1, kv_cache_dtype="fp32"
+        )
 
         match = sum(1 for a, b in zip(result_cpu["token_ids"], result_gpu["token_ids"]) if a == b)
-        assert match >= 2, \
+        assert match >= 2, (
             f"CPU/GPU should match at least 2/10 tokens, got {match}/10. CPU: {result_cpu['token_ids']}, GPU: {result_gpu['token_ids']}"
+        )
 
 
 @skip_no_cuda
@@ -191,12 +202,14 @@ class TestGPULayers:
 class TestGGUFGeneration:
     def test_gpu_generate_no_repeat(self, gpu_model):
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = gpu_model.generate(prompt, max_new_tokens=20, do_sample=False,
-                                    gpu_layers=-1, kv_cache_dtype="fp32")
+        result = gpu_model.generate(
+            prompt, max_new_tokens=20, do_sample=False, gpu_layers=-1, kv_cache_dtype="fp32"
+        )
         tokens = result["token_ids"]
         unique_ratio = len(set(tokens)) / len(tokens) if len(tokens) > 0 else 0
-        assert unique_ratio > 0.3, \
+        assert unique_ratio > 0.3, (
             f"Generated tokens should not be highly repetitive, unique_ratio={unique_ratio}"
+        )
 
     def test_gpu_generate_streaming(self, gpu_model):
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
@@ -214,15 +227,23 @@ class TestGGUFGeneration:
             top_k=1,
             do_sample=False,
             gpu_layers=-1,
-            kv_cache_dtype="fp32"
+            kv_cache_dtype="fp32",
         )
         assert len(collected_tokens) >= 1, "Should generate at least one token"
 
     def test_gpu_generate_with_sampling(self, gpu_model):
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = gpu_model.generate(prompt, max_new_tokens=10, temperature=0.8,
-                                    top_k=40, top_p=0.9, do_sample=True, seed=42,
-                                    gpu_layers=-1, kv_cache_dtype="fp32")
+        result = gpu_model.generate(
+            prompt,
+            max_new_tokens=10,
+            temperature=0.8,
+            top_k=40,
+            top_p=0.9,
+            do_sample=True,
+            seed=42,
+            gpu_layers=-1,
+            kv_cache_dtype="fp32",
+        )
         assert result["num_generated_tokens"] >= 1
 
 
@@ -244,8 +265,12 @@ class TestGGUFIncrementalInference:
             incremental_outputs.append(out[0])
 
         for i in range(len(ids)):
-            np.testing.assert_allclose(full_logits[i], incremental_outputs[i], atol=0.05,
-                                       err_msg=f"Token {i} mismatch between full and incremental on GPU")
+            np.testing.assert_allclose(
+                full_logits[i],
+                incremental_outputs[i],
+                atol=0.05,
+                err_msg=f"Token {i} mismatch between full and incremental on GPU",
+            )
 
     def test_incremental_deterministic_gpu(self, gpu_model):
         ctx = gpu_model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
@@ -258,5 +283,9 @@ class TestGGUFIncrementalInference:
         ctx.reset_kv()
         out2 = ctx.forward(ids)
 
-        np.testing.assert_allclose(out1, out2, atol=1e-2,
-                                   err_msg="GPU incremental inference should be deterministic within float precision")
+        np.testing.assert_allclose(
+            out1,
+            out2,
+            atol=1e-2,
+            err_msg="GPU incremental inference should be deterministic within float precision",
+        )

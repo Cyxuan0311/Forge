@@ -7,7 +7,6 @@ if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
 
-
 class TestEmbeddingOp:
     def test_embedding_shape(self, loaded_model, loaded_context):
         ids = np.array([0, 1, 2], dtype=np.int32)
@@ -58,12 +57,16 @@ class TestAttentionOp:
 
         loaded_context.reset_kv()
         out_single = loaded_context.forward(np.array([1], dtype=np.int32))
-        out_single_next = loaded_context.forward(np.array([2], dtype=np.int32), start_pos=1)
+        loaded_context.forward(np.array([2], dtype=np.int32), start_pos=1)
 
         assert out_full.shape == (3, 100)
         assert out_single.shape == (1, 100)
-        np.testing.assert_allclose(out_full[0], out_single[0], atol=1e-5,
-                                    err_msg="First token logits should match between full and incremental")
+        np.testing.assert_allclose(
+            out_full[0],
+            out_single[0],
+            atol=1e-5,
+            err_msg="First token logits should match between full and incremental",
+        )
 
     def test_attention_position_sensitivity(self, loaded_model, loaded_context):
         ids = np.arange(10, dtype=np.int32) % 100
@@ -87,8 +90,12 @@ class TestAttentionOp:
             incremental_outputs.append(out[0])
 
         for i in range(len(ids)):
-            np.testing.assert_allclose(full_out[i], incremental_outputs[i], atol=1e-4,
-                                        err_msg=f"Token {i} mismatch between full and incremental")
+            np.testing.assert_allclose(
+                full_out[i],
+                incremental_outputs[i],
+                atol=1e-4,
+                err_msg=f"Token {i} mismatch between full and incremental",
+            )
 
 
 class TestRopeOp:
@@ -118,8 +125,12 @@ class TestRopeOp:
             incremental_outputs.append(out[0])
 
         for i in range(len(ids)):
-            np.testing.assert_allclose(full_out[i], incremental_outputs[i], atol=1e-4,
-                                        err_msg=f"Token {i} RoPE mismatch between full and incremental")
+            np.testing.assert_allclose(
+                full_out[i],
+                incremental_outputs[i],
+                atol=1e-4,
+                err_msg=f"Token {i} RoPE mismatch between full and incremental",
+            )
 
 
 class TestFFNOp:
@@ -154,8 +165,12 @@ class TestKVCachOp:
         loaded_context.forward(np.array([2], dtype=np.int32), start_pos=1)
         out2_last = loaded_context.forward(np.array([3], dtype=np.int32), start_pos=2)
 
-        np.testing.assert_allclose(out1[2], out2_last[0], atol=1e-4,
-                                    err_msg="Incremental KV cache should match full forward")
+        np.testing.assert_allclose(
+            out1[2],
+            out2_last[0],
+            atol=1e-4,
+            err_msg="Incremental KV cache should match full forward",
+        )
 
     def test_kv_cache_memory_stats(self, loaded_model, loaded_context):
         stats = loaded_context.memory_stats()
@@ -165,11 +180,13 @@ class TestKVCachOp:
     def test_kv_cache_persistence(self, loaded_model, loaded_context):
         loaded_context.reset_kv()
         loaded_context.forward(np.array([1], dtype=np.int32), start_pos=0)
-        out_a = loaded_context.forward(np.array([2], dtype=np.int32), start_pos=1)
+        loaded_context.forward(np.array([2], dtype=np.int32), start_pos=1)
 
         loaded_context.reset_kv()
         loaded_context.forward(np.array([1], dtype=np.int32), start_pos=0)
         loaded_context.forward(np.array([2], dtype=np.int32), start_pos=1)
         out_b = loaded_context.forward(np.array([3], dtype=np.int32), start_pos=2)
 
-        assert out_b.shape == (1, 100), "Continued generation should work after KV cache persistence"
+        assert out_b.shape == (1, 100), (
+            "Continued generation should work after KV cache persistence"
+        )

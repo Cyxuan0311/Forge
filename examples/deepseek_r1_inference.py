@@ -25,6 +25,7 @@ Interactive commands:
   /help    - Show help message
   /profile - Toggle profiling on/off
 """
+
 import sys
 import os
 import time
@@ -44,11 +45,14 @@ import numpy as np
 # Performance Profiling Utilities
 # ============================================================================
 
+
 class PerfTimer:
     """Accumulative performance timer for profiling inference stages."""
 
     def __init__(self):
-        self._timings = defaultdict(lambda: {"total_ms": 0.0, "count": 0, "min_ms": float("inf"), "max_ms": 0.0})
+        self._timings = defaultdict(
+            lambda: {"total_ms": 0.0, "count": 0, "min_ms": float("inf"), "max_ms": 0.0}
+        )
         self._starts = {}
 
     def start(self, name):
@@ -82,7 +86,9 @@ class PerfTimer:
         print("\n" + "=" * 80)
         print("  Python-Level Performance Profile")
         print("=" * 80)
-        print(f"{'Stage':<35} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}")
+        print(
+            f"{'Stage':<35} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}"
+        )
         print("-" * 80)
 
         grand_total = sum(r["total_ms"] for r in self._timings.values())
@@ -91,10 +97,14 @@ class PerfTimer:
         for name, rec in sorted_items:
             avg = rec["total_ms"] / rec["count"] if rec["count"] > 0 else 0
             pct = (rec["total_ms"] / grand_total * 100) if grand_total > 0 else 0
-            print(f"{name:<35} {rec['count']:>6} {rec['total_ms']:>10.2f} {avg:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%")
+            print(
+                f"{name:<35} {rec['count']:>6} {rec['total_ms']:>10.2f} {avg:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%"
+            )
 
         print("-" * 80)
-        print(f"{'TOTAL':<35} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}")
+        print(
+            f"{'TOTAL':<35} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}"
+        )
         print("=" * 80)
 
 
@@ -112,7 +122,9 @@ def print_cpp_profiler_summary():
         print("\n" + "=" * 90)
         print("  C++ Operator-Level Performance Profile (from PerfProfiler)")
         print("=" * 90)
-        print(f"{'Operation':<45} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}")
+        print(
+            f"{'Operation':<45} {'Count':>6} {'Total(ms)':>10} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10} {'%Total':>7}"
+        )
         print("-" * 90)
 
         sorted_ops = sorted(summary.items(), key=lambda x: x[1]["total_ms"], reverse=True)
@@ -120,10 +132,14 @@ def print_cpp_profiler_summary():
 
         for name, rec in sorted_ops:
             pct = (rec["total_ms"] / grand_total * 100) if grand_total > 0 else 0
-            print(f"{name:<45} {rec['count']:>6} {rec['total_ms']:>10.2f} {rec['avg_ms']:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%")
+            print(
+                f"{name:<45} {rec['count']:>6} {rec['total_ms']:>10.2f} {rec['avg_ms']:>10.3f} {rec['min_ms']:>10.3f} {rec['max_ms']:>10.3f} {pct:>6.1f}%"
+            )
 
         print("-" * 90)
-        print(f"{'TOTAL':<45} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}")
+        print(
+            f"{'TOTAL':<45} {'':>6} {grand_total:>10.2f} {'':>10} {'':>10} {'':>10} {'100.0%':>7}"
+        )
         print("=" * 90)
     except Exception as e:
         print(f"[Profiler] Could not retrieve C++ profile: {e}")
@@ -133,6 +149,7 @@ def print_full_profile():
     """Print both Python-level and C++ operator-level profiles."""
     perf.print_summary()
     print_cpp_profiler_summary()
+
 
 GGUF_MODEL_PATH = "/mnt/g/AI/DeepSeek-R1-Distill-Qwen-7B/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
 TOKENIZER_DIR = "/mnt/g/AI/DeepSeek-R1-Distill-Qwen-7B"
@@ -266,9 +283,18 @@ def apply_chat_template(tokenizer, messages, add_generation_prompt=True):
     return ids
 
 
-def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
-                       temperature=0.6, top_k=40, top_p=0.9,
-                       repeat_penalty=1.1, eos_token_id=None):
+def generate_streaming(
+    model,
+    ctx,
+    tokenizer,
+    input_ids,
+    max_new_tokens=256,
+    temperature=0.6,
+    top_k=40,
+    top_p=0.9,
+    repeat_penalty=1.1,
+    eos_token_id=None,
+):
     if eos_token_id is None:
         eos_token_id = tokenizer.eos_token_id
 
@@ -288,8 +314,7 @@ def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
             try:
                 if profiling_enabled:
                     perf.start("decode/tokenize")
-                text = tokenizer.decode(token_buffer, skip_special=True,
-                                        strip_leading_space=False)
+                text = tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
                 if profiling_enabled:
                     perf.stop("decode/tokenize")
                 print(text, end="", flush=True)
@@ -298,8 +323,9 @@ def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
                 # Partial multi-byte UTF-8 at buffer boundary, wait for more tokens
                 if token_id == eos_token_id:
                     # Flush on EOS even if decode fails
-                    text = tokenizer.decode(token_buffer, skip_special=True,
-                                            strip_leading_space=False)
+                    text = tokenizer.decode(
+                        token_buffer, skip_special=True, strip_leading_space=False
+                    )
                     print(text, end="", flush=True)
                     token_buffer.clear()
 
@@ -329,8 +355,7 @@ def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
         perf.stop("generate_stream/total")
 
     if token_buffer:
-        text = tokenizer.decode(token_buffer, skip_special=True,
-                                strip_leading_space=False)
+        text = tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
         print(text, end="", flush=True)
         token_buffer.clear()
 
@@ -347,9 +372,17 @@ def generate_streaming(model, ctx, tokenizer, input_ids, max_new_tokens=256,
     return generated_tokens, elapsed
 
 
-def generate_batch(model, tokenizer, input_ids, max_new_tokens=256,
-                   temperature=0.6, top_k=40, top_p=0.9,
-                   repeat_penalty=1.1, eos_token_id=None):
+def generate_batch(
+    model,
+    tokenizer,
+    input_ids,
+    max_new_tokens=256,
+    temperature=0.6,
+    top_k=40,
+    top_p=0.9,
+    repeat_penalty=1.1,
+    eos_token_id=None,
+):
     if eos_token_id is None:
         eos_token_id = tokenizer.eos_token_id
 
@@ -371,12 +404,10 @@ def generate_batch(model, tokenizer, input_ids, max_new_tokens=256,
 
     num_generated = result["num_generated_tokens"]
     new_tokens = list(result["token_ids"])
-    response = tokenizer.decode(new_tokens, skip_special=True,
-                                strip_leading_space=False)
+    response = tokenizer.decode(new_tokens, skip_special=True, strip_leading_space=False)
     print(response, end="", flush=True)
 
     return num_generated, elapsed
-
 
 
 def interactive_chat(model, tokenizer, args):
@@ -434,8 +465,7 @@ def interactive_chat(model, tokenizer, args):
         if profiling_enabled:
             perf.start("template/encode")
         conversation.append({"role": "user", "content": user_input})
-        input_ids = apply_chat_template(tokenizer, conversation,
-                                        add_generation_prompt=True)
+        input_ids = apply_chat_template(tokenizer, conversation, add_generation_prompt=True)
         if profiling_enabled:
             perf.stop("template/encode")
 
@@ -465,8 +495,9 @@ def interactive_chat(model, tokenizer, args):
             new_tokens = list(result["token_ids"])
             if profiling_enabled:
                 perf.start("decode/tokenize")
-            assistant_text = tokenizer.decode(new_tokens, skip_special=True,
-                                              strip_leading_space=False)
+            assistant_text = tokenizer.decode(
+                new_tokens, skip_special=True, strip_leading_space=False
+            )
             if profiling_enabled:
                 perf.stop("decode/tokenize")
             print(assistant_text, end="", flush=True)
@@ -484,7 +515,10 @@ def interactive_chat(model, tokenizer, args):
             if profiling_enabled:
                 perf.stop("context.create")
             generated_tokens, elapsed = generate_streaming(
-                model, ctx, tokenizer, input_ids,
+                model,
+                ctx,
+                tokenizer,
+                input_ids,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
@@ -493,13 +527,16 @@ def interactive_chat(model, tokenizer, args):
             )
             num_generated = len(generated_tokens)
             assistant_text = tokenizer.decode(
-                generated_tokens, skip_special=True, strip_leading_space=False)
+                generated_tokens, skip_special=True, strip_leading_space=False
+            )
 
         print()
         if num_generated > 0 and elapsed > 0:
             speed = num_generated / elapsed
             prompt_len = len(input_ids)
-            print(f"[{num_generated} tokens, {elapsed:.2f}s, {speed:.1f} tok/s, prompt={prompt_len} tokens]")
+            print(
+                f"[{num_generated} tokens, {elapsed:.2f}s, {speed:.1f} tok/s, prompt={prompt_len} tokens]"
+            )
 
         if profiling_enabled:
             print_full_profile()
@@ -512,33 +549,47 @@ def interactive_chat(model, tokenizer, args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DeepSeek-R1-Distill-Qwen-7B inference with Forge")
-    parser.add_argument("--model-path", type=str, default=None,
-                        help="Path to .gguf model file")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
-                        help="Device for inference")
-    parser.add_argument("--gpu-layers", type=int, default=28,
-                        help="Number of layers to place on GPU (-1 for all)")
-    parser.add_argument("--kv-cache-dtype", type=str, default="fp32",
-                        choices=["fp32", "q4_0"], help="KV cache data type")
-    parser.add_argument("--max-new-tokens", type=int, default=256,
-                        help="Maximum number of tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.6,
-                        help="Sampling temperature (lower for more deterministic)")
-    parser.add_argument("--top-k", type=int, default=40,
-                        help="Top-k sampling parameter (0 to disable)")
-    parser.add_argument("--top-p", type=float, default=0.9,
-                        help="Top-p sampling parameter")
-    parser.add_argument("--repeat-penalty", type=float, default=1.1,
-                        help="Repetition penalty")
-    parser.add_argument("--no-stream", action="store_true",
-                        help="Disable streaming output")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to .gguf model file")
+    parser.add_argument(
+        "--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for inference"
+    )
+    parser.add_argument(
+        "--gpu-layers", type=int, default=28, help="Number of layers to place on GPU (-1 for all)"
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "q4_0"],
+        help="KV cache data type",
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=256, help="Maximum number of tokens to generate"
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.6,
+        help="Sampling temperature (lower for more deterministic)",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=40, help="Top-k sampling parameter (0 to disable)"
+    )
+    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling parameter")
+    parser.add_argument("--repeat-penalty", type=float, default=1.1, help="Repetition penalty")
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming output")
 
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose logging")
-    parser.add_argument("--profile", action="store_true",
-                        help="Enable performance profiling (Python + C++ PerfProfiler)")
-    parser.add_argument("--verify-tokenizer", action="store_true",
-                        help="Verify tokenizer against transformers and exit")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable performance profiling (Python + C++ PerfProfiler)",
+    )
+    parser.add_argument(
+        "--verify-tokenizer",
+        action="store_true",
+        help="Verify tokenizer against transformers and exit",
+    )
     return parser.parse_args()
 
 
@@ -575,9 +626,11 @@ def main():
     tokenizer = load_tokenizer(model_path)
     if profiling_enabled:
         perf.stop("startup.tokenizer_load")
-    print(f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
-          f"model_type={tokenizer.model_type}, "
-          f"bos_id={tokenizer.bos_token_id}, eos_id={tokenizer.eos_token_id}")
+    print(
+        f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
+        f"model_type={tokenizer.model_type}, "
+        f"bos_id={tokenizer.bos_token_id}, eos_id={tokenizer.eos_token_id}"
+    )
 
     if args.verify_tokenizer:
         verify_tokenizer(tokenizer, TOKENIZER_DIR)
@@ -594,12 +647,16 @@ def main():
         perf.stop("startup.model_load")
 
     cfg = model.config
-    print(f"Model loaded! arch={cfg.arch_type}, layers={cfg.num_layers}, "
-          f"hidden={cfg.hidden_dim}, heads={cfg.num_heads}, "
-          f"kv_heads={cfg.num_kv_heads}, vocab={cfg.vocab_size}")
+    print(
+        f"Model loaded! arch={cfg.arch_type}, layers={cfg.num_layers}, "
+        f"hidden={cfg.hidden_dim}, heads={cfg.num_heads}, "
+        f"kv_heads={cfg.num_kv_heads}, vocab={cfg.vocab_size}"
+    )
 
     if args.device == "cpu":
-        cpu_threads = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count()
+        cpu_threads = (
+            len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+        )
         forge.set_num_threads(cpu_threads)
         print(f"CPU threads set to: {cpu_threads}")
 
@@ -612,8 +669,10 @@ def main():
     if profiling_enabled:
         perf.stop("startup.context_create")
     stats = ctx.memory_stats()
-    print(f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
-          f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB")
+    print(
+        f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
+        f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB"
+    )
 
     # Warmup to trigger CUDA kernel JIT compilation
     if args.device == "cuda":

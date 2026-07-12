@@ -7,6 +7,7 @@ and multi-language tokenization performance.
 Usage:
     python3 benchmarks/bench_tokenizer.py
 """
+
 import os
 import sys
 import time
@@ -113,9 +114,12 @@ def main():
         ("1 word", "Hello"),
         ("1 sentence", "The quick brown fox jumps over the lazy dog."),
         ("2 sentences", "Hello world. This is a test of the tokenizer."),
-        ("1 paragraph", "Artificial intelligence is the simulation of human intelligence "
-                        "by machines. It includes learning, reasoning, and self-correction. "
-                        "AI has become an essential part of the technology industry."),
+        (
+            "1 paragraph",
+            "Artificial intelligence is the simulation of human intelligence "
+            "by machines. It includes learning, reasoning, and self-correction. "
+            "AI has become an essential part of the technology industry.",
+        ),
         ("Chinese", "人工智能是计算机科学的一个分支，它企图了解智能的实质。"),
         ("Japanese", "人工知能は、人間の知能を模倣するコンピュータシステムです。"),
         ("Mixed", "Hello 你好 こんにちは! This is a mixed-language text."),
@@ -126,9 +130,11 @@ def main():
 
     for name, text in texts:
         stats = bench_encode(tok, text)
-        print(f"  {name:20s}: {stats['mean_us']:8.1f} us  "
-              f"({stats['num_tokens']:4d} tokens,  "
-              f"{stats['chars_per_token']:.1f} chars/tok)")
+        print(
+            f"  {name:20s}: {stats['mean_us']:8.1f} us  "
+            f"({stats['num_tokens']:4d} tokens,  "
+            f"{stats['chars_per_token']:.1f} chars/tok)"
+        )
 
     # --- Decode Speed ---
     print("\n--- Decode Speed ---")
@@ -137,8 +143,7 @@ def main():
         if len(ids) == 0:
             continue
         stats = bench_decode(tok, ids)
-        print(f"  {name:20s}: {stats['mean_us']:8.1f} us  "
-              f"({stats['num_tokens']:4d} tokens)")
+        print(f"  {name:20s}: {stats['mean_us']:8.1f} us  ({stats['num_tokens']:4d} tokens)")
 
     # --- Token Lookup Speed ---
     print("\n--- Token Lookup Speed ---")
@@ -178,12 +183,16 @@ def main():
     long_text = "The quick brown fox jumps over the lazy dog. " * 100
     stats = bench_encode(tok, long_text, iters=20, warmup=5)
     encode_tps = stats["num_tokens"] / (stats["mean_us"] * 1e-6) if stats["mean_us"] > 0 else 0
-    print(f"  encode: {encode_tps:,.0f} tokens/sec  ({stats['num_tokens']} tokens in {stats['mean_us']:.1f} us)")
+    print(
+        f"  encode: {encode_tps:,.0f} tokens/sec  ({stats['num_tokens']} tokens in {stats['mean_us']:.1f} us)"
+    )
 
     ids_long = tok.encode(long_text, add_bos=False)
     stats = bench_decode(tok, ids_long, iters=20, warmup=5)
     decode_tps = stats["num_tokens"] / (stats["mean_us"] * 1e-6) if stats["mean_us"] > 0 else 0
-    print(f"  decode: {decode_tps:,.0f} tokens/sec  ({stats['num_tokens']} tokens in {stats['mean_us']:.1f} us)")
+    print(
+        f"  decode: {decode_tps:,.0f} tokens/sec  ({stats['num_tokens']} tokens in {stats['mean_us']:.1f} us)"
+    )
 
     print("\n" + "=" * 70)
     print("  Tokenizer benchmarks complete!")

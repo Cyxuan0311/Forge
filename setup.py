@@ -19,7 +19,9 @@ class CMakeBuild(build_ext):
 
         build_temp.mkdir(parents=True, exist_ok=True)
 
-        subprocess.run(["cmake", str(Path(__file__).parent), *cmake_args], cwd=build_temp, check=True)
+        subprocess.run(
+            ["cmake", str(Path(__file__).parent), *cmake_args], cwd=build_temp, check=True
+        )
         subprocess.run(
             ["cmake", "--build", ".", "--target", "forge", "-j"],
             cwd=build_temp,
