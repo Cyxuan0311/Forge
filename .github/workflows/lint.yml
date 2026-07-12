@@ -1,6 +1,7 @@
+---
 name: Lint
 
-on:
+"on":
   push:
     branches: [master]
   pull_request:
@@ -20,12 +21,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format
 
       - name: Check C++ formatting
         run: |
-          find . \( -name '*.cpp' -o -name '*.h' -o -name '*.cu' -o -name '*.cuh' \) \
-            -not -path './build/*' -not -path './_deps/*' \
+          find . \( -name '*.cpp' -o -name '*.h' \
+            -o -name '*.cu' -o -name '*.cuh' \) \
+            -not -path './build/*' \
+            -not -path './_deps/*' \
             -exec clang-format --dry-run --Werror {} +
 
   cmake-lint:
@@ -40,7 +45,9 @@ jobs:
 
       - name: Check CMake formatting
         run: |
-          find . -name 'CMakeLists.txt' -not -path './build/*' -not -path './_deps/*' \
+          find . -name 'CMakeLists.txt' \
+            -not -path './build/*' \
+            -not -path './_deps/*' \
             -exec cmake-format --check {} +
 
   python-lint:
