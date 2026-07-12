@@ -24,7 +24,7 @@ void register_core_types(py::module_& m) {
 
     py::enum_<LogLevel>(m, "LogLevel")
         .value("NONE", LogLevel::NONE)
-        .value("ERROR", LogLevel::ERROR)
+        .value("LOG_ERROR", LogLevel::LOG_ERROR)
         .value("WARN", LogLevel::WARN)
         .value("INFO", LogLevel::INFO)
         .value("DEBUG", LogLevel::DEBUG)

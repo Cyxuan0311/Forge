@@ -8,7 +8,7 @@ namespace forge {
 
 enum class LogLevel : int {
     NONE = 0,
-    ERROR = 1,
+    LOG_ERROR = 1,
     WARN = 2,
     INFO = 3,
     DEBUG = 4,
@@ -45,7 +45,7 @@ private:
         }                                                    \
     } while (0)
 
-#define LOG_ERROR(msg) NI_LOG(::forge::LogLevel::ERROR, msg)
+#define LOG_ERROR(msg) NI_LOG(::forge::LogLevel::LOG_ERROR, msg)
 #define LOG_WARN(msg) NI_LOG(::forge::LogLevel::WARN, msg)
 #define LOG_INFO(msg) NI_LOG(::forge::LogLevel::INFO, msg)
 #define LOG_DEBUG(msg) NI_LOG(::forge::LogLevel::DEBUG, msg)

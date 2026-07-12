@@ -7,7 +7,7 @@ namespace forge {
 
 static const char* level_name(LogLevel level) {
     switch (level) {
-    case LogLevel::ERROR:
+    case LogLevel::LOG_ERROR:
         return "ERROR";
     case LogLevel::WARN:
         return "WARN";
