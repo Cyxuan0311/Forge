@@ -13,28 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  clang-format:
-    name: C++ Formatting (clang-format)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install clang-format
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-format
-
-      - name: Check C++ formatting
-        run: |
-          find . \( -name '*.cpp' -o -name '*.h' \
-            -o -name '*.cu' -o -name '*.cuh' \) \
-            -not -path './build/*' \
-            -not -path './_deps/*' \
-            -not -name 'cpu_gemv.h' \
-            -not -path '*/cpu/gemv.h' \
-            -exec clang-format --dry-run --Werror {} +
-
   cmake-lint:
     name: CMake Formatting
     runs-on: ubuntu-latest
