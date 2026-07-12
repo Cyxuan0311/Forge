@@ -252,6 +252,7 @@ jobs:
 
       - name: Run Python tests (CPU-only, no external model)
         run: |
+          $env:PYTHONPATH = "build;build\Release"
           python -m pytest tests/ -v -k "not tinyllama and not gpu" `
             --ignore=tests/test_tinyllama_integration.py `
             --ignore=tests/test_gpu.py `

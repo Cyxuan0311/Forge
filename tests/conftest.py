@@ -5,6 +5,10 @@ import pytest
 build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
+    # MSVC multi-config builds put outputs in build/Release/
+    release_dir = os.path.join(build_dir, "Release")
+    if os.path.exists(release_dir):
+        sys.path.insert(0, release_dir)
 
 import forge
 
