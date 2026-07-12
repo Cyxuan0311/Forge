@@ -252,8 +252,8 @@ jobs:
 
       - name: Run Python tests (CPU-only, no external model)
         run: |
-          python -m pytest tests/ -v -k "not tinyllama and not gpu" ^
-            --ignore=tests/test_tinyllama_integration.py ^
-            --ignore=tests/test_gpu.py ^
-            --ignore=tests/test_gguf_gpu.py ^
+          python -m pytest tests/ -v -k "not tinyllama and not gpu" `
+            --ignore=tests/test_tinyllama_integration.py `
+            --ignore=tests/test_gpu.py `
+            --ignore=tests/test_gguf_gpu.py `
             -x --timeout=120
