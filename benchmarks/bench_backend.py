@@ -1,5 +1,5 @@
 """
-NanoInfer Backend & Device Performance Benchmarks.
+Forge Backend & Device Performance Benchmarks.
 
 Benchmarks backend capabilities, memory allocation, device transfer,
 and CPU vs CUDA performance comparison.
@@ -15,14 +15,14 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 import numpy as np
 
 
 def bench_tensor_alloc_dealloc(dtype, shape, device, iters=100, warmup=10):
     """Benchmark tensor creation + deallocation (as a proxy for backend allocation)."""
     def run():
-        t = nanoinfer.Tensor(dtype, shape, device)
+        t = forge.Tensor(dtype, shape, device)
         del t
 
     for _ in range(warmup):
@@ -31,7 +31,7 @@ def bench_tensor_alloc_dealloc(dtype, shape, device, iters=100, warmup=10):
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        t = nanoinfer.Tensor(dtype, shape, device)
+        t = forge.Tensor(dtype, shape, device)
         del t
         t1 = time.perf_counter()
         times.append(t1 - t0)
@@ -45,12 +45,12 @@ def bench_tensor_alloc_dealloc(dtype, shape, device, iters=100, warmup=10):
 
 def bench_tensor_device_transfer(size, iters=20, warmup=5):
     """Benchmark CPU->CUDA and CUDA->CPU tensor transfer (if CUDA available)."""
-    mgr = nanoinfer.BackendManager.instance()
+    mgr = forge.BackendManager.instance()
     if not mgr.has_cuda():
         return None
 
-    cpu_tensor = nanoinfer.Tensor(nanoinfer.DataType.FP32, [size], nanoinfer.DeviceType.CPU)
-    cuda_tensor = nanoinfer.Tensor(nanoinfer.DataType.FP32, [size], nanoinfer.DeviceType.CUDA)
+    cpu_tensor = forge.Tensor(forge.DataType.FP32, [size], forge.DeviceType.CPU)
+    cuda_tensor = forge.Tensor(forge.DataType.FP32, [size], forge.DeviceType.CUDA)
 
     # CPU -> CUDA
     for _ in range(warmup):
@@ -89,10 +89,10 @@ def bench_tensor_device_transfer(size, iters=20, warmup=5):
 
 def main():
     print("=" * 70)
-    print("  NanoInfer Backend & Device Performance Benchmarks")
+    print("  Forge Backend & Device Performance Benchmarks")
     print("=" * 70)
 
-    mgr = nanoinfer.BackendManager.instance()
+    mgr = forge.BackendManager.instance()
 
     # --- Backend Info ---
     print("\n--- Available Backends ---")
@@ -101,12 +101,12 @@ def main():
         caps = backend.capabilities()
         cap_strs = []
         for cap_name, cap_val in [
-            ("FP32", nanoinfer.BackendCapability.FP32),
-            ("FP16", nanoinfer.BackendCapability.FP16),
-            ("INT8", nanoinfer.BackendCapability.INT8),
-            ("Quantized", nanoinfer.BackendCapability.Quantized),
-            ("UnifiedMem", nanoinfer.BackendCapability.UnifiedMemory),
-            ("StreamAsync", nanoinfer.BackendCapability.StreamAsync),
+            ("FP32", forge.BackendCapability.FP32),
+            ("FP16", forge.BackendCapability.FP16),
+            ("INT8", forge.BackendCapability.INT8),
+            ("Quantized", forge.BackendCapability.Quantized),
+            ("UnifiedMem", forge.BackendCapability.UnifiedMemory),
+            ("StreamAsync", forge.BackendCapability.StreamAsync),
         ]:
             if backend.supports(cap_val):
                 cap_strs.append(cap_name)
@@ -128,7 +128,7 @@ def main():
         ("1 MB", [262144]),
         ("16 MB", [4194304]),
     ]:
-        stats = bench_tensor_alloc_dealloc(nanoinfer.DataType.FP32, shape, nanoinfer.DeviceType.CPU)
+        stats = bench_tensor_alloc_dealloc(forge.DataType.FP32, shape, forge.DeviceType.CPU)
         print(f"  alloc+dealloc({size_name:8s}): {stats['mean_us']:8.1f} us  "
               f"p50={stats['p50_us']:8.1f} us")
 
@@ -142,7 +142,7 @@ def main():
             ("1 MB", [262144]),
             ("16 MB", [4194304]),
         ]:
-            stats = bench_tensor_alloc_dealloc(nanoinfer.DataType.FP32, shape, nanoinfer.DeviceType.CUDA)
+            stats = bench_tensor_alloc_dealloc(forge.DataType.FP32, shape, forge.DeviceType.CUDA)
             print(f"  alloc+dealloc({size_name:8s}): {stats['mean_us']:8.1f} us  "
                   f"p50={stats['p50_us']:8.1f} us")
 
@@ -165,7 +165,7 @@ def main():
 
     # --- Tensor Creation by Device ---
     print("\n--- Tensor Creation by Device ---")
-    for device_name, device_type in [("CPU", nanoinfer.DeviceType.CPU)]:
+    for device_name, device_type in [("CPU", forge.DeviceType.CPU)]:
         for shape_name, shape in [
             ("[100]", [100]),
             ("[1K]", [1024]),
@@ -175,7 +175,7 @@ def main():
             times = []
             for _ in range(200):
                 t0 = time.perf_counter()
-                nanoinfer.Tensor(nanoinfer.DataType.FP32, shape, device_type)
+                forge.Tensor(forge.DataType.FP32, shape, device_type)
                 t1 = time.perf_counter()
                 times.append(t1 - t0)
 
@@ -192,7 +192,7 @@ def main():
             times = []
             for _ in range(200):
                 t0 = time.perf_counter()
-                nanoinfer.Tensor(nanoinfer.DataType.FP32, shape, nanoinfer.DeviceType.CUDA)
+                forge.Tensor(forge.DataType.FP32, shape, forge.DeviceType.CUDA)
                 t1 = time.perf_counter()
                 times.append(t1 - t0)
 

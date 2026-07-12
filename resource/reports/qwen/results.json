@@ -4,7 +4,7 @@
     "model_path": "/mnt/g/AI/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_0.gguf",
     "gpu_name": "NVIDIA GeForce RTX 4050 Laptop GPU",
     "gpu_mem_mb": 6141,
-    "nanoinfer_gpu_decode": {
+    "forge_gpu_decode": {
       "speeds": [
         12.64541665059975,
         12.64984600366071,
@@ -14,7 +14,7 @@
       "std": 0.046172915114640806,
       "median": 12.64541665059975
     },
-    "nanoinfer_cpu_decode": {
+    "forge_cpu_decode": {
       "speeds": [
         4.818613988350806,
         4.550418031489714,
@@ -24,7 +24,7 @@
       "std": 0.12484620099650905,
       "median": 4.811766861026237
     },
-    "nanoinfer_gpu_prefill": {
+    "forge_gpu_prefill": {
       "1": {
         "speeds": [
           1.5548354881603448,

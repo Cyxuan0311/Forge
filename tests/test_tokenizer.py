@@ -12,7 +12,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 TINYLLAMA_Q4_PATH = os.path.join(MODELS_DIR, "tinyllama-1.1b-chat-v1.0.Q4_0.gguf")
@@ -28,20 +28,20 @@ def tinyllama_available():
 
 class TestTokenizerBasic:
     def test_create_tokenizer(self):
-        tok = nanoinfer.Tokenizer()
+        tok = forge.Tokenizer()
         assert tok is not None
 
     def test_not_loaded_initially(self):
-        tok = nanoinfer.Tokenizer()
+        tok = forge.Tokenizer()
         assert not tok.is_loaded
 
     def test_load_nonexistent_file(self):
-        tok = nanoinfer.Tokenizer()
+        tok = forge.Tokenizer()
         result = tok.load_from_gguf("/nonexistent/model.gguf")
         assert result is False or not tok.is_loaded
 
     def test_encode_before_load_returns_empty_or_raises(self):
-        tok = nanoinfer.Tokenizer()
+        tok = forge.Tokenizer()
         try:
             ids = tok.encode("hello")
             # If no exception, should return empty or invalid result
@@ -50,7 +50,7 @@ class TestTokenizerBasic:
             pass  # Expected: raises exception
 
     def test_decode_before_load_returns_empty_or_raises(self):
-        tok = nanoinfer.Tokenizer()
+        tok = forge.Tokenizer()
         try:
             text = tok.decode([1, 2, 3])
             assert isinstance(text, str)
@@ -66,7 +66,7 @@ class TestTokenizerBasic:
 class TestTokenizerSPM:
     @pytest.fixture(autouse=True)
     def setup_tokenizer(self):
-        self.tok = nanoinfer.Tokenizer()
+        self.tok = forge.Tokenizer()
         self.tok.load_from_gguf(TINYLLAMA_Q4_PATH)
 
     def test_is_loaded(self):
@@ -80,7 +80,7 @@ class TestTokenizerSPM:
         assert self.tok.eos_token_id == 2
 
     def test_model_type_spm(self):
-        assert self.tok.model_type == nanoinfer.TokenizerModelType.SPM
+        assert self.tok.model_type == forge.TokenizerModelType.SPM
 
     def test_chat_template_not_empty(self):
         template = self.tok.chat_template
@@ -257,7 +257,7 @@ class TestTokenizerSPM:
 class TestTokenizerSPMAdvanced:
     @pytest.fixture(autouse=True)
     def setup_tokenizer(self):
-        self.tok = nanoinfer.Tokenizer()
+        self.tok = forge.Tokenizer()
         self.tok.load_from_gguf(TINYLLAMA_Q4_PATH)
 
     def test_encode_numbers(self):
@@ -314,7 +314,7 @@ class TestTokenizerSPMAdvanced:
 
     def test_multiple_load_calls(self):
         # Loading tokenizer multiple times should work
-        tok2 = nanoinfer.Tokenizer()
+        tok2 = forge.Tokenizer()
         tok2.load_from_gguf(TINYLLAMA_Q4_PATH)
         ids1 = self.tok.encode("test", add_bos=False)
         ids2 = tok2.encode("test", add_bos=False)

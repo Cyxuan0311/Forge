@@ -1,4 +1,4 @@
-# NanoInfer 性能报告模块
+# Forge 性能报告模块
 
 ## 目录结构
 
@@ -34,7 +34,7 @@ python -m report.runner --models tinyllama
 # 只跑 Qwen
 python -m report.runner --models qwen
 
-# 跳过 llama.cpp 对比（只需 NanoInfer 数据）
+# 跳过 llama.cpp 对比（只需 Forge 数据）
 python -m report.runner --skip-llama-cpp
 
 # 跳过 CPU benchmark（省时间）
@@ -73,7 +73,7 @@ class DeepSeekBenchmark(BenchmarkBase):
 
 ## 依赖
 
-- `nanoinfer`（本地 build 目录）
+- `forge`（本地 build 目录）
 - `numpy`
 - `matplotlib`
 - `llama-cpp-python`（仅对比 llama.cpp 时需要）

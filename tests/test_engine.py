@@ -7,7 +7,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 
 @pytest.fixture
@@ -34,34 +34,34 @@ def model_config():
 
 class TestEngineRegistry:
     def test_registered_archs_not_empty(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         archs = model.registered_archs()
         assert len(archs) > 0
 
     def test_llama_arch_registered(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         archs = model.registered_archs()
         assert "llama" in archs
 
     def test_mistral_arch_registered(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         archs = model.registered_archs()
         assert "mistral" in archs
 
     def test_qwen_arch_registered(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         archs = model.registered_archs()
         assert "qwen" in archs
 
     def test_qwen2_arch_registered(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         archs = model.registered_archs()
         assert "qwen2" in archs
 
 
 class TestArchLoading:
     def test_load_with_explicit_llama_arch(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -69,7 +69,7 @@ class TestArchLoading:
         assert out.shape == (3, model_config["vocab_size"])
 
     def test_load_with_mistral_arch(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="mistral", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -77,7 +77,7 @@ class TestArchLoading:
         assert out.shape == (3, model_config["vocab_size"])
 
     def test_load_with_qwen_arch(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="qwen", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -85,7 +85,7 @@ class TestArchLoading:
         assert out.shape == (3, model_config["vocab_size"])
 
     def test_load_with_yi_arch(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="yi", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -93,7 +93,7 @@ class TestArchLoading:
         assert out.shape == (3, model_config["vocab_size"])
 
     def test_load_with_deepseek_arch(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="deepseek", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -101,15 +101,15 @@ class TestArchLoading:
         assert out.shape == (3, model_config["vocab_size"])
 
     def test_unsupported_arch_raises(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="nonexistent_arch", **model_config)
         with pytest.raises(RuntimeError, match="No engine registered"):
             model.create_context()
 
     def test_same_weights_different_arch_names(self, model_path, model_config):
-        model_a = nanoinfer.Model()
+        model_a = forge.Model()
         model_a.load(model_path, arch_type="llama", **model_config)
-        model_b = nanoinfer.Model()
+        model_b = forge.Model()
         model_b.load(model_path, arch_type="mistral", **model_config)
 
         ctx_a = model_a.create_context()
@@ -123,21 +123,21 @@ class TestArchLoading:
 
 class TestModelConfigEnums:
     def test_norm_type_enum(self):
-        assert nanoinfer.NormType.RMSNorm is not None
-        assert nanoinfer.NormType.LayerNorm is not None
+        assert forge.NormType.RMSNorm is not None
+        assert forge.NormType.LayerNorm is not None
 
     def test_activation_type_enum(self):
-        assert nanoinfer.ActivationType.SiLU_GELU is not None
-        assert nanoinfer.ActivationType.GELU is not None
-        assert nanoinfer.ActivationType.ReLU is not None
+        assert forge.ActivationType.SiLU_GELU is not None
+        assert forge.ActivationType.GELU is not None
+        assert forge.ActivationType.ReLU is not None
 
     def test_rope_type_enum(self):
-        assert nanoinfer.RopeType.Standard is not None
-        assert nanoinfer.RopeType.LinearScaling is not None
-        assert nanoinfer.RopeType.NTK_Scaled is not None
+        assert forge.RopeType.Standard is not None
+        assert forge.RopeType.LinearScaling is not None
+        assert forge.RopeType.NTK_Scaled is not None
 
     def test_load_with_layernorm_option(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, norm_type="layernorm", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2], dtype=np.int32)
@@ -145,7 +145,7 @@ class TestModelConfigEnums:
         assert out.shape == (2, model_config["vocab_size"])
 
     def test_load_with_gelu_option(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, activation="gelu", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2], dtype=np.int32)
@@ -153,7 +153,7 @@ class TestModelConfigEnums:
         assert out.shape == (2, model_config["vocab_size"])
 
     def test_load_with_tie_embeddings(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, tie_embeddings=True, **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2], dtype=np.int32)

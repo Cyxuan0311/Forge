@@ -1,5 +1,5 @@
 """
-NanoInfer Tokenizer Performance Benchmarks.
+Forge Tokenizer Performance Benchmarks.
 
 Benchmarks tokenizer encode/decode speed, special token handling,
 and multi-language tokenization performance.
@@ -15,7 +15,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 import numpy as np
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
@@ -100,11 +100,11 @@ def main():
         return
 
     print("=" * 70)
-    print("  NanoInfer Tokenizer Performance Benchmarks")
+    print("  Forge Tokenizer Performance Benchmarks")
     print("  Model: TinyLlama-1.1B (SPM Tokenizer)")
     print("=" * 70)
 
-    tok = nanoinfer.Tokenizer()
+    tok = forge.Tokenizer()
     tok.load_from_gguf(TINYLLAMA_Q4_PATH)
 
     # --- Encode Speed ---

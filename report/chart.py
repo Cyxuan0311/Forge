@@ -46,20 +46,20 @@ def _plot_decode_bar(results, ax):
 
     for r in results:
         models.append(r["model_name"].replace(" Q4_0", ""))
-        ni_gpu.append(safe_get(r.get("nanoinfer_gpu_decode"), "median"))
+        ni_gpu.append(safe_get(r.get("forge_gpu_decode"), "median"))
         lc_gpu.append(safe_get(r.get("llama_cpp_gpu_decode"), "median"))
-        ni_cpu.append(safe_get(r.get("nanoinfer_cpu_decode"), "median"))
+        ni_cpu.append(safe_get(r.get("forge_cpu_decode"), "median"))
         lc_cpu.append(safe_get(r.get("llama_cpp_cpu_decode"), "median"))
 
     x = np.arange(len(models))
     n = 0
     bars_data = []
     if any(v > 0 for v in ni_gpu):
-        bars_data.append(("NanoInfer GPU", ni_gpu, C_NI_GPU)); n += 1
+        bars_data.append(("Forge GPU", ni_gpu, C_NI_GPU)); n += 1
     if any(v > 0 for v in lc_gpu):
         bars_data.append(("llama.cpp GPU", lc_gpu, C_LC_GPU)); n += 1
     if any(v > 0 for v in ni_cpu):
-        bars_data.append(("NanoInfer CPU", ni_cpu, C_NI_CPU)); n += 1
+        bars_data.append(("Forge CPU", ni_cpu, C_NI_CPU)); n += 1
     if any(v > 0 for v in lc_cpu):
         bars_data.append(("llama.cpp CPU", lc_cpu, C_LC_CPU)); n += 1
 
@@ -84,14 +84,14 @@ def _plot_decode_bar(results, ax):
 def _plot_prefill_lines(results, ax):
     for r in results:
         name = r["model_name"].replace(" Q4_0", "")
-        ni_pf = r.get("nanoinfer_gpu_prefill")
+        ni_pf = r.get("forge_gpu_prefill")
         lc_pf = r.get("llama_cpp_gpu_prefill")
 
         if ni_pf:
             lengths = sorted([int(k) for k in ni_pf.keys()])
             speeds = [ni_pf[str(l)]["mean"] if str(l) in ni_pf
                       else ni_pf.get(l, {}).get("mean", 0) for l in lengths]
-            ax.plot(lengths, speeds, "o-", color=C_NI_GPU, label=f"{name} (NanoInfer)",
+            ax.plot(lengths, speeds, "o-", color=C_NI_GPU, label=f"{name} (Forge)",
                     linewidth=2, markersize=5)
 
         if lc_pf:
@@ -115,8 +115,8 @@ def _plot_gpu_speedup(results, ax):
     ni_speedups, lc_speedups = [], []
 
     for r in results:
-        ni_gpu = safe_get(r.get("nanoinfer_gpu_decode"), "median")
-        ni_cpu = safe_get(r.get("nanoinfer_cpu_decode"), "median")
+        ni_gpu = safe_get(r.get("forge_gpu_decode"), "median")
+        ni_cpu = safe_get(r.get("forge_cpu_decode"), "median")
         lc_gpu = safe_get(r.get("llama_cpp_gpu_decode"), "median")
         lc_cpu = safe_get(r.get("llama_cpp_cpu_decode"), "median")
 
@@ -134,7 +134,7 @@ def _plot_gpu_speedup(results, ax):
     x = np.arange(len(models))
     width = 0.35
 
-    bars1 = ax.bar(x - width / 2, ni_speedups, width, label="NanoInfer",
+    bars1 = ax.bar(x - width / 2, ni_speedups, width, label="Forge",
                    color=C_NI_GPU, edgecolor="white")
     for bar, val in zip(bars1, ni_speedups):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
@@ -161,7 +161,7 @@ def _plot_ratio_bar(results, ax):
     ratios = []
 
     for r in results:
-        ni_gpu = safe_get(r.get("nanoinfer_gpu_decode"), "median")
+        ni_gpu = safe_get(r.get("forge_gpu_decode"), "median")
         lc_gpu = safe_get(r.get("llama_cpp_gpu_decode"), "median")
         if lc_gpu > 0:
             models.append(r["model_name"].replace(" Q4_0", ""))
@@ -170,7 +170,7 @@ def _plot_ratio_bar(results, ax):
     if not models:
         ax.text(0.5, 0.5, "No llama.cpp data", ha="center", va="center",
                 transform=ax.transAxes, fontsize=12)
-        ax.set_title("NanoInfer / llama.cpp Ratio", fontsize=13, fontweight="bold")
+        ax.set_title("Forge / llama.cpp Ratio", fontsize=13, fontweight="bold")
         return
 
     colors = ["#4CAF50" if r >= 80 else "#FFC107" if r >= 50 else "#F44336" for r in ratios]
@@ -181,7 +181,7 @@ def _plot_ratio_bar(results, ax):
         ax.text(val + 1, bar.get_y() + bar.get_height() / 2,
                 f"{val:.0f}%", ha="left", va="center", fontsize=11, fontweight="bold")
 
-    ax.set_title("NanoInfer / llama.cpp GPU Decode Ratio", fontsize=13, fontweight="bold")
+    ax.set_title("Forge / llama.cpp GPU Decode Ratio", fontsize=13, fontweight="bold")
     ax.set_xlabel("% of llama.cpp speed")
     ax.set_xlim(0, max(ratios) * 1.2 + 10)
     ax.invert_yaxis()
@@ -190,13 +190,13 @@ def _plot_ratio_bar(results, ax):
 def _plot_summary_table(results, ax):
     ax.axis("off")
 
-    headers = ["Model", "NanoInfer\nGPU", "NanoInfer\nCPU", "llama.cpp\nGPU", "llama.cpp\nCPU",
+    headers = ["Model", "Forge\nGPU", "Forge\nCPU", "llama.cpp\nGPU", "llama.cpp\nCPU",
                "NI/LC\nGPU Ratio", "GPU\nSpeedup"]
 
     rows = []
     for r in results:
-        ni_gpu = safe_get(r.get("nanoinfer_gpu_decode"), "median")
-        ni_cpu = safe_get(r.get("nanoinfer_cpu_decode"), "median")
+        ni_gpu = safe_get(r.get("forge_gpu_decode"), "median")
+        ni_cpu = safe_get(r.get("forge_cpu_decode"), "median")
         lc_gpu = safe_get(r.get("llama_cpp_gpu_decode"), "median")
         lc_cpu = safe_get(r.get("llama_cpp_cpu_decode"), "median")
         ratio = ni_gpu / lc_gpu * 100 if lc_gpu > 0 else 0
@@ -254,7 +254,7 @@ def _plot_model_breakdown(results, ax):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
                 f"{val}%", ha="center", va="bottom", fontsize=11, fontweight="bold")
 
-    ax.set_title("NanoInfer Layer Time Breakdown (TinyLlama Decode)", fontsize=13, fontweight="bold")
+    ax.set_title("Forge Layer Time Breakdown (TinyLlama Decode)", fontsize=13, fontweight="bold")
     ax.set_xticks(x)
     ax.set_xticklabels(categories, fontsize=10)
     ax.set_ylabel("% of Layer Time")
@@ -267,7 +267,7 @@ def _generate_individual_charts(results, output_dir):
         name = r["model_name"]
         safe_name = name.replace(" ", "_").replace("/", "_").replace("Q4_0", "").strip("_")
 
-        ni_pf = r.get("nanoinfer_gpu_prefill")
+        ni_pf = r.get("forge_gpu_prefill")
         lc_pf = r.get("llama_cpp_gpu_prefill")
 
         if ni_pf:
@@ -281,7 +281,7 @@ def _generate_individual_charts(results, output_dir):
             ax.set_xticklabels([str(l) for l in lengths])
             ax.set_xlabel("Prompt Length (tokens)")
             ax.set_ylabel("Prefill Speed (tok/s)")
-            ax.set_title(f"NanoInfer Prefill: {name}", fontweight="bold")
+            ax.set_title(f"Forge Prefill: {name}", fontweight="bold")
 
             for i, (l, s) in enumerate(zip(lengths, ni_speeds)):
                 ax.text(i, s + 0.5, f"{s:.1f}", ha="center", fontsize=9, fontweight="bold")
@@ -314,7 +314,7 @@ def generate_full_report(results, output_dir):
     gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.35, wspace=0.3)
 
     fig.suptitle(
-        f"NanoInfer Performance Report\n{gpu_name}  |  Q4_0 Quantization",
+        f"Forge Performance Report\n{gpu_name}  |  Q4_0 Quantization",
         fontsize=18, fontweight="bold", y=0.98
     )
 
@@ -338,4 +338,4 @@ def generate_report(results, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     print(f"\nGenerating report charts in {output_dir}/...")
     generate_full_report(results, output_dir)
-    print(f"Report generation complete!")
+    print("Report generation complete!")

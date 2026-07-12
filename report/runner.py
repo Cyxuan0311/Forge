@@ -41,7 +41,7 @@ def discover_benchmarks():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NanoInfer Benchmark Runner")
+    parser = argparse.ArgumentParser(description="Forge Benchmark Runner")
     parser.add_argument("--models", type=str, default=None,
                         help="Comma-separated list of model names to benchmark")
     parser.add_argument("--skip-llama-cpp", action="store_true",
@@ -57,7 +57,7 @@ def main():
     gpu_name, gpu_mem = get_gpu_info()
     print(f"GPU: {gpu_name} ({gpu_mem} MB)")
     print("=" * 60)
-    print("  NanoInfer vs llama.cpp Performance Benchmark")
+    print("  Forge vs llama.cpp Performance Benchmark")
     print("=" * 60)
 
     all_benchmarks = discover_benchmarks()

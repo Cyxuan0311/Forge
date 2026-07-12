@@ -1,10 +1,10 @@
 [
   {
     "model_name": "TinyLlama-1.1B-Chat Q4_0",
-    "model_path": "/mnt/f/My__StudyStack/My_Project/NanoInfer/models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
+    "model_path": "/mnt/f/My__StudyStack/My_Project/Forge/models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
     "gpu_name": "NVIDIA GeForce RTX 4050 Laptop GPU",
     "gpu_mem_mb": 6141,
-    "nanoinfer_gpu_decode": {
+    "forge_gpu_decode": {
       "speeds": [
         53.81159659777297,
         55.58513225360568,
@@ -14,7 +14,7 @@
       "std": 0.7273959332466567,
       "median": 54.84635177239341
     },
-    "nanoinfer_cpu_decode": {
+    "forge_cpu_decode": {
       "speeds": [
         16.771979787910215,
         14.98718820493012,
@@ -24,7 +24,7 @@
       "std": 1.0427392753253966,
       "median": 14.98718820493012
     },
-    "nanoinfer_gpu_prefill": {
+    "forge_gpu_prefill": {
       "1": {
         "speeds": [
           3.636564155474826,

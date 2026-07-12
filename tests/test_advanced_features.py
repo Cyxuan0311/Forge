@@ -7,7 +7,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 
 @pytest.fixture
@@ -34,7 +34,7 @@ def model_config():
 
 class TestSamplerConfig:
     def test_default_config(self):
-        cfg = nanoinfer.SamplerConfig()
+        cfg = forge.SamplerConfig()
         assert cfg.temperature == pytest.approx(1.0)
         assert cfg.top_k == 0
         assert cfg.top_p == pytest.approx(1.0)
@@ -43,7 +43,7 @@ class TestSamplerConfig:
         assert cfg.seed == 0
 
     def test_custom_config(self):
-        cfg = nanoinfer.SamplerConfig(temperature=0.7, top_k=50, top_p=0.9,
+        cfg = forge.SamplerConfig(temperature=0.7, top_k=50, top_p=0.9,
                                        repeat_penalty=1.2, do_sample=True, seed=42)
         assert cfg.temperature == pytest.approx(0.7, abs=1e-5)
         assert cfg.top_k == 50
@@ -52,7 +52,7 @@ class TestSamplerConfig:
         assert cfg.seed == 42
 
     def test_config_mutable(self):
-        cfg = nanoinfer.SamplerConfig()
+        cfg = forge.SamplerConfig()
         cfg.temperature = 0.5
         cfg.top_k = 10
         assert cfg.temperature == pytest.approx(0.5, abs=1e-5)
@@ -61,7 +61,7 @@ class TestSamplerConfig:
 
 class TestTopKTopPSampling:
     def test_top_k_sampling(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=10, top_k=5, do_sample=True, seed=42)
@@ -69,7 +69,7 @@ class TestTopKTopPSampling:
         assert result["finished"] is True
 
     def test_top_p_sampling(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=10, top_p=0.8, do_sample=True, seed=42)
@@ -77,7 +77,7 @@ class TestTopKTopPSampling:
         assert result["finished"] is True
 
     def test_top_k_and_top_p_combined(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=10, top_k=10, top_p=0.9,
@@ -85,7 +85,7 @@ class TestTopKTopPSampling:
         assert result["num_generated_tokens"] >= 1
 
     def test_repeat_penalty(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
 
@@ -98,7 +98,7 @@ class TestTopKTopPSampling:
         assert result_with_penalty["num_generated_tokens"] >= 1
 
     def test_temperature_zero_is_greedy(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
 
@@ -109,7 +109,7 @@ class TestTopKTopPSampling:
 
 class TestCPUOffload:
     def test_gpu_layers_zero_all_cpu(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         ctx = model.create_context(gpu_layers=0)
         prompt = np.array([1, 2, 3], dtype=np.int32)
@@ -117,7 +117,7 @@ class TestCPUOffload:
         assert out.shape == (3, model_config["vocab_size"])
 
     def test_gpu_layers_default(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         ctx = model.create_context()
         prompt = np.array([1, 2, 3], dtype=np.int32)
@@ -125,7 +125,7 @@ class TestCPUOffload:
         assert out.shape == (3, model_config["vocab_size"])
 
     def test_cpu_offload_generate(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=5, do_sample=False, gpu_layers=0)
@@ -133,9 +133,9 @@ class TestCPUOffload:
         assert result["finished"] is True
 
     def test_cpu_offload_forward_matches_default(self, model_path, model_config):
-        model_default = nanoinfer.Model()
+        model_default = forge.Model()
         model_default.load(model_path, arch_type="llama", **model_config)
-        model_offload = nanoinfer.Model()
+        model_offload = forge.Model()
         model_offload.load(model_path, arch_type="llama", **model_config)
 
         ctx_default = model_default.create_context()
@@ -149,7 +149,7 @@ class TestCPUOffload:
 
 class TestInferenceContext:
     def test_context_forward(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -157,7 +157,7 @@ class TestInferenceContext:
         assert logits.shape == (3, model_config["vocab_size"])
 
     def test_context_reset_kv(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -167,7 +167,7 @@ class TestInferenceContext:
         assert out_after_reset.shape == (3, model_config["vocab_size"])
 
     def test_context_memory_stats(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         ctx = model.create_context()
         stats = ctx.memory_stats()
@@ -175,45 +175,45 @@ class TestInferenceContext:
         assert "kv_cache_dtype" in stats
 
     def test_context_device(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         ctx = model.create_context()
-        assert ctx.device in (nanoinfer.DeviceType.CPU, nanoinfer.DeviceType.CUDA)
+        assert ctx.device in (forge.DeviceType.CPU, forge.DeviceType.CUDA)
 
 
 class TestRequestScheduler:
     def test_scheduler_submit(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
-        scheduler = nanoinfer.RequestScheduler(model, block_size=4, max_num_seqs=2)
-        cfg = nanoinfer.SamplerConfig(do_sample=False)
+        scheduler = forge.RequestScheduler(model, block_size=4, max_num_seqs=2)
+        cfg = forge.SamplerConfig(do_sample=False)
         rid = scheduler.submit([1, 2, 3], max_new_tokens=5, sampler_config=cfg)
         assert rid >= 0
         assert scheduler.num_waiting() == 1
 
     def test_scheduler_step(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
-        scheduler = nanoinfer.RequestScheduler(model, block_size=4, max_num_seqs=2)
-        cfg = nanoinfer.SamplerConfig(do_sample=False)
+        scheduler = forge.RequestScheduler(model, block_size=4, max_num_seqs=2)
+        cfg = forge.SamplerConfig(do_sample=False)
         scheduler.submit([1, 2, 3], max_new_tokens=5, sampler_config=cfg)
         has_more = scheduler.step()
         assert has_more is True or scheduler.num_active() >= 0
 
     def test_scheduler_multiple_requests(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
-        scheduler = nanoinfer.RequestScheduler(model, block_size=4, max_num_seqs=2)
-        cfg = nanoinfer.SamplerConfig(do_sample=False)
+        scheduler = forge.RequestScheduler(model, block_size=4, max_num_seqs=2)
+        cfg = forge.SamplerConfig(do_sample=False)
         rid1 = scheduler.submit([1, 2], max_new_tokens=3, sampler_config=cfg)
         rid2 = scheduler.submit([3, 4], max_new_tokens=3, sampler_config=cfg)
         assert rid1 != rid2
 
     def test_scheduler_run_to_completion(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
-        scheduler = nanoinfer.RequestScheduler(model, block_size=4, max_num_seqs=2)
-        cfg = nanoinfer.SamplerConfig(do_sample=False)
+        scheduler = forge.RequestScheduler(model, block_size=4, max_num_seqs=2)
+        cfg = forge.SamplerConfig(do_sample=False)
         scheduler.submit([1, 2, 3], max_new_tokens=3, sampler_config=cfg)
 
         for _ in range(20):
@@ -226,18 +226,18 @@ class TestRequestScheduler:
         assert finished[0].num_generated >= 1
 
     def test_scheduler_abort(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
-        scheduler = nanoinfer.RequestScheduler(model, block_size=4, max_num_seqs=2)
-        cfg = nanoinfer.SamplerConfig(do_sample=False)
+        scheduler = forge.RequestScheduler(model, block_size=4, max_num_seqs=2)
+        cfg = forge.SamplerConfig(do_sample=False)
         rid = scheduler.submit([1, 2, 3], max_new_tokens=10, sampler_config=cfg)
         scheduler.abort(rid)
 
     def test_scheduler_reset(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
-        scheduler = nanoinfer.RequestScheduler(model, block_size=4, max_num_seqs=2)
-        cfg = nanoinfer.SamplerConfig(do_sample=False)
+        scheduler = forge.RequestScheduler(model, block_size=4, max_num_seqs=2)
+        cfg = forge.SamplerConfig(do_sample=False)
         scheduler.submit([1, 2, 3], max_new_tokens=5, sampler_config=cfg)
         scheduler.submit([4, 5], max_new_tokens=5, sampler_config=cfg)
         scheduler.reset()
@@ -246,17 +246,17 @@ class TestRequestScheduler:
 
 class TestPagedKVCache:
     def test_request_status_enum(self):
-        assert nanoinfer.RequestStatus.Waiting is not None
-        assert nanoinfer.RequestStatus.Prefilling is not None
-        assert nanoinfer.RequestStatus.Decoding is not None
-        assert nanoinfer.RequestStatus.Finished is not None
-        assert nanoinfer.RequestStatus.Failed is not None
+        assert forge.RequestStatus.Waiting is not None
+        assert forge.RequestStatus.Prefilling is not None
+        assert forge.RequestStatus.Decoding is not None
+        assert forge.RequestStatus.Finished is not None
+        assert forge.RequestStatus.Failed is not None
 
     def test_generate_request_fields(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
-        scheduler = nanoinfer.RequestScheduler(model, block_size=4, max_num_seqs=2)
-        cfg = nanoinfer.SamplerConfig(do_sample=False)
+        scheduler = forge.RequestScheduler(model, block_size=4, max_num_seqs=2)
+        cfg = forge.SamplerConfig(do_sample=False)
         scheduler.submit([1, 2, 3], max_new_tokens=3, sampler_config=cfg)
 
         for _ in range(20):

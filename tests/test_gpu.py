@@ -7,7 +7,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 CUDA_AVAILABLE = False
 try:
@@ -44,7 +44,7 @@ def model_config():
 @skip_no_cuda
 class TestGPUForward:
     def test_gpu_forward_shape(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -53,7 +53,7 @@ class TestGPUForward:
         assert np.isfinite(logits).all()
 
     def test_gpu_forward_single_token(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         ctx = model.create_context()
         ids = np.array([5], dtype=np.int32)
@@ -62,7 +62,7 @@ class TestGPUForward:
         assert np.isfinite(logits).all()
 
     def test_gpu_forward_determinism(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         ctx = model.create_context()
         ids = np.array([3, 7, 15], dtype=np.int32)
@@ -73,7 +73,7 @@ class TestGPUForward:
         np.testing.assert_array_equal(out1, out2)
 
     def test_gpu_forward_logits_range(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         ctx = model.create_context()
         ids = np.array([1, 2, 3, 4, 5], dtype=np.int32)
@@ -82,7 +82,7 @@ class TestGPUForward:
         assert logits.min() > -1e6
 
     def test_gpu_forward_different_lengths(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         ctx = model.create_context()
         for sl in [1, 2, 3, 5, 8]:
@@ -95,7 +95,7 @@ class TestGPUForward:
 @skip_no_cuda
 class TestGPUGenerate:
     def test_gpu_generate_basic(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=5, do_sample=False)
@@ -106,7 +106,7 @@ class TestGPUGenerate:
         assert result["finished"] is True
 
     def test_gpu_generate_greedy_deterministic(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         r1 = model.generate(prompt, max_new_tokens=10, do_sample=False)
@@ -114,7 +114,7 @@ class TestGPUGenerate:
         assert list(r1["token_ids"]) == list(r2["token_ids"])
 
     def test_gpu_generate_max_tokens_limit(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         prompt = np.array([1, 2], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=3, do_sample=False)
@@ -122,14 +122,14 @@ class TestGPUGenerate:
         assert result["finish_reason"] == "length"
 
     def test_gpu_generate_with_temperature(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=5, temperature=0.8, do_sample=True, seed=42)
         assert result["num_generated_tokens"] >= 1
 
     def test_gpu_generate_with_eos(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=10, eos_token_id=5, do_sample=False)
@@ -138,7 +138,7 @@ class TestGPUGenerate:
             assert result["token_ids"][-1] == 5
 
     def test_gpu_generate_token_ids_valid(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=5, do_sample=False)
@@ -149,9 +149,9 @@ class TestGPUGenerate:
 @skip_no_cuda
 class TestCPUGPUConsistency:
     def test_forward_logits_consistency(self, model_path, model_config):
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load(model_path, device="cpu", **model_config)
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load(model_path, device="cuda", **model_config)
 
         ctx_cpu = model_cpu.create_context()
@@ -167,9 +167,9 @@ class TestCPUGPUConsistency:
                                    err_msg="CPU and GPU forward logits should match within 0.5")
 
     def test_forward_single_token_consistency(self, model_path, model_config):
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load(model_path, device="cpu", **model_config)
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load(model_path, device="cuda", **model_config)
 
         ctx_cpu = model_cpu.create_context()
@@ -185,9 +185,9 @@ class TestCPUGPUConsistency:
                                    err_msg="CPU and GPU single-token logits should match")
 
     def test_generate_greedy_consistency(self, model_path, model_config):
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load(model_path, device="cpu", **model_config)
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load(model_path, device="cuda", **model_config)
 
         prompt = np.array([1, 2, 3], dtype=np.int32)
@@ -198,9 +198,9 @@ class TestCPUGPUConsistency:
             f"CPU tokens: {result_cpu['token_ids']}, GPU tokens: {result_gpu['token_ids']}"
 
     def test_generate_longer_prompt_consistency(self, model_path, model_config):
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load(model_path, device="cpu", **model_config)
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load(model_path, device="cuda", **model_config)
 
         prompt = np.array([5, 10, 15, 20, 25], dtype=np.int32)
@@ -211,9 +211,9 @@ class TestCPUGPUConsistency:
             f"CPU tokens: {result_cpu['token_ids']}, GPU tokens: {result_gpu['token_ids']}"
 
     def test_forward_different_seq_lens_consistency(self, model_path, model_config):
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load(model_path, device="cpu", **model_config)
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load(model_path, device="cuda", **model_config)
 
         ctx_cpu = model_cpu.create_context()

@@ -1,5 +1,5 @@
 """
-NanoInfer Core Micro-Benchmarks.
+Forge Core Micro-Benchmarks.
 
 Benchmarks low-level operations: forward pass, tensor ops, model loading,
 operator performance, and graph mode overhead.
@@ -18,7 +18,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 import numpy as np
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures")
@@ -83,7 +83,7 @@ def get_small_model_and_context(device="cpu"):
     model_path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
     if not os.path.exists(model_path):
         return None, None
-    model = nanoinfer.Model()
+    model = forge.Model()
     model.load(model_path, vocab_size=100, hidden_dim=32, intermediate_dim=64,
                num_layers=1, num_heads=2, num_kv_heads=1, head_dim=16, device=device)
     ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=-1 if device != "cpu" else 0)
@@ -94,7 +94,7 @@ def get_tinyllama_model_and_context(device="cpu", gpu_layers=0):
     """Load TinyLlama GGUF model."""
     if not os.path.exists(TINYLLAMA_Q4_PATH):
         return None, None
-    model = nanoinfer.Model()
+    model = forge.Model()
     model.load_auto(TINYLLAMA_Q4_PATH, device=device)
     ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=gpu_layers)
     return model, ctx
@@ -136,13 +136,13 @@ def bench_forward_incremental(ctx, prompt_len, gen_len, warmup=3, iters=20):
 
 def bench_tensor_creation(shape, warmup=10, iters=200):
     def run():
-        nanoinfer.Tensor(nanoinfer.DataType.FP32, shape, nanoinfer.DeviceType.CPU)
+        forge.Tensor(forge.DataType.FP32, shape, forge.DeviceType.CPU)
     return bench(run, warmup, iters)
 
 
 def bench_tensor_copy(size, warmup=5, iters=50):
-    src = nanoinfer.Tensor(nanoinfer.DataType.FP32, [size], nanoinfer.DeviceType.CPU)
-    dst = nanoinfer.Tensor(nanoinfer.DataType.FP32, [size], nanoinfer.DeviceType.CPU)
+    src = forge.Tensor(forge.DataType.FP32, [size], forge.DeviceType.CPU)
+    dst = forge.Tensor(forge.DataType.FP32, [size], forge.DeviceType.CPU)
 
     def run():
         dst.copy_from(src)
@@ -159,7 +159,7 @@ def bench_model_loading_ninf(warmup=2, iters=10):
         return None
 
     def run():
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(model_path, vocab_size=100, hidden_dim=32, intermediate_dim=64,
                    num_layers=1, num_heads=2, num_kv_heads=1, head_dim=16, device="cpu")
     return bench(run, warmup, iters)
@@ -170,7 +170,7 @@ def bench_model_loading_gguf(warmup=1, iters=5):
         return None
 
     def run():
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
     return bench(run, warmup, iters)
 
@@ -221,7 +221,7 @@ def bench_kv_cache_memory_stats(ctx, warmup=10, iters=200):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="NanoInfer Core Micro-Benchmarks")
+    parser = argparse.ArgumentParser(description="Forge Core Micro-Benchmarks")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"],
                         help="Device for benchmarks")
     parser.add_argument("--seq-lengths", type=int, nargs="+", default=[1, 4, 16, 32, 64],
@@ -232,7 +232,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  NanoInfer Core Micro-Benchmarks")
+    print("  Forge Core Micro-Benchmarks")
     print(f"  Device: {args.device}  |  Iters: {args.iters}  |  Warmup: {args.warmup}")
     print("=" * 70)
 

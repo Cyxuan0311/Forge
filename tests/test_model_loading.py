@@ -8,7 +8,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -19,17 +19,17 @@ class TestNinfFormatDetection:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        fmt = nanoinfer.Model.detect_format(path)
+        fmt = forge.Model.detect_format(path)
         assert fmt == "ninf"
 
     def test_detect_invalid_format(self):
-        fmt = nanoinfer.Model.detect_format("/nonexistent/file.bin")
+        fmt = forge.Model.detect_format("/nonexistent/file.bin")
         assert fmt == ""
 
     def test_detect_non_model_file(self, tmp_path):
         dummy = tmp_path / "dummy.txt"
         dummy.write_text("hello world")
-        fmt = nanoinfer.Model.detect_format(str(dummy))
+        fmt = forge.Model.detect_format(str(dummy))
         assert fmt == ""
 
 
@@ -38,7 +38,7 @@ class TestNinfModelLoading:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load(path,
                    vocab_size=100, hidden_dim=32, intermediate_dim=64,
                    num_layers=1, num_heads=2, num_kv_heads=1, head_dim=16,
@@ -51,7 +51,7 @@ class TestNinfModelLoading:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(path, device="cpu")
         cfg = model.config
         assert cfg.vocab_size == 100
@@ -65,7 +65,7 @@ class TestNinfModelLoading:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(path, device="cpu")
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -80,23 +80,23 @@ class TestGGUFFormatDetection:
         with open(str(gguf_path), "wb") as f:
             f.write(struct.pack("<I", 0x46554747))
             f.write(b"\x00" * 100)
-        fmt = nanoinfer.Model.detect_format(str(gguf_path))
+        fmt = forge.Model.detect_format(str(gguf_path))
         assert fmt == "gguf"
 
     def test_load_gguf_nonexistent(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         with pytest.raises(RuntimeError):
             model.load_gguf("/nonexistent/model.gguf", device="cpu")
 
 
 class TestModelConfig:
     def test_config_defaults(self):
-        cfg = nanoinfer.ModelConfig()
+        cfg = forge.ModelConfig()
         assert cfg.vocab_size == 0
         assert cfg.hidden_dim == 0
 
     def test_config_modify(self):
-        cfg = nanoinfer.ModelConfig()
+        cfg = forge.ModelConfig()
         cfg.vocab_size = 32000
         cfg.hidden_dim = 4096
         cfg.num_layers = 32
@@ -111,7 +111,7 @@ class TestModelConfig:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(path, device="cpu")
         cfg = model.config
         assert cfg.vocab_size == 100
@@ -129,30 +129,30 @@ class TestModelDevice:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(path, device="cpu")
-        assert model.device == nanoinfer.DeviceType.CPU
+        assert model.device == forge.DeviceType.CPU
 
     def test_context_cpu_device(self):
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(path, device="cpu")
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
-        assert ctx.device == nanoinfer.DeviceType.CPU
+        assert ctx.device == forge.DeviceType.CPU
 
 
 class TestModelErrors:
     def test_load_nonexistent_path(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         with pytest.raises(RuntimeError):
             model.load("/nonexistent/model.ninf",
                        vocab_size=100, hidden_dim=32, intermediate_dim=64,
                        num_layers=1, num_heads=2, device="cpu")
 
     def test_forward_without_load(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         with pytest.raises(Exception):
             ctx = model.create_context()
 
@@ -162,7 +162,7 @@ class TestModelCreateContext:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(path, device="cpu")
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
         assert ctx is not None
@@ -171,7 +171,7 @@ class TestModelCreateContext:
         path = os.path.join(FIXTURES_DIR, "test_model_small.ninf")
         if not os.path.exists(path):
             pytest.skip("ninf test model not found")
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(path, device="cpu")
         ctx = model.create_context(kv_cache_dtype="q4_0", gpu_layers=-1)
         assert ctx is not None

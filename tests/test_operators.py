@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 import os
 import sys
 
@@ -7,7 +6,6 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
 
 
 class TestEmbeddingOp:

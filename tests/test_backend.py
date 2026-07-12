@@ -7,31 +7,31 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 
 class TestBackendManager:
     def test_instance_exists(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         assert mgr is not None
 
     def test_singleton(self):
-        mgr1 = nanoinfer.BackendManager.instance()
-        mgr2 = nanoinfer.BackendManager.instance()
+        mgr1 = forge.BackendManager.instance()
+        mgr2 = forge.BackendManager.instance()
         assert mgr1 is mgr2
 
     def test_cpu_backend_available(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         assert mgr.has_backend("cpu")
 
     def test_available_backends_not_empty(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         backends = mgr.available_backends()
         assert len(backends) > 0
         assert "cpu" in backends
 
     def test_backend_info_list(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         info_list = mgr.backend_info_list()
         assert len(info_list) > 0
         # Check first info has expected fields
@@ -40,24 +40,24 @@ class TestBackendManager:
         assert info.available is True
 
     def test_get_cpu_backend(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         cpu = mgr.get_backend("cpu")
         assert cpu is not None
         assert cpu.name() == "cpu"
 
     def test_get_nonexistent_backend(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         backend = mgr.get_backend("nonexistent_backend")
         assert backend is None
 
     def test_has_cuda(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         # has_cuda should return a boolean
         result = mgr.has_cuda()
         assert isinstance(result, bool)
 
     def test_cuda_device_count(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         count = mgr.cuda_device_count()
         assert isinstance(count, int)
         assert count >= 0
@@ -66,7 +66,7 @@ class TestBackendManager:
 class TestCPUBackend:
     @pytest.fixture(autouse=True)
     def setup(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         self.backend = mgr.get_backend("cpu")
         if self.backend is None:
             pytest.skip("CPU backend not available")
@@ -81,15 +81,15 @@ class TestCPUBackend:
 
     def test_capabilities_fp32(self):
         caps = self.backend.capabilities()
-        assert self.backend.supports(nanoinfer.BackendCapability.FP32)
+        assert self.backend.supports(forge.BackendCapability.FP32)
 
     def test_capabilities_quantized(self):
         # CPU backend should support quantized operations
-        assert self.backend.supports(nanoinfer.BackendCapability.Quantized)
+        assert self.backend.supports(forge.BackendCapability.Quantized)
 
     def test_capabilities_unified_memory(self):
         # CPU has unified memory
-        assert self.backend.supports(nanoinfer.BackendCapability.UnifiedMemory)
+        assert self.backend.supports(forge.BackendCapability.UnifiedMemory)
 
     def test_device_memory_total(self):
         total = self.backend.device_memory_total()
@@ -110,32 +110,32 @@ class TestCPUBackend:
 class TestBackendCapability:
     def test_capability_enum_values(self):
         # Note: BackendCapability.None is a Python keyword, test via integer comparison
-        assert nanoinfer.BackendCapability.FP32 is not None
-        assert nanoinfer.BackendCapability.FP16 is not None
-        assert nanoinfer.BackendCapability.INT8 is not None
-        assert nanoinfer.BackendCapability.Quantized is not None
-        assert nanoinfer.BackendCapability.UnifiedMemory is not None
-        assert nanoinfer.BackendCapability.StreamAsync is not None
+        assert forge.BackendCapability.FP32 is not None
+        assert forge.BackendCapability.FP16 is not None
+        assert forge.BackendCapability.INT8 is not None
+        assert forge.BackendCapability.Quantized is not None
+        assert forge.BackendCapability.UnifiedMemory is not None
+        assert forge.BackendCapability.StreamAsync is not None
 
     def test_capability_or_operation(self):
-        combined = nanoinfer.BackendCapability.FP32 | nanoinfer.BackendCapability.FP16
+        combined = forge.BackendCapability.FP32 | forge.BackendCapability.FP16
         assert combined is not None
 
     def test_capability_and_operation(self):
-        combined = nanoinfer.BackendCapability.FP32 | nanoinfer.BackendCapability.FP16
-        result = combined & nanoinfer.BackendCapability.FP32
+        combined = forge.BackendCapability.FP32 | forge.BackendCapability.FP16
+        result = combined & forge.BackendCapability.FP32
         # Result should be truthy (contains FP32)
         assert result
 
 
 @pytest.mark.skipif(
-    not nanoinfer.BackendManager.instance().has_cuda(),
+    not forge.BackendManager.instance().has_cuda(),
     reason="CUDA not available"
 )
 class TestCUDABackend:
     @pytest.fixture(autouse=True)
     def setup(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         self.backend = mgr.get_backend("cuda", 0)
         if self.backend is None:
             pytest.skip("CUDA backend not available")
@@ -144,10 +144,10 @@ class TestCUDABackend:
         assert "cuda" in self.backend.name()
 
     def test_capabilities_fp32(self):
-        assert self.backend.supports(nanoinfer.BackendCapability.FP32)
+        assert self.backend.supports(forge.BackendCapability.FP32)
 
     def test_capabilities_fp16(self):
-        assert self.backend.supports(nanoinfer.BackendCapability.FP16)
+        assert self.backend.supports(forge.BackendCapability.FP16)
 
     def test_device_memory_total(self):
         total = self.backend.device_memory_total()
@@ -165,6 +165,6 @@ class TestCUDABackend:
         assert did == 0
 
     def test_cuda_backend_in_available_list(self):
-        mgr = nanoinfer.BackendManager.instance()
+        mgr = forge.BackendManager.instance()
         backends = mgr.available_backends()
         assert "cuda" in backends

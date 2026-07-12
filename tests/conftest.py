@@ -6,7 +6,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def model_config():
 
 @pytest.fixture
 def loaded_model(model_path, model_config):
-    model = nanoinfer.Model()
+    model = forge.Model()
     model.load(model_path, **model_config)
     return model
 

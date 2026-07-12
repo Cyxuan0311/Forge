@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-import nanoinfer
+import forge
 
 
 class TestTransformerModel:
@@ -39,12 +39,12 @@ class TestTransformerModel:
         assert diff > 0, "RoPE should produce different outputs for different positions"
 
     def test_invalid_path(self, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         with pytest.raises(RuntimeError):
             model.load("/nonexistent/model.ninf", **model_config)
 
     def test_load_auto(self, model_path, model_config):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(model_path, device="cpu")
         ctx = model.create_context()
         ids = np.array([1, 2, 3], dtype=np.int32)
@@ -52,7 +52,7 @@ class TestTransformerModel:
         assert logits.shape[0] == 3
 
     def test_detect_format(self, model_path):
-        fmt = nanoinfer.Model.detect_format(model_path)
+        fmt = forge.Model.detect_format(model_path)
         assert fmt in ("ninf", "gguf")
 
     def test_model_config_accessible(self, loaded_model):

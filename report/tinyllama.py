@@ -1,5 +1,5 @@
 """
-TinyLlama-1.1B-Chat benchmark: NanoInfer vs llama.cpp comparison.
+TinyLlama-1.1B-Chat benchmark: Forge vs llama.cpp comparison.
 
 Usage:
     python -m report.tinyllama

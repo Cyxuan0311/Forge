@@ -1,5 +1,5 @@
 """
-Qwen2.5-7B-Instruct benchmark: NanoInfer vs llama.cpp comparison.
+Qwen2.5-7B-Instruct benchmark: Forge vs llama.cpp comparison.
 
 Usage:
     python -m report.qwen

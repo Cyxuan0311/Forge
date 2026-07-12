@@ -7,7 +7,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 TINYLLAMA_Q4_PATH = os.path.join(MODELS_DIR, "tinyllama-1.1b-chat-v1.0.Q4_0.gguf")
@@ -20,7 +20,7 @@ def tinyllama_available():
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama-1.1B GGUF model not found")
 class TestTinyLlamaLoading:
     def test_load_gguf_model(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         cfg = model.config
         assert cfg.vocab_size > 0
@@ -29,7 +29,7 @@ class TestTinyLlamaLoading:
         assert cfg.num_heads > 0
 
     def test_gguf_config_values(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         cfg = model.config
         assert cfg.vocab_size == 32000
@@ -40,7 +40,7 @@ class TestTinyLlamaLoading:
         assert cfg.head_dim > 0
 
     def test_create_context(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
         assert ctx is not None
@@ -50,7 +50,7 @@ class TestTinyLlamaLoading:
 class TestTinyLlamaInference:
     @pytest.fixture(autouse=True)
     def setup_model(self):
-        self.model = nanoinfer.Model()
+        self.model = forge.Model()
         self.model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         self.ctx = self.model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
 
@@ -142,7 +142,7 @@ class TestTinyLlamaInference:
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama-1.1B GGUF model not found")
 class TestTinyLlamaQuantized:
     def test_q4_0_kv_cache(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         ctx = model.create_context(kv_cache_dtype="q4_0", gpu_layers=0)
 
@@ -153,7 +153,7 @@ class TestTinyLlamaQuantized:
         assert np.isfinite(logits).all()
 
     def test_fp32_vs_q4_0_kv_cache(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
 
         ctx_fp32 = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
@@ -175,7 +175,7 @@ class TestTinyLlamaQuantized:
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama-1.1B GGUF model not found")
 class TestTinyLlamaQ6KWeights:
     def test_q6_k_output_weight_forward(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
 
@@ -187,7 +187,7 @@ class TestTinyLlamaQ6KWeights:
         assert logits.shape == (4, 32000)
 
     def test_q6_k_output_weight_top_token(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
 
@@ -198,7 +198,7 @@ class TestTinyLlamaQ6KWeights:
         assert 0 <= top_token < 32000, f"Top token {top_token} out of vocab range"
 
     def test_q6_k_deterministic(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
 
@@ -214,7 +214,7 @@ class TestTinyLlamaQ6KWeights:
 @pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama-1.1B GGUF model not found")
 class TestTinyLlamaGeneration:
     def test_generate_no_repeat(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=20, do_sample=False,
@@ -225,7 +225,7 @@ class TestTinyLlamaGeneration:
             f"Generated tokens should not be highly repetitive, unique_ratio={unique_ratio}"
 
     def test_generate_with_eos(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=50, eos_token_id=2,
@@ -234,7 +234,7 @@ class TestTinyLlamaGeneration:
             assert result["token_ids"][-1] == 2
 
     def test_generate_deterministic(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
         result1 = model.generate(prompt, max_new_tokens=10, do_sample=False,
@@ -245,7 +245,7 @@ class TestTinyLlamaGeneration:
             "Greedy generation should be deterministic"
 
     def test_generate_with_sampling(self):
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
         result = model.generate(prompt, max_new_tokens=10, temperature=0.8,

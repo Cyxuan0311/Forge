@@ -1,5 +1,5 @@
 """
-NanoInfer End-to-End Inference Benchmarks.
+Forge End-to-End Inference Benchmarks.
 
 Benchmarks full inference pipeline: text generation, streaming, batched prompts,
 and throughput measurements (tokens/sec).
@@ -18,7 +18,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 import numpy as np
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
@@ -143,7 +143,7 @@ def bench_decode_speed(ctx, prompt_len, gen_len, iters=5, warmup=2):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NanoInfer Inference Benchmarks")
+    parser = argparse.ArgumentParser(description="Forge Inference Benchmarks")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--max-tokens", type=int, default=32, help="Max tokens to generate")
     parser.add_argument("--iters", type=int, default=5, help="Benchmark iterations")
@@ -156,20 +156,20 @@ def main():
         return
 
     print("=" * 70)
-    print("  NanoInfer End-to-End Inference Benchmarks")
+    print("  Forge End-to-End Inference Benchmarks")
     print(f"  Model: TinyLlama-1.1B Q4_0  |  Device: {args.device}")
     print("=" * 70)
 
     # Load model
     print("\nLoading model...")
-    model = nanoinfer.Model()
+    model = forge.Model()
     model.load_auto(TINYLLAMA_Q4_PATH, device=args.device)
 
     gpu_layers = 0 if args.device == "cpu" else -1
     ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=gpu_layers)
 
     # Load tokenizer
-    tok = nanoinfer.Tokenizer()
+    tok = forge.Tokenizer()
     tok.load_from_gguf(TINYLLAMA_Q4_PATH)
 
     # --- Prompt Processing Speed ---

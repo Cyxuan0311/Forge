@@ -8,7 +8,7 @@ build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
 
-import nanoinfer
+import forge
 
 CUDA_AVAILABLE = False
 try:
@@ -38,7 +38,7 @@ tinyllama_skip = pytest.mark.skipif(not tinyllama_available(), reason="TinyLlama
 def gpu_model():
     if not CUDA_AVAILABLE or not tinyllama_available():
         pytest.skip("CUDA or TinyLlama model not available")
-    model = nanoinfer.Model()
+    model = forge.Model()
     model.load_gguf(TINYLLAMA_Q4_PATH, device="cuda")
     yield model
 
@@ -86,7 +86,7 @@ class TestGGUFCPUGPUConsistency:
     def test_logits_correlation(self):
         ids = np.array([1, 450, 4996, 29901], dtype=np.int32)
 
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load_gguf(TINYLLAMA_Q4_PATH, device="cpu")
         ctx_cpu = model_cpu.create_context(kv_cache_dtype="fp32", gpu_layers=0)
         ctx_cpu.reset_kv()
@@ -95,7 +95,7 @@ class TestGGUFCPUGPUConsistency:
         del model_cpu
         gc.collect()
 
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load_gguf(TINYLLAMA_Q4_PATH, device="cuda")
         ctx_gpu = model_gpu.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
         ctx_gpu.reset_kv()
@@ -109,7 +109,7 @@ class TestGGUFCPUGPUConsistency:
     def test_top_token_match(self):
         ids = np.array([1, 450, 4996, 29901], dtype=np.int32)
 
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load_gguf(TINYLLAMA_Q4_PATH, device="cpu")
         ctx_cpu = model_cpu.create_context(kv_cache_dtype="fp32", gpu_layers=0)
         ctx_cpu.reset_kv()
@@ -118,7 +118,7 @@ class TestGGUFCPUGPUConsistency:
         del model_cpu
         gc.collect()
 
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load_gguf(TINYLLAMA_Q4_PATH, device="cuda")
         ctx_gpu = model_gpu.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
         ctx_gpu.reset_kv()
@@ -130,7 +130,7 @@ class TestGGUFCPUGPUConsistency:
     def test_logits_close(self):
         ids = np.array([1, 450, 4996, 29901], dtype=np.int32)
 
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load_gguf(TINYLLAMA_Q4_PATH, device="cpu")
         ctx_cpu = model_cpu.create_context(kv_cache_dtype="fp32", gpu_layers=0)
         ctx_cpu.reset_kv()
@@ -139,7 +139,7 @@ class TestGGUFCPUGPUConsistency:
         del model_cpu
         gc.collect()
 
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load_gguf(TINYLLAMA_Q4_PATH, device="cuda")
         ctx_gpu = model_gpu.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
         ctx_gpu.reset_kv()
@@ -151,14 +151,14 @@ class TestGGUFCPUGPUConsistency:
     def test_greedy_generation_match(self):
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
 
-        model_cpu = nanoinfer.Model()
+        model_cpu = forge.Model()
         model_cpu.load_gguf(TINYLLAMA_Q4_PATH, device="cpu")
         result_cpu = model_cpu.generate(prompt, max_new_tokens=10, do_sample=False,
                                         gpu_layers=0, kv_cache_dtype="fp32")
         del model_cpu
         gc.collect()
 
-        model_gpu = nanoinfer.Model()
+        model_gpu = forge.Model()
         model_gpu.load_gguf(TINYLLAMA_Q4_PATH, device="cuda")
         result_gpu = model_gpu.generate(prompt, max_new_tokens=10, do_sample=False,
                                         gpu_layers=-1, kv_cache_dtype="fp32")

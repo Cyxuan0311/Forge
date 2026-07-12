@@ -1,8 +1,6 @@
 import pytest
-import numpy as np
-from nanoinfer import (
-    BackendManager, DeviceType, DeviceInfo,
-    InferenceContext, ModelConfig,
+from forge import (
+    BackendManager, DeviceType,
 )
 
 

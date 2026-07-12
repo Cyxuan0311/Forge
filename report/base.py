@@ -9,7 +9,7 @@ import os
 import time
 import json
 import subprocess
-from abc import ABC, abstractmethod
+from abc import ABC
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD_DIR = os.path.join(PROJECT_DIR, "build")
@@ -70,11 +70,11 @@ class BenchmarkBase(ABC):
     # ── Benchmark 方法 ───────────────────────────
 
     @staticmethod
-    def bench_nanoinfer_decode(model_path, device, gpu_layers, num_tokens, num_runs):
-        import nanoinfer
-        nanoinfer.Logger.set_level(0)
+    def bench_forge_decode(model_path, device, gpu_layers, num_tokens, num_runs):
+        import forge
+        forge.Logger.set_level(0)
 
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_gguf(model_path, device=device)
 
         ids = np.array([1], dtype=np.int32)
@@ -94,17 +94,17 @@ class BenchmarkBase(ABC):
         return speeds
 
     @staticmethod
-    def bench_nanoinfer_cpu_decode(model_path, num_tokens, num_runs):
-        return BenchmarkBase.bench_nanoinfer_decode(
+    def bench_forge_cpu_decode(model_path, num_tokens, num_runs):
+        return BenchmarkBase.bench_forge_decode(
             model_path, "cpu", 0, num_tokens, num_runs)
 
     @staticmethod
-    def bench_nanoinfer_prefill(model_path, device, gpu_layers,
+    def bench_forge_prefill(model_path, device, gpu_layers,
                                  prompt_lengths, num_runs):
-        import nanoinfer
-        nanoinfer.Logger.set_level(0)
+        import forge
+        forge.Logger.set_level(0)
 
-        model = nanoinfer.Model()
+        model = forge.Model()
         model.load_gguf(model_path, device=device)
 
         ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=gpu_layers)
@@ -197,11 +197,11 @@ class BenchmarkBase(ABC):
         self.results["gpu_name"] = gpu_name
         self.results["gpu_mem_mb"] = gpu_mem
 
-        # NanoInfer GPU Decode
-        print(f"\n  [NanoInfer GPU Decode] {num_tokens} tokens x {num_runs} runs...")
+        # Forge GPU Decode
+        print(f"\n  [Forge GPU Decode] {num_tokens} tokens x {num_runs} runs...")
         try:
-            speeds = self.bench_nanoinfer_decode(model_path, "cuda", gl, num_tokens, num_runs)
-            self.results["nanoinfer_gpu_decode"] = {
+            speeds = self.bench_forge_decode(model_path, "cuda", gl, num_tokens, num_runs)
+            self.results["forge_gpu_decode"] = {
                 "speeds": speeds,
                 "mean": float(np.mean(speeds)),
                 "std": float(np.std(speeds)),
@@ -210,14 +210,14 @@ class BenchmarkBase(ABC):
             print(f"    Mean: {np.mean(speeds):.1f} ± {np.std(speeds):.1f} tok/s")
         except Exception as e:
             print(f"    Failed: {e}")
-            self.results["nanoinfer_gpu_decode"] = None
+            self.results["forge_gpu_decode"] = None
 
-        # NanoInfer CPU Decode
+        # Forge CPU Decode
         if not skip_cpu:
-            print(f"\n  [NanoInfer CPU Decode] {num_tokens} tokens x {num_runs} runs...")
+            print(f"\n  [Forge CPU Decode] {num_tokens} tokens x {num_runs} runs...")
             try:
-                speeds = self.bench_nanoinfer_cpu_decode(model_path, num_tokens, num_runs)
-                self.results["nanoinfer_cpu_decode"] = {
+                speeds = self.bench_forge_cpu_decode(model_path, num_tokens, num_runs)
+                self.results["forge_cpu_decode"] = {
                     "speeds": speeds,
                     "mean": float(np.mean(speeds)),
                     "std": float(np.std(speeds)),
@@ -226,15 +226,15 @@ class BenchmarkBase(ABC):
                 print(f"    Mean: {np.mean(speeds):.1f} ± {np.std(speeds):.1f} tok/s")
             except Exception as e:
                 print(f"    Failed: {e}")
-                self.results["nanoinfer_cpu_decode"] = None
+                self.results["forge_cpu_decode"] = None
 
-        # NanoInfer GPU Prefill
-        print(f"\n  [NanoInfer GPU Prefill] lengths={plens}...")
+        # Forge GPU Prefill
+        print(f"\n  [Forge GPU Prefill] lengths={plens}...")
         try:
-            prefill = self.bench_nanoinfer_prefill(model_path, "cuda", gl, plens, num_runs)
-            self.results["nanoinfer_gpu_prefill"] = {}
+            prefill = self.bench_forge_prefill(model_path, "cuda", gl, plens, num_runs)
+            self.results["forge_gpu_prefill"] = {}
             for plen, speeds in prefill.items():
-                self.results["nanoinfer_gpu_prefill"][plen] = {
+                self.results["forge_gpu_prefill"][plen] = {
                     "speeds": speeds,
                     "mean": float(np.mean(speeds)),
                     "std": float(np.std(speeds)),
@@ -242,7 +242,7 @@ class BenchmarkBase(ABC):
                 print(f"    len={plen}: {np.mean(speeds):.1f} tok/s")
         except Exception as e:
             print(f"    Failed: {e}")
-            self.results["nanoinfer_gpu_prefill"] = None
+            self.results["forge_gpu_prefill"] = None
 
         # llama.cpp GPU Decode
         if not skip_llama_cpp:
