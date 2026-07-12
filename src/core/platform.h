@@ -2,7 +2,9 @@
 // Cross-platform portability helpers
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <BaseTsd.h>
+#include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
 #include <windows.h>
@@ -11,9 +13,6 @@ typedef SSIZE_T ssize_t;
 #define PROT_READ 0
 #define MAP_PRIVATE 0
 #define FORGE_MAP_FAILED ((void*)-1)
-#ifndef O_RDONLY
-#define O_RDONLY _O_RDONLY
-#endif
 
 // POSIX compat wrappers (avoid macro conflicts with class method names)
 static inline int forge_open(const char* path, int flags) {
@@ -72,7 +71,6 @@ static inline int forge_munmap(void* a, size_t l) {
     return munmap(a, l);
 }
 #define FORGE_MAP_FAILED MAP_FAILED
-// Use inline functions instead of macros to avoid conflicts with class method names
 static inline int forge_open(const char* path, int flags) {
     return open(path, flags);
 }
