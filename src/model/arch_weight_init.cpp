@@ -1,0 +1,154 @@
+#include "nanoinfer/arch_registry.h"
+#include "nanoinfer/weight_store.h"
+#include "nanoinfer/logger.h"
+
+namespace nanoinfer {
+
+// ============================================================================
+// WeightInitRegistry implementation
+// ============================================================================
+
+WeightInitRegistry& WeightInitRegistry::instance() {
+    static WeightInitRegistry registry;
+    return registry;
+}
+
+void WeightInitRegistry::register_init(const std::string& arch, LayerWeightInitFn fn) {
+    inits_[arch] = std::move(fn);
+}
+
+bool WeightInitRegistry::has(const std::string& arch) const {
+    return inits_.find(arch) != inits_.end();
+}
+
+void WeightInitRegistry::init_layer(const std::string& arch, LayerWeightInitContext& ctx) const {
+    auto it = inits_.find(arch);
+    if (it != inits_.end()) {
+        it->second(ctx);
+    }
+}
+
+WeightInitAutoRegister::WeightInitAutoRegister(const std::string& arch, LayerWeightInitFn fn) {
+    WeightInitRegistry::instance().register_init(arch, std::move(fn));
+}
+
+// ============================================================================
+// Architecture-specific weight init functions
+// ============================================================================
+
+namespace {
+
+static void load_if_present(const WeightStore& store, LayerWeights& lw,
+                            const std::string& canonical, const std::string& store_name) {
+    auto t = store.get(store_name);
+    if (t) lw.set(canonical, t);
+}
+
+static void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+    load_if_present(store, lw, "w1", base + ".gate_proj");
+    load_if_present(store, lw, "w2", base + ".down_proj");
+    load_if_present(store, lw, "w3", base + ".up_proj");
+    load_if_present(store, lw, "wq", base + ".wq");
+    load_if_present(store, lw, "wk", base + ".wk");
+    load_if_present(store, lw, "wv", base + ".wv");
+    load_if_present(store, lw, "wo", base + ".wo");
+    load_if_present(store, lw, "bq", base + ".bq");
+    load_if_present(store, lw, "bk", base + ".bk");
+    load_if_present(store, lw, "bv", base + ".bv");
+}
+
+static void init_mla_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+    load_if_present(store, lw, "w1", base + ".gate_proj");
+    load_if_present(store, lw, "w2", base + ".down_proj");
+    load_if_present(store, lw, "w3", base + ".up_proj");
+    load_if_present(store, lw, "wq_a", base + ".wq_a");
+    load_if_present(store, lw, "wq_b", base + ".wq_b");
+    load_if_present(store, lw, "kv_a_proj", base + ".kv_a_proj");
+    load_if_present(store, lw, "kv_b_proj", base + ".kv_b_proj");
+    load_if_present(store, lw, "wo", base + ".wo");
+}
+
+static void init_qwen35_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+    load_if_present(store, lw, "w1", base + ".gate_proj");
+    load_if_present(store, lw, "w2", base + ".down_proj");
+    load_if_present(store, lw, "w3", base + ".up_proj");
+
+    load_if_present(store, lw, "attn_q", base + ".attn_q");
+    load_if_present(store, lw, "attn_k", base + ".attn_k");
+    load_if_present(store, lw, "attn_v", base + ".attn_v");
+    load_if_present(store, lw, "attn_output", base + ".attn_output");
+    load_if_present(store, lw, "attn_q_norm", base + ".attn_q_norm");
+    load_if_present(store, lw, "attn_k_norm", base + ".attn_k_norm");
+    load_if_present(store, lw, "post_attention_norm", base + ".post_attention_norm");
+
+    load_if_present(store, lw, "attn_qkv", base + ".attn_qkv");
+    load_if_present(store, lw, "attn_gate", base + ".attn_gate");
+    load_if_present(store, lw, "ssm_conv1d", base + ".ssm_conv1d");
+    load_if_present(store, lw, "ssm_dt", base + ".ssm_dt");
+    load_if_present(store, lw, "ssm_a", base + ".ssm_a");
+    load_if_present(store, lw, "ssm_alpha", base + ".ssm_alpha");
+    load_if_present(store, lw, "ssm_beta", base + ".ssm_beta");
+    load_if_present(store, lw, "ssm_norm", base + ".ssm_norm");
+    load_if_present(store, lw, "ssm_out", base + ".ssm_out");
+}
+
+static void init_falcon_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+    load_if_present(store, lw, "ffn_norm_bias", base + ".ffn_norm_bias");
+    load_if_present(store, lw, "wq", base + ".wq");
+    load_if_present(store, lw, "wk", base + ".wk");
+    load_if_present(store, lw, "wv", base + ".wv");
+    load_if_present(store, lw, "wo", base + ".wo");
+    // Falcon FFN: up + down only (no gate/w1)
+    load_if_present(store, lw, "w3", base + ".up_proj");
+    load_if_present(store, lw, "w2", base + ".down_proj");
+    // Optional attn_norm_2 (Falcon-40B)
+    load_if_present(store, lw, "attn_norm_2", base + ".attn_norm_2");
+    load_if_present(store, lw, "attn_norm_2_bias", base + ".attn_norm_2_bias");
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// Register weight init functions for each architecture
+// ============================================================================
+
+static WeightInitAutoRegister _reg_winit_llama("llama", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_mistral("mistral", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_qwen("qwen", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_qwen2("qwen2", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_yi("yi", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_deepseek("deepseek", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_deepseek_v2("deepseek_v2", init_mla_layer_weights);
+static WeightInitAutoRegister _reg_winit_deepseek_v3("deepseek_v3", init_mla_layer_weights);
+static WeightInitAutoRegister _reg_winit_qwen35("qwen35", init_qwen35_layer_weights);
+
+static WeightInitAutoRegister _reg_winit_phi3("phi3", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_gemma("gemma", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_gemma2("gemma2", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_falcon("falcon", init_falcon_layer_weights);
+
+} // namespace nanoinfer

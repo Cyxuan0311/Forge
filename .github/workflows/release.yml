@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.20
+        with:
+          cuda: '12.4'
+          linux-local-args: '--toolkit'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3-dev python3-pip libomp-dev
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install numpy>=1.21.0
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
+
+      - name: Build
+        run: cmake --build build -j $(nproc)
+
+      - name: Package release artifacts
+        run: |
+          mkdir -p release
+          cp build/nanoinfer-cli release/
+          cp build/nanoinfer*.so release/ 2>/dev/null || true
+          cp build/*.a release/ 2>/dev/null || true
+          cp README.md LICENSE release/
+          cd release && tar czf ../nanoinfer-linux-x86_64.tar.gz .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NanoInfer ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+          files: |
+            nanoinfer-linux-x86_64.tar.gz

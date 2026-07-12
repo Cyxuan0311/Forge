@@ -1,0 +1,73 @@
+#pragma once
+
+#include <memory>
+#include <vector>
+#include <string>
+#include <functional>
+#include "tensor.h"
+#include "types.h"
+#include "kv_cache.h"
+
+namespace nanoinfer {
+
+class Model;
+class InferenceEngine;
+
+struct ContextParams {
+    int max_seq_len = 4096;
+    int gpu_layers = -1;
+    KVCacheDType kv_cache_dtype = KVCacheDType::FP32;
+    DeviceType device = DeviceType::CUDA;
+    int batch_size = 1;
+};
+
+class InferenceContext {
+public:
+    explicit InferenceContext(const Model& model);
+    InferenceContext(const Model& model, const ContextParams& params);
+    ~InferenceContext();
+
+    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos);
+    TensorPtr decode(int token_id, int64_t start_pos);
+
+    void reset();
+    void reset_kv_cache();
+
+    int generate(int start_token, int max_tokens,
+                 std::function<int(float*, int)> sampler_fn);
+
+    const Model& model() const { return model_; }
+    const KVCache& kv_cache() const { return *kv_cache_; }
+    KVCache& kv_cache() { return *kv_cache_; }
+
+    const ContextParams& params() const { return params_; }
+    int current_pos() const { return current_pos_; }
+
+    void set_engine(std::unique_ptr<InferenceEngine> engine);
+    InferenceEngine* engine();
+    const InferenceEngine* engine() const;
+
+    void set_gpu_layers(int layers);
+    int gpu_layers() const { return params_.gpu_layers; }
+
+    void set_kv_cache_dtype(KVCacheDType dtype);
+    KVCacheDType kv_cache_dtype() const { return params_.kv_cache_dtype; }
+
+    DeviceType device() const { return params_.device; }
+
+    bool init_kv_cache();
+
+    /// Run a warmup forward pass to trigger CUDA kernel JIT compilation.
+    /// Call this before timing inference to avoid first-run overhead.
+    void warmup();
+
+private:
+    const Model& model_;
+    ContextParams params_;
+    std::unique_ptr<KVCache> kv_cache_;
+    std::unique_ptr<InferenceEngine> engine_;
+    int current_pos_ = 0;
+    bool kv_cache_initialized_ = false;
+};
+
+} // namespace nanoinfer

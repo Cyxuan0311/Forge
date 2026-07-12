@@ -1,0 +1,82 @@
+# Build
+build/
+cmake-build-*/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake.in
+models/
+.pytest_cache/
+.ruff_cache/
+flower.png
+lion.png
+TOM_and_JERRY.mp4
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.pyc
+*.pyd
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+.eggs/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Pytest & Benchmarks
+.pytest_cache/
+.benchmarks/
+.cache/
+
+# Models (large binary files)
+models/*.gguf
+models/*.bin
+models/*.ninf
+
+# Project-specific __pycache__
+tools/__pycache__/
+benchmarks/__pycache__/
+examples/__pycache__/
+tests/__pycache__/
+report/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Reports & generated files
+report/*.json
+report/*.png
+
+# Logs
+*.log
+
+# Dependencies fetched by CMake
+_deps/

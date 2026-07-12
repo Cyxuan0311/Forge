@@ -1,0 +1,19 @@
+# Default code owners (fallback for all files)
+* @anomalyco
+
+# C++ core, operators, and inference engine
+/src/core/       @anomalyco
+/src/operators/  @anomalyco
+/src/inference/  @anomalyco
+
+# Model loading
+/src/model/      @anomalyco
+
+# Python bindings
+/src/bindings/   @anomalyco
+
+# Tests
+/tests/          @anomalyco
+
+# Build system
+CMakeLists.txt   @anomalyco

@@ -1,0 +1,258 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Linux (CUDA ${{ matrix.cuda }}, Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.11', '3.12']
+        cuda: ['12.1', '12.4']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.20
+        with:
+          cuda: ${{ matrix.cuda }}
+          linux-local-args: '--toolkit'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3-dev \
+            python3-pip \
+            libomp-dev
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+
+      - name: Verify environment
+        run: |
+          echo "OS: $(uname -a)"
+          echo "CMake: $(cmake --version | head -1)"
+          echo "CUDA: $(nvcc --version | tail -1)"
+          echo "Python: $(python3 --version)"
+          echo "GCC: $(gcc --version | head -1)"
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="86;89"
+
+      - name: Build
+        run: cmake --build build -j $(nproc)
+
+      - name: Test CLI
+        run: ./build/nanoinfer-cli --help
+
+      - name: Run Python tests (no external model)
+        run: |
+          python -m pytest tests/ -v -k "not tinyllama" \
+            --ignore=tests/test_tinyllama_integration.py \
+            --ignore=tests/test_gguf_gpu.py \
+            -x --timeout=120
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanoinfer-linux-cuda${{ matrix.cuda }}-py${{ matrix.python }}
+          path: |
+            build/nanoinfer-cli
+            build/nanoinfer*.so
+            build/*.a
+
+  build-linux-no-cublas:
+    name: Linux (CUDA ${{ matrix.cuda }}, no cuBLAS)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cuda: ['12.4']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.20
+        with:
+          cuda: ${{ matrix.cuda }}
+          linux-local-args: '--toolkit'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3-dev \
+            python3-pip \
+            libomp-dev
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+
+      - name: Configure CMake (no cuBLAS)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="86;89" \
+            -DUSE_CUBLAS=OFF
+
+      - name: Build
+        run: cmake --build build -j $(nproc)
+
+      - name: Test CLI
+        run: ./build/nanoinfer-cli --help
+
+      - name: Run Python tests (no external model)
+        run: |
+          python -m pytest tests/ -v -k "not tinyllama" \
+            --ignore=tests/test_tinyllama_integration.py \
+            --ignore=tests/test_gguf_gpu.py \
+            -x --timeout=120
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanoinfer-linux-cuda${{ matrix.cuda }}-nocublas
+          path: |
+            build/nanoinfer-cli
+            build/nanoinfer*.so
+            build/*.a
+
+  build-macos:
+    name: macOS (CPU-only)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          brew update
+          brew install cmake ninja libomp python@3.12
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+
+      - name: Verify environment
+        run: |
+          echo "OS: $(uname -a)"
+          echo "CMake: $(cmake --version | head -1)"
+          echo "Python: $(python3 --version)"
+          echo "CC: $(cc --version | head -1)"
+
+      - name: Configure CMake (CPU-only)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j $(sysctl -n hw.logicalcpu)
+
+      - name: Test CLI
+        run: ./build/nanoinfer-cli --help
+
+      - name: Run Python tests (CPU-only, no external model)
+        run: |
+          python -m pytest tests/ -v -k "not tinyllama and not gpu" \
+            --ignore=tests/test_tinyllama_integration.py \
+            --ignore=tests/test_gpu.py \
+            --ignore=tests/test_gguf_gpu.py \
+            -x --timeout=120
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanoinfer-macos
+          path: |
+            build/nanoinfer-cli
+            build/nanoinfer*.so
+            build/*.a
+
+  build-windows:
+    name: Windows (CPU-only)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install numpy>=1.21.0 pytest>=7.0 pytest-timeout
+
+      - name: Verify environment
+        run: |
+          echo "OS: $env:OS"
+          cmake --version
+          python --version
+
+      - name: Configure CMake (CPU-only, MSVC)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j --config Release
+
+      - name: Test CLI
+        run: .\build\nanoinfer-cli --help
+        shell: pwsh
+
+      - name: Run Python tests (CPU-only, no external model)
+        run: |
+          python -m pytest tests/ -v -k "not tinyllama and not gpu" ^
+            --ignore=tests/test_tinyllama_integration.py ^
+            --ignore=tests/test_gpu.py ^
+            --ignore=tests/test_gguf_gpu.py ^
+            -x --timeout=120

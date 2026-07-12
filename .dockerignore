@@ -1,0 +1,9 @@
+build/
+.git/
+.github/
+__pycache__/
+.pytest_cache/
+.benchmarks/
+models/
+report/
+*.md
