@@ -13,6 +13,7 @@ models/
 flower.png
 lion.png
 TOM_and_JERRY.mp4
+.mimocode/
 
 # Compiled objects
 *.o
