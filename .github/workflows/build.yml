@@ -69,7 +69,7 @@ jobs:
         run: cmake --build build -j $(nproc)
 
       - name: Test CLI
-        run: ./build/nanoinfer-cli --help
+        run: ./build/forge-cli --help
 
       - name: Run Python tests (no external model)
         run: |
@@ -82,10 +82,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nanoinfer-linux-cuda${{ matrix.cuda }}-py${{ matrix.python }}
+          name: forge-linux-cuda${{ matrix.cuda }}-py${{ matrix.python }}
           path: |
-            build/nanoinfer-cli
-            build/nanoinfer*.so
+            build/forge-cli
+            build/forge*.so
             build/*.a
 
   build-linux-no-cublas:
@@ -137,7 +137,7 @@ jobs:
         run: cmake --build build -j $(nproc)
 
       - name: Test CLI
-        run: ./build/nanoinfer-cli --help
+        run: ./build/forge-cli --help
 
       - name: Run Python tests (no external model)
         run: |
@@ -150,10 +150,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nanoinfer-linux-cuda${{ matrix.cuda }}-nocublas
+          name: forge-linux-cuda${{ matrix.cuda }}-nocublas
           path: |
-            build/nanoinfer-cli
-            build/nanoinfer*.so
+            build/forge-cli
+            build/forge*.so
             build/*.a
 
   build-macos:
@@ -195,7 +195,7 @@ jobs:
         run: cmake --build build -j $(sysctl -n hw.logicalcpu)
 
       - name: Test CLI
-        run: ./build/nanoinfer-cli --help
+        run: ./build/forge-cli --help
 
       - name: Run Python tests (CPU-only, no external model)
         run: |
@@ -209,10 +209,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nanoinfer-macos
+          name: forge-macos
           path: |
-            build/nanoinfer-cli
-            build/nanoinfer*.so
+            build/forge-cli
+            build/forge*.so
             build/*.a
 
   build-windows:
@@ -246,7 +246,7 @@ jobs:
         run: cmake --build build -j --config Release
 
       - name: Test CLI
-        run: .\build\nanoinfer-cli --help
+        run: .\build\forge-cli --help
         shell: pwsh
 
       - name: Run Python tests (CPU-only, no external model)

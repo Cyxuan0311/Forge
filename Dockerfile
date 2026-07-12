@@ -36,11 +36,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=builder /app/build/nanoinfer-cli /usr/local/bin/nanoinfer-cli
-COPY --from=builder /app/build/nanoinfer*.so /usr/local/lib/python3.10/dist-packages/
+COPY --from=builder /app/build/forge-cli /usr/local/bin/forge-cli
+COPY --from=builder /app/build/forge*.so /usr/local/lib/python3.10/dist-packages/
 COPY --from=builder /app/examples /app/examples
 
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages:$LD_LIBRARY_PATH
 
-ENTRYPOINT ["nanoinfer-cli"]
+ENTRYPOINT ["forge-cli"]
 CMD ["--help"]

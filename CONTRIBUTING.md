@@ -1,4 +1,4 @@
-# Contributing to NanoInfer
+# Contributing to Forge
 
 Welcome! We appreciate your interest in contributing. This document covers the development workflow, code style, and how to add new models or operators.
 
@@ -26,8 +26,8 @@ Welcome! We appreciate your interest in contributing. This document covers the d
 ### Native Build
 
 ```bash
-git clone https://github.com/yourname/NanoInfer.git
-cd NanoInfer
+git clone https://github.com/yourname/Forge.git
+cd Forge
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
@@ -35,8 +35,8 @@ cmake --build build -j
 ### Docker
 
 ```bash
-docker build -t nanoinfer-dev .
-docker run --gpus all -it --rm -v $(pwd):/workspace nanoinfer-dev
+docker build -t forge-dev .
+docker run --gpus all -it --rm -v $(pwd):/workspace forge-dev
 ```
 
 ### VS Code
@@ -164,14 +164,14 @@ Before submitting, ensure:
 
 ## Adding a New Model Architecture
 
-NanoInfer's plugin system makes adding new architectures straightforward. Here's the step-by-step process:
+Forge's plugin system makes adding new architectures straightforward. Here's the step-by-step process:
 
 ### 1. Register the architecture
 
-Add a call to `NANOINFER_REGISTER_ARCH` that ties together the architecture name, engine, config parser, and weight init:
+Add a call to `FORGE_REGISTER_ARCH` that ties together the architecture name, engine, config parser, and weight init:
 
 ```cpp
-NANOINFER_REGISTER_ARCH("my_model", MyModelEngine, my_model_config_parser,
+FORGE_REGISTER_ARCH("my_model", MyModelEngine, my_model_config_parser,
                          my_model_weight_init, { /* capabilities */ });
 ```
 
@@ -189,7 +189,7 @@ class MyModelEngine : public TransformerEngine {
 
 Register it:
 ```cpp
-NANOINFER_REGISTER_ENGINE("my_model", MyModelEngine);
+FORGE_REGISTER_ENGINE("my_model", MyModelEngine);
 ```
 
 ### 3. Implement the graph builder (optional)
@@ -199,7 +199,7 @@ For graph-based execution:
 class MyModelGraphBuilder : public LayerGraphBuilder {
   std::unique_ptr<ComputeGraph> build(const ModelConfig& config) override;
 };
-NANOINFER_REGISTER_GRAPH_BUILDER("my_model", MyModelGraphBuilder);
+FORGE_REGISTER_GRAPH_BUILDER("my_model", MyModelGraphBuilder);
 ```
 
 ### 4. Implement config parser
@@ -207,7 +207,7 @@ NANOINFER_REGISTER_GRAPH_BUILDER("my_model", MyModelGraphBuilder);
 Parse architecture-specific parameters from `ModelConfig`:
 ```cpp
 void my_model_config_parser(ModelConfig& config, const WeightStore& store);
-NANOINFER_REGISTER_CONFIG_PARSER("my_model", my_model_config_parser);
+FORGE_REGISTER_CONFIG_PARSER("my_model", my_model_config_parser);
 ```
 
 ### 5. Implement weight init / mapping
@@ -215,7 +215,7 @@ NANOINFER_REGISTER_CONFIG_PARSER("my_model", my_model_config_parser);
 Map weight names to the canonical scheme:
 ```cpp
 void my_model_weight_init(LayerWeights& w, const WeightStore& store);
-NANOINFER_REGISTER_WEIGHT_INIT("my_model", my_model_weight_init);
+FORGE_REGISTER_WEIGHT_INIT("my_model", my_model_weight_init);
 ```
 
 ### 6. Add tests
@@ -239,7 +239,7 @@ class MyOp : public Op {
   std::vector<Tensor> compute(const std::vector<Tensor>& inputs) override;
   std::string_view name() const override { return "my_op"; }
 };
-NANOINFER_REGISTER_OP("my_op", MyOp);
+FORGE_REGISTER_OP("my_op", MyOp);
 ```
 
 ### 2. Implement CPU kernel
@@ -248,7 +248,7 @@ Place in `src/operators/` with AVX2 optimizations in `src/operators/cpu/`.
 
 ### 3. Implement CUDA kernel
 
-Place in `src/operators/cuda*.cu` or `src/operators/cuda/`. Declare the kernel launcher in `include/nanoinfer/cuda_kernels.h`.
+Place in `src/operators/cuda*.cu` or `src/operators/cuda/`. Declare the kernel launcher in `include/forge/cuda_kernels.h`.
 
 ### 4. Add to dispatch
 

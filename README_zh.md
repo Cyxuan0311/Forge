@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="resource/logo.png" alt="NanoInfer" width="100%">
+  <img src="resource/logo.png" alt="NanoInfer" width="60%">
 </p>
 
 <h1 align="center">NanoInfer</h1>
@@ -171,6 +171,7 @@ cmake -B build -DUSE_CUBLAS=OFF -DUSE_OPENBLAS=OFF
 ## 文档
 
 - [构建指南](docs/build_zh.md)
+- [依赖说明](docs/dependencies_zh.md)
 - [Python API](docs/python_api_zh.md)
 - [CLI 使用](docs/cli_zh.md)
 - [模型支持](docs/models_zh.md)

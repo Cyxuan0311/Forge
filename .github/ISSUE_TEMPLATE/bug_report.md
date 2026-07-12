@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Create a report to help us improve NanoInfer
+about: Create a report to help us improve Forge
 title: '[Bug] '
 labels: bug
 assignees: ''
@@ -9,7 +9,7 @@ assignees: ''
 ## Environment
 
 - **OS:** Linux (e.g., Ubuntu 22.04)
-- **NanoInfer version:** (e.g., v0.5.0, commit hash)
+- **Forge version:** (e.g., v0.5.0, commit hash)
 - **CUDA version:** (e.g., 12.4)
 - **Python version:** (e.g., 3.10)
 - **Compiler:** (e.g., GCC 11.4)
@@ -48,7 +48,7 @@ What actually happened? Include error messages, logs, or stack traces.
 If possible, provide a minimal Python script or CLI command that reproduces the issue.
 
 ```python
-import nanoinfer
+import forge
 # ...
 ```
 

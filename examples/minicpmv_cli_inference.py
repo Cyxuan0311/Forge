@@ -180,7 +180,7 @@ def generate_response(ctx, tokenizer, prompt_ids, image_embeddings,
                 think_end_id = tid
             if think_start_id is not None and think_end_id is not None:
                 break
-        except:
+        except Exception:
             pass
     in_thinking = False
     thinking_text = ""
@@ -270,7 +270,6 @@ def generate_response(ctx, tokenizer, prompt_ids, image_embeddings,
 def interactive_chat(mm_model, tokenizer, args):
     """Interactive multi-turn chat loop with optional image/video support."""
     conversation = []
-    current_media_path = None
     image_embeddings = None
     num_img_tokens_list = []
     ctx = None
@@ -300,7 +299,6 @@ def interactive_chat(mm_model, tokenizer, args):
             break
         elif user_input == "/clear":
             conversation = []
-            current_media_path = None
             image_embeddings = None
             num_img_tokens_list = []
             print("[Conversation cleared]\n")
@@ -326,7 +324,6 @@ def interactive_chat(mm_model, tokenizer, args):
                 emb = mm_model.encode_image(pixels)
                 image_embeddings = emb
                 num_img_tokens_list = [emb.shape[0]]
-                current_media_path = img_path
                 print(f"  Image loaded: {img.size}, {emb.shape[0]} tokens, took {time.time()-t0:.2f}s")
                 if nanoinfer.profiler_enabled():
                     nanoinfer.profiler_print()
@@ -357,14 +354,13 @@ def interactive_chat(mm_model, tokenizer, args):
                     print(f"    frame {i+1}/{len(frames)} encoded ({dt:.2f}s)")
                 image_embeddings = np.concatenate(frame_embs, axis=0)
                 num_img_tokens_list = [emb.shape[0] for emb in frame_embs]
-                current_media_path = video_path
                 total_tok = image_embeddings.shape[0]
                 print(f"  Video loaded: {len(frames)} frames, {total_tok} tokens, took {time.time()-t0:.2f}s\n")
                 if nanoinfer.profiler_enabled():
                     nanoinfer.profiler_print()
                     nanoinfer.profiler_reset()
-            except ImportError as e:
-                print(f"  ERROR: decord not installed. Run: pip install decord\n")
+            except ImportError:
+                print("  ERROR: decord not installed. Run: pip install decord\n")
                 image_embeddings = None
                 num_img_tokens_list = []
             except Exception as e:
@@ -414,7 +410,6 @@ def interactive_chat(mm_model, tokenizer, args):
         # Clear media after use (next turn is text-only unless /image or /video is used again)
         image_embeddings = None
         num_img_tokens_list = []
-        current_media_path = None
         print()
 
 

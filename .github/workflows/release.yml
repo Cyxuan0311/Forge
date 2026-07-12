@@ -49,18 +49,18 @@ jobs:
       - name: Package release artifacts
         run: |
           mkdir -p release
-          cp build/nanoinfer-cli release/
-          cp build/nanoinfer*.so release/ 2>/dev/null || true
+          cp build/forge-cli release/
+          cp build/forge*.so release/ 2>/dev/null || true
           cp build/*.a release/ 2>/dev/null || true
           cp README.md LICENSE release/
-          cd release && tar czf ../nanoinfer-linux-x86_64.tar.gz .
+          cd release && tar czf ../forge-linux-x86_64.tar.gz .
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: NanoInfer ${{ github.ref_name }}
+          name: Forge ${{ github.ref_name }}
           body_path: CHANGELOG.md
           draft: false
           prerelease: false
           files: |
-            nanoinfer-linux-x86_64.tar.gz
+            forge-linux-x86_64.tar.gz

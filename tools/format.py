@@ -1,5 +1,5 @@
 """
-NanoInfer binary format constants and serialization helpers.
+Forge binary format constants and serialization helpers.
 
 Shared by convert.py and create_test_model.py to avoid duplicating
 the .ninf header/tensor info layout.

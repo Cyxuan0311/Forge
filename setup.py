@@ -1,4 +1,3 @@
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,16 +21,16 @@ class CMakeBuild(build_ext):
 
         subprocess.run(["cmake", str(Path(__file__).parent), *cmake_args], cwd=build_temp, check=True)
         subprocess.run(
-            ["cmake", "--build", ".", "--target", "nanoinfer", "-j"],
+            ["cmake", "--build", ".", "--target", "forge", "-j"],
             cwd=build_temp,
             check=True,
         )
 
 
 setup(
-    name="nanoinfer",
+    name="forge",
     version="0.5.0",
-    ext_modules=[Extension("nanoinfer", sources=[])],
+    ext_modules=[Extension("forge", sources=[])],
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
     python_requires=">=3.8",

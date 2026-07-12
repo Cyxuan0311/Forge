@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="resource/logo.png" alt="NanoInfer" width="100%">
+  <img src="resource/logo.png" alt="NanoInfer" width="60%">
 </p>
 
 <h1 align="center">NanoInfer</h1>
@@ -172,6 +172,7 @@ Detailed benchmark reports (NanoInfer vs llama.cpp, GPU & CPU) are generated via
 ## Documentation
 
 - [Build guide](docs/build.md)
+- [Dependencies](docs/dependencies.md)
 - [Python API](docs/python_api.md)
 - [CLI usage](docs/cli.md)
 - [Supported models](docs/models.md)

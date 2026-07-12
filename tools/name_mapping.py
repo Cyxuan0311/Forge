@@ -1,5 +1,5 @@
 """
-GGUF → NanoInfer canonical tensor name mapping.
+GGUF → Forge canonical tensor name mapping.
 
 Supports LLaMA-family models (blk.N.xxx naming).
 Extend SUFFIX_MAP for new architectures.
@@ -27,7 +27,7 @@ SUFFIX_MAP = {
 
 
 def map_gguf_name(gguf_name):
-    """Convert a GGUF tensor name to NanoInfer canonical form."""
+    """Convert a GGUF tensor name to Forge canonical form."""
     if gguf_name in GLOBAL_MAP:
         return GLOBAL_MAP[gguf_name]
 

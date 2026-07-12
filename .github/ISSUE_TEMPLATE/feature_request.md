@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Suggest an idea for NanoInfer
+about: Suggest an idea for Forge
 title: '[Feature] '
 labels: enhancement
 assignees: ''

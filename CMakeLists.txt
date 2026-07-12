@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(NanoInfer VERSION 0.5.0 LANGUAGES CXX CUDA)
+project(Forge VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -45,9 +45,33 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 set(PYBIND11_LTO_CXX_FLAGS "")
 
-find_package(CUDAToolkit REQUIRED)
+# ---- Optional CUDA support ----
+option(FORGE_USE_CUDA "Enable CUDA GPU acceleration" ON)
+
+if(FORGE_USE_CUDA)
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        enable_language(CUDA)
+        message(STATUS "CUDA found - building with GPU support")
+    else()
+        message(STATUS "CUDA not found - building CPU-only")
+    endif()
+else()
+    message(STATUS "CUDA disabled by user - building CPU-only")
+endif()
+
+# ---- Auto-detect CUDA architecture ----
+set(FORGE_CUDA_ARCH "86;89")
+if(CUDAToolkit_FOUND)
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    include(detect_cuda_arch)
+    detect_cuda_architecture(FORGE_CUDA_ARCH)
+endif()
+
 find_package(OpenMP)
 find_package(Python3 COMPONENTS Interpreter Development NumPy REQUIRED)
+
+set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.cache/fetchcontent" CACHE PATH "FetchContent cache directory")
 
 include(FetchContent)
 FetchContent_Declare(
@@ -58,7 +82,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(pybind11)
 
 # ---- Core library (static) ----
-add_library(nanoinfer_core STATIC
+add_library(forge_core STATIC
     src/core/tensor.cpp
     src/core/memory_pool.cpp
     src/core/backend.cpp
@@ -70,18 +94,20 @@ add_library(nanoinfer_core STATIC
     src/debug/logger.cpp
     src/inference/kv_cache.cpp
 )
-target_include_directories(nanoinfer_core PUBLIC
+target_include_directories(forge_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_compile_definitions(nanoinfer_core PUBLIC USE_CUDA)
-target_link_libraries(nanoinfer_core PUBLIC
-    CUDA::cudart
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(forge_core PUBLIC USE_CUDA)
+    target_link_libraries(forge_core PUBLIC CUDA::cudart)
+endif()
+target_link_libraries(forge_core PUBLIC
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
 
 # ---- Operators library (static) ----
-add_library(nanoinfer_ops STATIC
+add_library(forge_ops STATIC
     src/operators/norm.cpp
     src/operators/activation.cpp
     src/operators/matmul.cpp
@@ -89,74 +115,87 @@ add_library(nanoinfer_ops STATIC
     src/operators/rope.cpp
     src/operators/elementwise.cpp
     src/operators/attention.cpp
-    src/operators/cuda_norm.cu
-    src/operators/cuda_embedding.cu
-    src/operators/cuda_gemv.cu
-    src/operators/cuda_attention.cu
-    src/operators/cuda_quant.cu
-    src/operators/cuda_gemm.cu
 )
-target_include_directories(nanoinfer_ops PUBLIC
+if(CUDAToolkit_FOUND)
+    target_sources(forge_ops PRIVATE
+        src/operators/cuda_norm.cu
+        src/operators/cuda_embedding.cu
+        src/operators/cuda_gemv.cu
+        src/operators/cuda_attention.cu
+        src/operators/cuda_quant.cu
+        src/operators/cuda_gemm.cu
+    )
+    target_compile_definitions(forge_ops PUBLIC USE_CUDA)
+endif()
+
+target_include_directories(forge_ops PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_compile_definitions(nanoinfer_ops PUBLIC USE_CUDA)
-target_compile_definitions(nanoinfer_ops PRIVATE NANOINFER_USE_CUBLAS=$<BOOL:${USE_CUBLAS}>)
-target_compile_definitions(nanoinfer_ops PRIVATE NANOINFER_USE_OPENBLAS=$<BOOL:${USE_OPENBLAS}>)
-target_include_directories(nanoinfer_ops PRIVATE ${OPENBLAS_INCLUDE_DIRS})
-target_link_libraries(nanoinfer_ops PUBLIC
-    nanoinfer_core
-    $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>
+target_compile_definitions(forge_ops PRIVATE FORGE_USE_CUBLAS=$<BOOL:${USE_CUBLAS}>)
+target_compile_definitions(forge_ops PRIVATE FORGE_USE_OPENBLAS=$<BOOL:${USE_OPENBLAS}>)
+target_include_directories(forge_ops PRIVATE ${OPENBLAS_INCLUDE_DIRS})
+target_link_libraries(forge_ops PUBLIC
+    forge_core
     $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
+if(CUDAToolkit_FOUND)
+    target_link_libraries(forge_ops PUBLIC
+        $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>
+    )
+endif()
 
 # ---- Model library (static) ----
-add_library(nanoinfer_model STATIC
+add_library(forge_model STATIC
     src/model/model.cpp
     src/model/model_loader.cpp
     src/model/ninf_model.cpp
     src/model/gguf_model.cpp
     src/inference/engine_factory.cpp
 )
-target_include_directories(nanoinfer_model PUBLIC
+target_include_directories(forge_model PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_compile_definitions(nanoinfer_model PUBLIC USE_CUDA)
-target_link_libraries(nanoinfer_model PUBLIC
-    nanoinfer_core
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(forge_model PUBLIC USE_CUDA)
+endif()
+target_link_libraries(forge_model PUBLIC
+    forge_core
 )
 
 # ---- Tokenizer library (static) ----
-add_library(nanoinfer_tokenizer STATIC
+add_library(forge_tokenizer STATIC
     src/tokenizer/tokenizer.cpp
 )
-target_include_directories(nanoinfer_tokenizer PUBLIC
+target_include_directories(forge_tokenizer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(nanoinfer_tokenizer PUBLIC
-    nanoinfer_core
+target_link_libraries(forge_tokenizer PUBLIC
+    forge_core
 )
 
 # ---- Vision library (static) ----
-add_library(nanoinfer_vision STATIC
+add_library(forge_vision STATIC
     src/vision/vision_encoder.cpp
 )
-target_include_directories(nanoinfer_vision PUBLIC
+target_include_directories(forge_vision PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_compile_definitions(nanoinfer_vision PUBLIC USE_CUDA)
-target_link_libraries(nanoinfer_vision PUBLIC
-    nanoinfer_core
-    nanoinfer_ops
-    nanoinfer_model
-    nanoinfer_infer
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(forge_vision PUBLIC USE_CUDA)
+endif()
+target_link_libraries(forge_vision PUBLIC
+    forge_core
+    forge_ops
+    forge_model
+    forge_infer
 )
 
 # ---- Inference library (static) ----
-add_library(nanoinfer_infer STATIC
+add_library(forge_infer STATIC
     src/inference/perf_profiler.cpp
     src/inference/engines/transformer_engine.cpp
     src/inference/engines/llama_engine.cpp
@@ -172,53 +211,60 @@ add_library(nanoinfer_infer STATIC
     src/inference/paged_kv_cache.cpp
     src/inference/request_scheduler.cpp
 )
-target_include_directories(nanoinfer_infer PUBLIC
+target_include_directories(forge_infer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_compile_definitions(nanoinfer_infer PUBLIC USE_CUDA)
-target_link_libraries(nanoinfer_infer PUBLIC
-    nanoinfer_core
-    nanoinfer_ops
-    nanoinfer_model
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(forge_infer PUBLIC USE_CUDA)
+endif()
+target_link_libraries(forge_infer PUBLIC
+    forge_core
+    forge_ops
+    forge_model
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
 
 # ---- CLI executable ----
-add_executable(nanoinfer-cli
-    src/cli/nanoinfer_cli.cpp
+add_executable(forge-cli
+    src/cli/forge_cli.cpp
     src/cli/cli_args.cpp
     src/cli/cli_chat_template.cpp
     src/cli/cli_generation.cpp
     src/cli/cli_interactive.cpp
 )
-target_include_directories(nanoinfer-cli PRIVATE
+target_include_directories(forge-cli PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_compile_definitions(nanoinfer-cli PRIVATE USE_CUDA)
-target_link_libraries(nanoinfer-cli PRIVATE
-    nanoinfer_infer
-    nanoinfer_model
-    nanoinfer_ops
-    nanoinfer_core
-    nanoinfer_tokenizer
-    nanoinfer_vision
-    CUDA::cudart
-    $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(forge-cli PRIVATE USE_CUDA)
+endif()
+target_link_libraries(forge-cli PRIVATE
+    forge_infer
+    forge_model
+    forge_ops
+    forge_core
+    forge_tokenizer
+    forge_vision
     $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
-
-set_target_properties(nanoinfer-cli PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    CUDA_ARCHITECTURES "86;89"
-)
+if(CUDAToolkit_FOUND)
+    target_link_libraries(forge-cli PRIVATE
+        CUDA::cudart
+        $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>
+    )
+    set_target_properties(forge-cli PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}"
+    )
+endif()
 
 # ---- Python bindings ----
-pybind11_add_module(nanoinfer
-    src/bindings/nanoinfer_py.cpp
+pybind11_add_module(forge
+    src/bindings/forge_py.cpp
     src/bindings/core_types.cpp
     src/bindings/model.cpp
     src/bindings/tokenizer.cpp
@@ -228,27 +274,29 @@ pybind11_add_module(nanoinfer
     src/bindings/logger.cpp
     src/bindings/profiler.cpp
 )
-target_link_libraries(nanoinfer PRIVATE
-    nanoinfer_infer
-    nanoinfer_model
-    nanoinfer_ops
-    nanoinfer_core
-    nanoinfer_tokenizer
-    nanoinfer_vision
+target_link_libraries(forge PRIVATE
+    forge_infer
+    forge_model
+    forge_ops
+    forge_core
+    forge_tokenizer
+    forge_vision
     Python3::Python
     Python3::NumPy
     $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
 )
-target_include_directories(nanoinfer PRIVATE
+target_include_directories(forge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_compile_definitions(nanoinfer PRIVATE
+target_compile_definitions(forge PRIVATE
     VERSION_INFO=${PROJECT_VERSION}
-    USE_CUDA
 )
-set_target_properties(nanoinfer PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    CUDA_ARCHITECTURES "86;89"
-)
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(forge PRIVATE USE_CUDA)
+    set_target_properties(forge PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}"
+    )
+endif()

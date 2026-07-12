@@ -16,7 +16,7 @@ from tools.convert import convert_gguf_to_ninf
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert GGUF model to NanoInfer .ninf format')
+        description='Convert GGUF model to Forge .ninf format')
     parser.add_argument('input', help='Input GGUF file path')
     parser.add_argument('output', help='Output .ninf file path')
     parser.add_argument('--dtype', choices=['fp32', 'q4_0'], default='q4_0',
