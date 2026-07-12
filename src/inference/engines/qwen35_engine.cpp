@@ -884,4 +884,6 @@ namespace {
 static EngineAutoRegister _reg_qwen35("qwen35", [](Model& model, InferenceContext& ctx) {
     return std::make_unique<Qwen35Engine>(model, ctx);
 });
+}  // namespace
+
 }  // namespace forge
