@@ -1,5 +1,4 @@
 #include "forge/gguf_model.h"
-#include "../core/platform.h"
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +7,7 @@
 #include <numeric>
 #include <stdexcept>
 
+#include "../core/platform.h"
 #include "forge/logger.h"
 
 #ifdef USE_CUDA

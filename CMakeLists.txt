@@ -30,7 +30,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)")
     message(STATUS "AVX2 not supported - using scalar CPU kernels")
   endif()
 else()
-  message(STATUS "Non-x86 architecture (${CMAKE_SYSTEM_PROCESSOR}) - using scalar CPU kernels")
+  message(
+    STATUS
+      "Non-x86 architecture (${CMAKE_SYSTEM_PROCESSOR}) - using scalar CPU kernels"
+  )
 endif()
 
 option(USE_CUBLAS "Use cuBLAS for GPU matrix operations" ON)

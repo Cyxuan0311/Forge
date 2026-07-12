@@ -213,7 +213,7 @@ static void register_norm_ops() {
                 int32_t eps_bits = params[0];
                 std::memcpy(&eps, &eps_bits, sizeof(eps));
             }
-static const bool _auto_register_norm_ops = (register_norm_ops(), true);
+            static const bool _auto_register_norm_ops = (register_norm_ops(), true);
             TensorPtr weight;
             if (inputs.size() > 1 && inputs[1]) {
                 weight = inputs[1];

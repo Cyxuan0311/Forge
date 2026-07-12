@@ -1,5 +1,4 @@
 #include "forge/ninf_model.h"
-#include "../core/platform.h"
 
 #include <algorithm>
 #include <cctype>
@@ -7,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "../core/platform.h"
 #include "forge/logger.h"
 
 namespace forge {

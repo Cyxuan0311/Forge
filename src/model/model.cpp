@@ -213,7 +213,7 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     layers.resize(config.num_layers);
 
     // Determine layer types based on architecture
-    bool is_qwen35 = (config/*arch_type=*/= "qwen35");
+    bool is_qwen35 = (config /*arch_type=*/ = "qwen35");
     int full_attn_interval =
         config.full_attention_interval > 0 ? config.full_attention_interval : 4;
 
@@ -231,11 +231,11 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             if (store.has(base + ".attn_q")) {
                 is_full_attn = true;
             }
-            lw/*layer_type=*/ is_full_attn ? LayerType::FullAttention : LayerType::LinearAttention;
+            lw /*layer_type=*/is_full_attn ? LayerType::FullAttention : LayerType::LinearAttention;
         } else if (config.use_mla) {
-            lw/*layer_type=*/ LayerType::MLA;
+            lw /*layer_type=*/LayerType::MLA;
         } else {
-            lw/*layer_type=*/ LayerType::FullAttention;
+            lw /*layer_type=*/LayerType::FullAttention;
         }
 
         // Use registered weight init if available, otherwise fallback to inline logic
@@ -270,12 +270,12 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         }
 
         // Validate required weights
-        if (lw/*layer_type=*/= LayerType::FullAttention && !is_qwen35) {
+        if (lw /*layer_type=*/ = LayerType::FullAttention && !is_qwen35) {
             if (!lw.wq() || !lw.wk() || !lw.wv() || !lw.wo()) {
                 LOG_ERROR("Missing attention weights for layer " + std::to_string(i));
                 return false;
             }
-        } else if (lw/*layer_type=*/= LayerType::MLA) {
+        } else if (lw /*layer_type=*/ = LayerType::MLA) {
             if (!lw.wo() || !lw.kv_a_proj()) {
                 LOG_ERROR("Missing MLA attention weights for layer " + std::to_string(i));
                 return false;
@@ -425,26 +425,26 @@ ModelConfig Model::parse_config_from_ninf(ModelLoader& loader) {
         return loader.get_metadata_str(key, def);
     };
 
-    cfg/*vocab_size=*/ static_cast<int>(meta_int("vocab_size", 32000));
-    cfg/*hidden_dim=*/ static_cast<int>(meta_int("hidden_dim", 4096));
-    cfg/*intermediate_dim=*/ static_cast<int>(meta_int("intermediate_dim", 11008));
-    cfg/*num_layers=*/ static_cast<int>(meta_int("num_layers", 32));
-    cfg/*num_heads=*/ static_cast<int>(meta_int("num_heads", 32));
-    cfg/*num_kv_heads=*/ static_cast<int>(meta_int("num_kv_heads", cfg.num_heads));
-    cfg/*head_dim=*/ static_cast<int>(meta_int("head_dim", 0));
-    if (cfg/*head_dim=*/= 0)
-        cfg/*head_dim=*/ cfg.hidden_dim / cfg.num_heads;
-    cfg/*rope_theta=*/ static_cast<float>(meta_float("rope_theta", 10000.0));
-    cfg/*rms_norm_eps=*/ static_cast<float>(meta_float("rms_norm_eps", 1e-6));
-    cfg/*max_seq_len=*/ static_cast<int>(meta_int("max_seq_len", 4096));
-    cfg/*arch_type=*/ arch;
-    cfg/*norm_type=*/ NormType::RMSNorm;
-    cfg/*ffn_activation=*/ ActivationType::SiLU_GELU;
-    cfg/*use_gqa=*/ (cfg.num_kv_heads != cfg.num_heads);
+    cfg /*vocab_size=*/static_cast<int>(meta_int("vocab_size", 32000));
+    cfg /*hidden_dim=*/static_cast<int>(meta_int("hidden_dim", 4096));
+    cfg /*intermediate_dim=*/static_cast<int>(meta_int("intermediate_dim", 11008));
+    cfg /*num_layers=*/static_cast<int>(meta_int("num_layers", 32));
+    cfg /*num_heads=*/static_cast<int>(meta_int("num_heads", 32));
+    cfg /*num_kv_heads=*/static_cast<int>(meta_int("num_kv_heads", cfg.num_heads));
+    cfg /*head_dim=*/static_cast<int>(meta_int("head_dim", 0));
+    if (cfg /*head_dim=*/ = 0)
+        cfg /*head_dim=*/cfg.hidden_dim / cfg.num_heads;
+    cfg /*rope_theta=*/static_cast<float>(meta_float("rope_theta", 10000.0));
+    cfg /*rms_norm_eps=*/static_cast<float>(meta_float("rms_norm_eps", 1e-6));
+    cfg /*max_seq_len=*/static_cast<int>(meta_int("max_seq_len", 4096));
+    cfg /*arch_type=*/arch;
+    cfg /*norm_type=*/NormType::RMSNorm;
+    cfg /*ffn_activation=*/ActivationType::SiLU_GELU;
+    cfg /*use_gqa=*/(cfg.num_kv_heads != cfg.num_heads);
 
     std::string tie_str = meta_str("tie_embeddings", "");
     if (tie_str == "true" || tie_str == "1") {
-        cfg/*tie_embeddings=*/ true;
+        cfg /*tie_embeddings=*/true;
     }
 
     return cfg;
@@ -524,7 +524,7 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
             set_if(base + ".up_proj", blk + ".ffn_up.weight");
 
             // Architecture-specific attention weights
-            if (config_/*arch_type=*/= "qwen35") {
+            if (config_ /*arch_type=*/ = "qwen35") {
                 set_if(base + ".attn_q", blk + ".attn_q.weight");
                 set_if(base + ".attn_k", blk + ".attn_k.weight");
                 set_if(base + ".attn_v", blk + ".attn_v.weight");
@@ -714,7 +714,8 @@ static const ArchWeightMapping llama_mapping = {
     /*token_embedding=*/{{"model.embed_tokens.weight", "model.embedding.weight"}},
     /*output_norm=*/{{"model.norm.weight", "model.ln_f.weight"}},
     /*output_weight=*/{{"lm_head.weight", "model.output.weight"}},
-    /*layer=*/{
+    /*layer=*/
+    {
         /*attn_norm=*/{{"input_layernorm.weight", "attention_norm.weight"}},
         /*ffn_norm=*/{{"post_attention_layernorm.weight", "ffn_norm.weight"}},
         /*wo=*/{{"self_attn.o_proj.weight", "attention.wo.weight"}},
@@ -730,97 +731,97 @@ static const ArchWeightMapping llama_mapping = {
 };
 
 static const ArchWeightMapping mistral_mapping = {
-    /*token_embedding=*/ {{"model.embed_tokens.weight"}},
-    /*output_norm=*/ {{"model.norm.weight"}},
-    /*output_weight=*/ {{"lm_head.weight"}},
+    /*token_embedding=*/{{"model.embed_tokens.weight"}},
+    /*output_norm=*/{{"model.norm.weight"}},
+    /*output_weight=*/{{"lm_head.weight"}},
     /*layer=*/
-        {
-            /*attn_norm=*/ {{"input_layernorm.weight"}},
-            /*ffn_norm=*/ {{"post_attention_layernorm.weight"}},
-            /*wo=*/ {{"self_attn.o_proj.weight"}},
-            /*gate_proj=*/ {{"mlp.gate_proj.weight"}},
-            /*down_proj=*/ {{"mlp.down_proj.weight"}},
-            /*up_proj=*/ {{"mlp.up_proj.weight"}},
-            /*wq=*/ {{"self_attn.q_proj.weight"}},
-            /*wk=*/ {{"self_attn.k_proj.weight"}},
-            /*wv=*/ {{"self_attn.v_proj.weight"}},
-        },
-    /*layer_prefix_pattern=*/ "model.layers.{}",
-    /*tie_embeddings=*/ false,
+    {
+        /*attn_norm=*/{{"input_layernorm.weight"}},
+        /*ffn_norm=*/{{"post_attention_layernorm.weight"}},
+        /*wo=*/{{"self_attn.o_proj.weight"}},
+        /*gate_proj=*/{{"mlp.gate_proj.weight"}},
+        /*down_proj=*/{{"mlp.down_proj.weight"}},
+        /*up_proj=*/{{"mlp.up_proj.weight"}},
+        /*wq=*/{{"self_attn.q_proj.weight"}},
+        /*wk=*/{{"self_attn.k_proj.weight"}},
+        /*wv=*/{{"self_attn.v_proj.weight"}},
+    },
+    /*layer_prefix_pattern=*/"model.layers.{}",
+    /*tie_embeddings=*/false,
 };
 
 static const ArchWeightMapping qwen_mapping = {
-    /*token_embedding=*/ {{"model.embed_tokens.weight"}},
-    /*output_norm=*/ {{"model.norm.weight"}},
-    /*output_weight=*/ {{"lm_head.weight"}},
+    /*token_embedding=*/{{"model.embed_tokens.weight"}},
+    /*output_norm=*/{{"model.norm.weight"}},
+    /*output_weight=*/{{"lm_head.weight"}},
     /*layer=*/
-        {
-            /*attn_norm=*/ {{"input_layernorm.weight"}},
-            /*ffn_norm=*/ {{"post_attention_layernorm.weight"}},
-            /*wo=*/ {{"self_attn.o_proj.weight"}},
-            /*gate_proj=*/ {{"mlp.gate_proj.weight"}},
-            /*down_proj=*/ {{"mlp.down_proj.weight"}},
-            /*up_proj=*/ {{"mlp.up_proj.weight"}},
-            /*wq=*/ {{"self_attn.q_proj.weight"}},
-            /*wk=*/ {{"self_attn.k_proj.weight"}},
-            /*wv=*/ {{"self_attn.v_proj.weight"}},
-        },
-    /*layer_prefix_pattern=*/ "model.layers.{}",
-    /*tie_embeddings=*/ false,
+    {
+        /*attn_norm=*/{{"input_layernorm.weight"}},
+        /*ffn_norm=*/{{"post_attention_layernorm.weight"}},
+        /*wo=*/{{"self_attn.o_proj.weight"}},
+        /*gate_proj=*/{{"mlp.gate_proj.weight"}},
+        /*down_proj=*/{{"mlp.down_proj.weight"}},
+        /*up_proj=*/{{"mlp.up_proj.weight"}},
+        /*wq=*/{{"self_attn.q_proj.weight"}},
+        /*wk=*/{{"self_attn.k_proj.weight"}},
+        /*wv=*/{{"self_attn.v_proj.weight"}},
+    },
+    /*layer_prefix_pattern=*/"model.layers.{}",
+    /*tie_embeddings=*/false,
 };
 
 static const ArchWeightMapping deepseek_v2_mapping = {
-    /*token_embedding=*/ {{"model.embed_tokens.weight"}},
-    /*output_norm=*/ {{"model.norm.weight"}},
-    /*output_weight=*/ {{"lm_head.weight"}},
+    /*token_embedding=*/{{"model.embed_tokens.weight"}},
+    /*output_norm=*/{{"model.norm.weight"}},
+    /*output_weight=*/{{"lm_head.weight"}},
     /*layer=*/
-        {
-            /*attn_norm=*/ {{"input_layernorm.weight"}},
-            /*ffn_norm=*/ {{"post_attention_layernorm.weight"}},
-            /*wo=*/ {{"self_attn.o_proj.weight"}},
-            /*gate_proj=*/ {{"mlp.gate_proj.weight"}},
-            /*down_proj=*/ {{"mlp.down_proj.weight"}},
-            /*up_proj=*/ {{"mlp.up_proj.weight"}},
-            /*wq_a=*/ {{"self_attn.q_a_proj.weight"}},
-            /*wq_b=*/ {{"self_attn.q_b_proj.weight"}},
-            /*kv_a_proj=*/ {{"self_attn.kv_a_proj_with_mqa.weight"}},
-            /*kv_b_proj=*/ {{"self_attn.kv_b_proj.weight"}},
-        },
-    /*layer_prefix_pattern=*/ "model.layers.{}",
-    /*tie_embeddings=*/ false,
+    {
+        /*attn_norm=*/{{"input_layernorm.weight"}},
+        /*ffn_norm=*/{{"post_attention_layernorm.weight"}},
+        /*wo=*/{{"self_attn.o_proj.weight"}},
+        /*gate_proj=*/{{"mlp.gate_proj.weight"}},
+        /*down_proj=*/{{"mlp.down_proj.weight"}},
+        /*up_proj=*/{{"mlp.up_proj.weight"}},
+        /*wq_a=*/{{"self_attn.q_a_proj.weight"}},
+        /*wq_b=*/{{"self_attn.q_b_proj.weight"}},
+        /*kv_a_proj=*/{{"self_attn.kv_a_proj_with_mqa.weight"}},
+        /*kv_b_proj=*/{{"self_attn.kv_b_proj.weight"}},
+    },
+    /*layer_prefix_pattern=*/"model.layers.{}",
+    /*tie_embeddings=*/false,
 };
 
 static const ArchWeightMapping qwen35_mapping = {
-    /*token_embedding=*/ {{"model.embed_tokens.weight"}},
-    /*output_norm=*/ {{"model.norm.weight"}},
-    /*output_weight=*/ {{"lm_head.weight"}},
+    /*token_embedding=*/{{"model.embed_tokens.weight"}},
+    /*output_norm=*/{{"model.norm.weight"}},
+    /*output_weight=*/{{"lm_head.weight"}},
     /*layer=*/
-        {
-            /*attn_norm=*/ {{"input_layernorm.weight"}},
-            /*ffn_norm=*/ {{"post_attention_layernorm.weight"}},
-            /*wo=*/ {{"self_attn.o_proj.weight"}},
-            /*gate_proj=*/ {{"mlp.gate_proj.weight"}},
-            /*down_proj=*/ {{"mlp.down_proj.weight"}},
-            /*up_proj=*/ {{"mlp.up_proj.weight"}},
-            /*attn_q=*/ {{"self_attn.q_proj.weight"}},
-            /*attn_k=*/ {{"self_attn.k_proj.weight"}},
-            /*attn_v=*/ {{"self_attn.v_proj.weight"}},
-            /*attn_output=*/ {{"self_attn.o_proj.weight"}},
-            /*attn_q_norm=*/ {{"self_attn.q_norm.weight"}},
-            /*attn_k_norm=*/ {{"self_attn.k_norm.weight"}},
-            /*post_attention_norm=*/ {{"post_attention_layernorm.weight"}},
-            /*attn_qkv=*/ {{"self_attn.qkv_proj.weight"}},
-            /*attn_gate=*/ {{"self_attn.gate.weight"}},
-            /*ssm_conv1d=*/ {{"ssm.conv1d.weight"}},
-            /*ssm_dt=*/ {{"ssm.dt.bias"}},
-            /*ssm_a=*/ {{"ssm.a"}},
-            /*ssm_alpha=*/ {{"ssm.alpha.weight"}},
-            /*ssm_beta=*/ {{"ssm.beta.weight"}},
-            /*ssm_norm=*/ {{"ssm.norm.weight"}},
-            /*ssm_out=*/ {{"ssm.output.weight"}},
-        },
-    /*layer_prefix_pattern=*/ "model.layers.{}",
-    /*tie_embeddings=*/ false,
+    {
+        /*attn_norm=*/{{"input_layernorm.weight"}},
+        /*ffn_norm=*/{{"post_attention_layernorm.weight"}},
+        /*wo=*/{{"self_attn.o_proj.weight"}},
+        /*gate_proj=*/{{"mlp.gate_proj.weight"}},
+        /*down_proj=*/{{"mlp.down_proj.weight"}},
+        /*up_proj=*/{{"mlp.up_proj.weight"}},
+        /*attn_q=*/{{"self_attn.q_proj.weight"}},
+        /*attn_k=*/{{"self_attn.k_proj.weight"}},
+        /*attn_v=*/{{"self_attn.v_proj.weight"}},
+        /*attn_output=*/{{"self_attn.o_proj.weight"}},
+        /*attn_q_norm=*/{{"self_attn.q_norm.weight"}},
+        /*attn_k_norm=*/{{"self_attn.k_norm.weight"}},
+        /*post_attention_norm=*/{{"post_attention_layernorm.weight"}},
+        /*attn_qkv=*/{{"self_attn.qkv_proj.weight"}},
+        /*attn_gate=*/{{"self_attn.gate.weight"}},
+        /*ssm_conv1d=*/{{"ssm.conv1d.weight"}},
+        /*ssm_dt=*/{{"ssm.dt.bias"}},
+        /*ssm_a=*/{{"ssm.a"}},
+        /*ssm_alpha=*/{{"ssm.alpha.weight"}},
+        /*ssm_beta=*/{{"ssm.beta.weight"}},
+        /*ssm_norm=*/{{"ssm.norm.weight"}},
+        /*ssm_out=*/{{"ssm.output.weight"}},
+    },
+    /*layer_prefix_pattern=*/"model.layers.{}",
+    /*tie_embeddings=*/false,
 };
 
 static const std::unordered_map<std::string, const ArchWeightMapping*> arch_mappings = {
@@ -896,36 +897,36 @@ ConfigParserAutoRegister::ConfigParserAutoRegister(const std::string& arch, Conf
 
 static ModelConfig parse_common_gguf_config(ModelLoader& loader, const std::string& arch) {
     ModelConfig cfg;
-    cfg/*vocab_size=*/ static_cast<int>(loader.get_metadata_int(arch + ".vocab_size", 0));
-    cfg/*hidden_dim=*/ static_cast<int>(loader.get_metadata_int(arch + ".embedding_length", 4096));
-    cfg/*intermediate_dim=*/
+    cfg /*vocab_size=*/static_cast<int>(loader.get_metadata_int(arch + ".vocab_size", 0));
+    cfg /*hidden_dim=*/static_cast<int>(loader.get_metadata_int(arch + ".embedding_length", 4096));
+    cfg /*intermediate_dim=*/
         static_cast<int>(loader.get_metadata_int(arch + ".feed_forward_length", 11008));
-    cfg/*num_layers=*/ static_cast<int>(loader.get_metadata_int(arch + ".block_count", 32));
-    cfg/*num_heads=*/ static_cast<int>(loader.get_metadata_int(arch + ".attention.head_count", 32));
-    cfg/*num_kv_heads=*/
+    cfg /*num_layers=*/static_cast<int>(loader.get_metadata_int(arch + ".block_count", 32));
+    cfg /*num_heads=*/static_cast<int>(loader.get_metadata_int(arch + ".attention.head_count", 32));
+    cfg /*num_kv_heads=*/
         static_cast<int>(loader.get_metadata_int(arch + ".attention.head_count_kv", cfg.num_heads));
-    cfg/*head_dim=*/ static_cast<int>(loader.get_metadata_int(arch + ".attention.key_length", 0));
-    if (cfg/*head_dim=*/= 0)
-        cfg/*head_dim=*/ cfg.hidden_dim / cfg.num_heads;
-    cfg/*rope_theta=*/
+    cfg /*head_dim=*/static_cast<int>(loader.get_metadata_int(arch + ".attention.key_length", 0));
+    if (cfg /*head_dim=*/ = 0)
+        cfg /*head_dim=*/cfg.hidden_dim / cfg.num_heads;
+    cfg /*rope_theta=*/
         static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base", 10000.0));
-    cfg/*rms_norm_eps=*/ static_cast<float>(
+    cfg /*rms_norm_eps=*/static_cast<float>(
         loader.get_metadata_float(arch + ".attention.layer_norm_rms_epsilon", 1e-6));
-    cfg/*max_seq_len=*/ static_cast<int>(loader.get_metadata_int(arch + ".context_length", 4096));
-    cfg/*arch_type=*/ arch;
-    cfg/*norm_type=*/ NormType::RMSNorm;
-    cfg/*ffn_activation=*/ ActivationType::SiLU_GELU;
-    cfg/*use_gqa=*/ (cfg.num_kv_heads != cfg.num_heads);
+    cfg /*max_seq_len=*/static_cast<int>(loader.get_metadata_int(arch + ".context_length", 4096));
+    cfg /*arch_type=*/arch;
+    cfg /*norm_type=*/NormType::RMSNorm;
+    cfg /*ffn_activation=*/ActivationType::SiLU_GELU;
+    cfg /*use_gqa=*/(cfg.num_kv_heads != cfg.num_heads);
 
-    if (cfg/*vocab_size=*/= 0) {
+    if (cfg /*vocab_size=*/ = 0) {
         auto embd_shape = loader.get_tensor_shape("token_embd.weight");
         if (!embd_shape.empty() && embd_shape.size() >= 2) {
-            cfg/*vocab_size=*/ static_cast<int>(embd_shape[0]);
+            cfg /*vocab_size=*/static_cast<int>(embd_shape[0]);
         } else if (loader.has_tensor("token_embd.weight")) {
-            cfg/*vocab_size=*/ 32000;
+            cfg /*vocab_size=*/32000;
         }
-        if (cfg/*vocab_size=*/= 0)
-            cfg/*vocab_size=*/ 32000;
+        if (cfg /*vocab_size=*/ = 0)
+            cfg /*vocab_size=*/32000;
     }
 
     return cfg;
@@ -940,14 +941,14 @@ namespace {
 static ConfigParserAutoRegister _reg_cfg_llama(
     "llama", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
-        cfg/*use_neox_rope=*/ true;
+        cfg /*use_neox_rope=*/true;
         return cfg;
     });
 
 static ConfigParserAutoRegister _reg_cfg_mistral(
     "mistral", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
-        cfg/*use_neox_rope=*/ true;
+        cfg /*use_neox_rope=*/true;
         return cfg;
     });
 
@@ -955,18 +956,18 @@ static ConfigParserAutoRegister _reg_cfg_qwen("qwen",
                                               [](ModelLoader& loader,
                                                  const std::string& arch) -> ModelConfig {
                                                   auto cfg = parse_common_gguf_config(loader, arch);
-                                                  if (cfg/*rope_theta=*/= 10000.0f)
-                                                      cfg/*rope_theta=*/ 1000000.0f;
-                                                  cfg/*tie_embeddings=*/ true;
+                                                  if (cfg /*rope_theta=*/ = 10000.0f)
+                                                      cfg /*rope_theta=*/1000000.0f;
+                                                  cfg /*tie_embeddings=*/true;
                                                   return cfg;
                                               });
 
 static ConfigParserAutoRegister _reg_cfg_qwen2(
     "qwen2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
-        if (cfg/*rope_theta=*/= 10000.0f)
-            cfg/*rope_theta=*/ 1000000.0f;
-        cfg/*tie_embeddings=*/ true;
+        if (cfg /*rope_theta=*/ = 10000.0f)
+            cfg /*rope_theta=*/1000000.0f;
+        cfg /*tie_embeddings=*/true;
         return cfg;
     });
 
@@ -974,7 +975,7 @@ static ConfigParserAutoRegister _reg_cfg_yi("yi",
                                             [](ModelLoader& loader,
                                                const std::string& arch) -> ModelConfig {
                                                 auto cfg = parse_common_gguf_config(loader, arch);
-                                                cfg/*use_neox_rope=*/ true;
+                                                cfg /*use_neox_rope=*/true;
                                                 return cfg;
                                             });
 
@@ -987,18 +988,18 @@ static ConfigParserAutoRegister _reg_cfg_deepseek("deepseek",
 static ConfigParserAutoRegister _reg_cfg_deepseek_v2(
     "deepseek_v2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
-        cfg/*kv_lora_rank=*/ static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
-        cfg/*q_lora_rank=*/ static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
-        cfg/*use_mla=*/ (cfg.kv_lora_rank > 0);
-        cfg/*n_routed_experts=*/
+        cfg /*kv_lora_rank=*/static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
+        cfg /*q_lora_rank=*/static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
+        cfg /*use_mla=*/(cfg.kv_lora_rank > 0);
+        cfg /*n_routed_experts=*/
             static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-        cfg/*n_shared_experts=*/
+        cfg /*n_shared_experts=*/
             static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
-        cfg/*num_expert_per_tok=*/
+        cfg /*num_expert_per_tok=*/
             static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
         if (cfg.kv_lora_rank > 0) {
-            cfg/*num_kv_heads=*/ 1;
-            cfg/*head_dim=*/ cfg.kv_lora_rank;
+            cfg /*num_kv_heads=*/1;
+            cfg /*head_dim=*/cfg.kv_lora_rank;
         }
         return cfg;
     });
@@ -1006,18 +1007,18 @@ static ConfigParserAutoRegister _reg_cfg_deepseek_v2(
 static ConfigParserAutoRegister _reg_cfg_deepseek_v3(
     "deepseek_v3", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
-        cfg/*kv_lora_rank=*/ static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
-        cfg/*q_lora_rank=*/ static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
-        cfg/*use_mla=*/ (cfg.kv_lora_rank > 0);
-        cfg/*n_routed_experts=*/
+        cfg /*kv_lora_rank=*/static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
+        cfg /*q_lora_rank=*/static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
+        cfg /*use_mla=*/(cfg.kv_lora_rank > 0);
+        cfg /*n_routed_experts=*/
             static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-        cfg/*n_shared_experts=*/
+        cfg /*n_shared_experts=*/
             static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
-        cfg/*num_expert_per_tok=*/
+        cfg /*num_expert_per_tok=*/
             static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
         if (cfg.kv_lora_rank > 0) {
-            cfg/*num_kv_heads=*/ 1;
-            cfg/*head_dim=*/ cfg.kv_lora_rank;
+            cfg /*num_kv_heads=*/1;
+            cfg /*head_dim=*/cfg.kv_lora_rank;
         }
         return cfg;
     });
@@ -1025,25 +1026,27 @@ static ConfigParserAutoRegister _reg_cfg_deepseek_v3(
 static ConfigParserAutoRegister _reg_cfg_qwen35(
     "qwen35", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
-        cfg/*tie_embeddings=*/ true;
-        cfg/*use_ssm=*/ true;
-        cfg/*ssm_group_count=*/
+        cfg /*tie_embeddings=*/true;
+        cfg /*use_ssm=*/true;
+        cfg /*ssm_group_count=*/
             static_cast<int>(loader.get_metadata_int(arch + ".ssm.group_count", 0));
-        cfg/*ssm_time_step_rank=*/
+        cfg /*ssm_time_step_rank=*/
             static_cast<int>(loader.get_metadata_int(arch + ".ssm.time_step_rank", 0));
-        cfg/*ssm_inner_size=*/ static_cast<int>(loader.get_metadata_int(arch + ".ssm.inner_size", 0));
-        cfg/*ssm_state_size=*/ static_cast<int>(loader.get_metadata_int(arch + ".ssm.state_size", 0));
-        cfg/*ssm_conv_kernel=*/
+        cfg /*ssm_inner_size=*/static_cast<int>(
+            loader.get_metadata_int(arch + ".ssm.inner_size", 0));
+        cfg /*ssm_state_size=*/static_cast<int>(
+            loader.get_metadata_int(arch + ".ssm.state_size", 0));
+        cfg /*ssm_conv_kernel=*/
             static_cast<int>(loader.get_metadata_int(arch + ".ssm.conv_kernel", 0));
-        cfg/*full_attention_interval=*/
+        cfg /*full_attention_interval=*/
             static_cast<int>(loader.get_metadata_int(arch + ".full_attention_interval", 0));
 
         // MRoPE (Multi-dimensional RoPE) for Qwen3.5
-        cfg/*rope_dimension_count=*/
+        cfg /*rope_dimension_count=*/
             static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
         auto sections = loader.get_metadata_int_array(arch + ".rope.dimension_sections", {});
         if (!sections.empty() && cfg.rope_dimension_count > 0) {
-            cfg/*use_mrope=*/ true;
+            cfg /*use_mrope=*/true;
             for (size_t i = 0; i < sections.size() && i < 4; ++i) {
                 cfg.rope_dimension_sections[i] = sections[i];
             }
@@ -1214,26 +1217,26 @@ ArchCapabilityAutoRegister::ArchCapabilityAutoRegister(const std::string& arch,
 
 namespace {
 // GQA architectures (use LlamaEngine)
-static ArchCapabilityAutoRegister _reg_cap_llama("llama", ArchCapability{/*use_gqa=*/ true,
-                                                                         /*use_neox_rope=*/ true});
+static ArchCapabilityAutoRegister _reg_cap_llama("llama", ArchCapability{/*use_gqa=*/true,
+                                                                         /*use_neox_rope=*/true});
 static ArchCapabilityAutoRegister _reg_cap_mistral("mistral",
-                                                   ArchCapability{/*use_gqa=*/ true,
-                                                                  /*use_neox_rope=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_qwen("qwen", ArchCapability{/*use_gqa=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_qwen2("qwen2", ArchCapability{/*use_gqa=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_yi("yi", ArchCapability{/*use_gqa=*/ true,
-                                                                   /*use_neox_rope=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_deepseek("deepseek", ArchCapability{/*use_gqa=*/ true});
+                                                   ArchCapability{/*use_gqa=*/true,
+                                                                  /*use_neox_rope=*/true});
+static ArchCapabilityAutoRegister _reg_cap_qwen("qwen", ArchCapability{/*use_gqa=*/true});
+static ArchCapabilityAutoRegister _reg_cap_qwen2("qwen2", ArchCapability{/*use_gqa=*/true});
+static ArchCapabilityAutoRegister _reg_cap_yi("yi", ArchCapability{/*use_gqa=*/true,
+                                                                   /*use_neox_rope=*/true});
+static ArchCapabilityAutoRegister _reg_cap_deepseek("deepseek", ArchCapability{/*use_gqa=*/true});
 
 // MLA architectures (use DeepSeekEngine)
 static ArchCapabilityAutoRegister _reg_cap_deepseek_v2("deepseek_v2",
-                                                       ArchCapability{/*use_mla=*/ true});
+                                                       ArchCapability{/*use_mla=*/true});
 static ArchCapabilityAutoRegister _reg_cap_deepseek_v3("deepseek_v3",
-                                                       ArchCapability{/*use_mla=*/ true});
+                                                       ArchCapability{/*use_mla=*/true});
 
 // SSM architectures (use Qwen35Engine)
-static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35", ArchCapability{/*use_ssm=*/ true,
-                                                                           /*use_mrope=*/ true});
+static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35", ArchCapability{/*use_ssm=*/true,
+                                                                           /*use_mrope=*/true});
 }  // namespace
 
 }  // namespace forge

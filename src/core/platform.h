@@ -3,18 +3,18 @@
 
 #ifdef _WIN32
 // MSVC POSIX compat
-#include <BaseTsd.h>
+#    include <BaseTsd.h>
 typedef SSIZE_T ssize_t;
-#define open _open
-#define close _close
-#define read _read
-#define O_RDONLY _O_RDONLY
-#define PROT_READ 0
-#define MAP_PRIVATE 0
+#    define open _open
+#    define close _close
+#    define read _read
+#    define O_RDONLY _O_RDONLY
+#    define PROT_READ 0
+#    define MAP_PRIVATE 0
 
-#include <io.h>
-#include <sys/stat.h>
-#include <windows.h>
+#    include <io.h>
+#    include <sys/stat.h>
+#    include <windows.h>
 
 struct PortStat {
     long st_size;
@@ -45,17 +45,17 @@ static inline int forge_munmap(void* addr, size_t) {
     return UnmapViewOfFile(addr) ? 0 : -1;
 }
 
-#define FORGE_MAP_FAILED ((void*)-1)
+#    define FORGE_MAP_FAILED ((void*)-1)
 
 #else
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#    include <fcntl.h>
+#    include <sys/mman.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
 
 typedef struct stat forge_stat_t;
-#define forge_fstat fstat
-#define forge_mmap mmap
-#define forge_munmap munmap
-#define FORGE_MAP_FAILED MAP_FAILED
+#    define forge_fstat fstat
+#    define forge_mmap mmap
+#    define forge_munmap munmap
+#    define FORGE_MAP_FAILED MAP_FAILED
 #endif
