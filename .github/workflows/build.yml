@@ -247,7 +247,7 @@ jobs:
         run: cmake --build build -j --config Release
 
       - name: Test CLI
-        run: .\build\forge-cli --help
+        run: .\build\Release\forge-cli.exe --help
         shell: pwsh
 
       - name: Run Python tests (CPU-only, no external model)
