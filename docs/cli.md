@@ -5,7 +5,7 @@
 ## Basic Usage
 
 ```bash
-./nanoinfer-cli -m <model_path> [options]
+./forge-cli -m <model_path> [options]
 ```
 
 ## Options
@@ -62,7 +62,7 @@
 ### Interactive Chat
 
 ```bash
-./nanoinfer-cli -m model.gguf
+./forge-cli -m model.gguf
 
 # Type messages directly. Commands: /quit, /clear, /system, /help
 ```
@@ -70,39 +70,39 @@
 ### Single Prompt
 
 ```bash
-./nanoinfer-cli -m model.gguf -p "What is machine learning?" --stream
+./forge-cli -m model.gguf -p "What is machine learning?" --stream
 ```
 
 ### CPU-Only Inference
 
 ```bash
-./nanoinfer-cli -m model.gguf --device cpu --n-gpu-layers 0
+./forge-cli -m model.gguf --device cpu --n-gpu-layers 0
 ```
 
 ### Custom Sampling Parameters
 
 ```bash
-./nanoinfer-cli -m model.gguf -p "Write a poem about AI" \
+./forge-cli -m model.gguf -p "Write a poem about AI" \
   --temp 0.9 --top-p 0.95 --repeat-penalty 1.2 -n 512
 ```
 
 ### Multimodal (Vision-Language)
 
 ```bash
-./nanoinfer-cli -m minicpmv.gguf --mmproj mmproj.gguf \
+./forge-cli -m minicpmv.gguf --mmproj mmproj.gguf \
   --image photo.jpg -p "Describe this image"
 ```
 
 ### Benchmark Mode
 
 ```bash
-./nanoinfer-cli -m model.gguf --bench
+./forge-cli -m model.gguf --bench
 ```
 
 ### Show Model Info
 
 ```bash
-./nanoinfer-cli -m model.gguf --info
+./forge-cli -m model.gguf --info
 ```
 
 ## Interactive Commands

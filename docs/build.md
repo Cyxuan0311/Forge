@@ -16,16 +16,16 @@
 ## Build from Source
 
 ```bash
-git clone https://github.com/yourname/NanoInfer.git
-cd NanoInfer
+git clone https://github.com/yourname/Forge.git
+cd Forge
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
 After building:
-- `build/nanoinfer-cli` — CLI inference executable
-- `build/nanoinfer*.so` — Python binding module
+- `build/forge-cli` — CLI inference executable
+- `build/forge*.so` — Python binding module
 
 ## Build Options
 
@@ -88,7 +88,7 @@ After building, the `.so` file can be imported directly:
 ```python
 import sys
 sys.path.insert(0, "build")
-import nanoinfer
+import forge
 ```
 
 Or install via pip:
@@ -100,8 +100,8 @@ pip install .
 ## Verify Installation
 
 ```python
-import nanoinfer
-print(nanoinfer.__version__)  # 0.5.0
+import forge
+print(forge.__version__)  # 0.5.0
 ```
 
 ## Docker
@@ -109,8 +109,8 @@ print(nanoinfer.__version__)  # 0.5.0
 A Dockerfile is provided for reproducible builds:
 
 ```bash
-docker build -t nanoinfer .
-docker run --gpus all nanoinfer
+docker build -t forge .
+docker run --gpus all forge
 ```
 
 ## Troubleshooting

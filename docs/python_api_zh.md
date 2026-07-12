@@ -5,10 +5,10 @@
 ## 快速示例
 
 ```python
-import nanoinfer
+import forge
 
-model = nanoinfer.Model("model.gguf", device=nanoinfer.DeviceType.CUDA)
-tokenizer = nanoinfer.Tokenizer("model.gguf")
+model = forge.Model("model.gguf", device=forge.DeviceType.CUDA)
+tokenizer = forge.Tokenizer("model.gguf")
 
 tokens = tokenizer.encode("你好，世界！")
 result = model.generate(tokens, max_new_tokens=128)
@@ -23,19 +23,19 @@ print(tokenizer.decode(result))
 
 ```python
 # 创建
-t = nanoinfer.Tensor([1, 2, 3, 4, 5, 6], shape=[2, 3], dtype=nanoinfer.DataType.FP32)
-t = nanoinfer.Tensor.zeros([1024, 4096])                             # 零初始化
-t = nanoinfer.Tensor.from_numpy(np_array, device=nanoinfer.DeviceType.CUDA)
+t = forge.Tensor([1, 2, 3, 4, 5, 6], shape=[2, 3], dtype=forge.DataType.FP32)
+t = forge.Tensor.zeros([1024, 4096])                             # 零初始化
+t = forge.Tensor.from_numpy(np_array, device=forge.DeviceType.CUDA)
 
 # 属性
 t.shape              # [2, 3]
-t.dtype              # nanoinfer.DataType.FP32
-t.device             # nanoinfer.DeviceType.CUDA
+t.dtype              # forge.DataType.FP32
+t.device             # forge.DeviceType.CUDA
 t.size               # 总元素数
 t.nbytes             # 总字节数
 
 # 操作
-t.to_device(nanoinfer.DeviceType.CPU)   # 跨设备传输
+t.to_device(forge.DeviceType.CPU)   # 跨设备传输
 t.zero_()                                # 原地置零
 t.numpy()                                # 转为 numpy 数组（仅 CPU）
 ```
@@ -43,8 +43,8 @@ t.numpy()                                # 转为 numpy 数组（仅 CPU）
 ### Model
 
 ```python
-model = nanoinfer.Model("model.gguf", device=nanoinfer.DeviceType.CUDA)
-model = nanoinfer.Model.load_auto("model.gguf", device=nanoinfer.DeviceType.CUDA)
+model = forge.Model("model.gguf", device=forge.DeviceType.CUDA)
+model = forge.Model.load_auto("model.gguf", device=forge.DeviceType.CUDA)
 ```
 
 | 方法 | 说明 |
@@ -75,7 +75,7 @@ model = nanoinfer.Model.load_auto("model.gguf", device=nanoinfer.DeviceType.CUDA
 
 ```python
 ctx = model.create_context(
-    kv_cache_dtype=nanoinfer.KVCacheDType.FP32,
+    kv_cache_dtype=forge.KVCacheDType.FP32,
     gpu_layers=-1,
     batch_size=512
 )
@@ -88,9 +88,9 @@ ctx.warmup()                           # 预热 CUDA kernel
 ### Tokenizer
 
 ```python
-tokenizer = nanoinfer.Tokenizer("model.gguf")
+tokenizer = forge.Tokenizer("model.gguf")
 # 或
-tokenizer = nanoinfer.Tokenizer.load_from_gguf(model)
+tokenizer = forge.Tokenizer.load_from_gguf(model)
 ```
 
 | 方法 / 属性 | 说明 |
@@ -105,21 +105,21 @@ tokenizer = nanoinfer.Tokenizer.load_from_gguf(model)
 ### Generator
 
 ```python
-gen = nanoinfer.Generator(ctx)
+gen = forge.Generator(ctx)
 result = gen.generate(tokens, max_new_tokens=128, temperature=0.8)
 ```
 
 ### MultimodalModel
 
 ```python
-mm = nanoinfer.MultimodalModel("model.gguf", "mmproj.gguf")
+mm = forge.MultimodalModel("model.gguf", "mmproj.gguf")
 result = mm.chat("描述这张图片", image_path="photo.jpg")
 ```
 
 ### Backend
 
 ```python
-backend = nanoinfer.BackendManager.instance()
+backend = forge.BackendManager.instance()
 print(backend.available_backends())   # ['CPU', 'CUDA']
 print(backend.has_cuda())             # True / False
 ```
@@ -127,14 +127,14 @@ print(backend.has_cuda())             # True / False
 ### Logger
 
 ```python
-log = nanoinfer.Logger.instance()
-log.set_level(nanoinfer.LogLevel.DEBUG)  # NONE, ERROR, WARN, INFO, DEBUG, TRACE
+log = forge.Logger.instance()
+log.set_level(forge.LogLevel.DEBUG)  # NONE, ERROR, WARN, INFO, DEBUG, TRACE
 ```
 
 ### PerfProfiler
 
 ```python
-profiler = nanoinfer.PerfProfiler.instance()
+profiler = forge.PerfProfiler.instance()
 profiler.enable()
 # ... 运行推理 ...
 profiler.disable()
@@ -146,7 +146,7 @@ print(profiler.summary())
 使用分页 KV 缓存进行多请求批量调度：
 
 ```python
-scheduler = nanoinfer.RequestScheduler(model)
+scheduler = forge.RequestScheduler(model)
 req_id = scheduler.submit(input_tokens, max_new_tokens=128)
 while True:
     scheduler.step()
@@ -168,5 +168,5 @@ while True:
 ## 线程控制
 
 ```python
-nanoinfer.set_num_threads(8)  # 设置 OpenMP 线程数
+forge.set_num_threads(8)  # 设置 OpenMP 线程数
 ```

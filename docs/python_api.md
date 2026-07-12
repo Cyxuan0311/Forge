@@ -5,10 +5,10 @@
 ## Quick Example
 
 ```python
-import nanoinfer
+import forge
 
-model = nanoinfer.Model("model.gguf", device=nanoinfer.DeviceType.CUDA)
-tokenizer = nanoinfer.Tokenizer("model.gguf")
+model = forge.Model("model.gguf", device=forge.DeviceType.CUDA)
+tokenizer = forge.Tokenizer("model.gguf")
 
 tokens = tokenizer.encode("Hello, world!")
 result = model.generate(tokens, max_new_tokens=128)
@@ -23,19 +23,19 @@ Multi-dimensional array with CPU/CUDA storage.
 
 ```python
 # Create
-t = nanoinfer.Tensor([1, 2, 3, 4, 5, 6], shape=[2, 3], dtype=nanoinfer.DataType.FP32)
-t = nanoinfer.Tensor.zeros([1024, 4096])                          # Zero-initialized
-t = nanoinfer.Tensor.from_numpy(np_array, device=nanoinfer.DeviceType.CUDA)
+t = forge.Tensor([1, 2, 3, 4, 5, 6], shape=[2, 3], dtype=forge.DataType.FP32)
+t = forge.Tensor.zeros([1024, 4096])                          # Zero-initialized
+t = forge.Tensor.from_numpy(np_array, device=forge.DeviceType.CUDA)
 
 # Properties
 t.shape              # [2, 3]
-t.dtype              # nanoinfer.DataType.FP32
-t.device             # nanoinfer.DeviceType.CUDA
+t.dtype              # forge.DataType.FP32
+t.device             # forge.DeviceType.CUDA
 t.size               # total elements
 t.nbytes             # total bytes
 
 # Operations
-t.to_device(nanoinfer.DeviceType.CPU)   # Cross-device transfer
+t.to_device(forge.DeviceType.CPU)   # Cross-device transfer
 t.zero_()                                # In-place zero
 t.numpy()                                # Convert to numpy array (CPU only)
 ```
@@ -43,8 +43,8 @@ t.numpy()                                # Convert to numpy array (CPU only)
 ### Model
 
 ```python
-model = nanoinfer.Model("model.gguf", device=nanoinfer.DeviceType.CUDA)
-model = nanoinfer.Model.load_auto("model.gguf", device=nanoinfer.DeviceType.CUDA)
+model = forge.Model("model.gguf", device=forge.DeviceType.CUDA)
+model = forge.Model.load_auto("model.gguf", device=forge.DeviceType.CUDA)
 ```
 
 | Method | Description |
@@ -75,7 +75,7 @@ model = nanoinfer.Model.load_auto("model.gguf", device=nanoinfer.DeviceType.CUDA
 
 ```python
 ctx = model.create_context(
-    kv_cache_dtype=nanoinfer.KVCacheDType.FP32,
+    kv_cache_dtype=forge.KVCacheDType.FP32,
     gpu_layers=-1,
     batch_size=512
 )
@@ -88,9 +88,9 @@ ctx.warmup()                           # Warm up CUDA kernels
 ### Tokenizer
 
 ```python
-tokenizer = nanoinfer.Tokenizer("model.gguf")
+tokenizer = forge.Tokenizer("model.gguf")
 # or
-tokenizer = nanoinfer.Tokenizer.load_from_gguf(model)
+tokenizer = forge.Tokenizer.load_from_gguf(model)
 ```
 
 | Method / Property | Description |
@@ -105,21 +105,21 @@ tokenizer = nanoinfer.Tokenizer.load_from_gguf(model)
 ### Generator
 
 ```python
-gen = nanoinfer.Generator(ctx)
+gen = forge.Generator(ctx)
 result = gen.generate(tokens, max_new_tokens=128, temperature=0.8)
 ```
 
 ### MultimodalModel
 
 ```python
-mm = nanoinfer.MultimodalModel("model.gguf", "mmproj.gguf")
+mm = forge.MultimodalModel("model.gguf", "mmproj.gguf")
 result = mm.chat("Describe this image", image_path="photo.jpg")
 ```
 
 ### Backend
 
 ```python
-backend = nanoinfer.BackendManager.instance()
+backend = forge.BackendManager.instance()
 print(backend.available_backends())   # ['CPU', 'CUDA']
 print(backend.has_cuda())             # True / False
 ```
@@ -127,14 +127,14 @@ print(backend.has_cuda())             # True / False
 ### Logger
 
 ```python
-log = nanoinfer.Logger.instance()
-log.set_level(nanoinfer.LogLevel.DEBUG)  # NONE, ERROR, WARN, INFO, DEBUG, TRACE
+log = forge.Logger.instance()
+log.set_level(forge.LogLevel.DEBUG)  # NONE, ERROR, WARN, INFO, DEBUG, TRACE
 ```
 
 ### PerfProfiler
 
 ```python
-profiler = nanoinfer.PerfProfiler.instance()
+profiler = forge.PerfProfiler.instance()
 profiler.enable()
 # ... run inference ...
 profiler.disable()
@@ -146,7 +146,7 @@ print(profiler.summary())
 For multi-request batching with paged KV cache:
 
 ```python
-scheduler = nanoinfer.RequestScheduler(model)
+scheduler = forge.RequestScheduler(model)
 req_id = scheduler.submit(input_tokens, max_new_tokens=128)
 while True:
     scheduler.step()
@@ -168,5 +168,5 @@ while True:
 ## Threading
 
 ```python
-nanoinfer.set_num_threads(8)  # Set OpenMP thread count
+forge.set_num_threads(8)  # Set OpenMP thread count
 ```

@@ -8,7 +8,7 @@
 |-----|---------|---------|------|
 | CMake | 3.18+ | ✅ | 构建系统 |
 | C++ 编译器 | C++17（GCC ≥ 9, Clang ≥ 10, MSVC ≥ 2019） | ✅ | |
-| CUDA Toolkit | 11.0+ | ❌ | 通过 `NANOINFER_USE_CUDA=ON` 开启 |
+| CUDA Toolkit | 11.0+ | ❌ | 通过 `FORGE_USE_CUDA=ON` 开启 |
 | Python 3 | 3.8+ | ❌ | 仅 Python 绑定需要 |
 | NumPy | 任意 | ❌ | 仅 Python 绑定需要 |
 | cuBLAS | 随 CUDA Toolkit 提供 | ❌ | 通过 `USE_CUBLAS=ON` 开启 |
@@ -71,9 +71,9 @@ python3 --version               # ≥ 3.8
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    nanoinfer (.so / .exe)                 │
+│                    forge (.so / .exe)                 │
 ├─────────────┬──────────────┬──────────────┬──────────────┤
-│ nanoinfer_  │ nanoinfer_   │ nanoinfer_   │ nanoinfer_   │
+│ forge_  │ forge_   │ forge_   │ forge_   │
 │ core        │ ops          │ model        │ tokenizer    │
 ├──────┬──────┼──────┬───────┤              │              │
 │ C++  │ CUDA │ C++  │ CUDA  │              │              │
@@ -93,8 +93,8 @@ python3 --version               # ≥ 3.8
 |------|------|----------|------------|--------------|
 | GPU + cuBLAS（默认） | `cmake -B build` | 自动检测 | ON | OFF |
 | GPU，纯 CUDA 内核 | `cmake -B build -DUSE_CUBLAS=OFF` | 自动检测 | OFF | OFF |
-| 仅 CPU | `cmake -B build -DNANOINFER_USE_CUDA=OFF` | OFF | — | OFF |
-| CPU + OpenBLAS | `cmake -B build -DNANOINFER_USE_CUDA=OFF -DUSE_OPENBLAS=ON` | OFF | — | ON |
+| 仅 CPU | `cmake -B build -DFORGE_USE_CUDA=OFF` | OFF | — | OFF |
+| CPU + OpenBLAS | `cmake -B build -DFORGE_USE_CUDA=OFF -DUSE_OPENBLAS=ON` | OFF | — | ON |
 
 > 详细构建说明请参阅[构建指南](build_zh.md)。
 
@@ -110,8 +110,8 @@ cmake -B build
 检测原理：编译一个迷你 CUDA 程序，调用 `cudaGetDeviceProperties` 获取实际 GPU 的计算能力。如果检测失败（如无 GPU 的服务器），默认使用 `86;89`。手动指定：
 
 ```bash
-cmake -B build -DNANOINFER_CUDA_ARCH="90"         # RTX 5090
-cmake -B build -DNANOINFER_CUDA_ARCH="75;86;89"   # 便携二进制
+cmake -B build -DFORGE_CUDA_ARCH="90"         # RTX 5090
+cmake -B build -DFORGE_CUDA_ARCH="75;86;89"   # 便携二进制
 ```
 
 ## 后端汇总

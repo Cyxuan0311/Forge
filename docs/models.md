@@ -65,7 +65,7 @@ The standard format from the llama.cpp ecosystem. Widely available on HuggingFac
 
 ### .ninf
 
-NanoInfer's native format, optimized for faster loading. Convert from GGUF:
+Forge's native format, optimized for faster loading. Convert from GGUF:
 
 ```bash
 python tools/convert_gguf_to_ninf.py input.gguf output.ninf
@@ -83,7 +83,7 @@ wget https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7
 
 ## Weight Mapping
 
-NanoInfer uses a `WeightMapper` system that maps architecture-specific weight names to a unified canonical naming scheme. This enables a single inference code path across all supported architectures. The mapping supports patterns like:
+Forge uses a `WeightMapper` system that maps architecture-specific weight names to a unified canonical naming scheme. This enables a single inference code path across all supported architectures. The mapping supports patterns like:
 
 ```
 model.layers.0.self_attn.q_proj.weight → layers.0.attention.wq.weight

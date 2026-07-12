@@ -5,7 +5,7 @@
 ## 基本用法
 
 ```bash
-./nanoinfer-cli -m <模型路径> [选项]
+./forge-cli -m <模型路径> [选项]
 ```
 
 ## 选项
@@ -62,7 +62,7 @@
 ### 交互式对话
 
 ```bash
-./nanoinfer-cli -m model.gguf
+./forge-cli -m model.gguf
 
 # 直接输入消息。命令：/quit、/clear、/system、/help
 ```
@@ -70,39 +70,39 @@
 ### 单次提示
 
 ```bash
-./nanoinfer-cli -m model.gguf -p "什么是机器学习？" --stream
+./forge-cli -m model.gguf -p "什么是机器学习？" --stream
 ```
 
 ### 仅 CPU 推理
 
 ```bash
-./nanoinfer-cli -m model.gguf --device cpu --n-gpu-layers 0
+./forge-cli -m model.gguf --device cpu --n-gpu-layers 0
 ```
 
 ### 自定义采样参数
 
 ```bash
-./nanoinfer-cli -m model.gguf -p "写一首关于 AI 的诗" \
+./forge-cli -m model.gguf -p "写一首关于 AI 的诗" \
   --temp 0.9 --top-p 0.95 --repeat-penalty 1.2 -n 512
 ```
 
 ### 多模态（视觉语言）
 
 ```bash
-./nanoinfer-cli -m minicpmv.gguf --mmproj mmproj.gguf \
+./forge-cli -m minicpmv.gguf --mmproj mmproj.gguf \
   --image photo.jpg -p "描述这张图片"
 ```
 
 ### Benchmark 模式
 
 ```bash
-./nanoinfer-cli -m model.gguf --bench
+./forge-cli -m model.gguf --bench
 ```
 
 ### 查看模型信息
 
 ```bash
-./nanoinfer-cli -m model.gguf --info
+./forge-cli -m model.gguf --info
 ```
 
 ## 交互命令

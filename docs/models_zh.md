@@ -65,7 +65,7 @@ llama.cpp 生态的标准格式，在 HuggingFace 上广泛可用。支持基于
 
 ### .ninf
 
-NanoInfer 原生格式，优化了加载速度。从 GGUF 转换：
+Forge 原生格式，优化了加载速度。从 GGUF 转换：
 
 ```bash
 python tools/convert_gguf_to_ninf.py input.gguf output.ninf
@@ -83,7 +83,7 @@ wget https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7
 
 ## 权重映射
 
-NanoInfer 使用 `WeightMapper` 系统将架构特定的权重名称映射到统一的规范命名方案。这使得所有支持的架构可以共享同一推理代码路径。映射示例：
+Forge 使用 `WeightMapper` 系统将架构特定的权重名称映射到统一的规范命名方案。这使得所有支持的架构可以共享同一推理代码路径。映射示例：
 
 ```
 model.layers.0.self_attn.q_proj.weight → layers.0.attention.wq.weight

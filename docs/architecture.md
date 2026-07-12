@@ -4,7 +4,7 @@
 
 ## Overview
 
-NanoInfer is a modular LLM inference engine built with C++17 and CUDA. It follows a layered architecture with extensible plugin systems:
+Forge is a modular LLM inference engine built with C++17 and CUDA. It follows a layered architecture with extensible plugin systems:
 
 ```
 ┌──────────────────────────────────────┐
@@ -28,7 +28,7 @@ NanoInfer is a modular LLM inference engine built with C++17 and CUDA. It follow
 
 ### Tensor
 
-The fundamental data structure (`include/nanoinfer/tensor.h`). A multi-dimensional array with shape/stride/strides, supporting FP32, FP16, Q4_0, Q4_1, Q4_K, Q6_K, Q8_0, INT8, and INT32 data types.
+The fundamental data structure (`include/forge/tensor.h`). A multi-dimensional array with shape/stride/strides, supporting FP32, FP16, Q4_0, Q4_1, Q4_K, Q6_K, Q8_0, INT8, and INT32 data types.
 
 - **Storage**: CPU via `malloc`, CUDA via `cudaMalloc`
 - **Zero-copy**: `from_buffer()` wraps mmap'd pointers for GGUF loading
@@ -37,7 +37,7 @@ The fundamental data structure (`include/nanoinfer/tensor.h`). A multi-dimension
 
 ### Backend
 
-Abstract device backend (`include/nanoinfer/backend.h`):
+Abstract device backend (`include/forge/backend.h`):
 
 | Implementation | Allocation | Copy | Features |
 |---------------|-----------|------|----------|
@@ -48,11 +48,11 @@ Abstract device backend (`include/nanoinfer/backend.h`):
 
 ### MemoryPool
 
-Device-aware memory pool (`include/nanoinfer/memory_pool.h`) with free-list reuse and allocation tracking. Reduces `cudaMalloc`/`cudaFree` overhead during inference.
+Device-aware memory pool (`include/forge/memory_pool.h`) with free-list reuse and allocation tracking. Reduces `cudaMalloc`/`cudaFree` overhead during inference.
 
 ### ComputeGraph
 
-DAG-based execution system (`include/nanoinfer/compute_graph.h`):
+DAG-based execution system (`include/forge/compute_graph.h`):
 
 - `GraphNode`: op type, input/output tensors, compute function
 - `GraphBuilder`: fluent API for constructing compute graphs
@@ -107,24 +107,24 @@ Located in `src/operators/cpu/`:
 
 ### Model Loader
 
-Dual-format support (`include/nanoinfer/model_loader.h`):
+Dual-format support (`include/forge/model_loader.h`):
 
 | Format | Loader | Features |
 |--------|--------|----------|
 | **GGUF** | `GgufModel` | mmap-based zero-copy, reads metadata + tensors directly from GGUF files |
-| **NINF** | `NinfModel` | NanoInfer native format, packed binary header, optimized loading |
+| **NINF** | `NinfModel` | Forge native format, packed binary header, optimized loading |
 
 Auto-detection via `detect_format()`.
 
 ### Weight Mapper
 
-`WeightMapper` (`include/nanoinfer/weight_mapper.h`) maps architecture-specific weight names to a unified canonical naming scheme. Each architecture registers its own mapping via `NANOINFER_REGISTER_ARCH`. This allows a single `ModelWeights` / `LayerWeights` structure and inference code path for all architectures.
+`WeightMapper` (`include/forge/weight_mapper.h`) maps architecture-specific weight names to a unified canonical naming scheme. Each architecture registers its own mapping via `FORGE_REGISTER_ARCH`. This allows a single `ModelWeights` / `LayerWeights` structure and inference code path for all architectures.
 
 ## Inference Layer
 
 ### Engine Registry
 
-Architecture-specific engines are registered via `NANOINFER_REGISTER_ENGINE` / `NANOINFER_REGISTER_ARCH` macros. The factory pattern selects the correct engine at runtime based on model architecture.
+Architecture-specific engines are registered via `FORGE_REGISTER_ENGINE` / `FORGE_REGISTER_ARCH` macros. The factory pattern selects the correct engine at runtime based on model architecture.
 
 ```
 InferenceEngine (virtual base)
@@ -146,11 +146,11 @@ Each engine architecture has a corresponding `GraphBuilder` that constructs the 
 | `DeepSeekGraphBuilder` | DeepSeek V2/V3 (GQA + MLA) |
 | `Qwen35GraphBuilder` | Qwen3.5 (Hybrid SSM + Attention) |
 
-Registered via `NANOINFER_REGISTER_GRAPH_BUILDER` macro.
+Registered via `FORGE_REGISTER_GRAPH_BUILDER` macro.
 
 ### KV Cache
 
-Two cache implementations (`include/nanoinfer/kv_cache.h`):
+Two cache implementations (`include/forge/kv_cache.h`):
 
 | Type | Description |
 |------|-------------|
@@ -161,7 +161,7 @@ Both support FP32 and Q4_0 quantization for the KV cache data.
 
 ### Generator
 
-High-level text generation (`include/nanoinfer/generator.h`) with:
+High-level text generation (`include/forge/generator.h`) with:
 
 - Configurable sampling: temperature, top-k, top-p, repetition penalty
 - Greedy (argmax) mode
@@ -170,7 +170,7 @@ High-level text generation (`include/nanoinfer/generator.h`) with:
 
 ### Sampler
 
-`Sampler` (`include/nanoinfer/sampler.h`) implements:
+`Sampler` (`include/forge/sampler.h`) implements:
 
 - Temperature scaling
 - Top-K filtering
@@ -180,11 +180,11 @@ High-level text generation (`include/nanoinfer/generator.h`) with:
 
 ### RequestScheduler
 
-`RequestScheduler` (`include/nanoinfer/request_scheduler.h`) manages multiple concurrent inference requests with paged KV cache allocation. Supports prefill/decode scheduling for efficient batching.
+`RequestScheduler` (`include/forge/request_scheduler.h`) manages multiple concurrent inference requests with paged KV cache allocation. Supports prefill/decode scheduling for efficient batching.
 
 ## Vision Layer
 
-The vision encoder (`include/nanoinfer/vision_encoder.h`, `src/vision/`) implements a CLIP-based ViT for multimodal models:
+The vision encoder (`include/forge/vision_encoder.h`, `src/vision/`) implements a CLIP-based ViT for multimodal models:
 
 ```
 Image → Preprocess (resize + normalize)
@@ -208,18 +208,18 @@ The project extensively uses compile-time auto-registration:
 
 | Macro | Registry | Purpose |
 |-------|----------|---------|
-| `NANOINFER_REGISTER_ENGINE` | EngineRegistry | Register inference engine by arch name |
-| `NANOINFER_REGISTER_ARCH` | Arch registry | Register arch with engine + config + weights + capability |
-| `NANOINFER_REGISTER_LOADER` | ModelLoaderRegistry | Register model format loader |
-| `NANOINFER_REGISTER_CONFIG_PARSER` | ConfigParserRegistry | Architecture-specific config parsing |
-| `NANOINFER_REGISTER_WEIGHT_INIT` | WeightInitRegistry | Architecture-specific weight initialization |
-| `NANOINFER_REGISTER_ARCH_CAPABILITY` | Capability registry | Architecture capability flags |
-| `NANOINFER_REGISTER_GRAPH_BUILDER` | GraphBuilderRegistry | Compute graph builder |
-| `NANOINFER_REGISTER_OP` | OpRegistry | Operator registration |
+| `FORGE_REGISTER_ENGINE` | EngineRegistry | Register inference engine by arch name |
+| `FORGE_REGISTER_ARCH` | Arch registry | Register arch with engine + config + weights + capability |
+| `FORGE_REGISTER_LOADER` | ModelLoaderRegistry | Register model format loader |
+| `FORGE_REGISTER_CONFIG_PARSER` | ConfigParserRegistry | Architecture-specific config parsing |
+| `FORGE_REGISTER_WEIGHT_INIT` | WeightInitRegistry | Architecture-specific weight initialization |
+| `FORGE_REGISTER_ARCH_CAPABILITY` | Capability registry | Architecture capability flags |
+| `FORGE_REGISTER_GRAPH_BUILDER` | GraphBuilderRegistry | Compute graph builder |
+| `FORGE_REGISTER_OP` | OpRegistry | Operator registration |
 
 ## Performance Profiler
 
-The `PerfProfiler` (`include/nanoinfer/perf_profiler.h`) provides:
+The `PerfProfiler` (`include/forge/perf_profiler.h`) provides:
 
 - CUDA event-based GPU timing
 - Thread-local recording

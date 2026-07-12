@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="resource/logo.png" alt="NanoInfer" width="60%">
+  <img src="resource/logo.png" alt="Forge" width="60%">
 </p>
 
-<h1 align="center">NanoInfer</h1>
+<h1 align="center">Forge</h1>
 
 <p align="center">
   <strong>Lightweight LLM Inference Engine</strong> — Pure C++/CUDA, No Heavy Dependencies
@@ -24,14 +24,14 @@
 ## Demo
 
 <p align="center">
-  <img src="resource/demo.png" alt="NanoInfer Demo" width="90%">
+  <img src="resource/demo.png" alt="Forge Demo" width="90%">
 </p>
 
 ---
 
 ## Description
 
-NanoInfer is a lightweight LLM inference engine written from scratch in C++ and CUDA. The main goal is to provide a minimal, transparent, and high-performance inference stack — no PyTorch, no TensorFlow, no heavy framework dependencies.
+Forge is a lightweight LLM inference engine written from scratch in C++ and CUDA. The main goal is to provide a minimal, transparent, and high-performance inference stack — no PyTorch, no TensorFlow, no heavy framework dependencies.
 
 - Plain C++/CUDA — zero dependency on ML frameworks
 - Hand-written CUDA kernels (GEMM, GEMV, flash attention, RMS norm, RoPE, etc.)
@@ -45,13 +45,13 @@ NanoInfer is a lightweight LLM inference engine written from scratch in C++ and 
 ## Quick start
 
 ```bash
-git clone https://github.com/your-org/NanoInfer.git
-cd NanoInfer
+git clone https://github.com/your-org/Forge.git
+cd Forge
 
 cmake -B build && cmake --build build -j
 
 # CLI inference
-./build/nanoinfer-cli -m model.gguf -p "Hello" --stream
+./build/forge-cli -m model.gguf -p "Hello" --stream
 
 # Python inference
 python examples/qwen_inference.py --model-path model.gguf --device cuda
@@ -62,10 +62,10 @@ python examples/qwen_inference.py --model-path model.gguf --device cuda
 ### Python API
 
 ```python
-import nanoinfer
+import forge
 
-model = nanoinfer.Model("model.gguf", device="cuda")
-tokenizer = nanoinfer.Tokenizer("model.gguf")
+model = forge.Model("model.gguf", device="cuda")
+tokenizer = forge.Tokenizer("model.gguf")
 
 tokens = tokenizer.encode("Hello, world!")
 result = model.generate(tokens, max_new_tokens=128)
@@ -76,10 +76,10 @@ print(tokenizer.decode(result))
 
 ```bash
 # Interactive chat
-./build/nanoinfer-cli -m model.gguf --stream
+./build/forge-cli -m model.gguf --stream
 
 # One-shot generation
-./build/nanoinfer-cli -m model.gguf -p "Once upon a time" -n 128
+./build/forge-cli -m model.gguf -p "Once upon a time" -n 128
 ```
 
 ---
@@ -135,7 +135,7 @@ cmake -B build -DUSE_CUBLAS=OFF -DUSE_OPENBLAS=OFF
 
 ## Performance
 
-Detailed benchmark reports (NanoInfer vs llama.cpp, GPU & CPU) are generated via the `report/` module and stored in `resource/reports/`.
+Detailed benchmark reports (Forge vs llama.cpp, GPU & CPU) are generated via the `report/` module and stored in `resource/reports/`.
 
 ### Qwen2.5-7B-Instruct Q4_0 (RTX 4050 Laptop)
 

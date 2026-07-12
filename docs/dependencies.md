@@ -8,7 +8,7 @@
 |-----------|----------------|----------|-------|
 | CMake | 3.18+ | ✅ | Build system |
 | C++ Compiler | C++17 (GCC ≥ 9, Clang ≥ 10, MSVC ≥ 2019) | ✅ | |
-| CUDA Toolkit | 11.0+ | ❌ | opt-in via `NANOINFER_USE_CUDA=ON` |
+| CUDA Toolkit | 11.0+ | ❌ | opt-in via `FORGE_USE_CUDA=ON` |
 | Python 3 | 3.8+ | ❌ | Only needed for Python bindings |
 | NumPy | any | ❌ | Only needed for Python bindings |
 | cuBLAS | bundled with CUDA Toolkit | ❌ | opt-in via `USE_CUBLAS=ON` |
@@ -71,9 +71,9 @@ python3 --version               # ≥ 3.8
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    nanoinfer (.so / .exe)                 │
+│                    forge (.so / .exe)                 │
 ├─────────────┬──────────────┬──────────────┬──────────────┤
-│ nanoinfer_  │ nanoinfer_   │ nanoinfer_   │ nanoinfer_   │
+│ forge_  │ forge_   │ forge_   │ forge_   │
 │ core        │ ops          │ model        │ tokenizer    │
 ├──────┬──────┼──────┬───────┤              │              │
 │ C++  │ CUDA │ C++  │ CUDA  │              │              │
@@ -93,8 +93,8 @@ python3 --version               # ≥ 3.8
 |----------|---------|----------|------------|--------------|
 | GPU + cuBLAS (default) | `cmake -B build` | auto-detect | ON | OFF |
 | GPU, pure CUDA kernels | `cmake -B build -DUSE_CUBLAS=OFF` | auto-detect | OFF | OFF |
-| CPU-only | `cmake -B build -DNANOINFER_USE_CUDA=OFF` | OFF | — | OFF |
-| CPU + OpenBLAS | `cmake -B build -DNANOINFER_USE_CUDA=OFF -DUSE_OPENBLAS=ON` | OFF | — | ON |
+| CPU-only | `cmake -B build -DFORGE_USE_CUDA=OFF` | OFF | — | OFF |
+| CPU + OpenBLAS | `cmake -B build -DFORGE_USE_CUDA=OFF -DUSE_OPENBLAS=ON` | OFF | — | ON |
 
 > See [Build Guide](build.md) for detailed build instructions.
 
@@ -110,8 +110,8 @@ cmake -B build
 The detection compiles a small CUDA program that calls `cudaGetDeviceProperties` on the actual GPU. If detection fails (e.g., on a headless server), the default `86;89` is used. To override:
 
 ```bash
-cmake -B build -DNANOINFER_CUDA_ARCH="90"         # RTX 5090
-cmake -B build -DNANOINFER_CUDA_ARCH="75;86;89"   # portable binary
+cmake -B build -DFORGE_CUDA_ARCH="90"         # RTX 5090
+cmake -B build -DFORGE_CUDA_ARCH="75;86;89"   # portable binary
 ```
 
 ## Backend Summary

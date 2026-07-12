@@ -16,16 +16,16 @@
 ## 从源码构建
 
 ```bash
-git clone https://github.com/yourname/NanoInfer.git
-cd NanoInfer
+git clone https://github.com/yourname/Forge.git
+cd Forge
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
 构建产物：
-- `build/nanoinfer-cli` — CLI 推理可执行文件
-- `build/nanoinfer*.so` — Python 绑定模块
+- `build/forge-cli` — CLI 推理可执行文件
+- `build/forge*.so` — Python 绑定模块
 
 ## 编译选项
 
@@ -88,7 +88,7 @@ CMake 在配置时自动检测 AVX2 / FMA / F16C 支持。若支持，定义 `US
 ```python
 import sys
 sys.path.insert(0, "build")
-import nanoinfer
+import forge
 ```
 
 或通过 pip 安装：
@@ -100,8 +100,8 @@ pip install .
 ## 验证安装
 
 ```python
-import nanoinfer
-print(nanoinfer.__version__)  # 0.5.0
+import forge
+print(forge.__version__)  # 0.5.0
 ```
 
 ## Docker
@@ -109,8 +109,8 @@ print(nanoinfer.__version__)  # 0.5.0
 提供 Dockerfile 用于可重现构建：
 
 ```bash
-docker build -t nanoinfer .
-docker run --gpus all nanoinfer
+docker build -t forge .
+docker run --gpus all forge
 ```
 
 ## 常见问题
