@@ -140,7 +140,7 @@ cmake -B build -DUSE_CUBLAS=OFF -DUSE_OPENBLAS=OFF
 ### Qwen2.5-7B-Instruct Q4_0 (RTX 4050 Laptop GPU)
 
 <p align="center">
-  <img src="resource/reports/qwen/performance_report.png" alt="Qwen 性能报告" width="70%">
+  <img src="resource/reports/qwen2.5-7b-instruct//performance_report.png" alt="Qwen2.5 性能报告" width="70%">
 </p>
 
 <details>

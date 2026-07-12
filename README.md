@@ -140,7 +140,7 @@ Detailed benchmark reports (Forge vs llama.cpp, GPU & CPU) are generated via the
 ### Qwen2.5-7B-Instruct Q4_0 (RTX 4050 Laptop)
 
 <p align="center">
-  <img src="resource/reports/qwen/performance_report.png" alt="Qwen Performance Report" width="70%">
+  <img src="resource/reports/qwen2.5-7b-instruct/performance_report.png" alt="Qwen2.5 Performance Report" width="70%">
 </p>
 
 <details>
