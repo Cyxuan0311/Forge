@@ -6,6 +6,10 @@
 namespace forge {
 namespace cuda {
 
+// =========================================================================
+// Prefill kernels (q_len > 1)
+// =========================================================================
+
 template <int HEAD_DIM, int BLOCK_SIZE>
 __global__ void flash_attn_kernel(const float* Q, const float* K, const float* V, float* O,
                                   int q_len, int kv_len, int num_heads, bool causal) {
@@ -127,12 +131,19 @@ void launch_flash_attention(const float* Q, const float* K, const float* V, floa
     case 256:
         LAUNCH_FLASH_ATTN(256);
         break;
+    case 512:
+        LAUNCH_FLASH_ATTN(512);
+        break;
     default:
         fprintf(stderr, "[ERROR] flash_attn_kernel: unsupported head_dim=%d\n", head_dim);
         break;
     }
 #undef LAUNCH_FLASH_ATTN
 }
+
+// =========================================================================
+// GQA Prefill kernel
+// =========================================================================
 
 template <int HEAD_DIM, int BLOCK_SIZE>
 __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const float* V, float* O,
@@ -258,12 +269,20 @@ void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, 
     case 256:
         LAUNCH_FLASH_ATTN_GQA(256);
         break;
+    case 512:
+        LAUNCH_FLASH_ATTN_GQA(512);
+        break;
     default:
         fprintf(stderr, "[ERROR] flash_attn_gqa_kernel: unsupported head_dim=%d\n", head_dim);
         break;
     }
 #undef LAUNCH_FLASH_ATTN_GQA
 }
+
+// =========================================================================
+// GQA Decode kernel (small head_dim: 64, 96, 128)
+// Uses per-thread register arrays + warp-level reduction
+// =========================================================================
 
 template <int HEAD_DIM, int NUM_WARPS>
 __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
@@ -402,15 +421,139 @@ __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
     }
 }
 
+// =========================================================================
+// GQA Decode kernel for LARGE head_dim (256, 512)
+// Uses two-pass tiled approach with shared memory accumulators
+// to avoid per-thread register array overflow.
+//
+// Design:
+//   - Each block handles one head
+//   - Q is loaded into shared memory s_q[HEAD_DIM]
+//   - Pass 1: each thread iterates over assigned KV rows, computes local max
+//     (online softmax per thread)
+//   - Cross-thread max reduction via shared memory
+//   - Pass 2: each thread recomputes Q·K for its KV rows using global max,
+//     accumulates weighted V into s_acc[HEAD_DIM] via atomicAdd
+//   - Final: thread 0 normalizes s_acc and writes output
+//
+// Shared memory usage: s_q[HEAD_DIM] + s_acc[HEAD_DIM] + s_max[BLOCK_SIZE]
+//   For HEAD_DIM=512: 512*4*3 + 512*4 = ~10 KB (well within 48KB limit)
+// =========================================================================
+
+template <int HEAD_DIM, int BLOCK_SIZE>
+__global__ void flash_attn_gqa_decode_large_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int kv_len, int num_heads, int num_kv_heads) {
+
+    int h = blockIdx.x;
+    if (h >= num_heads)
+        return;
+
+    int kv_groups = num_heads / num_kv_heads;
+    int kv_h = h / kv_groups;
+    int tid = threadIdx.x;
+
+    // Shared memory: Q vector, accumulator, and per-thread max values
+    __shared__ float s_q[HEAD_DIM];
+    __shared__ float s_acc[HEAD_DIM];
+    __shared__ float s_max[BLOCK_SIZE];
+    __shared__ float s_sum;
+
+    // Load Q into shared memory
+    for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) {
+        s_q[d] = Q[h * HEAD_DIM + d];
+    }
+    __syncthreads();
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+
+    // ---- Pass 1: compute per-thread local max with online softmax ----
+    float local_max = -1e30f;
+
+    for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
+        const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
+
+        float dot = 0.0f;
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            dot += s_q[d] * k_row[d];
+        }
+        dot *= scale;
+        local_max = fmaxf(local_max, dot);
+    }
+
+    // Reduce max across all threads
+    s_max[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float global_max = s_max[0];
+
+    // ---- Pass 2: compute weighted sum using global max ----
+    // Initialize shared accumulator
+    for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) {
+        s_acc[d] = 0.0f;
+    }
+    if (tid == 0) {
+        s_sum = 0.0f;
+    }
+    __syncthreads();
+
+    float local_sum = 0.0f;
+
+    for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
+        const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
+        const float* v_row = V + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
+
+        float dot = 0.0f;
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            dot += s_q[d] * k_row[d];
+        }
+        dot *= scale;
+
+        float weight = expf(dot - global_max);
+        local_sum += weight;
+
+        // Accumulate weighted V into shared memory
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            atomicAdd(&s_acc[d], weight * v_row[d]);
+        }
+    }
+
+    // Reduce sum across threads
+    atomicAdd(&s_sum, local_sum);
+    __syncthreads();
+
+    // Normalize and write output
+    float inv_sum = 1.0f / (s_sum + 1e-30f);
+    for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) {
+        O[h * HEAD_DIM + d] = s_acc[d] * inv_sum;
+    }
+}
+
+// =========================================================================
+// Launch function for GQA decode
+// =========================================================================
+
 void launch_flash_attention_gqa_decode(const float* Q, const float* K, const float* V, float* O,
                                        int kv_len, int num_heads, int num_kv_heads, int head_dim,
                                        cudaStream_t stream) {
-    int threads = 128;
     int blocks = num_heads;
 
 #define LAUNCH_DECODE(HD, NW)            \
     flash_attn_gqa_decode_kernel<HD, NW> \
-        <<<blocks, threads, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads)
+        <<<blocks, 128, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads)
+
+#define LAUNCH_DECODE_LARGE(HD)                    \
+    flash_attn_gqa_decode_large_kernel<HD, 256>    \
+        <<<blocks, 256, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads)
 
     switch (head_dim) {
     case 64:
@@ -422,11 +565,18 @@ void launch_flash_attention_gqa_decode(const float* Q, const float* K, const flo
     case 128:
         LAUNCH_DECODE(128, 4);
         break;
+    case 256:
+        LAUNCH_DECODE_LARGE(256);
+        break;
+    case 512:
+        LAUNCH_DECODE_LARGE(512);
+        break;
     default:
         fprintf(stderr, "[ERROR] flash_attn_gqa_decode: unsupported head_dim=%d\n", head_dim);
         break;
     }
 #undef LAUNCH_DECODE
+#undef LAUNCH_DECODE_LARGE
 }
 
 }  // namespace cuda
