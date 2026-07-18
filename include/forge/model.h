@@ -13,7 +13,7 @@
 namespace forge {
 
 enum class NormType : int { RMSNorm, LayerNorm };
-enum class ActivationType : int { SiLU_GELU, GELU, ReLU };
+enum class ActivationType : int { SiLU_GELU, GELU, ReLU, GeGLU };
 enum class RopeType : int { None, Standard, LinearScaling, NTK_Scaled };
 
 struct ModelConfig {
@@ -60,6 +60,29 @@ struct ModelConfig {
     int rope_dimension_count = 0;                   // number of dimensions to apply RoPE (e.g., 64)
     int rope_dimension_sections[4] = {0, 0, 0, 0};  // sections for MRoPE [t, h, w, extra]
     bool use_mrope = false;                         // whether to use MRoPE instead of standard RoPE
+
+    // Gemma2 softcapping
+    float f_attn_logit_softcapping = 0.0f;
+    float f_final_logit_softcapping = 0.0f;
+
+    bool use_parallel_residual = false;
+
+    // Gemma4-specific fields
+    int n_embd_per_layer = 0;            // per-layer embedding dimension (0 = disabled)
+    int n_ff_exp = 0;                    // expert FFN intermediate dimension
+    int n_expert = 0;                    // total number of experts
+    int n_expert_used = 0;               // number of experts per token (top-K)
+    int n_swa = 0;                       // sliding window attention size
+    std::vector<int> swa_layers;         // which layers use SWA (1=SWA, 0=full attention)
+    int n_layer_kv_from_start = 0;       // layers with own KV cache (from start)
+    bool use_qk_norm = false;            // whether to apply QK-norm before attention
+    int head_dim_swa = 0;               // head dimension for SWA layers (0 = same as head_dim)
+    int num_heads_swa = 0;              // number of attention heads for SWA layers (0 = same as num_heads)
+    int num_kv_heads_swa = 0;           // number of KV heads for SWA layers (0 = same as num_kv_heads)
+    float rope_theta_swa = 10000.0f;    // RoPE freq base for SWA layers
+    int rope_dim_count = 0;             // RoPE dimension count for full-attention layers
+    int rope_dim_count_swa = 0;         // RoPE dimension count for SWA layers
+    std::vector<int32_t> suppress_tokens; // tokens to suppress during generation (set to -INF in logits)
 };
 
 class WeightStore {
@@ -158,6 +181,7 @@ struct LayerWeights {
     TensorPtr attn_q_norm() const { return get("attn_q_norm"); }
     TensorPtr attn_k_norm() const { return get("attn_k_norm"); }
     TensorPtr post_attention_norm() const { return get("post_attention_norm"); }
+    TensorPtr post_ffn_norm() const { return get("post_ffn_norm"); }
 
     // Qwen35 linear attention / SSM
     TensorPtr attn_qkv() const { return get("attn_qkv"); }
@@ -169,6 +193,29 @@ struct LayerWeights {
     TensorPtr ssm_beta() const { return get("ssm_beta"); }
     TensorPtr ssm_norm() const { return get("ssm_norm"); }
     TensorPtr ssm_out() const { return get("ssm_out"); }
+
+    // Gemma4 attention norms
+    TensorPtr attn_post_norm() const { return get("attn_post_norm"); }
+
+    // Gemma4 MoE weights
+    TensorPtr ffn_gate_inp() const { return get("ffn_gate_inp"); }
+    TensorPtr ffn_gate_inp_s() const { return get("ffn_gate_inp_s"); }
+    TensorPtr ffn_gate_exps() const { return get("ffn_gate_exps"); }
+    TensorPtr ffn_up_exps() const { return get("ffn_up_exps"); }
+    TensorPtr ffn_down_exps() const { return get("ffn_down_exps"); }
+    TensorPtr ffn_gate_up_exps() const { return get("ffn_gate_up_exps"); }
+    TensorPtr ffn_pre_norm_2() const { return get("ffn_pre_norm_2"); }
+    TensorPtr ffn_post_norm_1() const { return get("ffn_post_norm_1"); }
+    TensorPtr ffn_post_norm_2() const { return get("ffn_post_norm_2"); }
+    TensorPtr layer_out_scale() const { return get("layer_out_scale"); }
+
+    // Gemma4 per-layer embeddings
+    TensorPtr per_layer_inp_gate() const { return get("per_layer_inp_gate"); }
+    TensorPtr per_layer_proj() const { return get("per_layer_proj"); }
+    TensorPtr per_layer_post_norm() const { return get("per_layer_post_norm"); }
+
+    // Gemma4 proportional RoPE frequency factors (per-layer, full-attention layers only)
+    TensorPtr rope_freqs() const { return get("rope_freqs"); }
 };
 
 // Unified model-level weight container
@@ -179,6 +226,11 @@ struct ModelWeights {
     TensorPtr output_weight;
     TensorPtr output_weight_fp32;  // Pre-dequantized FP32 cache for CPU output_proj
     std::vector<LayerWeights> layers;
+
+    // Gemma4 per-layer embedding weights
+    TensorPtr per_layer_tok_embd;
+    TensorPtr per_layer_model_proj;
+    TensorPtr per_layer_proj_norm;
 
     bool init(const WeightStore& store, const ModelConfig& config);
 

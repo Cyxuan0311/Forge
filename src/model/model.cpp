@@ -152,6 +152,23 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         output_weight = token_embedding;
     }
 
+    // Gemma4 model-level weights
+    if (config.arch_type == "gemma4") {
+        per_layer_tok_embd = store.get("per_layer_tok_embd");
+        per_layer_model_proj = store.get("per_layer_model_proj");
+        per_layer_proj_norm = store.get("per_layer_proj_norm");
+        if (per_layer_tok_embd) {
+            LOG_INFO("Loaded per_layer_tok_embd: shape=" +
+                     std::to_string(per_layer_tok_embd->shape()[0]) + "x" +
+                     std::to_string(per_layer_tok_embd->shape()[1]));
+        }
+        if (per_layer_model_proj) {
+            LOG_INFO("Loaded per_layer_model_proj: shape=" +
+                     std::to_string(per_layer_model_proj->shape()[0]) + "x" +
+                     std::to_string(per_layer_model_proj->shape()[1]));
+        }
+    }
+
     // Optimize output_weight for CPU inference using fused quantized GEMV kernels.
     // Strategy:
     //   - Q4_0/Q8_0: already have fast fused GEMV kernels, use directly
@@ -272,7 +289,9 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         // Validate required weights
         if (lw.layer_type == LayerType::FullAttention && !is_qwen35) {
             if (!lw.wq() || !lw.wk() || !lw.wv() || !lw.wo()) {
-                LOG_ERROR("Missing attention weights for layer " + std::to_string(i));
+                LOG_ERROR("Missing attention weights for layer " + std::to_string(i) +
+                          ": wq=" + std::to_string(!!lw.wq()) + " wk=" + std::to_string(!!lw.wk()) +
+                          " wv=" + std::to_string(!!lw.wv()) + " wo=" + std::to_string(!!lw.wo()));
                 return false;
             }
         } else if (lw.layer_type == LayerType::MLA) {
@@ -504,6 +523,19 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
             weight_store_.set("output_weight", te);
         }
 
+        // Gemma4 per-layer embedding weights (model-level, not per-blk)
+        if (config_.arch_type == "gemma4") {
+            auto ple = load_tensor("per_layer_token_embd.weight");
+            if (ple) weight_store_.set("per_layer_tok_embd", ple);
+            auto plmp = load_tensor("per_layer_model_proj.weight");
+            if (plmp) weight_store_.set("per_layer_model_proj", plmp);
+            auto plpn = load_tensor("per_layer_proj_norm.weight");
+            if (plpn) weight_store_.set("per_layer_proj_norm", plpn);
+            // RoPE frequency factors for proportional RoPE (full-attention layers)
+            auto rf = load_tensor("rope_freqs.weight");
+            if (rf) weight_store_.set("rope_freqs", rf);
+        }
+
         // Build GGUF-specific layer mapping based on the arch mapping
         // GGUF uses "blk.{i}" prefix and names like attn_q.weight, ffn_gate.weight
         for (int i = 0; i < config_.num_layers; ++i) {
@@ -524,7 +556,36 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
             set_if(base + ".up_proj", blk + ".ffn_up.weight");
 
             // Architecture-specific attention weights
-            if (config_.arch_type == "qwen35") {
+            if (config_.arch_type == "gemma4") {
+                // Gemma4 attention weights with QK-norm
+                set_if(base + ".wq", blk + ".attn_q.weight");
+                set_if(base + ".wk", blk + ".attn_k.weight");
+                set_if(base + ".wv", blk + ".attn_v.weight");
+                set_if(base + ".wo", blk + ".attn_output.weight");
+                set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
+                set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
+                set_if(base + ".attn_post_norm", blk + ".post_attention_norm.weight");
+                // Per-layer proportional RoPE frequency factors (full-attention layers only)
+                set_if(base + ".rope_freqs", blk + ".rope_freqs.weight");
+                // Post-FFN norm
+                set_if(base + ".ffn_post_norm", blk + ".post_ffw_norm.weight");
+                // MoE weights
+                set_if(base + ".ffn_gate_inp", blk + ".ffn_gate_inp.weight");
+                set_if(base + ".ffn_gate_inp_s", blk + ".ffn_gate_inp.scale");
+                set_if(base + ".ffn_gate_exps", blk + ".ffn_gate_exps.weight");
+                set_if(base + ".ffn_up_exps", blk + ".ffn_up_exps.weight");
+                set_if(base + ".ffn_down_exps", blk + ".ffn_down_exps.weight");
+                set_if(base + ".ffn_gate_up_exps", blk + ".ffn_gate_up_exps.weight");
+                set_if(base + ".ffn_pre_norm_2", blk + ".ffn_pre_norm_2.weight");
+                set_if(base + ".ffn_post_norm_1", blk + ".ffn_post_norm_1.weight");
+                set_if(base + ".ffn_post_norm_2", blk + ".ffn_post_norm_2.weight");
+                // Per-layer embeddings
+                set_if(base + ".per_layer_inp_gate", blk + ".inp_gate.weight");
+                set_if(base + ".per_layer_proj", blk + ".proj.weight");
+                set_if(base + ".per_layer_post_norm", blk + ".post_norm.weight");
+                // Layer output scale
+                set_if(base + ".layer_out_scale", blk + ".layer_output_scale.weight");
+            } else if (config_.arch_type == "qwen35") {
                 set_if(base + ".attn_q", blk + ".attn_q.weight");
                 set_if(base + ".attn_k", blk + ".attn_k.weight");
                 set_if(base + ".attn_v", blk + ".attn_v.weight");
@@ -542,6 +603,14 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
                 set_if(base + ".ssm_alpha", blk + ".ssm_alpha.weight");
                 set_if(base + ".ssm_beta", blk + ".ssm_beta.weight");
                 set_if(base + ".ssm_out", blk + ".ssm_out.weight");
+            } else if (config_.arch_type == "qwen3vl") {
+                // Qwen3-VL: standard GQA with QK-norm and MRoPE
+                set_if(base + ".wq", blk + ".attn_q.weight");
+                set_if(base + ".wk", blk + ".attn_k.weight");
+                set_if(base + ".wv", blk + ".attn_v.weight");
+                set_if(base + ".wo", blk + ".attn_output.weight");
+                set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
+                set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
             } else if (config_.use_mla) {
                 set_if(base + ".wq_a", blk + ".attn_q_a.weight");
                 set_if(base + ".wq_b", blk + ".attn_q_b.weight");
@@ -564,16 +633,32 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
             // Neox RoPE: convert interleaved weights to half-split format
             // so that both CPU and GPU RoPE use (x[d], x[d+half_dim]) indexing
             if (config_.use_neox_rope) {
+                // For Gemma4, SWA and full-attention layers have different head dimensions
+                bool is_swa = (i < (int)config_.swa_layers.size() && config_.swa_layers[i] == 1);
+                int layer_head_dim = is_swa ? config_.head_dim_swa : config_.head_dim;
+                int layer_num_heads = is_swa ? config_.num_heads_swa : config_.num_heads;
+
                 auto wq = weight_store_.get(base + ".wq");
-                if (wq)
-                    weight_store_.set(base + ".wq", inverse_neox_permute_rows(wq, config_.num_heads,
-                                                                              config_.head_dim));
+                if (wq) {
+                    int wq_rows = static_cast<int>(wq->shape()[0]);
+                    // Use actual head dim inferred from tensor shape for robustness
+                    int wq_head_dim = (layer_num_heads > 0) ? wq_rows / layer_num_heads : wq_rows / config_.num_heads;
+                    int wq_num_heads = wq_rows / wq_head_dim;
+                    weight_store_.set(base + ".wq",
+                                      inverse_neox_permute_rows(wq, wq_num_heads, wq_head_dim));
+                }
 
                 auto wk = weight_store_.get(base + ".wk");
-                if (wk)
-                    weight_store_.set(
-                        base + ".wk",
-                        inverse_neox_permute_rows(wk, config_.num_kv_heads, config_.head_dim));
+                if (wk) {
+                    int wk_rows = static_cast<int>(wk->shape()[0]);
+                    // For Gemma4, WK head_dim matches the layer's head_dim (SWA or full)
+                    int wk_head_dim = layer_head_dim;
+                    int wk_kv_heads = wk_rows / wk_head_dim;
+                    if (wk_kv_heads > 0) {
+                        weight_store_.set(base + ".wk",
+                                          inverse_neox_permute_rows(wk, wk_kv_heads, wk_head_dim));
+                    }
+                }
             }
         }
 
@@ -863,37 +948,14 @@ TensorPtr WeightMapper::resolve(const WeightStore& store, const WeightAlias& ali
     return nullptr;
 }
 
-// ============================================================================
-// ConfigParserRegistry implementation
-// ============================================================================
+// ConfigParserRegistry, WeightInitRegistry, ArchCapabilityRegistry implementations
+// and their static auto-registrations are defined in:
+//   arch_config_parser.cpp, arch_weight_init.cpp, arch_capability.cpp
+// They were removed from this file to avoid ODR violations that caused
+// static auto-registrations to be silently discarded by the linker.
 
-ConfigParserRegistry& ConfigParserRegistry::instance() {
-    static ConfigParserRegistry registry;
-    return registry;
-}
-
-void ConfigParserRegistry::register_parser(const std::string& arch, ConfigParseFn fn) {
-    parsers_[arch] = std::move(fn);
-}
-
-bool ConfigParserRegistry::has(const std::string& arch) const {
-    return parsers_.find(arch) != parsers_.end();
-}
-
-ModelConfig ConfigParserRegistry::parse(ModelLoader& loader, const std::string& arch) const {
-    auto it = parsers_.find(arch);
-    if (it != parsers_.end())
-        return it->second(loader, arch);
-    return ModelConfig{};
-}
-
-ConfigParserAutoRegister::ConfigParserAutoRegister(const std::string& arch, ConfigParseFn fn) {
-    ConfigParserRegistry::instance().register_parser(arch, std::move(fn));
-}
-
-// ============================================================================
-// Default config parsing: common fields shared by all architectures
-// ============================================================================
+// Keep the fallback parse_common_gguf_config for parse_config_from_gguf's fallback path.
+// (arch_config_parser.cpp has its own copy used by registered parsers.)
 
 static ModelConfig parse_common_gguf_config(ModelLoader& loader, const std::string& arch) {
     ModelConfig cfg;
@@ -929,312 +991,10 @@ static ModelConfig parse_common_gguf_config(ModelLoader& loader, const std::stri
             cfg.vocab_size = 32000;
     }
 
+    // Read suppress_tokens from GGUF metadata (for archs without a registered parser)
+    cfg.suppress_tokens = loader.get_metadata_int_array("tokenizer.ggml.suppress_tokens", {});
+
     return cfg;
 }
-
-// ============================================================================
-// Architecture-specific config parsers (registered via static auto-register)
-// ============================================================================
-
-// LLaMA config parser
-namespace {
-static ConfigParserAutoRegister _reg_cfg_llama(
-    "llama", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-        auto cfg = parse_common_gguf_config(loader, arch);
-        cfg.use_neox_rope = true;
-        return cfg;
-    });
-
-static ConfigParserAutoRegister _reg_cfg_mistral(
-    "mistral", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-        auto cfg = parse_common_gguf_config(loader, arch);
-        cfg.use_neox_rope = true;
-        return cfg;
-    });
-
-static ConfigParserAutoRegister _reg_cfg_qwen("qwen",
-                                              [](ModelLoader& loader,
-                                                 const std::string& arch) -> ModelConfig {
-                                                  auto cfg = parse_common_gguf_config(loader, arch);
-                                                  if (cfg.rope_theta == 10000.0f)
-                                                      cfg.rope_theta = 1000000.0f;
-                                                  cfg.tie_embeddings = true;
-                                                  return cfg;
-                                              });
-
-static ConfigParserAutoRegister _reg_cfg_qwen2(
-    "qwen2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-        auto cfg = parse_common_gguf_config(loader, arch);
-        if (cfg.rope_theta == 10000.0f)
-            cfg.rope_theta = 1000000.0f;
-        cfg.tie_embeddings = true;
-        return cfg;
-    });
-
-static ConfigParserAutoRegister _reg_cfg_yi("yi",
-                                            [](ModelLoader& loader,
-                                               const std::string& arch) -> ModelConfig {
-                                                auto cfg = parse_common_gguf_config(loader, arch);
-                                                cfg.use_neox_rope = true;
-                                                return cfg;
-                                            });
-
-static ConfigParserAutoRegister _reg_cfg_deepseek("deepseek",
-                                                  [](ModelLoader& loader,
-                                                     const std::string& arch) -> ModelConfig {
-                                                      return parse_common_gguf_config(loader, arch);
-                                                  });
-
-static ConfigParserAutoRegister _reg_cfg_deepseek_v2(
-    "deepseek_v2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-        auto cfg = parse_common_gguf_config(loader, arch);
-        cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
-        cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
-        cfg.use_mla = (cfg.kv_lora_rank > 0);
-        cfg.n_routed_experts =
-            static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-        cfg.n_shared_experts =
-            static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
-        cfg.num_expert_per_tok =
-            static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
-        if (cfg.kv_lora_rank > 0) {
-            cfg.num_kv_heads = 1;
-            cfg.head_dim = cfg.kv_lora_rank;
-        }
-        return cfg;
-    });
-
-static ConfigParserAutoRegister _reg_cfg_deepseek_v3(
-    "deepseek_v3", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-        auto cfg = parse_common_gguf_config(loader, arch);
-        cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
-        cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
-        cfg.use_mla = (cfg.kv_lora_rank > 0);
-        cfg.n_routed_experts =
-            static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-        cfg.n_shared_experts =
-            static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
-        cfg.num_expert_per_tok =
-            static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
-        if (cfg.kv_lora_rank > 0) {
-            cfg.num_kv_heads = 1;
-            cfg.head_dim = cfg.kv_lora_rank;
-        }
-        return cfg;
-    });
-
-static ConfigParserAutoRegister _reg_cfg_qwen35(
-    "qwen35", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
-        auto cfg = parse_common_gguf_config(loader, arch);
-        cfg.tie_embeddings = true;
-        cfg.use_ssm = true;
-        cfg.ssm_group_count =
-            static_cast<int>(loader.get_metadata_int(arch + ".ssm.group_count", 0));
-        cfg.ssm_time_step_rank =
-            static_cast<int>(loader.get_metadata_int(arch + ".ssm.time_step_rank", 0));
-        cfg.ssm_inner_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.inner_size", 0));
-        cfg.ssm_state_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.state_size", 0));
-        cfg.ssm_conv_kernel =
-            static_cast<int>(loader.get_metadata_int(arch + ".ssm.conv_kernel", 0));
-        cfg.full_attention_interval =
-            static_cast<int>(loader.get_metadata_int(arch + ".full_attention_interval", 0));
-
-        // MRoPE (Multi-dimensional RoPE) for Qwen3.5
-        cfg.rope_dimension_count =
-            static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
-        auto sections = loader.get_metadata_int_array(arch + ".rope.dimension_sections", {});
-        if (!sections.empty() && cfg.rope_dimension_count > 0) {
-            cfg.use_mrope = true;
-            for (size_t i = 0; i < sections.size() && i < 4; ++i) {
-                cfg.rope_dimension_sections[i] = sections[i];
-            }
-        }
-        return cfg;
-    });
-}  // namespace
-
-// ============================================================================
-// WeightInitRegistry implementation
-// ============================================================================
-
-WeightInitRegistry& WeightInitRegistry::instance() {
-    static WeightInitRegistry registry;
-    return registry;
-}
-
-void WeightInitRegistry::register_init(const std::string& arch, LayerWeightInitFn fn) {
-    inits_[arch] = std::move(fn);
-}
-
-bool WeightInitRegistry::has(const std::string& arch) const {
-    return inits_.find(arch) != inits_.end();
-}
-
-void WeightInitRegistry::init_layer(const std::string& arch, LayerWeightInitContext& ctx) const {
-    auto it = inits_.find(arch);
-    if (it != inits_.end()) {
-        it->second(ctx);
-    }
-}
-
-WeightInitAutoRegister::WeightInitAutoRegister(const std::string& arch, LayerWeightInitFn fn) {
-    WeightInitRegistry::instance().register_init(arch, std::move(fn));
-}
-
-// ============================================================================
-// Architecture-specific weight init functions (registered via static auto-register)
-// ============================================================================
-
-namespace {
-
-// Helper: load weight from store into LayerWeights if present
-static void load_if_present(const WeightStore& store, LayerWeights& lw,
-                            const std::string& canonical, const std::string& store_name) {
-    auto t = store.get(store_name);
-    if (t)
-        lw.set(canonical, t);
-}
-
-// Standard GQA attention weight init (LLaMA, Mistral, Qwen2, Yi, DeepSeek)
-static void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
-    const auto& store = ctx.store;
-    auto& lw = ctx.lw;
-    std::string base = "layers." + std::to_string(ctx.layer_idx);
-
-    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
-    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
-    load_if_present(store, lw, "w1", base + ".gate_proj");
-    load_if_present(store, lw, "w2", base + ".down_proj");
-    load_if_present(store, lw, "w3", base + ".up_proj");
-    load_if_present(store, lw, "wq", base + ".wq");
-    load_if_present(store, lw, "wk", base + ".wk");
-    load_if_present(store, lw, "wv", base + ".wv");
-    load_if_present(store, lw, "wo", base + ".wo");
-    load_if_present(store, lw, "bq", base + ".bq");
-    load_if_present(store, lw, "bk", base + ".bk");
-    load_if_present(store, lw, "bv", base + ".bv");
-}
-
-// MLA attention weight init (DeepSeek V2/V3)
-static void init_mla_layer_weights(LayerWeightInitContext& ctx) {
-    const auto& store = ctx.store;
-    auto& lw = ctx.lw;
-    std::string base = "layers." + std::to_string(ctx.layer_idx);
-
-    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
-    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
-    load_if_present(store, lw, "w1", base + ".gate_proj");
-    load_if_present(store, lw, "w2", base + ".down_proj");
-    load_if_present(store, lw, "w3", base + ".up_proj");
-    load_if_present(store, lw, "wq_a", base + ".wq_a");
-    load_if_present(store, lw, "wq_b", base + ".wq_b");
-    load_if_present(store, lw, "kv_a_proj", base + ".kv_a_proj");
-    load_if_present(store, lw, "kv_b_proj", base + ".kv_b_proj");
-    load_if_present(store, lw, "wo", base + ".wo");
-}
-
-// Qwen35 hybrid attention/SSM weight init
-static void init_qwen35_layer_weights(LayerWeightInitContext& ctx) {
-    const auto& store = ctx.store;
-    auto& lw = ctx.lw;
-    std::string base = "layers." + std::to_string(ctx.layer_idx);
-
-    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
-    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
-    load_if_present(store, lw, "w1", base + ".gate_proj");
-    load_if_present(store, lw, "w2", base + ".down_proj");
-    load_if_present(store, lw, "w3", base + ".up_proj");
-
-    // Full attention weights
-    load_if_present(store, lw, "attn_q", base + ".attn_q");
-    load_if_present(store, lw, "attn_k", base + ".attn_k");
-    load_if_present(store, lw, "attn_v", base + ".attn_v");
-    load_if_present(store, lw, "attn_output", base + ".attn_output");
-    load_if_present(store, lw, "attn_q_norm", base + ".attn_q_norm");
-    load_if_present(store, lw, "attn_k_norm", base + ".attn_k_norm");
-    load_if_present(store, lw, "post_attention_norm", base + ".post_attention_norm");
-
-    // Linear attention / SSM weights
-    load_if_present(store, lw, "attn_qkv", base + ".attn_qkv");
-    load_if_present(store, lw, "attn_gate", base + ".attn_gate");
-    load_if_present(store, lw, "ssm_conv1d", base + ".ssm_conv1d");
-    load_if_present(store, lw, "ssm_dt", base + ".ssm_dt");
-    load_if_present(store, lw, "ssm_a", base + ".ssm_a");
-    load_if_present(store, lw, "ssm_alpha", base + ".ssm_alpha");
-    load_if_present(store, lw, "ssm_beta", base + ".ssm_beta");
-    load_if_present(store, lw, "ssm_norm", base + ".ssm_norm");
-    load_if_present(store, lw, "ssm_out", base + ".ssm_out");
-}
-
-// Register weight init functions for each architecture
-static WeightInitAutoRegister _reg_winit_llama("llama", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_mistral("mistral", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_qwen("qwen", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_qwen2("qwen2", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_yi("yi", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_deepseek("deepseek", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_deepseek_v2("deepseek_v2", init_mla_layer_weights);
-static WeightInitAutoRegister _reg_winit_deepseek_v3("deepseek_v3", init_mla_layer_weights);
-static WeightInitAutoRegister _reg_winit_qwen35("qwen35", init_qwen35_layer_weights);
-
-}  // namespace
-
-// ============================================================================
-// ArchCapabilityRegistry implementation
-// ============================================================================
-
-ArchCapabilityRegistry& ArchCapabilityRegistry::instance() {
-    static ArchCapabilityRegistry registry;
-    return registry;
-}
-
-void ArchCapabilityRegistry::register_capability(const std::string& arch,
-                                                 const ArchCapability& cap) {
-    capabilities_[arch] = cap;
-}
-
-bool ArchCapabilityRegistry::has(const std::string& arch) const {
-    return capabilities_.find(arch) != capabilities_.end();
-}
-
-ArchCapability ArchCapabilityRegistry::get(const std::string& arch) const {
-    auto it = capabilities_.find(arch);
-    if (it != capabilities_.end())
-        return it->second;
-    return ArchCapability{};
-}
-
-ArchCapabilityAutoRegister::ArchCapabilityAutoRegister(const std::string& arch,
-                                                       const ArchCapability& cap) {
-    ArchCapabilityRegistry::instance().register_capability(arch, cap);
-}
-
-// ============================================================================
-// Register architecture capabilities
-// ============================================================================
-
-namespace {
-// GQA architectures (use LlamaEngine)
-static ArchCapabilityAutoRegister _reg_cap_llama("llama", ArchCapability{/*use_gqa=*/ true,
-                                                                         /*use_neox_rope=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_mistral("mistral",
-                                                   ArchCapability{/*use_gqa=*/ true,
-                                                                  /*use_neox_rope=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_qwen("qwen", ArchCapability{/*use_gqa=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_qwen2("qwen2", ArchCapability{/*use_gqa=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_yi("yi", ArchCapability{/*use_gqa=*/ true,
-                                                                   /*use_neox_rope=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_deepseek("deepseek", ArchCapability{/*use_gqa=*/ true});
-
-// MLA architectures (use DeepSeekEngine)
-static ArchCapabilityAutoRegister _reg_cap_deepseek_v2("deepseek_v2",
-                                                       ArchCapability{/*use_mla=*/ true});
-static ArchCapabilityAutoRegister _reg_cap_deepseek_v3("deepseek_v3",
-                                                       ArchCapability{/*use_mla=*/ true});
-
-// SSM architectures (use Qwen35Engine)
-static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35", ArchCapability{/*use_ssm=*/ true,
-                                                                           /*use_mrope=*/ true});
-}  // namespace
 
 }  // namespace forge
