@@ -128,7 +128,8 @@ py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> pr
                                      int max_new_tokens, float temperature, int top_k, float top_p,
                                      float repeat_penalty, bool do_sample, uint64_t seed,
                                      int eos_token_id, const std::string& kv_cache_dtype_str,
-                                     int gpu_layers) {
+                                     int gpu_layers,
+                                     const std::vector<int32_t>& stop_token_ids) {
     auto ctx = std::make_unique<InferenceContext>(model_);
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, *ctx);
     if (!engine) {
@@ -159,6 +160,7 @@ py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> pr
     gen_cfg.do_sample = do_sample;
     gen_cfg.seed = seed;
     gen_cfg.eos_token_id = eos_token_id;
+    gen_cfg.stop_token_ids = stop_token_ids;
 
     Generator gen(*ctx);
     auto result = gen.generate(tokens, gen_cfg);
@@ -176,7 +178,8 @@ void PyMultimodalModel::generate_stream(py::array_t<int32_t, py::array::c_style>
                                         py::object callback, int max_new_tokens, float temperature,
                                         int top_k, float top_p, float repeat_penalty,
                                         bool do_sample, uint64_t seed, int eos_token_id,
-                                        const std::string& kv_cache_dtype_str, int gpu_layers) {
+                                        const std::string& kv_cache_dtype_str, int gpu_layers,
+                                        const std::vector<int32_t>& stop_token_ids) {
     auto ctx = std::make_unique<InferenceContext>(model_);
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, *ctx);
     if (!engine) {
@@ -207,6 +210,7 @@ void PyMultimodalModel::generate_stream(py::array_t<int32_t, py::array::c_style>
     gen_cfg.do_sample = do_sample;
     gen_cfg.seed = seed;
     gen_cfg.eos_token_id = eos_token_id;
+    gen_cfg.stop_token_ids = stop_token_ids;
 
     Generator gen(*ctx);
 
@@ -238,12 +242,13 @@ void register_multimodal(py::module_& m) {
              py::arg("max_new_tokens") = 256, py::arg("temperature") = 1.0f, py::arg("top_k") = 0,
              py::arg("top_p") = 1.0f, py::arg("repeat_penalty") = 1.0f, py::arg("do_sample") = true,
              py::arg("seed") = 0, py::arg("eos_token_id") = -1, py::arg("kv_cache_dtype") = "fp32",
-             py::arg("gpu_layers") = -1)
+             py::arg("gpu_layers") = -1, py::arg("stop_token_ids") = std::vector<int32_t>{})
         .def("generate_stream", &PyMultimodalModel::generate_stream, py::arg("prompt_ids"),
              py::arg("callback"), py::arg("max_new_tokens") = 256, py::arg("temperature") = 1.0f,
              py::arg("top_k") = 0, py::arg("top_p") = 1.0f, py::arg("repeat_penalty") = 1.0f,
              py::arg("do_sample") = true, py::arg("seed") = 0, py::arg("eos_token_id") = -1,
-             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1)
+             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
+             py::arg("stop_token_ids") = std::vector<int32_t>{})
         .def_property_readonly("config", &PyMultimodalModel::config,
                                py::return_value_policy::reference)
         .def_property_readonly("vision_config", &PyMultimodalModel::vision_config,

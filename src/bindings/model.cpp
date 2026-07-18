@@ -5,7 +5,8 @@
 py::dict PyModel::generate(py::array_t<int32_t, py::array::c_style> prompt_ids, int max_new_tokens,
                            float temperature, int top_k, float top_p, float repeat_penalty,
                            bool do_sample, uint64_t seed, int eos_token_id,
-                           const std::string& kv_cache_dtype_str, int gpu_layers) {
+                           const std::string& kv_cache_dtype_str, int gpu_layers,
+                           const std::vector<int32_t>& stop_token_ids) {
     auto ctx = std::unique_ptr<PyInferenceContext>(create_context(kv_cache_dtype_str, gpu_layers));
 
     auto buf = prompt_ids.request();
@@ -25,6 +26,7 @@ py::dict PyModel::generate(py::array_t<int32_t, py::array::c_style> prompt_ids, 
     gen_cfg.do_sample = do_sample;
     gen_cfg.seed = seed;
     gen_cfg.eos_token_id = eos_token_id;
+    gen_cfg.stop_token_ids = stop_token_ids;
 
     Generator gen(ctx->get());
     auto result = gen.generate(tokens, gen_cfg);
@@ -42,7 +44,7 @@ void PyModel::generate_stream(py::array_t<int32_t, py::array::c_style> prompt_id
                               py::object callback, int max_new_tokens, float temperature, int top_k,
                               float top_p, float repeat_penalty, bool do_sample, uint64_t seed,
                               int eos_token_id, const std::string& kv_cache_dtype_str,
-                              int gpu_layers) {
+                              int gpu_layers, const std::vector<int32_t>& stop_token_ids) {
     auto ctx = std::unique_ptr<PyInferenceContext>(create_context(kv_cache_dtype_str, gpu_layers));
 
     auto buf = prompt_ids.request();
@@ -62,6 +64,7 @@ void PyModel::generate_stream(py::array_t<int32_t, py::array::c_style> prompt_id
     gen_cfg.do_sample = do_sample;
     gen_cfg.seed = seed;
     gen_cfg.eos_token_id = eos_token_id;
+    gen_cfg.stop_token_ids = stop_token_ids;
 
     Generator gen(ctx->get());
 
@@ -102,12 +105,13 @@ void register_model(py::module_& m) {
              py::arg("temperature") = 1.0f, py::arg("top_k") = 0, py::arg("top_p") = 1.0f,
              py::arg("repeat_penalty") = 1.0f, py::arg("do_sample") = true, py::arg("seed") = 0,
              py::arg("eos_token_id") = -1, py::arg("kv_cache_dtype") = "fp32",
-             py::arg("gpu_layers") = -1)
+             py::arg("gpu_layers") = -1, py::arg("stop_token_ids") = std::vector<int32_t>{})
         .def("generate_stream", &PyModel::generate_stream, py::arg("prompt_ids"),
              py::arg("callback"), py::arg("max_new_tokens") = 256, py::arg("temperature") = 1.0f,
              py::arg("top_k") = 0, py::arg("top_p") = 1.0f, py::arg("repeat_penalty") = 1.0f,
              py::arg("do_sample") = true, py::arg("seed") = 0, py::arg("eos_token_id") = -1,
-             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1)
+             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
+             py::arg("stop_token_ids") = std::vector<int32_t>{})
         .def("registered_archs", &PyModel::registered_archs)
         .def("detect_format", &PyModel::detect_format)
         .def_property_readonly("config", &PyModel::config,

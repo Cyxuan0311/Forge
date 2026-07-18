@@ -16,7 +16,8 @@ void register_core_types(py::module_& m) {
         .value("Q2_K", DataType::Q2_K)
         .value("Q3_K", DataType::Q3_K)
         .value("Q5_K", DataType::Q5_K)
-        .value("Q6_K", DataType::Q6_K);
+        .value("Q6_K", DataType::Q6_K)
+        .value("IQ2_S", DataType::IQ2_S);
 
     py::enum_<DeviceType>(m, "DeviceType")
         .value("CPU", DeviceType::CPU)
@@ -97,7 +98,21 @@ void register_core_types(py::module_& m) {
         .def_readwrite("ssm_conv_kernel", &ModelConfig::ssm_conv_kernel)
         .def_readwrite("full_attention_interval", &ModelConfig::full_attention_interval)
         .def_readwrite("rope_dimension_count", &ModelConfig::rope_dimension_count)
-        .def_readwrite("use_mrope", &ModelConfig::use_mrope);
+        .def_readwrite("use_mrope", &ModelConfig::use_mrope)
+        .def_readwrite("f_attn_logit_softcapping", &ModelConfig::f_attn_logit_softcapping)
+        .def_readwrite("f_final_logit_softcapping", &ModelConfig::f_final_logit_softcapping)
+        .def_readwrite("use_parallel_residual", &ModelConfig::use_parallel_residual)
+        .def_readwrite("n_embd_per_layer", &ModelConfig::n_embd_per_layer)
+        .def_readwrite("n_ff_exp", &ModelConfig::n_ff_exp)
+        .def_readwrite("n_expert", &ModelConfig::n_expert)
+        .def_readwrite("n_expert_used", &ModelConfig::n_expert_used)
+        .def_readwrite("n_swa", &ModelConfig::n_swa)
+        .def_readwrite("n_layer_kv_from_start", &ModelConfig::n_layer_kv_from_start)
+        .def_readwrite("use_qk_norm", &ModelConfig::use_qk_norm)
+        .def_readwrite("head_dim_swa", &ModelConfig::head_dim_swa)
+        .def_readwrite("num_heads_swa", &ModelConfig::num_heads_swa)
+        .def_readwrite("num_kv_heads_swa", &ModelConfig::num_kv_heads_swa)
+        .def_readwrite("suppress_tokens", &ModelConfig::suppress_tokens);
 
     // ---- VisionConfig ----
     py::class_<VisionConfig>(m, "VisionConfig")

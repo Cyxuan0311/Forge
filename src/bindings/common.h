@@ -12,6 +12,7 @@
 #include "forge/context.h"
 #include "forge/engine.h"
 #include "forge/engines/deepseek_engine.h"
+#include "forge/engines/gemma4_engine.h"
 #include "forge/engines/llama_engine.h"
 #include "forge/engines/qwen35_engine.h"
 #include "forge/engines/transformer_engine.h"
@@ -94,6 +95,11 @@ inline void ensure_engines_registered() {
             return std::make_unique<Qwen35Engine>(model, ctx);
         });
     }
+    if (!reg.has("gemma4")) {
+        reg.register_engine("gemma4", [](Model& model, InferenceContext& ctx) {
+            return std::make_unique<Gemma4Engine>(model, ctx);
+        });
+    }
 }
 
 inline void ensure_loaders_registered() {
@@ -107,6 +113,25 @@ inline void ensure_loaders_registered() {
         "ninf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<NinfModel>(); });
     reg.register_loader(
         "gguf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<GgufModel>(); });
+}
+
+// Force static initializers in shared libraries by touching registry instances.
+// This ensures ConfigParserAutoRegister, WeightInitAutoRegister, and
+// ArchCapabilityAutoRegister from arch_config_parser.cpp, arch_weight_init.cpp,
+// and arch_capability.cpp are executed even if the linker would otherwise
+// discard those translation units.
+inline void ensure_config_and_weight_registered() {
+    static bool registered = false;
+    if (registered)
+        return;
+    registered = true;
+
+    // Trigger static registrations by accessing the singleton instances.
+    // The first access causes the static initializers in the linked translation
+    // units to run (if they haven't already).
+    (void)ConfigParserRegistry::instance().has("");
+    (void)WeightInitRegistry::instance().has("");
+    (void)ArchCapabilityRegistry::instance().has("");
 }
 
 // ---- Utility ----
@@ -359,11 +384,13 @@ public:
     py::dict generate(py::array_t<int32_t, py::array::c_style> prompt_ids, int max_new_tokens,
                       float temperature, int top_k, float top_p, float repeat_penalty,
                       bool do_sample, uint64_t seed, int eos_token_id,
-                      const std::string& kv_cache_dtype_str, int gpu_layers);
+                      const std::string& kv_cache_dtype_str, int gpu_layers,
+                      const std::vector<int32_t>& stop_token_ids = {});
     void generate_stream(py::array_t<int32_t, py::array::c_style> prompt_ids, py::object callback,
                          int max_new_tokens, float temperature, int top_k, float top_p,
                          float repeat_penalty, bool do_sample, uint64_t seed, int eos_token_id,
-                         const std::string& kv_cache_dtype_str, int gpu_layers);
+                         const std::string& kv_cache_dtype_str, int gpu_layers,
+                         const std::vector<int32_t>& stop_token_ids = {});
 
     const ModelConfig& config() const { return model_.config(); }
     Model& get_model() { return model_; }
@@ -450,12 +477,14 @@ public:
     py::dict generate(py::array_t<int32_t, py::array::c_style> prompt_ids, int max_new_tokens,
                       float temperature, int top_k, float top_p, float repeat_penalty,
                       bool do_sample, uint64_t seed, int eos_token_id,
-                      const std::string& kv_cache_dtype_str, int gpu_layers);
+                      const std::string& kv_cache_dtype_str, int gpu_layers,
+                      const std::vector<int32_t>& stop_token_ids = {});
 
     void generate_stream(py::array_t<int32_t, py::array::c_style> prompt_ids, py::object callback,
                          int max_new_tokens, float temperature, int top_k, float top_p,
                          float repeat_penalty, bool do_sample, uint64_t seed, int eos_token_id,
-                         const std::string& kv_cache_dtype_str, int gpu_layers);
+                         const std::string& kv_cache_dtype_str, int gpu_layers,
+                         const std::vector<int32_t>& stop_token_ids = {});
 
     const ModelConfig& config() const { return model_.config(); }
     const VisionConfig& vision_config() const { return vision_.config(); }
