@@ -83,6 +83,7 @@ public:
     bool release_intermediates() const { return release_intermediates_; }
 
     const std::vector<TensorPtr>& inputs() const { return inputs_; }
+    void set_input(int idx, const TensorPtr& tensor) { inputs_[idx] = tensor; }
 
     // Operator fusion: merge consecutive fusible ops
     int optimize_fusion();
