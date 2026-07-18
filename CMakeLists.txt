@@ -4,7 +4,7 @@ project(
   VERSION 0.5.0
   LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 
@@ -158,11 +158,17 @@ endif()
 # ---- Model library (static) ----
 add_library(
   forge_model STATIC
-  src/model/model.cpp src/model/model_loader.cpp src/model/ninf_model.cpp
-  src/model/gguf_model.cpp src/model/arch_config_parser.cpp
-  src/model/arch_weight_init.cpp src/model/arch_capability.cpp
-  src/model/model_weights.cpp src/model/weight_store.cpp
-  src/model/weight_mapper.cpp src/inference/engine_factory.cpp)
+  src/model/model.cpp
+  src/model/model_loader.cpp
+  src/model/ninf_model.cpp
+  src/model/gguf_model.cpp
+  src/model/arch_config_parser.cpp
+  src/model/arch_weight_init.cpp
+  src/model/arch_capability.cpp
+  src/model/model_weights.cpp
+  src/model/weight_store.cpp
+  src/model/weight_mapper.cpp
+  src/inference/engine_factory.cpp)
 target_include_directories(
   forge_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CUDAToolkit_INCLUDE_DIRS})
