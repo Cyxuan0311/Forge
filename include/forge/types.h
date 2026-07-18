@@ -20,6 +20,8 @@ enum class DataType : uint32_t {
     Q3_K = 11,
     Q5_K = 12,
     Q6_K = 13,
+    IQ2_S = 14,   // 82 bytes/block, 256 elements/block
+    BF16 = 15,    // bfloat16 (converted to FP32 at load time)
 };
 
 enum class DeviceType : uint32_t {
@@ -32,6 +34,8 @@ inline size_t dtype_size(DataType dt) {
     case DataType::FP32:
         return 4;
     case DataType::FP16:
+        return 2;
+    case DataType::BF16:
         return 2;
     case DataType::INT8:
         return 1;
@@ -72,6 +76,10 @@ inline std::string dtype_name(DataType dt) {
         return "q5_k";
     case DataType::Q6_K:
         return "q6_k";
+    case DataType::IQ2_S:
+        return "iq2_s";
+    case DataType::BF16:
+        return "bf16";
     default:
         return "unknown";
     }
@@ -89,6 +97,7 @@ inline bool is_quantized_type(DataType dt) {
     case DataType::Q3_K:
     case DataType::Q5_K:
     case DataType::Q6_K:
+    case DataType::IQ2_S:
         return true;
     default:
         return false;
@@ -108,7 +117,7 @@ inline int64_t dtype_block_size(DataType dt) {
     case DataType::Q5_1:
         return 24;
     case DataType::Q2_K:
-        return 64;
+        return 84;  // d(2) + dmin(2) + scales(16) + qs(64)
     case DataType::Q3_K:
         return 110;
     case DataType::Q4_K:
@@ -117,6 +126,8 @@ inline int64_t dtype_block_size(DataType dt) {
         return 176;
     case DataType::Q6_K:
         return 210;
+    case DataType::IQ2_S:
+        return 82;   // d(2) + qs[64] + qh[8] + scales[8]
     default:
         return 0;
     }
@@ -135,6 +146,7 @@ inline int64_t dtype_block_elements(DataType dt) {
     case DataType::Q4_K:
     case DataType::Q5_K:
     case DataType::Q6_K:
+    case DataType::IQ2_S:
         return 256;
     default:
         return 1;
