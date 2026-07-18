@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "forge/backend.h"
 #include "forge/backend_scheduler.h"
 #include "forge/cuda_kernels.h"
 #include "forge/logger.h"
@@ -121,6 +122,36 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     }
 
     DeviceType kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
+
+    // If CUDA, check available memory and reduce if needed
+    if (kv_dev == DeviceType::CUDA) {
+        size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
+                          cfg.head_dim * sizeof(float);
+        auto backend = BackendManager::instance().get_cuda_backend();
+        if (backend) {
+            size_t free_mem = backend->device_memory_free();
+            // Leave 256MB headroom for other allocations
+            const size_t headroom = 256 * 1024 * 1024;
+            if (kv_bytes + headroom > free_mem && free_mem > headroom) {
+                size_t available = free_mem - headroom;
+                int reduced_seq =
+                    static_cast<int>(available / ((size_t)cfg.num_layers * 2 * cfg.num_kv_heads *
+                                                  cfg.head_dim * sizeof(float)));
+                if (reduced_seq < kv_max_seq) {
+                    // Round down to nearest 256 for alignment
+                    reduced_seq = (reduced_seq / 256) * 256;
+                    if (reduced_seq < 256)
+                        reduced_seq = 256;
+                    LOG_WARN("KV cache needs " + std::to_string(kv_bytes / (1024 * 1024)) +
+                             "MB but only " + std::to_string(free_mem / (1024 * 1024)) +
+                             "MB free, reducing max_seq_len from " + std::to_string(kv_max_seq) +
+                             " to " + std::to_string(reduced_seq));
+                    kv_max_seq = reduced_seq;
+                }
+            }
+        }
+    }
+
     LOG_INFO("KV cache init: layers=" + std::to_string(cfg.num_layers) + ", kv_heads=" +
              std::to_string(cfg.num_kv_heads) + ", head_dim=" + std::to_string(cfg.head_dim) +
              ", max_seq_len=" + std::to_string(kv_max_seq) +
@@ -175,6 +206,7 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
             fflush(stderr);
             return nullptr;
         }
+
     }
 
     // Use unified weights for output norm and projection

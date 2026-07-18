@@ -37,7 +37,7 @@ protected:
                                     int64_t start_pos, DeviceType dev) = 0;
     virtual bool init_weights() = 0;
 
-    void init_kv_cache(const ModelConfig& cfg);
+    virtual void init_kv_cache(const ModelConfig& cfg);
     TensorPtr forward_layers(const TensorPtr& hidden, int seq_len, int64_t start_pos);
     TensorPtr forward_layers_graph(const TensorPtr& hidden, int seq_len, int64_t start_pos);
 

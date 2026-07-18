@@ -154,7 +154,6 @@ TensorPtr FalconEngine::forward_layer(const TensorPtr& hidden, int layer_idx, in
 void FalconEngine::apply_rope_neox_cpu(const float* q_data, const float* k_data, float* q_out,
                                        float* k_out, int seq_len, int num_heads, int num_kv_heads,
                                        int head_dim, int64_t start_pos, float theta) {
-    ensure_rope_freqs(head_dim, theta);
     int half_dim = head_dim / 2;
     int q_stride = num_heads * head_dim;
     int k_stride = num_kv_heads * head_dim;
@@ -162,7 +161,8 @@ void FalconEngine::apply_rope_neox_cpu(const float* q_data, const float* k_data,
         int64_t pos = start_pos + s;
         for (int h = 0; h < num_heads; ++h) {
             for (int d = 0; d < half_dim; ++d) {
-                float angle = pos * rope_freqs_[d];
+                float freq = 1.0f / std::pow(theta, 2.0f * d / head_dim);
+                float angle = pos * freq;
                 float cos_a = std::cos(angle);
                 float sin_a = std::sin(angle);
 

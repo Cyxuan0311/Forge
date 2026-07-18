@@ -19,6 +19,9 @@ private:
     void apply_rope_neox_cpu(const float* q_data, const float* k_data, float* q_out, float* k_out,
                              int seq_len, int num_heads, int num_kv_heads, int head_dim,
                              int64_t start_pos, float theta);
+    void apply_rope_mrope_cpu(const float* q_data, const float* k_data, float* q_out, float* k_out,
+                              int seq_len, int num_heads, int num_kv_heads, int head_dim, int n_rot,
+                              int64_t start_pos, float theta);
 };
 
 }  // namespace forge

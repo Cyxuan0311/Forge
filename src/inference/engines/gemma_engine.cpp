@@ -59,11 +59,10 @@ TensorPtr GemmaEngine::forward(const TensorPtr& input_ids, int64_t start_pos) {
     if (is_gemma2_ && cfg.f_final_logit_softcapping > 0.0f && logits) {
         PERF_SCOPE("forward/logit_softcap");
         float cap = cfg.f_final_logit_softcapping;
-        logits = ops::tanh_act(logits);
         int n = static_cast<int>(logits->numel());
         float* data = static_cast<float*>(logits->data());
         for (int i = 0; i < n; ++i) {
-            data[i] *= cap;
+            data[i] = std::tanh(data[i] / cap) * cap;
         }
     }
 
@@ -100,7 +99,6 @@ TensorPtr GemmaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
     auto k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), dev);
     {
         PERF_SCOPE("layer/rope");
-        ensure_rope_freqs(head_dim, cfg.rope_theta);
         const float* q_data = static_cast<const float*>(q->data());
         const float* k_data = static_cast<const float*>(k->data());
         float* qo = static_cast<float*>(q_rope->data());
@@ -113,7 +111,8 @@ TensorPtr GemmaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
             int64_t pos = start_pos + s;
             for (int h = 0; h < num_heads; ++h) {
                 for (int d = 0; d < half_dim; ++d) {
-                    float angle = pos * rope_freqs_[d];
+                    float freq = 1.0f / std::pow(cfg.rope_theta, 2.0f * d / head_dim);
+                    float angle = pos * freq;
                     float cos_a = std::cos(angle);
                     float sin_a = std::sin(angle);
 

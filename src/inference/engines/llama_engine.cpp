@@ -154,20 +154,209 @@ TensorPtr LlamaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
         }
     }
 
+    // Apply QK-Norm (per-head RMSNorm) if enabled
+    // On CUDA: reuse launch_rms_norm (per-head norm = per-row RMSNorm with head_dim cols)
+    // On CPU: per-head RMSNorm via OpenMP loop
+    bool qk_norm_on_cpu = false;
+    if (cfg.use_qk_norm) {
+        PERF_SCOPE("layer/qk_norm");
+        // Q-norm
+        if (lw.attn_q_norm()) {
+            int q_rows = seq_len * num_heads;
+            if (dev == DeviceType::CUDA && q->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+                auto q_norm_w = lw.attn_q_norm();
+                // Ensure norm weight is on CUDA
+                const float* w_ptr = nullptr;
+                TensorPtr w_cuda_tmp;
+                if (q_norm_w->dtype() == DataType::FP32) {
+                    if (q_norm_w->device() == DeviceType::CUDA) {
+                        w_ptr = static_cast<const float*>(q_norm_w->data());
+                    } else {
+                        w_cuda_tmp = std::make_shared<Tensor>(DataType::FP32, q_norm_w->shape(),
+                                                              DeviceType::CUDA);
+                        w_cuda_tmp->copy_from(*q_norm_w);
+                        w_ptr = static_cast<const float*>(w_cuda_tmp->data());
+                    }
+                }
+                if (w_ptr) {
+                    // In-place: each row's reads complete before writes (due to __syncthreads)
+                    auto q_out = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
+                    cuda::launch_rms_norm(static_cast<const float*>(q->data()), w_ptr,
+                                         static_cast<float*>(q_out->data()), q_rows, head_dim,
+                                         cfg.rms_norm_eps);
+                    q = q_out;
+                }
+#endif
+            } else {
+                // CPU path
+                float* qd = static_cast<float*>(q->data());
+                auto q_norm_w = lw.attn_q_norm();
+                std::vector<float> qn_w(head_dim);
+                if (q_norm_w->dtype() == DataType::FP32) {
+                    if (q_norm_w->device() == DeviceType::CUDA) {
+                        auto tmp = std::make_shared<Tensor>(DataType::FP32, q_norm_w->shape(),
+                                                            DeviceType::CPU);
+                        tmp->copy_from(*q_norm_w);
+                        std::memcpy(qn_w.data(), tmp->data(), head_dim * sizeof(float));
+                    } else {
+                        std::memcpy(qn_w.data(), q_norm_w->data(), head_dim * sizeof(float));
+                    }
+                } else {
+                    std::fill(qn_w.begin(), qn_w.end(), 1.0f);
+                }
+#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_heads > 4)
+                for (int s = 0; s < seq_len; ++s) {
+                    for (int h = 0; h < num_heads; ++h) {
+                        float* head_ptr = qd + s * num_heads * head_dim + h * head_dim;
+                        float norm_sq = 0.0f;
+                        for (int d = 0; d < head_dim; ++d)
+                            norm_sq += head_ptr[d] * head_ptr[d];
+                        float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + cfg.rms_norm_eps);
+                        for (int d = 0; d < head_dim; ++d)
+                            head_ptr[d] *= inv_rms * qn_w[d];
+                    }
+                }
+                qk_norm_on_cpu = true;
+            }
+        }
+        // K-norm
+        if (lw.attn_k_norm()) {
+            int k_rows = seq_len * num_kv_heads;
+            if (dev == DeviceType::CUDA && k->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+                auto k_norm_w = lw.attn_k_norm();
+                const float* w_ptr = nullptr;
+                TensorPtr w_cuda_tmp;
+                if (k_norm_w->dtype() == DataType::FP32) {
+                    if (k_norm_w->device() == DeviceType::CUDA) {
+                        w_ptr = static_cast<const float*>(k_norm_w->data());
+                    } else {
+                        w_cuda_tmp = std::make_shared<Tensor>(DataType::FP32, k_norm_w->shape(),
+                                                              DeviceType::CUDA);
+                        w_cuda_tmp->copy_from(*k_norm_w);
+                        w_ptr = static_cast<const float*>(w_cuda_tmp->data());
+                    }
+                }
+                if (w_ptr) {
+                    auto k_out = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CUDA);
+                    cuda::launch_rms_norm(static_cast<const float*>(k->data()), w_ptr,
+                                         static_cast<float*>(k_out->data()), k_rows, head_dim,
+                                         cfg.rms_norm_eps);
+                    k = k_out;
+                }
+#endif
+            } else {
+                // CPU path
+                if (k->device() != DeviceType::CPU) {
+                    auto k_cpu = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
+                    k_cpu->copy_from(*k);
+                    k = k_cpu;
+                }
+                float* kd = static_cast<float*>(k->data());
+                auto k_norm_w = lw.attn_k_norm();
+                std::vector<float> kn_w(head_dim);
+                if (k_norm_w->dtype() == DataType::FP32) {
+                    if (k_norm_w->device() == DeviceType::CUDA) {
+                        auto tmp = std::make_shared<Tensor>(DataType::FP32, k_norm_w->shape(),
+                                                            DeviceType::CPU);
+                        tmp->copy_from(*k_norm_w);
+                        std::memcpy(kn_w.data(), tmp->data(), head_dim * sizeof(float));
+                    } else {
+                        std::memcpy(kn_w.data(), k_norm_w->data(), head_dim * sizeof(float));
+                    }
+                } else {
+                    std::fill(kn_w.begin(), kn_w.end(), 1.0f);
+                }
+#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_kv_heads > 4)
+                for (int s = 0; s < seq_len; ++s) {
+                    for (int h = 0; h < num_kv_heads; ++h) {
+                        float* head_ptr = kd + s * num_kv_heads * head_dim + h * head_dim;
+                        float norm_sq = 0.0f;
+                        for (int d = 0; d < head_dim; ++d)
+                            norm_sq += head_ptr[d] * head_ptr[d];
+                        float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + cfg.rms_norm_eps);
+                        for (int d = 0; d < head_dim; ++d)
+                            head_ptr[d] *= inv_rms * kn_w[d];
+                    }
+                }
+                qk_norm_on_cpu = true;
+            }
+        }
+    }
+
     auto q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), dev);
     auto k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), dev);
 
     {
         PERF_SCOPE("layer/rope");
+        int n_rot = cfg.use_mrope ? cfg.rope_dimension_count : head_dim;
+        if (n_rot <= 0) n_rot = head_dim;
         if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cuda::launch_rope_gqa(
-                static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
-                static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), num_heads,
-                num_kv_heads, head_dim, seq_len, start_pos, cfg.rope_theta);
+            // For text-only MRoPE where n_rot == head_dim, all position counters are
+            // identical, so MRoPE reduces to standard Neox-style RoPE — use CUDA kernel.
+            // CPU fallback only needed when Q/K are already on CPU (QK-Norm CPU path)
+            // or when n_rot < head_dim (partial MRoPE not yet supported on CUDA).
+            bool use_cpu_rope = (cfg.use_mrope && n_rot < head_dim) || qk_norm_on_cpu;
+            if (use_cpu_rope) {
+                // Ensure Q/K are on CPU
+                auto q_cpu = (q->device() == DeviceType::CPU)
+                                 ? q
+                                 : [&]() {
+                                       auto t = std::make_shared<Tensor>(DataType::FP32, q->shape(),
+                                                                         DeviceType::CPU);
+                                       t->copy_from(*q);
+                                       return t;
+                                   }();
+                auto k_cpu = (k->device() == DeviceType::CPU)
+                                 ? k
+                                 : [&]() {
+                                       auto t = std::make_shared<Tensor>(DataType::FP32, k->shape(),
+                                                                         DeviceType::CPU);
+                                       t->copy_from(*k);
+                                       return t;
+                                   }();
+                auto q_rope_cpu = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
+                auto k_rope_cpu = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
+                if (cfg.use_mrope) {
+                    apply_rope_mrope_cpu(
+                        static_cast<const float*>(q_cpu->data()),
+                        static_cast<const float*>(k_cpu->data()),
+                        static_cast<float*>(q_rope_cpu->data()),
+                        static_cast<float*>(k_rope_cpu->data()),
+                        seq_len, num_heads, num_kv_heads, head_dim, n_rot, start_pos, cfg.rope_theta);
+                } else if (cfg.use_neox_rope) {
+                    apply_rope_neox_cpu(
+                        static_cast<const float*>(q_cpu->data()),
+                        static_cast<const float*>(k_cpu->data()),
+                        static_cast<float*>(q_rope_cpu->data()),
+                        static_cast<float*>(k_rope_cpu->data()),
+                        seq_len, num_heads, num_kv_heads, head_dim, start_pos, cfg.rope_theta);
+                } else {
+                    apply_rope_standard(
+                        static_cast<const float*>(q_cpu->data()),
+                        static_cast<const float*>(k_cpu->data()),
+                        static_cast<float*>(q_rope_cpu->data()),
+                        static_cast<float*>(k_rope_cpu->data()),
+                        seq_len, num_heads, num_kv_heads, head_dim, start_pos, cfg.rope_theta);
+                }
+                q_rope->copy_from(*q_rope_cpu);
+                k_rope->copy_from(*k_rope_cpu);
+            } else {
+                cuda::launch_rope_gqa(
+                    static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+                    static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), num_heads,
+                    num_kv_heads, head_dim, seq_len, start_pos, cfg.rope_theta);
+            }
 #endif
         } else {
-            if (cfg.use_neox_rope) {
+            if (cfg.use_mrope) {
+                apply_rope_mrope_cpu(
+                    static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+                    static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()),
+                    seq_len, num_heads, num_kv_heads, head_dim, n_rot, start_pos, cfg.rope_theta);
+            } else if (cfg.use_neox_rope) {
                 apply_rope_neox_cpu(
                     static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
                     static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()),
@@ -315,8 +504,14 @@ TensorPtr LlamaEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int
     }
 
     TensorPtr output;
-    if ((dev == DeviceType::CUDA || dev == DeviceType::CPU) && seq_len == 1 &&
-        (lw.w2()->dtype() == DataType::Q4_0 || lw.w2()->dtype() == DataType::Q6_K)) {
+    // Only skip residual add if a fused kernel already added it:
+    // - Q4_0 CUDA: launch_ffn_down_fused_q4_0 adds residual
+    // - Q4_0 CPU: matmul_transB_fused_ffn_down_residual_q4_0 adds residual
+    // - Q6_K CPU: matmul_transB_fused_ffn_down_residual_q6_k adds residual
+    // - Q6_K CUDA: NO fused kernel, generic matmul_transB without residual
+    if ((dev == DeviceType::CUDA && seq_len == 1 && lw.w2()->dtype() == DataType::Q4_0) ||
+        (dev == DeviceType::CPU && seq_len == 1 &&
+         (lw.w2()->dtype() == DataType::Q4_0 || lw.w2()->dtype() == DataType::Q6_K))) {
         output = ffn_out;  // residual already added in fused kernel
     } else {
         output = ops::add(hidden_after_attn, ffn_out);
@@ -357,6 +552,67 @@ void LlamaEngine::apply_rope_neox_cpu(const float* q_data, const float* k_data, 
     }
 }
 
+void LlamaEngine::apply_rope_mrope_cpu(const float* q_data, const float* k_data, float* q_out,
+                                       float* k_out, int seq_len, int num_heads, int num_kv_heads,
+                                       int head_dim, int n_rot, int64_t start_pos, float theta) {
+    // MRoPE: apply rotary embeddings to the first n_rot dimensions only.
+    // For text-only inference, all position counters advance identically,
+    // so this reduces to standard RoPE with n_rot rotary dimensions.
+    int half_rot = n_rot / 2;
+    float theta_scale = 1.0f / theta;
+    int q_stride = num_heads * head_dim;
+    int k_stride = num_kv_heads * head_dim;
+
+#pragma omp parallel for schedule(static) if (seq_len > 1)
+    for (int s = 0; s < seq_len; ++s) {
+        int64_t pos = start_pos + s;
+
+        for (int h = 0; h < num_heads; ++h) {
+            const float* q_src = q_data + s * q_stride + h * head_dim;
+            float* q_dst = q_out + s * q_stride + h * head_dim;
+
+            // Apply RoPE to first n_rot dimensions
+            for (int d = 0; d < half_rot; ++d) {
+                float freq = std::pow(theta_scale, 2.0f * d / n_rot);
+                float angle = pos * freq;
+                float cos_a = std::cos(angle);
+                float sin_a = std::sin(angle);
+
+                float x0 = q_src[d];
+                float x1 = q_src[d + half_rot];
+
+                q_dst[d] = x0 * cos_a - x1 * sin_a;
+                q_dst[d + half_rot] = x0 * sin_a + x1 * cos_a;
+            }
+            // Copy remaining dimensions unchanged
+            for (int d = n_rot; d < head_dim; ++d) {
+                q_dst[d] = q_src[d];
+            }
+        }
+
+        for (int h = 0; h < num_kv_heads; ++h) {
+            const float* k_src = k_data + s * k_stride + h * head_dim;
+            float* k_dst = k_out + s * k_stride + h * head_dim;
+
+            for (int d = 0; d < half_rot; ++d) {
+                float freq = std::pow(theta_scale, 2.0f * d / n_rot);
+                float angle = pos * freq;
+                float cos_a = std::cos(angle);
+                float sin_a = std::sin(angle);
+
+                float x0 = k_src[d];
+                float x1 = k_src[d + half_rot];
+
+                k_dst[d] = x0 * cos_a - x1 * sin_a;
+                k_dst[d + half_rot] = x0 * sin_a + x1 * cos_a;
+            }
+            for (int d = n_rot; d < head_dim; ++d) {
+                k_dst[d] = k_src[d];
+            }
+        }
+    }
+}
+
 // Register engines for all GQA-based architectures
 namespace {
 static EngineAutoRegister _reg_llama("llama", [](Model& model, InferenceContext& ctx) {
@@ -369,6 +625,9 @@ static EngineAutoRegister _reg_qwen("qwen", [](Model& model, InferenceContext& c
     return std::make_unique<LlamaEngine>(model, ctx);
 });
 static EngineAutoRegister _reg_qwen2("qwen2", [](Model& model, InferenceContext& ctx) {
+    return std::make_unique<LlamaEngine>(model, ctx);
+});
+static EngineAutoRegister _reg_qwen3vl("qwen3vl", [](Model& model, InferenceContext& ctx) {
     return std::make_unique<LlamaEngine>(model, ctx);
 });
 static EngineAutoRegister _reg_yi("yi", [](Model& model, InferenceContext& ctx) {
