@@ -57,6 +57,7 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_JOBS 0)
 set(PYBIND11_LTO_CXX_FLAGS "")
 
 # ---- Optional CUDA support ----
@@ -95,7 +96,7 @@ set(FETCHCONTENT_BASE_DIR
 include(FetchContent)
 FetchContent_Declare(
   pybind11
-  GIT_REPOSITORY https://github.com/pybind/pybind11.git
+  GIT_REPOSITORY https://ghproxy.net/https://github.com/pybind/pybind11.git
   GIT_TAG v2.13.6)
 FetchContent_MakeAvailable(pybind11)
 
@@ -158,7 +159,10 @@ endif()
 add_library(
   forge_model STATIC
   src/model/model.cpp src/model/model_loader.cpp src/model/ninf_model.cpp
-  src/model/gguf_model.cpp src/inference/engine_factory.cpp)
+  src/model/gguf_model.cpp src/model/arch_config_parser.cpp
+  src/model/arch_weight_init.cpp src/model/arch_capability.cpp
+  src/model/model_weights.cpp src/model/weight_store.cpp
+  src/model/weight_mapper.cpp src/inference/engine_factory.cpp)
 target_include_directories(
   forge_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CUDAToolkit_INCLUDE_DIRS})
@@ -192,6 +196,9 @@ add_library(
   src/inference/engines/llama_engine.cpp
   src/inference/engines/deepseek_engine.cpp
   src/inference/engines/qwen35_engine.cpp
+  src/inference/engines/gemma_engine.cpp
+  src/inference/engines/gemma4_engine.cpp
+  src/inference/engines/falcon_engine.cpp
   src/inference/engines/layer_graph_builder.cpp
   src/inference/engines/llama_graph_builder.cpp
   src/inference/engines/deepseek_graph_builder.cpp

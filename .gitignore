@@ -81,3 +81,6 @@ report/*.png
 
 # Dependencies fetched by CMake
 _deps/
+
+# some unused files
+plan.md
