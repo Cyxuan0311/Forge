@@ -17,18 +17,14 @@ import gc
 import numpy as np
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root / "build"))
+from chat_utils import load_tokenizer
 
 import forge
 
-# ============================================================
 # Configuration
-# ============================================================
 MODEL_DIR = "/mnt/g/AI/MiniCPM-V-4.6.F16"
 DEVICE = "cuda"
-GPU_LAYERS = -1  # -1 = all layers on GPU
+GPU_LAYERS = -1
 MAX_NEW_TOKENS = 512
 TEMPERATURE = 0.7
 TOP_K = 40
@@ -37,24 +33,8 @@ REPEAT_PENALTY = 1.1
 KV_CACHE_DTYPE = "fp32"
 
 
-# ============================================================
-# MiniCPM-V Chat Template (Qwen2-style ChatML)
-# ============================================================
 def apply_chat_template(tokenizer, messages, add_generation_prompt=True):
-    """Apply MiniCPM-V chat template (Qwen-style ChatML).
-
-    MiniCPM-V 4.6 uses Qwen-style chat template:
-      <|im_start|>user\n<image>[img_tokens]{text}<|im_end|>\n<|im_start|>assistant\n
-
-    Special tokens (<|im_start|>, <|im_end|>, <image>, </image>) are single vocabulary
-    entries and must be looked up via token_to_id(), not BPE-encoded.
-    Newline must be encoded via encode() since token_to_id('\n') returns unk.
-
-    Returns:
-        token_ids: list of token IDs
-        image_insert_start: index where image embeddings should be inserted
-        num_img_tokens: number of image placeholder tokens
-    """
+    """Apply MiniCPM-V chat template (Qwen-style ChatML)."""
     token_ids = []
     image_insert_start = 0
     num_img_tokens = 0
@@ -75,68 +55,43 @@ def apply_chat_template(tokenizer, messages, add_generation_prompt=True):
 
         if role == "user":
             n_img = msg.get("num_image_tokens", 0) if has_image else 0
-
             if n_img > 0:
                 num_img_tokens = n_img
                 prompt_ids = list(tokenizer.encode(content, add_bos=False))
                 user_ids = (
-                    [im_start_id]
-                    + user_text_ids
-                    + newline_ids
-                    + [img_start_id]
-                    + [0] * n_img
-                    + [img_end_id]
-                    + prompt_ids
-                    + [im_end_id]
-                    + newline_ids
+                    [im_start_id] + user_text_ids + newline_ids
+                    + [img_start_id] + [0] * n_img + [img_end_id]
+                    + prompt_ids + [im_end_id] + newline_ids
                 )
                 image_insert_start = len(token_ids) + 1 + len(user_text_ids) + len(newline_ids) + 1
                 token_ids.extend(user_ids)
             else:
                 prompt_ids = list(tokenizer.encode(content, add_bos=False))
                 user_ids = (
-                    [im_start_id]
-                    + user_text_ids
-                    + newline_ids
-                    + prompt_ids
-                    + [im_end_id]
-                    + newline_ids
+                    [im_start_id] + user_text_ids + newline_ids
+                    + prompt_ids + [im_end_id] + newline_ids
                 )
                 token_ids.extend(user_ids)
 
         elif role == "assistant":
             asst_ids = list(tokenizer.encode(content, add_bos=False))
-            asst_full = (
-                [im_start_id]
-                + assistant_text_ids
-                + newline_ids
-                + asst_ids
-                + [im_end_id]
-                + newline_ids
-            )
+            asst_full = [im_start_id] + assistant_text_ids + newline_ids + asst_ids + [im_end_id] + newline_ids
             token_ids.extend(asst_full)
 
     if add_generation_prompt:
-        gen_prompt = [im_start_id] + assistant_text_ids + newline_ids
-        token_ids.extend(gen_prompt)
+        token_ids.extend([im_start_id] + assistant_text_ids + newline_ids)
 
     return token_ids, image_insert_start, num_img_tokens
 
 
-# ============================================================
-# Sampling
-# ============================================================
 def sample_token(logits, temperature, top_k, top_p, repeat_penalty, generated_ids):
-    """Sample next token from logits with temperature, top-k, top-p, and repeat penalty."""
     if isinstance(logits, np.ndarray):
         logits_1d = logits[-1].copy()
     else:
         logits_1d = np.array(logits)[-1].copy()
 
-    # Guard against NaN/Inf
     logits_1d = np.where(np.isfinite(logits_1d), logits_1d, -1e9)
 
-    # Apply repeat penalty
     if repeat_penalty != 1.0 and len(generated_ids) > 0:
         for tid in set(generated_ids[-64:]):
             if 0 <= tid < len(logits_1d):
@@ -146,17 +101,13 @@ def sample_token(logits, temperature, top_k, top_p, repeat_penalty, generated_id
                     logits_1d[tid] *= repeat_penalty
 
     if temperature > 0:
-        # Numerically stable softmax with temperature
         shifted = logits_1d - np.max(logits_1d)
         probs = np.exp(shifted / temperature)
         probs = probs / probs.sum()
-
-        # Top-K
         k = min(top_k, len(probs))
         top_indices = np.argsort(probs)[-k:]
         top_probs = probs[top_indices]
         top_probs = top_probs / top_probs.sum()
-
         token_id = int(np.random.choice(top_indices, p=top_probs))
     else:
         token_id = int(np.argmax(logits_1d))
@@ -164,11 +115,7 @@ def sample_token(logits, temperature, top_k, top_p, repeat_penalty, generated_id
     return token_id
 
 
-# ============================================================
-# Thinking mode detection
-# ============================================================
 def find_thinking_tokens(tokenizer):
-    """Find <think and </think token IDs for thinking mode detection."""
     think_start_id = None
     think_end_id = None
     for tid in range(tokenizer.vocab_size - 1, max(0, tokenizer.vocab_size - 200), -1):
@@ -185,12 +132,7 @@ def find_thinking_tokens(tokenizer):
     return think_start_id, think_end_id
 
 
-# ============================================================
-# Model Manager
-# ============================================================
 class MiniCPMVModel:
-    """Manages the MiniCPM-V multimodal model for inference."""
-
     def __init__(self, model_dir, device="cuda", gpu_layers=-1):
         self.model_dir = model_dir
         self.device = device
@@ -202,9 +144,7 @@ class MiniCPMVModel:
         self.think_end_id = None
 
     def load(self):
-        """Load model, tokenizer, and vision encoder."""
         print(f"Loading model from {self.model_dir}...")
-
         llm_path, mmproj_path = self._find_gguf_files()
         if not llm_path:
             raise FileNotFoundError(f"No LLM GGUF file found in {self.model_dir}")
@@ -212,17 +152,10 @@ class MiniCPMVModel:
         print(f"  LLM: {os.path.basename(llm_path)}")
         print(f"  mmproj: {os.path.basename(mmproj_path) if mmproj_path else 'N/A'}")
 
-        # Load tokenizer
         print("Loading tokenizer...")
-        self.tokenizer = forge.Tokenizer()
-        self.tokenizer.load_from_gguf(llm_path)
-        print(
-            f"  vocab_size={self.tokenizer.vocab_size}, "
-            f"bos_id={self.tokenizer.bos_token_id}, "
-            f"eos_id={self.tokenizer.eos_token_id}"
-        )
+        self.tokenizer = load_tokenizer(llm_path)
+        print(f"  vocab_size={self.tokenizer.vocab_size}, bos_id={self.tokenizer.bos_token_id}, eos_id={self.tokenizer.eos_token_id}")
 
-        # Load multimodal model
         print("Loading multimodal model...")
         self.mm_model = forge.MultimodalModel()
         try:
@@ -234,18 +167,12 @@ class MiniCPMVModel:
             self.mm_model.load_with_mmproj(llm_path, mmproj_path, self.device)
 
         cfg = self.mm_model.config
-        print(
-            f"  arch={cfg.arch_type}, hidden_dim={cfg.hidden_dim}, "
-            f"num_layers={cfg.num_layers}, num_heads={cfg.num_heads}, "
-            f"use_ssm={cfg.use_ssm}"
-        )
+        print(f"  arch={cfg.arch_type}, hidden_dim={cfg.hidden_dim}, num_layers={cfg.num_layers}, num_heads={cfg.num_heads}, use_ssm={cfg.use_ssm}")
 
-        # Detect thinking tokens
         self.think_start_id, self.think_end_id = find_thinking_tokens(self.tokenizer)
         if self.think_start_id is not None:
             print(f"  Thinking mode: <think={self.think_start_id}, </think={self.think_end_id}")
 
-        # Warmup
         if self.device == "cuda":
             print("Warming up CUDA kernels...")
             try:
@@ -261,85 +188,44 @@ class MiniCPMVModel:
         return True
 
     def _find_gguf_files(self):
-        """Find LLM and mmproj GGUF files in model directory."""
         model_dir = Path(self.model_dir)
-
         if model_dir.is_file() and model_dir.suffix == ".gguf":
             return str(model_dir), None
-
         if not model_dir.is_dir():
             return None, None
 
         gguf_files = list(model_dir.glob("*.gguf"))
-
         llm_path = None
         mmproj_path = None
-
         for f in gguf_files:
             name_lower = f.name.lower()
             if "mmproj" in name_lower or "vision" in name_lower or "clip" in name_lower:
                 mmproj_path = str(f)
             else:
                 llm_path = str(f)
-
         if llm_path is None and len(gguf_files) == 1:
             llm_path = str(gguf_files[0])
-
         return llm_path, mmproj_path
 
     def encode_image(self, image):
-        """Encode image using vision encoder.
-
-        Args:
-            image: PIL Image or numpy array (H, W, C) uint8
-
-        Returns:
-            numpy array of shape [num_tokens, hidden_dim]
-        """
         if isinstance(image, np.ndarray):
             img_array = image
         else:
             img_array = np.array(image.convert("RGB"))
-
-        # Ensure HWC uint8 format
         if img_array.ndim == 2:
             img_array = np.stack([img_array] * 3, axis=-1)
         elif img_array.ndim == 3 and img_array.shape[2] == 4:
             img_array = img_array[:, :, :3]
         elif img_array.ndim == 3 and img_array.shape[2] == 1:
             img_array = np.repeat(img_array, 3, axis=2)
-
         img_array = img_array.astype(np.uint8)
         return self.mm_model.encode_image(img_array)
 
-    def chat(
-        self,
-        user_message,
-        image=None,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=TEMPERATURE,
-        top_k=TOP_K,
-        top_p=TOP_P,
-        reset_conversation=False,
-    ):
-        """Chat with the model.
-
-        Args:
-            user_message: User's text message
-            image: Optional PIL Image or numpy array
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-K sampling parameter
-            top_p: Top-P sampling parameter
-            reset_conversation: Whether to reset conversation history
-
-        Returns:
-            Generated text response (thinking content stripped)
-        """
+    def chat(self, user_message, image=None, max_new_tokens=MAX_NEW_TOKENS,
+             temperature=TEMPERATURE, top_k=TOP_K, top_p=TOP_P, reset_conversation=False):
         if reset_conversation:
             self.conversation_history = []
 
-        # Encode image if provided
         image_embeddings = None
         num_img_tokens = 0
         has_image = image is not None
@@ -348,35 +234,21 @@ class MiniCPMVModel:
             image_embeddings = self.encode_image(image)
             num_img_tokens = image_embeddings.shape[0]
 
-        # Add user message to history
-        self.conversation_history.append(
-            {
-                "role": "user",
-                "content": user_message,
-                "has_image": has_image,
-                "num_image_tokens": num_img_tokens,
-            }
-        )
+        self.conversation_history.append({"role": "user", "content": user_message, "has_image": has_image, "num_image_tokens": num_img_tokens})
 
-        # Build prompt with chat template
-        prompt_ids, img_insert_start, n_img = apply_chat_template(
-            self.tokenizer, self.conversation_history
-        )
-
-        # Create fresh context for each turn (re-forward full prompt for correctness)
+        prompt_ids, img_insert_start, n_img = apply_chat_template(self.tokenizer, self.conversation_history)
         ctx = self.mm_model.create_context(KV_CACHE_DTYPE, self.gpu_layers)
 
-        # Build embeddings and forward
         if has_image and image_embeddings is not None:
-            combined_emb = self._build_embeddings(
-                ctx, prompt_ids, image_embeddings, img_insert_start, num_img_tokens
-            )
-            logits = ctx.forward_with_embeddings(combined_emb, 0)
+            prompt_array = np.array(prompt_ids, dtype=np.int32)
+            text_embeddings = np.array(ctx.get_embeddings(prompt_array))
+            if n_img > 0 and image_embeddings is not None:
+                text_embeddings[img_insert_start:img_insert_start + num_img_tokens] = image_embeddings
+            logits = ctx.forward_with_embeddings(text_embeddings, 0)
         else:
             prompt_array = np.array(prompt_ids, dtype=np.int32)
             logits = ctx.forward(prompt_array, 0)
 
-        # Generate tokens
         start_pos = len(prompt_ids)
         generated_ids = []
         generated_text = ""
@@ -385,16 +257,11 @@ class MiniCPMVModel:
         token_buffer = []
 
         for step in range(max_new_tokens):
-            next_token = sample_token(
-                logits, temperature, top_k, top_p, REPEAT_PENALTY, generated_ids
-            )
+            next_token = sample_token(logits, temperature, top_k, top_p, REPEAT_PENALTY, generated_ids)
             generated_ids.append(next_token)
 
-            # Check EOS
             if next_token == self.tokenizer.eos_token_id:
                 break
-
-            # Check thinking mode transitions
             if self.think_start_id is not None and next_token == self.think_start_id:
                 in_thinking = True
                 continue
@@ -402,28 +269,22 @@ class MiniCPMVModel:
                 in_thinking = False
                 continue
 
-            # Buffered decode for smoother output
             token_buffer.append(next_token)
             if len(token_buffer) >= 4:
-                text = self.tokenizer.decode(
-                    token_buffer, skip_special=True, strip_leading_space=False
-                )
+                text = self.tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
                 if in_thinking:
                     thinking_text += text
                 else:
                     generated_text += text
                 token_buffer.clear()
 
-            # Forward next token
             next_ids = np.array([next_token], dtype=np.int32)
             try:
                 logits = ctx.forward(next_ids, start_pos)
-            except Exception as e:
-                print(f"Error at step {step}: {e}")
+            except Exception:
                 break
             start_pos += 1
 
-        # Flush remaining buffer
         if token_buffer:
             text = self.tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
             if in_thinking:
@@ -431,44 +292,21 @@ class MiniCPMVModel:
             else:
                 generated_text += text
 
-        # Free context
         del ctx
         gc.collect()
 
-        # Add assistant response to history
-        self.conversation_history.append(
-            {"role": "assistant", "content": generated_text.strip(), "has_image": False}
-        )
+        self.conversation_history.append({"role": "assistant", "content": generated_text.strip(), "has_image": False})
 
-        # Return response with optional thinking prefix
         result = generated_text.strip()
         if thinking_text.strip():
             result = f"[Thinking: {thinking_text.strip()}]\n\n{result}"
-
         return result
 
-    def _build_embeddings(
-        self, ctx, prompt_ids, image_embeddings, img_insert_start, num_img_tokens
-    ):
-        """Build full embeddings with image embeddings injected."""
-        prompt_array = np.array(prompt_ids, dtype=np.int32)
-        text_embeddings = np.array(ctx.get_embeddings(prompt_array))
-
-        if num_img_tokens > 0 and image_embeddings is not None:
-            text_embeddings[img_insert_start : img_insert_start + num_img_tokens] = image_embeddings
-
-        return text_embeddings
-
     def reset(self):
-        """Reset conversation history."""
         self.conversation_history = []
 
 
-# ============================================================
-# Gradio Web Interface
-# ============================================================
 def create_web_interface(model):
-    """Create Gradio web interface for multimodal chat."""
     try:
         import gradio as gr
     except ImportError:
@@ -478,11 +316,9 @@ def create_web_interface(model):
     from PIL import Image
 
     def chat_fn(message, image, history, temperature, top_k, top_p, max_tokens):
-        """Handle chat interaction."""
         if not message.strip() and image is None:
             return history, ""
 
-        # Process image if provided
         img_array = None
         if image is not None:
             if isinstance(image, dict):
@@ -496,23 +332,17 @@ def create_web_interface(model):
             else:
                 img_array = np.array(image.convert("RGB") if hasattr(image, "convert") else image)
 
-        # Generate response
         try:
             response = model.chat(
-                user_message=message,
-                image=img_array if img_array is not None else None,
-                max_new_tokens=int(max_tokens),
-                temperature=temperature,
-                top_k=int(top_k),
-                top_p=top_p,
+                user_message=message, image=img_array if img_array is not None else None,
+                max_new_tokens=int(max_tokens), temperature=temperature,
+                top_k=int(top_k), top_p=top_p,
             )
         except Exception as e:
             import traceback
-
             traceback.print_exc()
             response = f"Error: {str(e)}"
 
-        # Update history
         history = history or []
         if image is not None:
             user_msg = f"[Image uploaded] {message}"
@@ -520,62 +350,37 @@ def create_web_interface(model):
             user_msg = message
         history.append({"role": "user", "content": user_msg})
         history.append({"role": "assistant", "content": response})
-
         return history, ""
 
     def reset_fn():
-        """Reset conversation."""
         model.reset()
         return [], ""
 
-    # Build interface
     with gr.Blocks(title="MiniCPM-V 4.6 - Forge") as demo:
-        gr.Markdown(
-            "# MiniCPM-V 4.6 Multimodal Chat\n"
-            "Powered by Forge - Upload an image and ask questions about it!"
-        )
-
+        gr.Markdown("# MiniCPM-V 4.6 Multimodal Chat\nPowered by Forge")
         with gr.Row():
             with gr.Column(scale=3):
                 chatbot = gr.Chatbot(height=500)
                 with gr.Row():
-                    msg_input = gr.Textbox(
-                        placeholder="Type your message here...", show_label=False, scale=4
-                    )
+                    msg_input = gr.Textbox(placeholder="Type your message here...", show_label=False, scale=4)
                     submit_btn = gr.Button("Send", variant="primary", scale=1)
                 with gr.Row():
                     image_input = gr.Image(type="pil", label="Upload Image (optional)", height=200)
                     clear_btn = gr.Button("Clear Conversation")
-
             with gr.Column(scale=1):
                 gr.Markdown("### Generation Parameters")
-                temperature = gr.Slider(
-                    minimum=0.0, maximum=2.0, value=TEMPERATURE, step=0.1, label="Temperature"
-                )
+                temperature = gr.Slider(minimum=0.0, maximum=2.0, value=TEMPERATURE, step=0.1, label="Temperature")
                 top_k = gr.Slider(minimum=0, maximum=200, value=TOP_K, step=1, label="Top-K")
                 top_p = gr.Slider(minimum=0.0, maximum=1.0, value=TOP_P, step=0.05, label="Top-P")
-                max_tokens = gr.Slider(
-                    minimum=32, maximum=2048, value=MAX_NEW_TOKENS, step=32, label="Max Tokens"
-                )
+                max_tokens = gr.Slider(minimum=32, maximum=2048, value=MAX_NEW_TOKENS, step=32, label="Max Tokens")
 
-        submit_btn.click(
-            chat_fn,
-            inputs=[msg_input, image_input, chatbot, temperature, top_k, top_p, max_tokens],
-            outputs=[chatbot, msg_input],
-        )
-        msg_input.submit(
-            chat_fn,
-            inputs=[msg_input, image_input, chatbot, temperature, top_k, top_p, max_tokens],
-            outputs=[chatbot, msg_input],
-        )
+        submit_btn.click(chat_fn, inputs=[msg_input, image_input, chatbot, temperature, top_k, top_p, max_tokens], outputs=[chatbot, msg_input])
+        msg_input.submit(chat_fn, inputs=[msg_input, image_input, chatbot, temperature, top_k, top_p, max_tokens], outputs=[chatbot, msg_input])
         clear_btn.click(reset_fn, outputs=[chatbot, msg_input])
 
     return demo
 
 
-# ============================================================
-# Main
-# ============================================================
 def main():
     print("=" * 60)
     print("MiniCPM-V 4.6 Multimodal Inference - Forge")
@@ -587,19 +392,15 @@ def main():
         model.load()
     except Exception as e:
         import traceback
-
         traceback.print_exc()
         print(f"\nFailed to load model: {e}")
-
         try:
             import gradio as gr
         except ImportError:
             print("Gradio not installed. Install with: pip install gradio")
             return
-
         with gr.Blocks(title="MiniCPM-V 4.6 - Error") as demo:
             gr.Markdown(f"# Error Loading Model\n\n{e}")
-
         demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
         return
 
