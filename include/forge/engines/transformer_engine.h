@@ -9,6 +9,23 @@
 
 namespace forge {
 
+struct GraphCache {
+    std::unique_ptr<ComputeGraph> graph;
+    int cached_seq_len = -1;
+    int cached_gpu_layers = -1;
+    std::string cached_arch;
+    bool valid = false;
+
+    bool can_reuse(int seq_len, int gpu_layers, const std::string& arch) const {
+        return valid && graph
+               && seq_len == cached_seq_len
+               && gpu_layers == cached_gpu_layers
+               && arch == cached_arch;
+    }
+
+    void invalidate() { valid = false; }
+};
+
 class TransformerEngine : public InferenceEngine {
 public:
     explicit TransformerEngine(Model& model, InferenceContext& ctx);
@@ -61,6 +78,7 @@ protected:
     int gpu_layers_ = -1;
     bool use_graph_ = false;
     std::unique_ptr<LayerGraphBuilder> graph_builder_;
+    GraphCache graph_cache_;
 };
 
 }  // namespace forge

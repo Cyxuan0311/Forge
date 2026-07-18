@@ -30,9 +30,11 @@ TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
 void TransformerEngine::reset() {
     kv_cache_.reset();
     kv_cache_initialized_ = false;
+    graph_cache_.invalidate();
 }
 
 void TransformerEngine::set_gpu_layers(int gpu_layers) {
+    graph_cache_.invalidate();
     gpu_layers_ = gpu_layers;
     const auto& cfg = model_.config();
     int num_layers = cfg.num_layers;
@@ -258,40 +260,58 @@ TensorPtr TransformerEngine::forward_layers_graph(const TensorPtr& hidden, int s
     const auto& cfg = model_.config();
     auto t0 = std::chrono::steady_clock::now();
 
-    ComputeGraph graph;
+    // Check if cached graph can be reused
+    if (graph_cache_.can_reuse(seq_len, gpu_layers_, cfg.arch_type)) {
+        graph_cache_.graph->set_input(0, hidden);
+        auto result = graph_cache_.graph->execute();
+        auto t1 = std::chrono::steady_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        LOG_INFO("Forward (graph, reused) total: " + std::to_string((int)total_ms) +
+                 "ms (seq_len=" + std::to_string(seq_len) + ")");
+        return result;
+    }
+
+    // Cache miss: build a new graph
+    auto graph = std::make_unique<ComputeGraph>();
 
     // Add hidden state as graph input
-    int hidden_idx = graph.add_input(hidden);
+    int hidden_idx = graph->add_input(hidden);
 
     // Build layer graphs
     int cur_idx = hidden_idx;
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
         DeviceType layer_dev = layer_device(layer);
         const auto& lw = weights_.layers[layer];
-        cur_idx = graph_builder_->build_layer_graph(graph, cur_idx, lw, cfg, layer, seq_len,
+        cur_idx = graph_builder_->build_layer_graph(*graph, cur_idx, lw, cfg, layer, seq_len,
                                                     start_pos, layer_dev, kv_cache_);
     }
 
     // Build output head graph
-    int output_idx = graph_builder_->build_output_graph(graph, cur_idx, weights_, cfg);
+    int output_idx = graph_builder_->build_output_graph(*graph, cur_idx, weights_, cfg);
 
     // Schedule: assign nodes to optimal devices
     {
         BackendScheduler scheduler;
-        SchedulingPlan plan = scheduler.schedule(graph);
+        SchedulingPlan plan = scheduler.schedule(*graph);
         if (plan.valid) {
-            graph.apply_schedule(plan);
+            graph->apply_schedule(plan);
         }
     }
 
-    // Execute the graph
-    auto result = graph.execute();
+    // Update cache
+    graph_cache_.graph = std::move(graph);
+    graph_cache_.cached_seq_len = seq_len;
+    graph_cache_.cached_gpu_layers = gpu_layers_;
+    graph_cache_.cached_arch = cfg.arch_type;
+    graph_cache_.valid = true;
+
+    auto result = graph_cache_.graph->execute();
 
     auto t1 = std::chrono::steady_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    LOG_INFO("Forward (graph) total: " + std::to_string((int)total_ms) +
+    LOG_INFO("Forward (graph, built) total: " + std::to_string((int)total_ms) +
              "ms (seq_len=" + std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos) +
-             ", nodes=" + std::to_string(graph.num_nodes()) + ")");
+             ", nodes=" + std::to_string(graph_cache_.graph->num_nodes()) + ")");
 
     return result;
 }
