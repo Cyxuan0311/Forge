@@ -394,7 +394,8 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
         const float* v_data = static_cast<const float*>(v->data());
         float* out_data = static_cast<float*>(out->data());
 
-        bool cuda_decode_supported = (head_dim == 64 || head_dim == 96 || head_dim == 128);
+        bool cuda_decode_supported = (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
+                                       head_dim == 256 || head_dim == 512);
 
         if (q_len == 1 && cuda_decode_supported) {
             // Decode path (supported head_dim)

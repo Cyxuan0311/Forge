@@ -125,19 +125,26 @@ target_link_libraries(forge_core
 # ---- Operators library (static) ----
 add_library(
   forge_ops STATIC
-  src/operators/norm.cpp
-  src/operators/activation.cpp
-  src/operators/matmul.cpp
-  src/operators/embedding.cpp
-  src/operators/rope.cpp
-  src/operators/elementwise.cpp
-  src/operators/attention.cpp)
+  src/operators/cpu/norm.cpp
+  src/operators/cpu/activation.cpp
+  src/operators/cpu/matmul.cpp
+  src/operators/cpu/embedding.cpp
+  src/operators/cpu/rope.cpp
+  src/operators/cpu/elementwise.cpp
+  src/operators/cpu/attention.cpp)
 if(CUDAToolkit_FOUND)
   target_sources(
     forge_ops
-    PRIVATE src/operators/cuda_norm.cu src/operators/cuda_embedding.cu
-            src/operators/cuda_gemv.cu src/operators/cuda_attention.cu
-            src/operators/cuda_quant.cu src/operators/cuda_gemm.cu)
+    PRIVATE src/operators/cuda/cuda_rms_norm.cu
+            src/operators/cuda/cuda_activation.cu
+            src/operators/cuda/cuda_elementwise.cu
+            src/operators/cuda/cuda_rope.cu
+            src/operators/cuda/cuda_flash_attn.cu
+            src/operators/cuda/cuda_embedding.cu
+            src/operators/cuda/cuda_gemv.cu
+            src/operators/cuda/cuda_fused.cu
+            src/operators/cuda/cuda_quant.cu
+            src/operators/cuda/cuda_gemm.cu)
   target_compile_definitions(forge_ops PUBLIC USE_CUDA)
 endif()
 
