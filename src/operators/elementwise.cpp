@@ -5,6 +5,7 @@
 
 #include "forge/cuda_kernels.h"
 #include "forge/op_dispatch.h"
+#include "forge/operator_activation.h"
 #include "forge/operator_elementwise.h"
 #include "forge/perf_profiler.h"
 
@@ -159,6 +160,61 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
             float v = g_data[i];
             float silu_v = v / (1.0f + std::exp(-v));
             o_data[i] = silu_v * u_data[i];
+        }
+#endif
+    }
+    return out;
+}
+
+TensorPtr gelu_multiply(const TensorPtr& gate, const TensorPtr& up) {
+    auto out = std::make_shared<Tensor>(DataType::FP32, gate->shape(), gate->device());
+    int n = static_cast<int>(gate->numel());
+
+    if (gate->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        auto gelu_gate = gelu(gate);
+        cuda::launch_multiply(static_cast<const float*>(gelu_gate->data()),
+                              static_cast<const float*>(up->data()),
+                              static_cast<float*>(out->data()), n);
+#endif
+    } else {
+        PERF_SCOPE("gelu_multiply/cpu");
+        const float* g_data = static_cast<const float*>(gate->data());
+        const float* u_data = static_cast<const float*>(up->data());
+        float* o_data = static_cast<float*>(out->data());
+        const float sqrt_2_over_pi = 0.7978845608028654f;  // sqrt(2/pi)
+        const float coeff = 0.044715f;
+#ifdef USE_AVX2
+        int i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 gv = _mm256_loadu_ps(g_data + i);
+            __m256 uv = _mm256_loadu_ps(u_data + i);
+            // GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+            __m256 x3 = _mm256_mul_ps(gv, _mm256_mul_ps(gv, gv));
+            __m256 inner = _mm256_mul_ps(_mm256_set1_ps(sqrt_2_over_pi),
+                                          _mm256_add_ps(gv, _mm256_mul_ps(_mm256_set1_ps(coeff), x3)));
+            // Fast tanh approximation using rational function
+            // Note: the Padé approximant x*(27+x^2)/(27+9x^2) diverges for large x,
+            // so we must clamp to [-1, 1] to match tanh's saturation behavior.
+            __m256 inner2 = _mm256_mul_ps(inner, inner);
+            __m256 tanh_approx =
+                _mm256_mul_ps(inner, _mm256_div_ps(_mm256_add_ps(_mm256_set1_ps(27.0f), inner2),
+                                                    _mm256_add_ps(_mm256_set1_ps(27.0f), _mm256_mul_ps(_mm256_set1_ps(9.0f), inner2))));
+            tanh_approx = _mm256_min_ps(_mm256_max_ps(tanh_approx, _mm256_set1_ps(-1.0f)), _mm256_set1_ps(1.0f));
+            __m256 one_plus_tanh = _mm256_add_ps(_mm256_set1_ps(1.0f), tanh_approx);
+            __m256 gelu_val = _mm256_mul_ps(_mm256_set1_ps(0.5f), _mm256_mul_ps(gv, one_plus_tanh));
+            _mm256_storeu_ps(o_data + i, _mm256_mul_ps(gelu_val, uv));
+        }
+        for (; i < n; ++i) {
+            float x = g_data[i];
+            float gelu_val = 0.5f * x * (1.0f + std::tanh(sqrt_2_over_pi * (x + coeff * x * x * x)));
+            o_data[i] = gelu_val * u_data[i];
+        }
+#else
+        for (int i = 0; i < n; ++i) {
+            float x = g_data[i];
+            float gelu_val = 0.5f * x * (1.0f + std::tanh(sqrt_2_over_pi * (x + coeff * x * x * x)));
+            o_data[i] = gelu_val * u_data[i];
         }
 #endif
     }

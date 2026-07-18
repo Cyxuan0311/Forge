@@ -32,14 +32,22 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
 
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cuda::launch_rms_norm(static_cast<const float*>(x->data()),
-                              static_cast<const float*>(weight->data()),
-                              static_cast<float*>(out->data()), rows, cols, eps);
+        if (weight) {
+            cuda::launch_rms_norm(static_cast<const float*>(x->data()),
+                                  static_cast<const float*>(weight->data()),
+                                  static_cast<float*>(out->data()), rows, cols, eps);
+        } else {
+            // rms_norm without weight: output = x * rms(x)
+            std::vector<float> ones(cols, 1.0f);
+            cuda::launch_rms_norm(static_cast<const float*>(x->data()),
+                                  ones.data(),
+                                  static_cast<float*>(out->data()), rows, cols, eps);
+        }
 #endif
     } else {
         PERF_SCOPE("rms_norm/cpu");
         const float* x_data = static_cast<const float*>(x->data());
-        const float* w_data = static_cast<const float*>(weight->data());
+        const float* w_data = weight ? static_cast<const float*>(weight->data()) : nullptr;
         float* o_data = static_cast<float*>(out->data());
 
 #pragma omp parallel for schedule(static) if (rows > 1)
@@ -67,14 +75,24 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
             float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
             __m256 rms_v = _mm256_set1_ps(rms);
             c = 0;
-            for (; c + 8 <= cols; c += 8) {
-                __m256 xv = _mm256_loadu_ps(x_row + c);
-                __m256 wv = _mm256_loadu_ps(w_data + c);
-                __m256 ov = _mm256_mul_ps(_mm256_mul_ps(xv, rms_v), wv);
-                _mm256_storeu_ps(o_row + c, ov);
-            }
-            for (; c < cols; ++c) {
-                o_row[c] = x_row[c] * rms * w_data[c];
+            if (w_data) {
+                for (; c + 8 <= cols; c += 8) {
+                    __m256 xv = _mm256_loadu_ps(x_row + c);
+                    __m256 wv = _mm256_loadu_ps(w_data + c);
+                    __m256 ov = _mm256_mul_ps(_mm256_mul_ps(xv, rms_v), wv);
+                    _mm256_storeu_ps(o_row + c, ov);
+                }
+                for (; c < cols; ++c) {
+                    o_row[c] = x_row[c] * rms * w_data[c];
+                }
+            } else {
+                for (; c + 8 <= cols; c += 8) {
+                    __m256 xv = _mm256_loadu_ps(x_row + c);
+                    _mm256_storeu_ps(o_row + c, _mm256_mul_ps(xv, rms_v));
+                }
+                for (; c < cols; ++c) {
+                    o_row[c] = x_row[c] * rms;
+                }
             }
 #else
             float sum_sq = 0.0f;
@@ -83,8 +101,14 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
                 sum_sq += v * v;
             }
             float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
-            for (int c = 0; c < cols; ++c) {
-                o_row[c] = x_row[c] * rms * w_data[c];
+            if (w_data) {
+                for (int c = 0; c < cols; ++c) {
+                    o_row[c] = x_row[c] * rms * w_data[c];
+                }
+            } else {
+                for (int c = 0; c < cols; ++c) {
+                    o_row[c] = x_row[c] * rms;
+                }
             }
 #endif
         }

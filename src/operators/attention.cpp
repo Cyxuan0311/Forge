@@ -386,7 +386,89 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
     auto out = std::make_shared<Tensor>(
         DataType::FP32, std::vector<int64_t>{q_len, num_heads * head_dim}, q->device());
 
-    // This function is CPU-only; CUDA uses flash attention kernels directly
+    // CUDA path: use GQA flash attention kernels
+    if (q->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        const float* q_data = static_cast<const float*>(q->data());
+        const float* k_data = static_cast<const float*>(k->data());
+        const float* v_data = static_cast<const float*>(v->data());
+        float* out_data = static_cast<float*>(out->data());
+
+        bool cuda_decode_supported = (head_dim == 64 || head_dim == 96 || head_dim == 128);
+
+        if (q_len == 1 && cuda_decode_supported) {
+            // Decode path (supported head_dim)
+            cuda::launch_flash_attention_gqa_decode(q_data, k_data, v_data, out_data,
+                                                     kv_len, num_heads, num_kv_heads, head_dim);
+            return out;
+        } else if (q_len > 1) {
+            // Prefill path
+            cuda::launch_flash_attention_gqa(q_data, k_data, v_data, out_data,
+                                              q_len, kv_len, num_heads, num_kv_heads, head_dim, causal);
+            return out;
+        }
+        // Fall through to CPU path for unsupported head_dim in decode mode
+        // Copy tensors to CPU, compute, then copy result back
+        auto q_cpu = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
+        q_cpu->copy_from(*q);
+        auto k_cpu = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
+        k_cpu->copy_from(*k);
+        auto v_cpu = std::make_shared<Tensor>(DataType::FP32, v->shape(), DeviceType::CPU);
+        v_cpu->copy_from(*v);
+        auto out_cpu = std::make_shared<Tensor>(DataType::FP32, out->shape(), DeviceType::CPU);
+
+        // Run CPU GQA attention on the CPU copies
+        const float* q_cpu_data = static_cast<const float*>(q_cpu->data());
+        const float* k_cpu_data = static_cast<const float*>(k_cpu->data());
+        const float* v_cpu_data = static_cast<const float*>(v_cpu->data());
+        float* out_cpu_data = static_cast<float*>(out_cpu->data());
+
+        int kv_group_size = num_heads / num_kv_heads;
+
+        if (q_len == 1) {
+            // Decode path: online softmax
+            for (int h = 0; h < num_heads; ++h) {
+                const float* q_row = q_cpu_data + h * head_dim;
+                float* out_row = out_cpu_data + h * head_dim;
+                int kv_h = h / kv_group_size;
+
+                float max_val = -1e30f;
+                float sum_exp = 0.0f;
+                std::memset(out_row, 0, head_dim * sizeof(float));
+
+                for (int j = 0; j < kv_len; ++j) {
+                    const float* k_row = k_cpu_data + j * num_kv_heads * head_dim + kv_h * head_dim;
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d)
+                        dot += q_row[d] * k_row[d];
+                    float score = dot * scale;
+                    float new_max = std::max(max_val, score);
+                    float rescale = std::exp(max_val - new_max);
+                    if (new_max > max_val) {
+                        sum_exp *= rescale;
+                        for (int d = 0; d < head_dim; ++d)
+                            out_row[d] *= rescale;
+                    }
+                    float exp_score = std::exp(score - new_max);
+                    sum_exp += exp_score;
+                    const float* v_row = v_cpu_data + j * num_kv_heads * head_dim + kv_h * head_dim;
+                    for (int d = 0; d < head_dim; ++d)
+                        out_row[d] += exp_score * v_row[d];
+                    max_val = new_max;
+                }
+                float inv_sum = 1.0f / (sum_exp + 1e-30f);
+                for (int d = 0; d < head_dim; ++d)
+                    out_row[d] *= inv_sum;
+            }
+        }
+
+        // Copy result back to CUDA
+        out->copy_from(*out_cpu);
+        return out;
+#endif
+    }
+
+    // CPU path
     const float* q_data = static_cast<const float*>(q->data());
     const float* k_data = static_cast<const float*>(k->data());
     const float* v_data = static_cast<const float*>(v->data());
