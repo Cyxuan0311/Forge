@@ -8,20 +8,22 @@
 |------|------|--------|---------|
 | LLaMA / LLaMA 2 / LLaMA 3 | LlamaEngine | GQA | NeoX RoPE, SiLU+GELU |
 | Mistral | LlamaEngine | GQA | 滑动窗口 |
-| Qwen / Qwen2 / Qwen2.5 | LlamaEngine | GQA | RoPE theta=1e6, 共享嵌入 |
+| Qwen / Qwen2 / Qwen2.5 / Qwen3-VL | LlamaEngine | GQA | RoPE theta=1e6, 共享嵌入, MRoPE (Qwen3-VL), QK-Norm |
 | Yi / Yi 1.5 | LlamaEngine | GQA | NeoX RoPE |
 | Phi-3 | LlamaEngine | GQA | NeoX RoPE |
 | DeepSeek (V2) | DeepSeekEngine | MLA + GQA | KV LoRA, Q LoRA |
 | DeepSeek (V3, R1) | DeepSeekEngine | MLA + GQA | KV LoRA, Q LoRA, MoE |
-| Qwen3.5 (MoE) | Qwen35Engine | 混合（Full Attn + SSM） | MRoPE, Gated Delta Net, MoE |
+| Qwen3.5 (MoE) | Qwen35Engine | 混合（Full Attn + SSM + Gated Delta Net） | MRoPE, Gated Delta Net, MoE |
 | Falcon | FalconEngine | GQA | LayerNorm, 并行残差 |
 | Gemma 1 / 2 | GemmaEngine | GQA | GeGLU, logit softcapping |
+| Gemma4 | Gemma4Engine | SWA + Full Attention | MoE（共享+路由专家），逐层嵌入，QK-Norm，GeGLU，logit softcapping |
 
 ### 多模态
 
 | 模型 | 视觉编码器 | 备注 |
 |------|-----------|------|
 | MiniCPM-V 4.6 | CLIP ViT (mmproj) | 需要单独的 mmproj 权重文件 |
+| Qwen3-VL | CLIP ViT (mmproj) | MRoPE, QK-Norm，需要单独的 mmproj 权重文件 |
 
 ### 模型规模
 
@@ -33,17 +35,23 @@
 | DeepSeek V2/V3 | 236B – 671B |
 | Phi-3 | 3.8B – 14B |
 | Gemma 1/2 | 2B – 27B |
+| Gemma4 | 2B – 9B |
 | Falcon | 7B – 180B |
 
 ## 引擎能力矩阵
 
-| 能力 | LLaMA | DeepSeek | Qwen3.5 | Falcon | Gemma | MiniCPM-V |
-|------|-------|----------|---------|--------|-------|-----------|
-| GQA | ✅ | ✅ | — | ✅ | ✅ | ✅ |
-| MLA | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| MoE | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| SSM | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| 多模态 | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| 能力 | LLaMA | DeepSeek | Qwen3.5 | Falcon | Gemma | Gemma4 | MiniCPM-V |
+|------|-------|----------|---------|--------|-------|--------|-----------|
+| GQA | ✅ | ✅ | — | ✅ | ✅ | — | ✅ |
+| MLA | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| MoE | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| SSM | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| SWA | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| QK-Norm | ✅\(*\) | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| MRoPE | ✅\(*\) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| 多模态 | ✅\(*\) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+
+> \(*\) 仅 Qwen3-VL（通过 LlamaEngine）
 
 ## 量化类型
 

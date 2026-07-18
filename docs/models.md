@@ -8,20 +8,22 @@
 |-------------|--------|-----------|------------------|
 | LLaMA / LLaMA 2 / LLaMA 3 | LlamaEngine | GQA | NeoX RoPE, SiLU+GELU |
 | Mistral | LlamaEngine | GQA | Sliding window |
-| Qwen / Qwen2 / Qwen2.5 | LlamaEngine | GQA | RoPE theta=1e6, tied embeddings |
+| Qwen / Qwen2 / Qwen2.5 / Qwen3-VL | LlamaEngine | GQA | RoPE theta=1e6, tied embeddings, MRoPE (Qwen3-VL), QK-Norm |
 | Yi / Yi 1.5 | LlamaEngine | GQA | NeoX RoPE |
 | Phi-3 | LlamaEngine | GQA | NeoX RoPE |
 | DeepSeek (V2) | DeepSeekEngine | MLA + GQA | KV LoRA, Q LoRA |
 | DeepSeek (V3, R1) | DeepSeekEngine | MLA + GQA | KV LoRA, Q LoRA, MoE |
-| Qwen3.5 (MoE) | Qwen35Engine | Hybrid (Full Attn + SSM) | MRoPE, Gated Delta Net, MoE |
+| Qwen3.5 (MoE) | Qwen35Engine | Hybrid (Full Attn + SSM + Gated Delta Net) | MRoPE, Gated Delta Net, MoE |
 | Falcon | FalconEngine | GQA | LayerNorm, parallel residual |
 | Gemma 1 / 2 | GemmaEngine | GQA | GeGLU, logit softcapping |
+| Gemma4 | Gemma4Engine | SWA + Full Attention | MoE (shared+routed experts), per-layer embeddings, QK-Norm, GeGLU, logit softcapping |
 
 ### Multimodal
 
 | Model | Vision Encoder | Notes |
 |-------|---------------|-------|
 | MiniCPM-V 4.6 | CLIP ViT (mmproj) | Requires separate mmproj weights |
+| Qwen3-VL | CLIP ViT (mmproj) | MRoPE, QK-Norm, requires separate mmproj weights |
 
 ### Model Sizes
 
@@ -33,17 +35,23 @@
 | DeepSeek V2/V3 | 236B – 671B |
 | Phi-3 | 3.8B – 14B |
 | Gemma 1/2 | 2B – 27B |
+| Gemma4 | 2B – 9B |
 | Falcon | 7B – 180B |
 
 ## Engine Architecture Matrix
 
-| Capability | LLaMA | DeepSeek | Qwen3.5 | Falcon | Gemma | MiniCPM-V |
-|-----------|-------|----------|---------|--------|-------|-----------|
-| GQA | ✅ | ✅ | — | ✅ | ✅ | ✅ |
-| MLA | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| MoE | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| SSM | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| Multimodal | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Capability | LLaMA | DeepSeek | Qwen3.5 | Falcon | Gemma | Gemma4 | MiniCPM-V |
+|-----------|-------|----------|---------|--------|-------|--------|-----------|
+| GQA | ✅ | ✅ | — | ✅ | ✅ | — | ✅ |
+| MLA | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| MoE | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| SSM | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| SWA | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| QK-Norm | ✅\(*\) | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| MRoPE | ✅\(*\) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Multimodal | ✅\(*\) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+
+> \(*\) Qwen3-VL only (via LlamaEngine)
 
 ## Quantization Types
 

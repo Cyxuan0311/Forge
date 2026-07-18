@@ -38,7 +38,7 @@ Forge is a lightweight LLM inference engine written from scratch in C++ and CUDA
 - Hand-tuned AVX2 kernels with OpenMP parallelism
 - Q4_0, Q4_1, Q4_K, Q6_K, Q8_0 quantization
 - cuBLAS / OpenBLAS optional — default OFF, pure custom kernels used instead
-- Supports LLaMA, DeepSeek (MLA), Qwen3.5 (Hybrid SSM+Attention), MiniCPM-V (multimodal)
+- Supports LLaMA, DeepSeek (MLA), Qwen3.5 (Hybrid SSM+Attention), Qwen3-VL (multimodal), Gemma4 (MoE+SWA), MiniCPM-V (multimodal)
 
 ---
 
@@ -109,9 +109,10 @@ cmake -B build -DUSE_CUBLAS=OFF -DUSE_OPENBLAS=OFF
 
 | Architecture | Example Models | Attention | Multimodal |
 |-------------|---------------|-----------|------------|
-| LLaMA | TinyLlama, Qwen2.5 | GQA | ❌ |
+| LLaMA | TinyLlama, Qwen2.5, Qwen3-VL | GQA | ✅ VLM (Qwen3-VL) |
 | DeepSeek | DeepSeek-V2/V3, DeepSeek-R1 | MLA | ❌ |
-| Qwen3.5 | Qwen3.5-MoE | Hybrid (Attention + SSM) | ❌ |
+| Qwen3.5 | Qwen3.5-MoE | Hybrid (SSM + Gated Delta Net + Full Attn) | ❌ |
+| Gemma4 | Gemma4 | SWA + Full Attention (MoE) | ❌ |
 | MiniCPM-V | MiniCPM-V 4.6 | GQA | ✅ VLM |
 
 <details>

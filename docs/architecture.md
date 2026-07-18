@@ -129,11 +129,12 @@ Architecture-specific engines are registered via `FORGE_REGISTER_ENGINE` / `FORG
 ```
 InferenceEngine (virtual base)
   └── TransformerEngine
-        ├── LlamaEngine        (LLaMA, Mistral, Qwen, Yi, Phi-3)
+        ├── LlamaEngine        (LLaMA, Mistral, Qwen, Yi, Phi-3, Qwen3-VL)
         ├── DeepSeekEngine     (DeepSeek V2/V3/R1)
         ├── Qwen35Engine       (Qwen3.5 Hybrid SSM+Attention)
         ├── FalconEngine       (Falcon)
-        └── GemmaEngine        (Gemma 1/2)
+        ├── GemmaEngine        (Gemma 1/2)
+        └── Gemma4Engine       (Gemma4)
 ```
 
 ### Graph Builders
@@ -142,7 +143,7 @@ Each engine architecture has a corresponding `GraphBuilder` that constructs the 
 
 | Graph Builder | Architecture |
 |--------------|-------------|
-| `LlamaGraphBuilder` | LLaMA / Mistral / Qwen / Yi |
+| `LlamaGraphBuilder` | LLaMA / Mistral / Qwen / Yi / Qwen3-VL |
 | `DeepSeekGraphBuilder` | DeepSeek V2/V3 (GQA + MLA) |
 | `Qwen35GraphBuilder` | Qwen3.5 (Hybrid SSM + Attention) |
 
