@@ -107,6 +107,15 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             result.num_generated_tokens = 1;
             return result;
         }
+        // Check additional stop tokens
+        for (int stop_id : config.stop_token_ids) {
+            if (token_id == stop_id) {
+                result.finished = true;
+                result.finish_reason = "stop";
+                result.num_generated_tokens = 1;
+                return result;
+            }
+        }
     }
 
     int64_t pos = prompt_len;
@@ -152,6 +161,19 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         if (config.eos_token_id >= 0 && token_id == config.eos_token_id) {
             result.finished = true;
             result.finish_reason = "eos";
+            break;
+        }
+        // Check additional stop tokens
+        bool hit_stop = false;
+        for (int stop_id : config.stop_token_ids) {
+            if (token_id == stop_id) {
+                hit_stop = true;
+                break;
+            }
+        }
+        if (hit_stop) {
+            result.finished = true;
+            result.finish_reason = "stop";
             break;
         }
     }

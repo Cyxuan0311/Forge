@@ -46,7 +46,7 @@ bool InferenceContext::init_kv_cache() {
     }
 
     int kv_max_seq = params_.max_seq_len;
-    const int KV_MAX_SEQ_CAP = 4096;
+    const int KV_MAX_SEQ_CAP = 2048;
 
     // Cap max_seq_len to avoid OOM
     if (kv_max_seq > KV_MAX_SEQ_CAP) {
@@ -190,12 +190,11 @@ void InferenceContext::warmup() {
 
     const auto& cfg = model_.config();
 
-    // Ensure KV cache is initialized
-    if (!kv_cache_initialized_) {
-        init_kv_cache();
-    }
-
     // Run a short dummy forward pass to trigger CUDA kernel compilation
+    // Note: do NOT call InferenceContext::init_kv_cache() here, as the engine
+    // (TransformerEngine) manages its own KV cache and will init it on first forward.
+    // Calling init_kv_cache() here would allocate a redundant KV cache wasting GPU memory.
+
     // Use 2 tokens for prefill + 1 token for decode to cover both paths
     auto input_ids =
         std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{2}, DeviceType::CPU);

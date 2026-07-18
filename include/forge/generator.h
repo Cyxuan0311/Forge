@@ -21,6 +21,7 @@ struct GenerationConfig {
     bool do_sample = true;
     uint64_t seed = 0;
     int eos_token_id = -1;
+    std::vector<int32_t> stop_token_ids;  // Additional stop tokens beyond eos
 };
 
 struct GenerationResult {
