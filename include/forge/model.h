@@ -400,6 +400,13 @@ struct ArchCapability {
     bool use_neox_rope = false;
     ActivationType ffn_activation = ActivationType::SiLU_GELU;
     NormType norm_type = NormType::RMSNorm;
+    bool has_qkv_bias = false;
+    bool has_norm_bias = false;
+    bool use_parallel_residual = false;
+    bool use_qk_norm = false;
+    bool embedding_scale = false;
+    bool has_post_attention_norm = false;
+    bool has_post_ffn_norm = false;
 };
 
 class ArchCapabilityRegistry {
