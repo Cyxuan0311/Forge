@@ -41,5 +41,11 @@ void launch_gemv_q6_k_transB(const float* x, const void* q_weight, float* out, i
 void launch_gemv_q6_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
                                    int N, cudaStream_t stream = 0);
 
+void launch_gemv_q3_k_transB(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+
+void launch_gemv_q3_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
+                                   int N, cudaStream_t stream = 0);
+
 }  // namespace cuda
 }  // namespace forge

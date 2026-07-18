@@ -408,6 +408,9 @@ void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, 
     case 256:
         LAUNCH_FLASH_ATTN_GQA(256);
         break;
+    case 512:
+        LAUNCH_FLASH_ATTN_GQA(512);
+        break;
     default:
         fprintf(stderr, "[ERROR] flash_attn_gqa_kernel: unsupported head_dim=%d\n", head_dim);
         break;

@@ -1881,5 +1881,208 @@ void launch_qkv_fused_q4_0(const float* x, const void* q_wq, int N_q, const void
         static_cast<const uint8_t*>(q_wv), N_v, out_q, out_k, out_v, K);
 }
 
+// ---- Q3_K GEMV (M=1, decode) ----
+// Q3_K block: 110 bytes per 256 elements
+// Layout: hmask[32] + qs[64] + scales[12] + d[2]
+
+__device__ void q3_k_unpack_scales(const uint8_t* scales_raw, int8_t* scales_out) {
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    memcpy(aux, scales_raw, 12);
+    uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    memcpy(scales_out, aux, 16);
+}
+
+__global__ void gemv_q3_k_transB_kernel(const float* __restrict__ x,
+                                        const uint8_t* __restrict__ q_weight,
+                                        float* __restrict__ out, int K, int N) {
+    const int QK_K = 256;
+    const int Q3_K_BLOCK_SIZE = 110;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    if (warp_id >= N)
+        return;
+
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * blocks_per_row * Q3_K_BLOCK_SIZE;
+
+    float sum = 0.0f;
+
+    int super_blocks_per_thread = (blocks_per_row + 31) / 32;
+
+    for (int sb = 0; sb < super_blocks_per_thread; ++sb) {
+        int bi = sb * 32 + lane;
+        if (bi >= blocks_per_row)
+            break;
+
+        const uint8_t* block_ptr = row_ptr + bi * Q3_K_BLOCK_SIZE;
+        const uint8_t* hm = block_ptr;
+        const uint8_t* qs = block_ptr + 32;
+        const uint8_t* scales_raw = block_ptr + 96;
+        uint16_t d_bits;
+        memcpy(&d_bits, block_ptr + 108, 2);
+        float d_all = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+        int8_t scales[16];
+        q3_k_unpack_scales(scales_raw, scales);
+
+        int is = 0;
+        uint8_t m = 1;
+        const uint8_t* q = qs;
+
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                float dl = d_all * static_cast<float>(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    int idx = bi * QK_K + n + j * 32 + l;
+                    if (idx < K) {
+                        int8_t q_val =
+                            static_cast<int8_t>((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4);
+                        sum += x[idx] * dl * static_cast<float>(q_val);
+                    }
+                }
+
+                dl = d_all * static_cast<float>(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    int idx = bi * QK_K + n + j * 32 + 16 + l;
+                    if (idx < K) {
+                        int8_t q_val =
+                            static_cast<int8_t>((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
+                        sum += x[idx] * dl * static_cast<float>(q_val);
+                    }
+                }
+
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        out[warp_id] = sum;
+    }
+}
+
+void launch_gemv_q3_k_transB(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream) {
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (N + warps_per_block - 1) / warps_per_block;
+    gemv_q3_k_transB_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, K, N);
+}
+
+// ---- Batched Q3_K GEMV (M > 1) ----
+
+__global__ void gemv_q3_k_transB_batch_kernel(const float* __restrict__ x,
+                                               const uint8_t* __restrict__ q_weight,
+                                               float* __restrict__ out, int M, int K, int N) {
+    const int QK_K = 256;
+    const int Q3_K_BLOCK_SIZE = 110;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    int total_warps = M * N;
+    if (warp_id >= total_warps)
+        return;
+
+    int m_idx = warp_id / N;
+    int n_idx = warp_id % N;
+
+    const float* x_row = x + (size_t)m_idx * K;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+    const uint8_t* row_ptr = q_weight + (size_t)n_idx * blocks_per_row * Q3_K_BLOCK_SIZE;
+
+    float sum = 0.0f;
+
+    int super_blocks_per_thread = (blocks_per_row + 31) / 32;
+
+    for (int sb = 0; sb < super_blocks_per_thread; ++sb) {
+        int bi = sb * 32 + lane;
+        if (bi >= blocks_per_row)
+            break;
+
+        const uint8_t* block_ptr = row_ptr + bi * Q3_K_BLOCK_SIZE;
+        const uint8_t* hm = block_ptr;
+        const uint8_t* qs = block_ptr + 32;
+        const uint8_t* scales_raw = block_ptr + 96;
+        uint16_t d_bits;
+        memcpy(&d_bits, block_ptr + 108, 2);
+        float d_all = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+        int8_t scales[16];
+        q3_k_unpack_scales(scales_raw, scales);
+
+        int is = 0;
+        uint8_t m = 1;
+        const uint8_t* q = qs;
+
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                float dl = d_all * static_cast<float>(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    int idx = bi * QK_K + n + j * 32 + l;
+                    if (idx < K) {
+                        int8_t q_val =
+                            static_cast<int8_t>((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4);
+                        sum += x_row[idx] * dl * static_cast<float>(q_val);
+                    }
+                }
+
+                dl = d_all * static_cast<float>(scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    int idx = bi * QK_K + n + j * 32 + 16 + l;
+                    if (idx < K) {
+                        int8_t q_val =
+                            static_cast<int8_t>((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
+                        sum += x_row[idx] * dl * static_cast<float>(q_val);
+                    }
+                }
+
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        out[m_idx * N + n_idx] = sum;
+    }
+}
+
+void launch_gemv_q3_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
+                                   int N, cudaStream_t stream) {
+    int total_warps = M * N;
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
+    gemv_q3_k_transB_batch_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, M, K, N);
+}
+
 }  // namespace cuda
 }  // namespace forge
