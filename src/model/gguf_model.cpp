@@ -44,7 +44,14 @@ static DataType ggml_dtype_to_dtype(GgmlDType dt) {
         return DataType::Q5_K;
     case GgmlDType::Q6_K:
         return DataType::Q6_K;
+    // IQ types
+    case GgmlDType::IQ2_S:
+        return DataType::IQ2_S;
+    case GgmlDType::BF16:
+        return DataType::BF16;
     default:
+        LOG_WARN("ggml_dtype_to_dtype: unsupported GgmlDType=" +
+                 std::to_string(static_cast<uint32_t>(dt)));
         return DataType::FP32;
     }
 }
@@ -222,6 +229,15 @@ bool GgufModel::load(const std::string& path) {
                     offset += 4;
                 }
                 metadata_int_arrays_[key] = std::move(arr);
+            } else if (arr_type == 7) {  // BOOL array -> store as INT32 array
+                std::vector<int32_t> arr(arr_len);
+                for (uint64_t j = 0; j < arr_len; ++j) {
+                    bool val;
+                    std::memcpy(&val, data + offset, 1);
+                    offset += 1;
+                    arr[j] = val ? 1 : 0;
+                }
+                metadata_int_arrays_[key] = std::move(arr);
             } else {
                 for (uint64_t j = 0; j < arr_len; ++j) {
                     switch (arr_type) {
@@ -343,13 +359,7 @@ bool GgufModel::load(const std::string& path) {
         lt.shape = tensor_infos[i].dims;
         std::reverse(lt.shape.begin(), lt.shape.end());
         if (lt.shape.size() == 2 && (lt.shape[0] > 1 || lt.shape[1] > 1)) {
-            // Debug: tensor dimension reversal (disabled by default)
-            // fprintf(stderr, "[DEBUG] tensor '%s' original_dims=[%ld,%ld]
-            // reversed_dims=[%ld,%ld]\n",
-            //         lt.name.c_str(),
-            //         (long)tensor_infos[i].dims[0], (long)tensor_infos[i].dims[1],
-            //         (long)lt.shape[0], (long)lt.shape[1]);
-            // fflush(stderr);
+            // tensor dimension reversal applied above
         }
         lt.file_offset = static_cast<int64_t>(data_offset + tensor_infos[i].offset);
         lt.is_gguf_layout = true;
@@ -420,6 +430,24 @@ TensorPtr GgufModel::get_tensor(const std::string& name, DeviceType device) cons
                   std::to_string(lt.file_offset) + " + size=" + std::to_string(lt.data_size) +
                   " > file_size=" + std::to_string(mapped_size_));
         return nullptr;
+    }
+
+    // BF16: convert to FP32 at load time since compute paths don't support BF16 natively
+    if (lt.dtype == DataType::BF16) {
+        int64_t numel = 1;
+        for (auto d : lt.shape) numel *= d;
+        auto tensor = std::make_shared<Tensor>(DataType::FP32, lt.shape, DeviceType::CPU);
+        const uint16_t* bf16_data = static_cast<const uint16_t*>(src);
+        float* fp32_data = static_cast<float*>(tensor->data());
+        for (int64_t i = 0; i < numel; ++i) {
+            // BF16 -> FP32: shift the 16-bit value to the upper 16 bits of a 32-bit float
+            uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
+            std::memcpy(fp32_data + i, &bits, sizeof(float));
+        }
+        if (device == DeviceType::CUDA) {
+            tensor->to_device(DeviceType::CUDA);
+        }
+        return tensor;
     }
 
     if (device == DeviceType::CPU) {

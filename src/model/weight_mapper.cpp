@@ -127,11 +127,13 @@ static const std::unordered_map<std::string, const ArchWeightMapping*> arch_mapp
     {"mistral", &mistral_mapping},
     {"qwen", &qwen_mapping},
     {"qwen2", &qwen_mapping},
+    {"qwen3vl", &qwen_mapping},
     {"yi", &llama_mapping},
     {"deepseek", &llama_mapping},
     {"deepseek_v2", &deepseek_v2_mapping},
     {"deepseek_v3", &deepseek_v2_mapping},
     {"qwen35", &qwen35_mapping},
+    {"gemma4", &llama_mapping},  // Gemma4 uses GGUF naming, not HuggingFace
 };
 
 const ArchWeightMapping& WeightMapper::get_mapping(const std::string& arch_type) {

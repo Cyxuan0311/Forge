@@ -32,6 +32,11 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         output_weight = token_embedding;
     }
 
+    // Gemma4 per-layer embedding weights
+    per_layer_tok_embd = store.get("per_layer_tok_embd");
+    per_layer_model_proj = store.get("per_layer_model_proj");
+    per_layer_proj_norm = store.get("per_layer_proj_norm");
+
     if (output_weight && output_weight->device() == DeviceType::CPU) {
         bool has_fused_kernel =
             (output_weight->dtype() == DataType::Q4_0 || output_weight->dtype() == DataType::Q8_0 ||
@@ -135,7 +140,9 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         }
 
         if (lw.layer_type == LayerType::FullAttention && !is_qwen35) {
-            if (!lw.wq() || !lw.wk() || !lw.wv() || !lw.wo()) {
+            bool is_gemma4 = (config.arch_type == "gemma4");
+            // Gemma4: wv is optional (may use wk as fallback)
+            if (!lw.wq() || !lw.wk() || (!is_gemma4 && !lw.wv()) || !lw.wo()) {
                 LOG_ERROR("Missing attention weights for layer " + std::to_string(i));
                 return false;
             }

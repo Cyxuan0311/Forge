@@ -22,6 +22,21 @@ enum class GgmlDType : uint32_t {
     Q5_K = 13,
     Q6_K = 14,
     Q8_K = 15,
+    IQ2_XXS = 16,
+    IQ2_XS  = 17,
+    IQ3_XXS = 18,
+    IQ1_S   = 19,
+    IQ4_NL  = 20,
+    IQ3_S   = 21,
+    IQ2_S   = 22,
+    IQ4_XS  = 23,
+    I8      = 24,
+    I16     = 25,
+    I32     = 26,
+    I64     = 27,
+    F64     = 28,
+    IQ1_M   = 29,
+    BF16    = 30,
 };
 
 struct GgufTensorInfo {
