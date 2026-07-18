@@ -8,7 +8,7 @@
 
 namespace forge {
 
-class Tensor {
+class Tensor : public std::enable_shared_from_this<Tensor> {
 public:
     Tensor() = default;
 
@@ -60,6 +60,9 @@ private:
     int64_t numel_ = 0;
     size_t nbytes_ = 0;
     bool owns_data_ = true;
+    // Keeps the backing tensor alive when this is a view/slice.
+    // Without this, view() creates a dangling pointer when the owning tensor is freed.
+    std::shared_ptr<Tensor> backing_;
 };
 
 using TensorPtr = std::shared_ptr<Tensor>;

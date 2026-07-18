@@ -30,7 +30,8 @@ Tensor::Tensor(Tensor&& other) noexcept
       device_(other.device_),
       numel_(other.numel_),
       nbytes_(other.nbytes_),
-      owns_data_(other.owns_data_) {
+      owns_data_(other.owns_data_),
+      backing_(std::move(other.backing_)) {
     other.data_ = nullptr;
     other.numel_ = 0;
     other.nbytes_ = 0;
@@ -48,6 +49,7 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
         numel_ = other.numel_;
         nbytes_ = other.nbytes_;
         owns_data_ = other.owns_data_;
+        backing_ = std::move(other.backing_);
         other.data_ = nullptr;
         other.numel_ = 0;
         other.nbytes_ = 0;
@@ -195,6 +197,15 @@ Tensor Tensor::view(const std::vector<int64_t>& new_shape) const {
     t.compute_strides();
     t.nbytes_ = nbytes_;
     t.owns_data_ = false;
+    // Keep the backing tensor alive to prevent use-after-free.
+    // If this tensor is managed by a shared_ptr, capture it.
+    // If this tensor already has a backing reference, propagate it.
+    try {
+        t.backing_ = backing_ ? backing_ : const_cast<Tensor*>(this)->shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        // This tensor is not managed by a shared_ptr — backing_ stays null.
+        // Caller must ensure the original outlives the view.
+    }
     return t;
 }
 
@@ -228,6 +239,12 @@ Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end) const {
         t.nbytes_ = t.numel_ * dtype_size(dtype_);
     }
 
+    // Keep the backing tensor alive to prevent use-after-free.
+    try {
+        t.backing_ = backing_ ? backing_ : const_cast<Tensor*>(this)->shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        // This tensor is not managed by a shared_ptr — backing_ stays null.
+    }
     return t;
 }
 
