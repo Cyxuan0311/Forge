@@ -16,6 +16,41 @@
 
 namespace forge {
 
+static const char* ggml_dtype_name(GgmlDType dt) {
+    switch (dt) {
+    case GgmlDType::F32:     return "F32";
+    case GgmlDType::F16:     return "F16";
+    case GgmlDType::Q4_0:    return "Q4_0";
+    case GgmlDType::Q4_1:    return "Q4_1";
+    case GgmlDType::Q5_0:    return "Q5_0";
+    case GgmlDType::Q5_1:    return "Q5_1";
+    case GgmlDType::Q8_0:    return "Q8_0";
+    case GgmlDType::Q8_1:    return "Q8_1";
+    case GgmlDType::Q2_K:    return "Q2_K";
+    case GgmlDType::Q3_K:    return "Q3_K";
+    case GgmlDType::Q4_K:    return "Q4_K";
+    case GgmlDType::Q5_K:    return "Q5_K";
+    case GgmlDType::Q6_K:    return "Q6_K";
+    case GgmlDType::Q8_K:    return "Q8_K";
+    case GgmlDType::IQ2_XXS: return "IQ2_XXS";
+    case GgmlDType::IQ2_XS:  return "IQ2_XS";
+    case GgmlDType::IQ3_XXS: return "IQ3_XXS";
+    case GgmlDType::IQ1_S:   return "IQ1_S";
+    case GgmlDType::IQ4_NL:  return "IQ4_NL";
+    case GgmlDType::IQ3_S:   return "IQ3_S";
+    case GgmlDType::IQ2_S:   return "IQ2_S";
+    case GgmlDType::IQ4_XS:  return "IQ4_XS";
+    case GgmlDType::IQ1_M:   return "IQ1_M";
+    case GgmlDType::BF16:    return "BF16";
+    case GgmlDType::I8:      return "I8";
+    case GgmlDType::I16:     return "I16";
+    case GgmlDType::I32:     return "I32";
+    case GgmlDType::I64:     return "I64";
+    case GgmlDType::F64:     return "F64";
+    default:                  return "UNKNOWN";
+    }
+}
+
 static DataType ggml_dtype_to_dtype(GgmlDType dt) {
     switch (dt) {
     case GgmlDType::F32:
@@ -50,9 +85,11 @@ static DataType ggml_dtype_to_dtype(GgmlDType dt) {
     case GgmlDType::BF16:
         return DataType::BF16;
     default:
-        LOG_WARN("ggml_dtype_to_dtype: unsupported GgmlDType=" +
-                 std::to_string(static_cast<uint32_t>(dt)));
-        return DataType::FP32;
+        throw std::runtime_error(
+            std::string("Unsupported GGUF tensor type '") + ggml_dtype_name(dt) +
+            "' (GgmlDType=" + std::to_string(static_cast<uint32_t>(dt)) +
+            "). Forge does not yet support this quantization format. "
+            "Please use a model with a supported format (Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ2_S, F16, BF16, etc.)");
     }
 }
 
