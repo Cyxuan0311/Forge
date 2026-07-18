@@ -34,6 +34,10 @@ public:
     bool init_quantized(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
                         DeviceType device, KVCacheDType kv_dtype);
 
+    // Per-layer KV cache init (for mixed-attention architectures like Gemma 4)
+    bool init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
+                        DeviceType device);
+
     void reset();
 
     int update(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
@@ -49,6 +53,11 @@ public:
     int num_layers() const { return static_cast<int>(layers_.size()); }
     DeviceType device() const { return device_; }
     KVCacheDType kv_dtype() const { return kv_dtype_; }
+    int kv_dim(int layer) const {
+        if (!kv_dim_per_layer_.empty() && layer >= 0 && layer < (int)kv_dim_per_layer_.size())
+            return kv_dim_per_layer_[layer];
+        return num_kv_heads_ * head_dim_;
+    }
 
     size_t nbytes() const;
 
@@ -67,6 +76,7 @@ private:
     std::vector<KVCacheLayer> layers_;
     int num_kv_heads_ = 0;
     int head_dim_ = 0;
+    std::vector<int> kv_dim_per_layer_;  // per-layer kv_dim for mixed-attention archs
     int max_seq_len_ = 0;
     DeviceType device_ = DeviceType::CPU;
     KVCacheDType kv_dtype_ = KVCacheDType::FP32;

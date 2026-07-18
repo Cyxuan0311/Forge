@@ -74,6 +74,35 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
     return true;
 }
 
+bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
+                             DeviceType device) {
+    kv_dim_per_layer_ = kv_dims;
+    num_kv_heads_ = 0;
+    head_dim_ = 0;
+    max_seq_len_ = max_seq_len;
+    device_ = device;
+    kv_dtype_ = KVCacheDType::FP32;
+
+    layers_.resize(num_layers);
+
+    for (int i = 0; i < num_layers; ++i) {
+        int dim = (i < (int)kv_dims.size()) ? kv_dims[i] : kv_dims.back();
+        if (dim > 0) {
+            auto shape = std::vector<int64_t>{max_seq_len, dim};
+            layers_[i].key_cache = std::make_shared<Tensor>(DataType::FP32, shape, device);
+            layers_[i].value_cache = std::make_shared<Tensor>(DataType::FP32, shape, device);
+            layers_[i].key_cache->zero_();
+            layers_[i].value_cache->zero_();
+        }
+        // dim == 0 layers: no KV cache allocated, key_cache/value_cache stay nullptr
+        layers_[i].filled = 0;
+    }
+
+    LOG_INFO("KVCache init_per_layer: " + std::to_string(num_layers) + " layers, max_seq_len=" +
+             std::to_string(max_seq_len) + ", " + (device == DeviceType::CUDA ? "CUDA" : "CPU"));
+    return true;
+}
+
 void KVCache::reset() {
     for (auto& layer : layers_) {
         layer.filled = 0;
@@ -168,7 +197,7 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
         return -1;
     }
 
-    int kv_dim = num_kv_heads_ * head_dim_;
+    int kv_dim = this->kv_dim(layer);
 
     if (device_ == DeviceType::CUDA) {
 #ifdef USE_CUDA
@@ -322,6 +351,8 @@ TensorPtr KVCache::get_key_filled(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return nullptr;
     const auto& kv = layers_[layer];
+    if (!kv.key_cache)
+        return nullptr;
     int f = kv.filled;
     if (f == max_seq_len_)
         return kv.key_cache;
@@ -332,6 +363,8 @@ TensorPtr KVCache::get_value_filled(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return nullptr;
     const auto& kv = layers_[layer];
+    if (!kv.value_cache)
+        return nullptr;
     int f = kv.filled;
     if (f == max_seq_len_)
         return kv.value_cache;
@@ -345,6 +378,17 @@ int KVCache::filled(int layer) const {
 }
 
 size_t KVCache::nbytes() const {
+    if (!kv_dim_per_layer_.empty()) {
+        // Per-layer mode: sum up each layer's KV cache size
+        size_t total = 0;
+        for (int i = 0; i < (int)layers_.size(); ++i) {
+            int dim = (i < (int)kv_dim_per_layer_.size()) ? kv_dim_per_layer_[i] : 0;
+            if (dim > 0) {
+                total += max_seq_len_ * dim * sizeof(float) * 2;  // key + value
+            }
+        }
+        return total;
+    }
     if (kv_dtype_ == KVCacheDType::Q4_0) {
         int kv_dim = num_kv_heads_ * head_dim_;
         size_t q_row_size = q4_0_block_nbytes(kv_dim);
