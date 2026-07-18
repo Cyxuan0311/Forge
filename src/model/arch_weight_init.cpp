@@ -62,6 +62,8 @@ static void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "bq", base + ".bq");
     load_if_present(store, lw, "bk", base + ".bk");
     load_if_present(store, lw, "bv", base + ".bv");
+    load_if_present(store, lw, "attn_q_norm", base + ".attn_q_norm");
+    load_if_present(store, lw, "attn_k_norm", base + ".attn_k_norm");
 }
 
 static void init_mla_layer_weights(LayerWeightInitContext& ctx) {
@@ -131,6 +133,51 @@ static void init_falcon_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "attn_norm_2_bias", base + ".attn_norm_2_bias");
 }
 
+static void init_gemma4_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    // Attention weights
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "wq", base + ".wq");
+    load_if_present(store, lw, "wk", base + ".wk");
+    load_if_present(store, lw, "wv", base + ".wv");
+    load_if_present(store, lw, "wo", base + ".wo");
+    load_if_present(store, lw, "attn_q_norm", base + ".attn_q_norm");
+    load_if_present(store, lw, "attn_k_norm", base + ".attn_k_norm");
+    load_if_present(store, lw, "attn_post_norm", base + ".attn_post_norm");
+
+    // FFN weights (shared expert / dense FFN)
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+    load_if_present(store, lw, "w1", base + ".gate_proj");
+    load_if_present(store, lw, "w2", base + ".down_proj");
+    load_if_present(store, lw, "w3", base + ".up_proj");
+    load_if_present(store, lw, "post_ffn_norm", base + ".ffn_post_norm");
+
+    // MoE weights (optional - only for MoE layers)
+    load_if_present(store, lw, "ffn_gate_inp", base + ".ffn_gate_inp");
+    load_if_present(store, lw, "ffn_gate_inp_s", base + ".ffn_gate_inp_s");
+    load_if_present(store, lw, "ffn_gate_exps", base + ".ffn_gate_exps");
+    load_if_present(store, lw, "ffn_up_exps", base + ".ffn_up_exps");
+    load_if_present(store, lw, "ffn_down_exps", base + ".ffn_down_exps");
+    load_if_present(store, lw, "ffn_gate_up_exps", base + ".ffn_gate_up_exps");
+    load_if_present(store, lw, "ffn_pre_norm_2", base + ".ffn_pre_norm_2");
+    load_if_present(store, lw, "ffn_post_norm_1", base + ".ffn_post_norm_1");
+    load_if_present(store, lw, "ffn_post_norm_2", base + ".ffn_post_norm_2");
+
+    // Per-layer embeddings (optional)
+    load_if_present(store, lw, "per_layer_inp_gate", base + ".per_layer_inp_gate");
+    load_if_present(store, lw, "per_layer_proj", base + ".per_layer_proj");
+    load_if_present(store, lw, "per_layer_post_norm", base + ".per_layer_post_norm");
+
+    // Layer output scale (optional)
+    load_if_present(store, lw, "layer_out_scale", base + ".layer_out_scale");
+
+    // Proportional RoPE frequency factors (full-attention layers only, optional)
+    load_if_present(store, lw, "rope_freqs", base + ".rope_freqs");
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -141,6 +188,7 @@ static WeightInitAutoRegister _reg_winit_llama("llama", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_mistral("mistral", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_qwen("qwen", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_qwen2("qwen2", init_gqa_layer_weights);
+static WeightInitAutoRegister _reg_winit_qwen3vl("qwen3vl", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_yi("yi", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_deepseek("deepseek", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_deepseek_v2("deepseek_v2", init_mla_layer_weights);
@@ -151,5 +199,6 @@ static WeightInitAutoRegister _reg_winit_phi3("phi3", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_gemma("gemma", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_gemma2("gemma2", init_gqa_layer_weights);
 static WeightInitAutoRegister _reg_winit_falcon("falcon", init_falcon_layer_weights);
+static WeightInitAutoRegister _reg_winit_gemma4("gemma4", init_gemma4_layer_weights);
 
 }  // namespace forge

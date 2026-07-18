@@ -96,8 +96,6 @@ static ConfigParserAutoRegister _reg_cfg_qwen("qwen",
                                               [](ModelLoader& loader,
                                                  const std::string& arch) -> ModelConfig {
                                                   auto cfg = parse_common_gguf_config(loader, arch);
-                                                  if (cfg.rope_theta == 10000.0f)
-                                                      cfg.rope_theta = 1000000.0f;
                                                   cfg.tie_embeddings = true;
                                                   return cfg;
                                               });
@@ -105,9 +103,31 @@ static ConfigParserAutoRegister _reg_cfg_qwen("qwen",
 static ConfigParserAutoRegister _reg_cfg_qwen2(
     "qwen2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
-        if (cfg.rope_theta == 10000.0f)
-            cfg.rope_theta = 1000000.0f;
         cfg.tie_embeddings = true;
+        return cfg;
+    });
+
+static ConfigParserAutoRegister _reg_cfg_qwen3vl(
+    "qwen3vl", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        cfg.tie_embeddings = true;
+        cfg.use_mrope = true;
+        cfg.use_qk_norm = true;
+
+        // MRoPE: rope_dimension_count defaults to head_dim (same as llama.cpp).
+        // The sections array defines how the n_rot/2 pairs are distributed among
+        // position counters (t/h/w), but does NOT reduce the number of rotary dims.
+        cfg.rope_dimension_count =
+            static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+        if (cfg.rope_dimension_count <= 0) {
+            cfg.rope_dimension_count = cfg.head_dim;
+        }
+        auto sections = loader.get_metadata_int_array(arch + ".rope.dimension_sections", {});
+        if (!sections.empty()) {
+            for (size_t i = 0; i < sections.size() && i < 4; ++i) {
+                cfg.rope_dimension_sections[i] = sections[i];
+            }
+        }
         return cfg;
     });
 
@@ -233,6 +253,108 @@ static ConfigParserAutoRegister _reg_cfg_falcon(
             loader.get_metadata_float(arch + ".attention.layer_norm_epsilon", 1e-5f));
         cfg.ffn_activation = ActivationType::GELU;
         cfg.use_parallel_residual = true;
+        return cfg;
+    });
+
+// Gemma4
+static ConfigParserAutoRegister _reg_cfg_gemma4(
+    "gemma4", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
+        auto cfg = parse_common_gguf_config(loader, arch);
+        cfg.use_neox_rope = false;  // Gemma4 GGUF already stores weights in half-split format
+        cfg.tie_embeddings = true;
+        cfg.ffn_activation = ActivationType::GeGLU;
+        cfg.use_qk_norm = true;
+
+        // Per-layer embeddings
+        cfg.n_embd_per_layer =
+            static_cast<int>(loader.get_metadata_int(arch + ".embedding_length_per_layer_input", 0));
+
+        // Expert FFN intermediate dim
+        cfg.n_ff_exp =
+            static_cast<int>(loader.get_metadata_int(arch + ".expert_feed_forward_length", 0));
+
+        // MoE configuration
+        cfg.n_expert =
+            static_cast<int>(loader.get_metadata_int(arch + ".expert_count", 0));
+        cfg.n_expert_used =
+            static_cast<int>(loader.get_metadata_int(arch + ".expert_used_count", 0));
+
+        // Sliding Window Attention
+        cfg.n_swa =
+            static_cast<int>(loader.get_metadata_int(arch + ".attention.sliding_window", 0));
+
+        // SWA layer pattern (BOOL array, now supported by gguf_model.cpp)
+        auto swa_pattern = loader.get_metadata_int_array(
+            arch + ".attention.sliding_window_pattern", {});
+        cfg.swa_layers.resize(cfg.num_layers, 0);
+        for (size_t i = 0; i < swa_pattern.size() && i < (size_t)cfg.num_layers; ++i) {
+            cfg.swa_layers[i] = static_cast<int>(swa_pattern[i]);
+        }
+
+        // KV shared layers
+        int n_kv_shared =
+            static_cast<int>(loader.get_metadata_int(arch + ".attention.shared_kv_layers", 0));
+        cfg.n_layer_kv_from_start = cfg.num_layers - n_kv_shared;
+
+        // Final logit softcapping
+        cfg.f_final_logit_softcapping =
+            static_cast<float>(loader.get_metadata_float(arch + ".final_logit_softcapping", 0.0f));
+
+        // SWA-specific dimensions from GGUF metadata
+        int key_length_swa =
+            static_cast<int>(loader.get_metadata_int(arch + ".attention.key_length_swa", 0));
+        int value_length_swa =
+            static_cast<int>(loader.get_metadata_int(arch + ".attention.value_length_swa", 0));
+
+        if (key_length_swa > 0) {
+            // Use metadata values directly
+            cfg.head_dim_swa = key_length_swa;
+            cfg.num_kv_heads_swa = cfg.num_kv_heads;  // Same KV head count
+        } else if (!cfg.swa_layers.empty()) {
+            // Fallback: infer from tensor shapes
+            for (int i = 0; i < cfg.num_layers; ++i) {
+                if (cfg.swa_layers[i] == 1) {
+                    auto k_norm_shape = loader.get_tensor_shape(
+                        "blk." + std::to_string(i) + ".attn_k_norm.weight");
+                    if (k_norm_shape.size() >= 1 && k_norm_shape[0] > 0) {
+                        cfg.head_dim_swa = static_cast<int>(k_norm_shape[0]);
+                        cfg.num_kv_heads_swa = cfg.num_kv_heads;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Gemma4 SWA layers use the same number of Q heads as full-attention layers
+        if (cfg.num_heads_swa == 0) {
+            cfg.num_heads_swa = cfg.num_heads;
+        }
+
+        // Fallback: if no SWA layers detected, default to same as full-attention
+        if (cfg.head_dim_swa == 0) {
+            cfg.head_dim_swa = cfg.head_dim;
+            cfg.num_heads_swa = cfg.num_heads;
+            cfg.num_kv_heads_swa = cfg.num_kv_heads;
+        }
+
+        // SWA RoPE frequency base
+        cfg.rope_theta_swa =
+            static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base_swa", cfg.rope_theta));
+
+        // RoPE dimension counts
+        cfg.rope_dim_count =
+            static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+        cfg.rope_dim_count_swa =
+            static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count_swa", 0));
+
+        // Suppress tokens: read from GGUF metadata, fallback to known Gemma4 tokens
+        cfg.suppress_tokens = loader.get_metadata_int_array("tokenizer.ggml.suppress_tokens", {});
+        if (cfg.suppress_tokens.empty()) {
+            // Gemma4 models should suppress <image|> and <audio|> tokens to avoid
+            // degenerate repetition loops in generated output
+            cfg.suppress_tokens = {258882, 258883};
+        }
+
         return cfg;
     });
 

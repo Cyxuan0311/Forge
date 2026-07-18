@@ -48,6 +48,8 @@ static ArchCapabilityAutoRegister _reg_cap_deepseek_v3("deepseek_v3",
                                                        ArchCapability{.use_mla = true});
 
 // SSM architectures
+static ArchCapabilityAutoRegister _reg_cap_qwen3vl("qwen3vl", ArchCapability{.use_gqa = true,
+                                                                              .use_mrope = true});
 static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35", ArchCapability{.use_ssm = true,
                                                                            .use_mrope = true});
 
@@ -55,11 +57,14 @@ static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35", ArchCapability{.use_
 static ArchCapabilityAutoRegister _reg_cap_phi3("phi3", ArchCapability{.use_gqa = true,
                                                                        .use_neox_rope = true});
 
-// Gemma/Gemma2
+// Gemma/Gemma2/Gemma4
 static ArchCapabilityAutoRegister _reg_cap_gemma("gemma", ArchCapability{.use_gqa = true,
                                                                          .use_neox_rope = true});
 static ArchCapabilityAutoRegister _reg_cap_gemma2("gemma2", ArchCapability{.use_gqa = true,
                                                                            .use_neox_rope = true});
+static ArchCapabilityAutoRegister _reg_cap_gemma4("gemma4", ArchCapability{.use_gqa = true,
+                                                                           .use_neox_rope = true,
+                                                                           .ffn_activation = ActivationType::GeGLU});
 
 // Falcon
 static ArchCapabilityAutoRegister _reg_cap_falcon("falcon", ArchCapability{.use_gqa = true,
