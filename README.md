@@ -15,7 +15,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="version">
   <img src="https://img.shields.io/badge/C++-17-blue" alt="C++17">
-  <img src="https://img.shields.io/badge/CUDA-11.0+-green" alt="CUDA">
+  <img src="https://img.shields.io/badge/CUDA-12.8+-green" alt="CUDA">
   <img src="https://img.shields.io/badge/license-MIT-yellow" alt="license">
 </p>
 
@@ -45,7 +45,7 @@ Forge is a lightweight LLM inference engine written from scratch in C++ and CUDA
 ## Quick start
 
 ```bash
-git clone https://github.com/your-org/Forge.git
+git clone https://github.com/Cyxuan0311/Forge.git
 cd Forge
 
 cmake -B build && cmake --build build -j
