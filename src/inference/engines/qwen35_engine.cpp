@@ -879,11 +879,4 @@ void Qwen35Engine::apply_rope_mrope(const float* q_data, const float* k_data, fl
     }
 }
 
-// Register engine
-namespace {
-static EngineAutoRegister _reg_qwen35("qwen35", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<Qwen35Engine>(model, ctx);
-});
-}  // namespace
-
 }  // namespace forge

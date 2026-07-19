@@ -26,6 +26,7 @@
 #include "cli_common.h"
 
 // Forge headers
+#include "forge/arch_registry.h"
 #include "forge/context.h"
 #include "forge/engine.h"
 #include "forge/kv_cache.h"
@@ -69,61 +70,10 @@ static void signal_handler(int sig) {
 // ============================================================================
 
 static void ensure_engines_registered() {
-    // Static registration via EngineAutoRegister may not work in all link scenarios.
-    // Explicitly register engines as a reliable fallback.
-    static bool registered = false;
-    if (registered)
-        return;
-    registered = true;
-
-    auto& reg = EngineRegistry::instance();
-    (void)reg.registered_archs();
-
-    if (!reg.has("llama")) {
-        reg.register_engine("llama", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("mistral")) {
-        reg.register_engine("mistral", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("qwen")) {
-        reg.register_engine("qwen", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("qwen2")) {
-        reg.register_engine("qwen2", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("yi")) {
-        reg.register_engine("yi", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("deepseek")) {
-        reg.register_engine("deepseek", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("deepseek_v2")) {
-        reg.register_engine("deepseek_v2", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<DeepSeekEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("deepseek_v3")) {
-        reg.register_engine("deepseek_v3", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<DeepSeekEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("qwen35")) {
-        reg.register_engine("qwen35", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<Qwen35Engine>(model, ctx);
-        });
-    }
+    // Force arch_registrations.cpp to be linked (contains all static auto-registrations).
+    (void)forge::_arch_registrations_linked;
+    // Trigger static initializers by accessing the registry.
+    (void)EngineRegistry::instance().registered_archs();
 }
 
 static void ensure_loaders_registered() {

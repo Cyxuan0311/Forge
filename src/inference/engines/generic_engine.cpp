@@ -1005,41 +1005,4 @@ void GenericEngine::init_kv_cache(const ModelConfig& cfg) {
     TransformerEngine::init_kv_cache(cfg);
 }
 
-// ============================================================================
-// Engine registrations
-// ============================================================================
-
-namespace {
-static EngineAutoRegister _reg_llama("llama", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_mistral("mistral", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_qwen("qwen", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_qwen2("qwen2", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_qwen3vl("qwen3vl", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_yi("yi", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_deepseek("deepseek", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_gemma("gemma", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_gemma2("gemma2", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_falcon("falcon", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<GenericEngine>(model, ctx);
-});
-}  // namespace
-
 }  // namespace forge

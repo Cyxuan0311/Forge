@@ -777,11 +777,4 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
     return output;
 }
 
-// Engine registration
-namespace {
-EngineAutoRegister _reg_gemma4("gemma4", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<Gemma4Engine>(model, ctx);
-});
-}  // anonymous namespace
-
 }  // namespace forge

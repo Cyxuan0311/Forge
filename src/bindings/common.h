@@ -7,14 +7,11 @@
 #include <pybind11/stl.h>
 
 #include "../core/platform.h"
+#include "forge/arch_registry.h"
 #include "forge/backend.h"
 #include "forge/compute_graph.h"
 #include "forge/context.h"
 #include "forge/engine.h"
-#include "forge/engines/deepseek_engine.h"
-#include "forge/engines/gemma4_engine.h"
-#include "forge/engines/llama_engine.h"
-#include "forge/engines/qwen35_engine.h"
 #include "forge/engines/transformer_engine.h"
 #include "forge/generator.h"
 #include "forge/gguf_model.h"
@@ -37,69 +34,11 @@ using namespace forge;
 // ---- Registration helpers ----
 
 inline void ensure_engines_registered() {
-    // Static registration via EngineAutoRegister may not work in shared libraries
-    // (linker can discard translation units with no referenced symbols).
-    // We explicitly register engines here as a reliable fallback.
-    static bool registered = false;
-    if (registered)
-        return;
-    registered = true;
-
-    auto& reg = EngineRegistry::instance();
-    // Force registry access first (triggers any static registrations that did work)
-    (void)reg.registered_archs();
-
-    // Explicitly register if not already done by static initializers
-    if (!reg.has("llama")) {
-        reg.register_engine("llama", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("mistral")) {
-        reg.register_engine("mistral", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("qwen")) {
-        reg.register_engine("qwen", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("qwen2")) {
-        reg.register_engine("qwen2", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("yi")) {
-        reg.register_engine("yi", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("deepseek")) {
-        reg.register_engine("deepseek", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<LlamaEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("deepseek_v2")) {
-        reg.register_engine("deepseek_v2", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<DeepSeekEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("deepseek_v3")) {
-        reg.register_engine("deepseek_v3", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<DeepSeekEngine>(model, ctx);
-        });
-    }
-    if (!reg.has("qwen35")) {
-        reg.register_engine("qwen35", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<Qwen35Engine>(model, ctx);
-        });
-    }
-    if (!reg.has("gemma4")) {
-        reg.register_engine("gemma4", [](Model& model, InferenceContext& ctx) {
-            return std::make_unique<Gemma4Engine>(model, ctx);
-        });
-    }
+    // Force arch_registrations.cpp to be linked (contains all static auto-registrations).
+    // Without this reference, the linker may discard that translation unit in .so builds.
+    (void)forge::_arch_registrations_linked;
+    // Trigger static initializers by accessing the registry.
+    (void)EngineRegistry::instance().registered_archs();
 }
 
 inline void ensure_loaders_registered() {

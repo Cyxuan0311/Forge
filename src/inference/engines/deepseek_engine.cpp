@@ -206,14 +206,4 @@ TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden, int layer_i
     return output;
 }
 
-// Register engines for DeepSeek MLA architectures
-namespace {
-static EngineAutoRegister _reg_deepseek_v2("deepseek_v2", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<DeepSeekEngine>(model, ctx);
-});
-static EngineAutoRegister _reg_deepseek_v3("deepseek_v3", [](Model& model, InferenceContext& ctx) {
-    return std::make_unique<DeepSeekEngine>(model, ctx);
-});
-}  // namespace
-
 }  // namespace forge
