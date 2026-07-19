@@ -128,6 +128,7 @@ add_library(
   src/operators/cpu/norm.cpp
   src/operators/cpu/activation.cpp
   src/operators/cpu/matmul.cpp
+  src/operators/cpu/quant_traits.cpp
   src/operators/cpu/embedding.cpp
   src/operators/cpu/rope.cpp
   src/operators/cpu/elementwise.cpp
@@ -142,6 +143,7 @@ if(CUDAToolkit_FOUND)
             src/operators/cuda/cuda_flash_attn.cu
             src/operators/cuda/cuda_embedding.cu
             src/operators/cuda/cuda_gemv.cu
+            src/operators/cuda/cuda_gemv_instances.cu
             src/operators/cuda/cuda_fused.cu
             src/operators/cuda/cuda_quant.cu
             src/operators/cuda/cuda_gemm.cu)
@@ -206,12 +208,10 @@ add_library(
   forge_infer STATIC
   src/inference/perf_profiler.cpp
   src/inference/engines/transformer_engine.cpp
-  src/inference/engines/llama_engine.cpp
   src/inference/engines/deepseek_engine.cpp
   src/inference/engines/qwen35_engine.cpp
-  src/inference/engines/gemma_engine.cpp
   src/inference/engines/gemma4_engine.cpp
-  src/inference/engines/falcon_engine.cpp
+  src/inference/engines/generic_engine.cpp
   src/inference/engines/layer_graph_builder.cpp
   src/inference/engines/llama_graph_builder.cpp
   src/inference/engines/deepseek_graph_builder.cpp

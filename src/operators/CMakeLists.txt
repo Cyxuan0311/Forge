@@ -18,6 +18,7 @@ if(CUDAToolkit_FOUND)
             cuda/cuda_flash_attn.cu
             cuda/cuda_embedding.cu
             cuda/cuda_gemv.cu
+            cuda/cuda_gemv_instances.cu
             cuda/cuda_fused.cu
             cuda/cuda_quant.cu
             cuda/cuda_gemm.cu)
