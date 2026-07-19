@@ -50,5 +50,7 @@ void register_scheduler(py::module_& m) {
         .def_property_readonly("prefix_cache_hits", &PyRequestScheduler::prefix_cache_hits)
         .def_property_readonly("prefix_cache_misses", &PyRequestScheduler::prefix_cache_misses)
         .def_property("n_batch", &PyRequestScheduler::n_batch, &PyRequestScheduler::set_n_batch)
-        .def_property("n_ubatch", &PyRequestScheduler::n_ubatch, &PyRequestScheduler::set_n_ubatch);
+        .def_property("n_ubatch", &PyRequestScheduler::n_ubatch, &PyRequestScheduler::set_n_ubatch)
+        .def_property("n_threads", &PyRequestScheduler::n_threads, &PyRequestScheduler::set_n_threads)
+        .def_property("n_threads_batch", &PyRequestScheduler::n_threads_batch, &PyRequestScheduler::set_n_threads_batch);
 }

@@ -20,8 +20,10 @@ struct ContextParams {
     KVCacheDType kv_cache_dtype = KVCacheDType::FP32;
     DeviceType device = DeviceType::CUDA;
     int batch_size = 1;
-    int n_batch = 512;    // max tokens per forward_batch() call
-    int n_ubatch = 256;   // max tokens per internal micro-batch
+    int n_batch = 512;          // max tokens per forward_batch() call
+    int n_ubatch = 256;         // max tokens per internal micro-batch
+    int n_threads = 4;          // decode (single-token) thread count
+    int n_threads_batch = 8;    // prefill/batch (multi-token) thread count
 };
 
 class InferenceContext {

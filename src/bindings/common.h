@@ -393,6 +393,11 @@ public:
     int n_ubatch() const { return scheduler_.context().params().n_ubatch; }
     void set_n_ubatch(int v) { scheduler_.context().params_mut().n_ubatch = v; }
 
+    int n_threads() const { return scheduler_.context().params().n_threads; }
+    void set_n_threads(int v) { scheduler_.context().params_mut().n_threads = v; }
+    int n_threads_batch() const { return scheduler_.context().params().n_threads_batch; }
+    void set_n_threads_batch(int v) { scheduler_.context().params_mut().n_threads_batch = v; }
+
 private:
     RequestScheduler scheduler_;
 };

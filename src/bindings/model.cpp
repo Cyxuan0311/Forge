@@ -138,5 +138,11 @@ void register_model(py::module_& m) {
         .def_property("n_ubatch",
             [](PyInferenceContext& self) { return self.get().params().n_ubatch; },
             [](PyInferenceContext& self, int v) { self.get().params_mut().n_ubatch = v; })
+        .def_property("n_threads",
+            [](PyInferenceContext& self) { return self.get().params().n_threads; },
+            [](PyInferenceContext& self, int v) { self.get().params_mut().n_threads = v; })
+        .def_property("n_threads_batch",
+            [](PyInferenceContext& self) { return self.get().params().n_threads_batch; },
+            [](PyInferenceContext& self, int v) { self.get().params_mut().n_threads_batch = v; })
         .def_property_readonly("device", &PyInferenceContext::device);
 }
