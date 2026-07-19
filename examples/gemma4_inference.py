@@ -14,25 +14,17 @@ Interactive commands:
   /help    - Show help message
 """
 
-import os
-import sys
-import time
 import gc
 import argparse
 
 from chat_utils import (
-    PerfTimer,
     add_common_args,
     generate_streaming,
     generate_batch,
     load_model_and_tokenize,
-    profiling_enabled,
-    perf,
     resolve_model_path,
 )
 
-import forge
-import numpy as np
 
 GGUF_MODEL_PATH = "/mnt/g/AI/Gemma-4-12B/gemma-4-E2B-it-Q4_K_M.gguf"
 GEMMA4_STOP_TOKEN_IDS = [106]
@@ -98,7 +90,7 @@ def interactive_chat_gemma4(model, tokenizer, args):
     ctx = None
 
     print("\n" + "=" * 60)
-    print(f"  Gemma-4-12B Interactive Chat (Forge)")
+    print("  Gemma-4-12B Interactive Chat (Forge)")
     print(f"  Device: {args.device}")
     if args.think:
         print("  Thinking mode: ON")

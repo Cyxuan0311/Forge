@@ -35,11 +35,8 @@ from chat_utils import (
     add_common_args,
     interactive_chat,
     load_model_and_tokenize,
-    profiling_enabled,
-    resolve_model_path,
 )
 
-import forge
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(PROJECT_DIR, "models")

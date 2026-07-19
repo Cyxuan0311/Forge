@@ -14,14 +14,11 @@ Interactive commands:
   /profile - Toggle profiling on/off
 """
 
-import os
-import sys
 
 from chat_utils import (
     add_common_args,
     interactive_chat,
     load_model_and_tokenize,
-    profiling_enabled,
     resolve_model_path,
 )
 

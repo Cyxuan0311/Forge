@@ -25,8 +25,6 @@ import numpy as np
 from chat_utils import (
     add_common_args,
     load_tokenizer,
-    profiling_enabled,
-    resolve_model_path,
 )
 
 import forge

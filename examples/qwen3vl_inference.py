@@ -13,22 +13,17 @@ Interactive commands:
 """
 
 import os
-import sys
 import time
 import gc
 import argparse
 import numpy as np
 
 from chat_utils import (
-    PerfTimer,
     add_common_args,
     load_model_and_tokenize,
-    load_tokenizer,
-    profiling_enabled,
     resolve_model_path,
 )
 
-import forge
 
 MODEL_DIR = "/mnt/g/AI/Qwen3-VL-4B-Instruct-GGUF"
 GGUF_MODEL_PATH = os.path.join(MODEL_DIR, "Qwen3-VL-4B-Instruct-Q3_K_M.gguf")
@@ -248,7 +243,7 @@ def interactive_chat_vl(model, tokenizer, args):
     multimodal = args.multimodal
 
     print("\n" + "=" * 60)
-    print(f"  Qwen3-VL-4B-Instruct Interactive Chat (Forge)")
+    print("  Qwen3-VL-4B-Instruct Interactive Chat (Forge)")
     print(f"  Device: {args.device}")
     print(f"  Mode: {'Multimodal' if multimodal else 'Text-only'}")
     print("  Commands: /clear, /quit, /help" + (", /image <path>" if multimodal else ""))

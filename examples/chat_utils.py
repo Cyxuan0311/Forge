@@ -12,7 +12,6 @@ import sys
 import os
 import time
 import gc
-import argparse
 from collections import defaultdict
 
 # ---------------------------------------------------------------------------
@@ -289,8 +288,8 @@ def generate_streaming(
         token_buffer.append(token_id)
 
         if profiling_enabled and step > 0:
-            now = time.perf_counter()
             # timing is approximate since we can't measure per-token precisely in callback
+            pass
 
         if len(token_buffer) >= 4 or token_id == eos_token_id:
             try:
@@ -651,7 +650,6 @@ def load_model_and_tokenize(args, model_path=None):
         forge.profiler_set_cuda_events(args.device == "cuda")
 
     # Context + warmup
-    t4 = time.time()
     ctx = model.create_context(
         kv_cache_dtype=args.kv_cache_dtype,
         gpu_layers=args.gpu_layers,
