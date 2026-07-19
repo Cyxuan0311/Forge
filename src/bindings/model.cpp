@@ -132,5 +132,11 @@ void register_model(py::module_& m) {
         .def("set_use_graph", &PyInferenceContext::set_use_graph, py::arg("use_graph"))
         .def("use_graph", &PyInferenceContext::use_graph)
         .def("memory_stats", &PyInferenceContext::memory_stats)
+        .def_property("n_batch",
+            [](PyInferenceContext& self) { return self.get().params().n_batch; },
+            [](PyInferenceContext& self, int v) { self.get().params_mut().n_batch = v; })
+        .def_property("n_ubatch",
+            [](PyInferenceContext& self) { return self.get().params().n_ubatch; },
+            [](PyInferenceContext& self, int v) { self.get().params_mut().n_ubatch = v; })
         .def_property_readonly("device", &PyInferenceContext::device);
 }

@@ -215,9 +215,9 @@ public:
         if (!tfm_eng)
             return stats;
 
-        const auto& cache = tfm_eng->kv_cache();
-        stats["kv_cache_nbytes"] = static_cast<int64_t>(cache.nbytes());
-        stats["kv_cache_dtype"] = (cache.kv_dtype() == KVCacheDType::Q4_0) ? "q4_0" : "fp32";
+        const KVCache* cache = tfm_eng->kv_cache();
+        stats["kv_cache_nbytes"] = static_cast<int64_t>(cache->nbytes());
+        stats["kv_cache_dtype"] = (cache->kv_dtype() == KVCacheDType::Q4_0) ? "q4_0" : "fp32";
         return stats;
     }
 
@@ -384,6 +384,14 @@ public:
     bool has_pending() const { return scheduler_.has_pending(); }
     void abort(int request_id) { scheduler_.abort(request_id); }
     void reset() { scheduler_.reset(); }
+
+    int prefix_cache_hits() const { return scheduler_.prefix_cache_hits(); }
+    int prefix_cache_misses() const { return scheduler_.prefix_cache_misses(); }
+
+    int n_batch() const { return scheduler_.context().params().n_batch; }
+    void set_n_batch(int v) { scheduler_.context().params_mut().n_batch = v; }
+    int n_ubatch() const { return scheduler_.context().params().n_ubatch; }
+    void set_n_ubatch(int v) { scheduler_.context().params_mut().n_ubatch = v; }
 
 private:
     RequestScheduler scheduler_;

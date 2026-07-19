@@ -25,7 +25,14 @@ void register_scheduler(py::module_& m) {
         .def_readonly("status", &GenerateRequest::status)
         .def_readonly("output_tokens", &GenerateRequest::output_tokens)
         .def_readonly("num_generated", &GenerateRequest::num_generated)
-        .def_readonly("finish_reason", &GenerateRequest::finish_reason);
+        .def_readonly("finish_reason", &GenerateRequest::finish_reason)
+        .def_readonly("prefix_len", &GenerateRequest::prefix_len)
+        .def_readonly("from_cache", &GenerateRequest::from_cache);
+
+    py::class_<CachedPrompt>(m, "CachedPrompt")
+        .def_readonly("tokens", &CachedPrompt::tokens)
+        .def_readonly("seq_id", &CachedPrompt::seq_id)
+        .def_readonly("valid", &CachedPrompt::valid);
 
     py::class_<PyRequestScheduler>(m, "RequestScheduler")
         .def(py::init<PyModel&, int, int>(), py::arg("model"), py::arg("block_size") = 16,
@@ -39,5 +46,9 @@ void register_scheduler(py::module_& m) {
         .def("num_waiting", &PyRequestScheduler::num_waiting)
         .def("has_pending", &PyRequestScheduler::has_pending)
         .def("abort", &PyRequestScheduler::abort, py::arg("request_id"))
-        .def("reset", &PyRequestScheduler::reset);
+        .def("reset", &PyRequestScheduler::reset)
+        .def_property_readonly("prefix_cache_hits", &PyRequestScheduler::prefix_cache_hits)
+        .def_property_readonly("prefix_cache_misses", &PyRequestScheduler::prefix_cache_misses)
+        .def_property("n_batch", &PyRequestScheduler::n_batch, &PyRequestScheduler::set_n_batch)
+        .def_property("n_ubatch", &PyRequestScheduler::n_ubatch, &PyRequestScheduler::set_n_ubatch);
 }
