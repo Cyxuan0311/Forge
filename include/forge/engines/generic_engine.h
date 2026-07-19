@@ -41,9 +41,11 @@ protected:
                             DeviceType dev);
 
     // 4. Attention: CUDA flash/GQA decode or CPU SDPA, with SWA window support
+    // Optional mask: [q_len, kv_len] additive bias (0=attend, -inf=mask out)
     TensorPtr attention_forward(const TensorPtr& q, const TensorPtr& k,
                                 const TensorPtr& v, int layer_idx,
-                                int64_t start_pos, int seq_len, DeviceType dev);
+                                int64_t start_pos, int seq_len, DeviceType dev,
+                                const TensorPtr& mask = nullptr);
 
     // 5. FFN: SiLUGated/GeGLU/SimpleGELU/MoE, with fused quantized fast paths
     TensorPtr ffn_forward(const TensorPtr& x, const TensorPtr& residual,

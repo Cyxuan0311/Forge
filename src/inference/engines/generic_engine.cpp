@@ -15,6 +15,10 @@
 #    include <cuda_runtime.h>
 #endif
 
+#ifdef _OPENMP
+#    include <omp.h>
+#endif
+
 namespace forge {
 
 // ============================================================================
@@ -185,6 +189,11 @@ bool GenericEngine::init_weights() {
 TensorPtr GenericEngine::forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id) {
     const auto& cfg = model_.config();
     int seq_len = static_cast<int>(input_ids->numel());
+
+    // Decode path: use fewer threads (memory-bandwidth bound)
+#ifdef _OPENMP
+    omp_set_num_threads(ctx_.params().n_threads);
+#endif
 
     init_kv_cache(cfg);
 
@@ -604,7 +613,8 @@ GenericEngine::RopeResult GenericEngine::rope_forward(const TensorPtr& q, const 
 
 TensorPtr GenericEngine::attention_forward(const TensorPtr& q, const TensorPtr& k,
                                            const TensorPtr& v, int layer_idx,
-                                           int64_t start_pos, int seq_len, DeviceType dev) {
+                                           int64_t start_pos, int seq_len, DeviceType dev,
+                                           const TensorPtr& mask) {
     (void)start_pos;
     (void)v;  // v is already in KV cache; we use k_sliced/v_sliced from cache
     const auto& cfg = model_.config();
@@ -629,6 +639,26 @@ TensorPtr GenericEngine::attention_forward(const TensorPtr& q, const TensorPtr& 
         v_sliced = v_cuda;
     }
 
+    // Prepare mask data pointer for CUDA kernels
+    const float* mask_data = nullptr;
+    TensorPtr mask_on_dev = mask;
+    if (mask && dev == DeviceType::CUDA && mask->device() == DeviceType::CPU) {
+        mask_on_dev = std::make_shared<Tensor>(DataType::FP32, mask->shape(), DeviceType::CUDA);
+        mask_on_dev->copy_from(*mask);
+    }
+    if (mask_on_dev) {
+        mask_data = static_cast<const float*>(mask_on_dev->data());
+    }
+
+    // For decode with mask, extract the single row for this sequence
+    const float* mask_row = nullptr;
+    TensorPtr mask_row_tensor;
+    if (mask && seq_len == 1 && mask->ndim() == 2) {
+        // mask is [n_seqs, kv_len] — extract the first (and only) row
+        // When called per-sequence from forward_batch, the mask has already been sliced
+        mask_row = mask_data;
+    }
+
     TensorPtr attn_out;
     if (dev == DeviceType::CUDA && num_kv_heads < num_heads) {
         attn_out = std::make_shared<Tensor>(DataType::FP32,
@@ -639,28 +669,32 @@ TensorPtr GenericEngine::attention_forward(const TensorPtr& q, const TensorPtr& 
             cuda::launch_flash_attention_gqa_decode(
                 static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
                 static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
-                total_len, num_heads, num_kv_heads, head_dim);
+                total_len, num_heads, num_kv_heads, head_dim,
+                mask_row,  // decode mask row
+                0);
 #endif
         } else {
 #ifdef USE_CUDA
             cuda::launch_flash_attention_gqa(
                 static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
                 static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
-                seq_len, total_len, num_heads, num_kv_heads, head_dim, true);
+                seq_len, total_len, num_heads, num_kv_heads, head_dim,
+                mask_data,  // prefill mask
+                true);
 #endif
         }
     } else if (dev == DeviceType::CUDA) {
         attn_out = ops::scaled_dot_product_attention_2d(q, k_sliced, v_sliced, seq_len, total_len,
-                                                        num_heads, head_dim, true);
+                                                        num_heads, head_dim, mask, true);
     } else {
         // CPU path
         if (num_kv_heads < num_heads) {
             attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
                                                                 total_len, num_heads, num_kv_heads,
-                                                                head_dim, true);
+                                                                head_dim, mask, true);
         } else {
             attn_out = ops::scaled_dot_product_attention_2d(q, k_sliced, v_sliced, seq_len,
-                                                            total_len, num_heads, head_dim, true);
+                                                            total_len, num_heads, head_dim, mask, true);
         }
     }
 
