@@ -1,7 +1,9 @@
 #include "forge/engine.h"
+#include "forge/inference_batch.h"
 #include "forge/logger.h"
 #include "forge/model.h"
 
+#include <cstring>
 #include <mutex>
 
 namespace forge {
@@ -251,6 +253,105 @@ bool EngineRegistry::has(const std::string& arch) const {
 
 EngineAutoRegister::EngineAutoRegister(const std::string& arch, EngineCreator creator) {
     EngineRegistry::instance().register_engine(arch, std::move(creator));
+}
+
+// Default forward_batch implementation: sequential fallback to forward()
+// Returns [n_seq, vocab_size] with each sequence's last-token logits on CPU.
+TensorPtr InferenceEngine::forward_batch(const InferenceBatch& batch) {
+    if (batch.empty())
+        return nullptr;
+
+    // Call forward() for each sequence individually
+    std::vector<TensorPtr> all_logits;
+    for (const auto& item : batch.items) {
+        int seq_len = static_cast<int>(item.tokens.size());
+        auto input_ids =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{seq_len}, DeviceType::CPU);
+        std::memcpy(input_ids->data(), item.tokens.data(), seq_len * sizeof(int32_t));
+        all_logits.push_back(forward(input_ids, item.start_pos, item.seq_id));
+    }
+
+    int n_seq = static_cast<int>(all_logits.size());
+    int vocab_size = static_cast<int>(all_logits[0]->shape().back());
+
+    // Stack last-token logits from each sequence into [n_seq, vocab_size] on CPU
+    auto result = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{n_seq, vocab_size},
+                                            DeviceType::CPU);
+
+    for (int i = 0; i < n_seq; i++) {
+        int seq_len_i = static_cast<int>(all_logits[i]->shape()[0]);
+        // Bring to CPU if needed
+        TensorPtr logits_cpu = all_logits[i];
+        if (all_logits[i]->device() == DeviceType::CUDA) {
+            logits_cpu = std::make_shared<Tensor>(DataType::FP32, all_logits[i]->shape(),
+                                                   DeviceType::CPU);
+            logits_cpu->copy_from(*all_logits[i]);
+        }
+        // Copy last row into result row i
+        const float* src = static_cast<const float*>(logits_cpu->data()) +
+                           (seq_len_i - 1) * vocab_size;
+        float* dst = static_cast<float*>(result->data()) + i * vocab_size;
+        std::memcpy(dst, src, vocab_size * sizeof(float));
+    }
+
+    return result;
+}
+
+// Split a batch into micro-batches, each with at most n_ubatch tokens.
+// Per-sequence chunking: long sequences are split into chunks; short sequences
+// may be packed together as long as the total token count stays <= n_ubatch.
+std::vector<InferenceBatch> split_batch(const InferenceBatch& batch, int n_ubatch) {
+    if (batch.empty() || n_ubatch <= 0)
+        return {batch};
+
+    // Fast path: entire batch fits in one micro-batch
+    if (batch.n_tokens() <= n_ubatch)
+        return {batch};
+
+    std::vector<InferenceBatch> micros;
+    InferenceBatch current;
+    int current_tokens = 0;
+
+    for (const auto& item : batch.items) {
+        int item_len = static_cast<int>(item.tokens.size());
+        int offset = 0;
+
+        while (offset < item_len) {
+            int remaining = item_len - offset;
+            int available = n_ubatch - current_tokens;
+
+            if (available <= 0) {
+                // Flush current micro-batch
+                micros.push_back(std::move(current));
+                current = InferenceBatch();
+                current_tokens = 0;
+                available = n_ubatch;
+            }
+
+            int chunk_len = std::min(remaining, available);
+
+            InferenceBatchItem chunk;
+            chunk.seq_id = item.seq_id;
+            chunk.logits = item.logits && (offset + chunk_len == item_len);
+            chunk.start_pos = item.start_pos + offset;
+            chunk.tokens.assign(item.tokens.begin() + offset,
+                                item.tokens.begin() + offset + chunk_len);
+            if (!item.positions.empty()) {
+                chunk.positions.assign(item.positions.begin() + offset,
+                                       item.positions.begin() + offset + chunk_len);
+            }
+
+            current.items.push_back(std::move(chunk));
+            current_tokens += chunk_len;
+            offset += chunk_len;
+        }
+    }
+
+    if (!current.empty())
+        micros.push_back(std::move(current));
+
+    return micros;
 }
 
 }  // namespace forge

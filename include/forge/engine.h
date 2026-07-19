@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "inference_batch.h"
 #include "model.h"
 #include "tensor.h"
 
@@ -14,6 +15,7 @@ namespace forge {
 
 class Model;
 class InferenceContext;
+class KVCache;
 
 // Describes what an engine can handle, used for compatibility checking
 // when falling back from an unregistered architecture to a known engine.
@@ -63,7 +65,15 @@ struct EngineCapability {
 class InferenceEngine {
 public:
     virtual ~InferenceEngine() = default;
-    virtual TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos) = 0;
+
+    // Single-sequence forward (backward compatible, seq_id defaults to 0)
+    virtual TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) = 0;
+
+    // Multi-sequence batch forward.
+    // Default implementation: fall back to sequential forward() calls.
+    // Subclasses can override for true batched computation.
+    virtual TensorPtr forward_batch(const InferenceBatch& batch);
+
     virtual TensorPtr forward_from_hidden(const TensorPtr& hidden, int64_t start_pos) {
         (void)hidden;
         (void)start_pos;
@@ -73,6 +83,10 @@ public:
     virtual void reset() {}
     virtual void set_gpu_layers(int layers) { (void)layers; }
     virtual int gpu_layers() const { return -1; }
+
+    // Access the engine's KV cache (returns nullptr if not available)
+    virtual KVCache* kv_cache() { return nullptr; }
+    virtual const KVCache* kv_cache() const { return nullptr; }
 };
 
 using EngineCreator = std::function<std::unique_ptr<InferenceEngine>(Model&, InferenceContext&)>;
