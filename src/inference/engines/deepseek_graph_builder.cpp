@@ -135,8 +135,8 @@ int DeepSeekGraphBuilder::build_gqa_layer(ComputeGraph& graph, int hidden_idx,
 
     int cache_idx = graph.add_node(
         "cache_cpy", "cpy_k", {ref(k_rope_idx), ref(v_idx)},
-        [&kv_cache, layer_idx, seq_len, dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
-            kv_cache.update(layer_idx, inputs[0], inputs[1], seq_len);
+        [&kv_cache, layer_idx, seq_len, start_pos, dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
+            kv_cache.update(layer_idx, /*seq_id=*/0, start_pos, inputs[0], inputs[1], seq_len);
             if (kv_cache.kv_dtype() == KVCacheDType::Q4_0) {
                 kv_cache.dequantize_layer(layer_idx);
             }
@@ -288,8 +288,8 @@ int DeepSeekGraphBuilder::build_mla_layer(ComputeGraph& graph, int hidden_idx,
     // KV cache update
     int cache_idx = graph.add_node(
         "cache_cpy", "cpy_k", {ref(k_rope_idx), ref(v_latent_idx)},
-        [&kv_cache, layer_idx, seq_len, dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
-            kv_cache.update(layer_idx, inputs[0], inputs[1], seq_len);
+        [&kv_cache, layer_idx, seq_len, start_pos, dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
+            kv_cache.update(layer_idx, /*seq_id=*/0, start_pos, inputs[0], inputs[1], seq_len);
             if (kv_cache.kv_dtype() == KVCacheDType::Q4_0) {
                 kv_cache.dequantize_layer(layer_idx);
             }

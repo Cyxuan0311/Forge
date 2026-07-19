@@ -397,7 +397,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
         // ---- KV Cache update (on CPU, then copy to cache device) ----
         {
             PERF_SCOPE("layer/kv_cache_update");
-            kv_cache_.update(layer_idx, k_rope, v, seq_len);
+            kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
         }
     } else {
         // Non-KV layer: reuse KV cache from the last two KV layers

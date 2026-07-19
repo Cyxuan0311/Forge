@@ -198,10 +198,10 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
     // Node: cache_cpy (update KV cache: store k_rope + v, optionally dequantize)
     int cache_idx = graph.add_node(
         "cache_cpy", "cpy_k", {ref(k_rope_idx), ref(v_idx)},
-        [&kv_cache, layer_idx, seq_len, dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
+        [&kv_cache, layer_idx, seq_len, start_pos, dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
             auto k_rope = inputs[0];
             auto v = inputs[1];
-            kv_cache.update(layer_idx, k_rope, v, seq_len);
+            kv_cache.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
             if (kv_cache.kv_dtype() == KVCacheDType::Q4_0) {
                 kv_cache.dequantize_layer(layer_idx);
             }

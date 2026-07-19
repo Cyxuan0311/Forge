@@ -329,7 +329,7 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
                      seq_len, num_heads, num_kv_heads, head_dim, n_rot, start_pos, cfg.rope_theta);
 
     // KV cache
-    kv_cache_.update(layer_idx, k_rope, v, seq_len);
+    kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(layer_idx);
     }

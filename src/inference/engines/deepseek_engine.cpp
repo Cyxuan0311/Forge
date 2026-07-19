@@ -66,7 +66,7 @@ TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden, int layer_i
             num_heads, num_kv_heads, head_dim, start_pos, cfg.rope_theta);
     }
 
-    kv_cache_.update(layer_idx, k_rope, v, seq_len);
+    kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
 
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(layer_idx);
@@ -156,7 +156,7 @@ TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden, int layer_i
             num_heads, 1, head_dim, start_pos, cfg.rope_theta);
     }
 
-    kv_cache_.update(layer_idx, k_rope, v_latent, seq_len);
+    kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v_latent, seq_len);
 
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(layer_idx);
