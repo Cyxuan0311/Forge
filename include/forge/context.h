@@ -20,6 +20,8 @@ struct ContextParams {
     KVCacheDType kv_cache_dtype = KVCacheDType::FP32;
     DeviceType device = DeviceType::CUDA;
     int batch_size = 1;
+    int n_batch = 512;    // max tokens per forward_batch() call
+    int n_ubatch = 256;   // max tokens per internal micro-batch
 };
 
 class InferenceContext {
@@ -41,6 +43,7 @@ public:
     KVCache& kv_cache() { return *kv_cache_; }
 
     const ContextParams& params() const { return params_; }
+    ContextParams& params_mut() { return params_; }
     int current_pos() const { return current_pos_; }
 
     void set_engine(std::unique_ptr<InferenceEngine> engine);
