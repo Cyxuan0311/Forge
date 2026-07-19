@@ -1,3 +1,4 @@
+#include "forge/arch_weight_inits.h"
 #include "forge/arch_registry.h"
 #include "forge/logger.h"
 #include "forge/weight_store.h"
@@ -33,10 +34,8 @@ WeightInitAutoRegister::WeightInitAutoRegister(const std::string& arch, LayerWei
 }
 
 // ============================================================================
-// Architecture-specific weight init functions
+// Architecture-specific weight init functions (named, non-static)
 // ============================================================================
-
-namespace {
 
 static void load_if_present(const WeightStore& store, LayerWeights& lw,
                             const std::string& canonical, const std::string& store_name) {
@@ -45,7 +44,7 @@ static void load_if_present(const WeightStore& store, LayerWeights& lw,
         lw.set(canonical, t);
 }
 
-static void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
+void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
     const auto& store = ctx.store;
     auto& lw = ctx.lw;
     std::string base = "layers." + std::to_string(ctx.layer_idx);
@@ -66,7 +65,7 @@ static void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "attn_k_norm", base + ".attn_k_norm");
 }
 
-static void init_mla_layer_weights(LayerWeightInitContext& ctx) {
+void init_mla_layer_weights(LayerWeightInitContext& ctx) {
     const auto& store = ctx.store;
     auto& lw = ctx.lw;
     std::string base = "layers." + std::to_string(ctx.layer_idx);
@@ -83,7 +82,7 @@ static void init_mla_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "wo", base + ".wo");
 }
 
-static void init_qwen35_layer_weights(LayerWeightInitContext& ctx) {
+void init_qwen35_layer_weights(LayerWeightInitContext& ctx) {
     const auto& store = ctx.store;
     auto& lw = ctx.lw;
     std::string base = "layers." + std::to_string(ctx.layer_idx);
@@ -113,7 +112,7 @@ static void init_qwen35_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "ssm_out", base + ".ssm_out");
 }
 
-static void init_falcon_layer_weights(LayerWeightInitContext& ctx) {
+void init_falcon_layer_weights(LayerWeightInitContext& ctx) {
     const auto& store = ctx.store;
     auto& lw = ctx.lw;
     std::string base = "layers." + std::to_string(ctx.layer_idx);
@@ -133,7 +132,7 @@ static void init_falcon_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "attn_norm_2_bias", base + ".attn_norm_2_bias");
 }
 
-static void init_gemma4_layer_weights(LayerWeightInitContext& ctx) {
+void init_gemma4_layer_weights(LayerWeightInitContext& ctx) {
     const auto& store = ctx.store;
     auto& lw = ctx.lw;
     std::string base = "layers." + std::to_string(ctx.layer_idx);
@@ -177,28 +176,5 @@ static void init_gemma4_layer_weights(LayerWeightInitContext& ctx) {
     // Proportional RoPE frequency factors (full-attention layers only, optional)
     load_if_present(store, lw, "rope_freqs", base + ".rope_freqs");
 }
-
-}  // anonymous namespace
-
-// ============================================================================
-// Register weight init functions for each architecture
-// ============================================================================
-
-static WeightInitAutoRegister _reg_winit_llama("llama", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_mistral("mistral", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_qwen("qwen", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_qwen2("qwen2", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_qwen3vl("qwen3vl", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_yi("yi", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_deepseek("deepseek", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_deepseek_v2("deepseek_v2", init_mla_layer_weights);
-static WeightInitAutoRegister _reg_winit_deepseek_v3("deepseek_v3", init_mla_layer_weights);
-static WeightInitAutoRegister _reg_winit_qwen35("qwen35", init_qwen35_layer_weights);
-
-static WeightInitAutoRegister _reg_winit_phi3("phi3", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_gemma("gemma", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_gemma2("gemma2", init_gqa_layer_weights);
-static WeightInitAutoRegister _reg_winit_falcon("falcon", init_falcon_layer_weights);
-static WeightInitAutoRegister _reg_winit_gemma4("gemma4", init_gemma4_layer_weights);
 
 }  // namespace forge

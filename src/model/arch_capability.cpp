@@ -2,6 +2,10 @@
 
 namespace forge {
 
+// ============================================================================
+// ArchCapabilityRegistry implementation
+// ============================================================================
+
 ArchCapabilityRegistry& ArchCapabilityRegistry::instance() {
     static ArchCapabilityRegistry registry;
     return registry;
@@ -27,66 +31,5 @@ ArchCapabilityAutoRegister::ArchCapabilityAutoRegister(const std::string& arch,
                                                        const ArchCapability& cap) {
     ArchCapabilityRegistry::instance().register_capability(arch, cap);
 }
-
-namespace {
-// GQA architectures (RMSNorm + SiLU_GELU, standard GQA patterns)
-static ArchCapabilityAutoRegister _reg_cap_llama("llama",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true});
-static ArchCapabilityAutoRegister _reg_cap_mistral("mistral",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true});
-static ArchCapabilityAutoRegister _reg_cap_qwen("qwen",
-    ArchCapability{.use_gqa = true});
-static ArchCapabilityAutoRegister _reg_cap_qwen2("qwen2",
-    ArchCapability{.use_gqa = true});
-static ArchCapabilityAutoRegister _reg_cap_yi("yi",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true});
-static ArchCapabilityAutoRegister _reg_cap_deepseek("deepseek",
-    ArchCapability{.use_gqa = true});
-
-// MLA architectures
-static ArchCapabilityAutoRegister _reg_cap_deepseek_v2("deepseek_v2",
-    ArchCapability{.use_mla = true});
-static ArchCapabilityAutoRegister _reg_cap_deepseek_v3("deepseek_v3",
-    ArchCapability{.use_mla = true});
-
-// SSM / MRoPE architectures
-static ArchCapabilityAutoRegister _reg_cap_qwen3vl("qwen3vl",
-    ArchCapability{.use_gqa = true, .use_mrope = true,
-                   /* ffn_activation & norm_type default */
-                   .use_qk_norm = true});
-static ArchCapabilityAutoRegister _reg_cap_qwen35("qwen35",
-    ArchCapability{.use_ssm = true, .use_mrope = true});
-
-// Phi-3
-static ArchCapabilityAutoRegister _reg_cap_phi3("phi3",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true});
-
-// Gemma: GeGLU + embedding_scale
-static ArchCapabilityAutoRegister _reg_cap_gemma("gemma",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true,
-                   .ffn_activation = ActivationType::GeGLU,
-                   .embedding_scale = true});
-// Gemma2: GeGLU + embedding_scale + post-norms
-static ArchCapabilityAutoRegister _reg_cap_gemma2("gemma2",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true,
-                   .ffn_activation = ActivationType::GeGLU,
-                   .embedding_scale = true,
-                   .has_post_attention_norm = true,
-                   .has_post_ffn_norm = true});
-// Gemma4: GeGLU + QK-norm + embedding_scale
-static ArchCapabilityAutoRegister _reg_cap_gemma4("gemma4",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true,
-                   .ffn_activation = ActivationType::GeGLU,
-                   .use_qk_norm = true,
-                   .embedding_scale = true});
-
-// Falcon: LayerNorm + bias + parallel residual
-static ArchCapabilityAutoRegister _reg_cap_falcon("falcon",
-    ArchCapability{.use_gqa = true, .use_neox_rope = true,
-                   .norm_type = NormType::LayerNorm,
-                   .has_qkv_bias = true,
-                   .has_norm_bias = true,
-                   .use_parallel_residual = true});
-}  // anonymous namespace
 
 }  // namespace forge
