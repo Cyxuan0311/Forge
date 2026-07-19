@@ -70,7 +70,7 @@ static inline float fp16_to_fp32(uint16_t bits) {
     return sign ? -v : v;
 }
 
-static void dequantize_q4_0_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_q4_0_row(const uint8_t* q_data, float* out, int K, int row) {
     const int Q4_0_BLOCK_SIZE = 18;
     int blocks_per_row = (K + 31) / 32;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * Q4_0_BLOCK_SIZE;
@@ -86,7 +86,7 @@ static void dequantize_q4_0_row(const uint8_t* q_data, float* out, int K, int ro
     }
 }
 
-static void dequantize_q4_1_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_q4_1_row(const uint8_t* q_data, float* out, int K, int row) {
     const int Q4_1_BLOCK_SIZE = 20;
     int blocks_per_row = (K + 31) / 32;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * Q4_1_BLOCK_SIZE;
@@ -103,7 +103,7 @@ static void dequantize_q4_1_row(const uint8_t* q_data, float* out, int K, int ro
     }
 }
 
-static void dequantize_q8_0_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_q8_0_row(const uint8_t* q_data, float* out, int K, int row) {
     const int Q8_0_BLOCK_SIZE = 34;
     int blocks_per_row = (K + 31) / 32;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * Q8_0_BLOCK_SIZE;
@@ -129,7 +129,7 @@ static void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
     }
 }
 
-static void dequantize_q6_k_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_q6_k_row(const uint8_t* q_data, float* out, int K, int row) {
     const int Q6_K_BLOCK_SIZE = 210;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * Q6_K_BLOCK_SIZE;
@@ -171,7 +171,7 @@ static void dequantize_q6_k_row(const uint8_t* q_data, float* out, int K, int ro
 // Q3_K dequantize: 110 bytes per block of 256 elements
 // Block layout: hmask[32] + qs[64] + scales[12] + d[2]
 // Ported from llama.cpp dequantize_row_q3_K (pointer-increment style)
-static void dequantize_q3_k_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_q3_k_row(const uint8_t* q_data, float* out, int K, int row) {
     const int Q3_K_BLOCK_SIZE = 110;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * Q3_K_BLOCK_SIZE;
@@ -227,7 +227,7 @@ static void dequantize_q3_k_row(const uint8_t* q_data, float* out, int K, int ro
     }
 }
 
-static void dequantize_q4_k_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_q4_k_row(const uint8_t* q_data, float* out, int K, int row) {
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * Q4_K_BLOCK_SIZE;
@@ -269,7 +269,7 @@ static void dequantize_q4_k_row(const uint8_t* q_data, float* out, int K, int ro
 // Q5_K dequantize: 176 bytes per block of 256 elements
 // Block layout: d[2] + dmin[2] + scales[12] + qh[32] + qs[128]
 // Ported from llama.cpp dequantize_row_q5_K (pointer-increment style)
-static void dequantize_q5_k_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_q5_k_row(const uint8_t* q_data, float* out, int K, int row) {
     const int Q5_K_BLOCK_SIZE = 176;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * Q5_K_BLOCK_SIZE;
@@ -572,7 +572,7 @@ static const uint64_t iq2s_grid[1024] = {
 // Block layout: d[2] + qs[64] + qh[8] + scales[8]
 // qs[0..31] = quantized values (8 groups of 4 bytes), qs[32..63] = sign bits
 // Ported from llama.cpp dequantize_row_iq2_s (pointer-increment style)
-static void dequantize_iq2_s_row(const uint8_t* q_data, float* out, int K, int row) {
+void dequantize_iq2_s_row(const uint8_t* q_data, float* out, int K, int row) {
     const int IQ2_S_BLOCK_SIZE = 82;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
     const uint8_t* row_ptr = q_data + row * blocks_per_row * IQ2_S_BLOCK_SIZE;
@@ -605,71 +605,6 @@ static void dequantize_iq2_s_row(const uint8_t* q_data, float* out, int K, int r
             qs += 4;
             signs += 4;
         }
-    }
-}
-
-using DequantRowFn = void (*)(const uint8_t*, float*, int, int);
-
-static DequantRowFn get_dequant_row_fn(DataType dt) {
-    switch (dt) {
-    case DataType::Q4_0:
-        return dequantize_q4_0_row;
-    case DataType::Q4_1:
-        return dequantize_q4_1_row;
-    case DataType::Q4_K:
-        return dequantize_q4_k_row;
-    case DataType::Q8_0:
-        return dequantize_q8_0_row;
-    case DataType::Q3_K:
-        return dequantize_q3_k_row;
-    case DataType::Q5_K:
-        return dequantize_q5_k_row;
-    case DataType::Q6_K:
-        return dequantize_q6_k_row;
-    case DataType::IQ2_S:
-        return dequantize_iq2_s_row;
-    default:
-        return nullptr;
-    }
-}
-
-static int get_row_block_bytes(DataType dt) {
-    switch (dt) {
-    case DataType::Q4_0:
-        return 18;
-    case DataType::Q4_1:
-        return 20;
-    case DataType::Q4_K:
-        return 144;
-    case DataType::Q8_0:
-        return 34;
-    case DataType::Q3_K:
-        return 110;
-    case DataType::Q5_K:
-        return 176;
-    case DataType::Q6_K:
-        return 210;
-    case DataType::IQ2_S:
-        return 82;
-    default:
-        return 0;
-    }
-}
-
-static int get_row_block_elements(DataType dt) {
-    switch (dt) {
-    case DataType::Q4_0:
-    case DataType::Q4_1:
-    case DataType::Q8_0:
-        return 32;
-    case DataType::Q4_K:
-    case DataType::Q3_K:
-    case DataType::Q5_K:
-    case DataType::Q6_K:
-    case DataType::IQ2_S:
-        return 256;
-    default:
-        return 1;
     }
 }
 
@@ -960,22 +895,10 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
 
         if (M > 1 && M <= GEMV_THRESHOLD) {
             // Small batch: use batched GEMV with on-the-fly dequantization
-            if (b->dtype() == DataType::Q4_0) {
-                cuda::launch_gemv_q4_0_transB_batch(static_cast<const float*>(a->data()), b->data(),
-                                                    static_cast<float*>(out->data()), M, K, N);
-            } else if (b->dtype() == DataType::Q4_1) {
-                cuda::launch_gemv_q4_1_transB_batch(static_cast<const float*>(a->data()), b->data(),
-                                                    static_cast<float*>(out->data()), M, K, N);
-            } else if (b->dtype() == DataType::Q6_K) {
-                cuda::launch_gemv_q6_k_transB_batch(static_cast<const float*>(a->data()), b->data(),
-                                                    static_cast<float*>(out->data()), M, K, N);
-            } else if (b->dtype() == DataType::Q4_K) {
-                // Q4_K batch: on-the-fly dequant GEMV (avoids full matrix dequant)
-                cuda::launch_gemv_q4_k_transB_batch(static_cast<const float*>(a->data()), b->data(),
-                                                    static_cast<float*>(out->data()), M, K, N);
-            } else if (b->dtype() == DataType::Q3_K) {
-                cuda::launch_gemv_q3_k_transB_batch(static_cast<const float*>(a->data()), b->data(),
-                                                    static_cast<float*>(out->data()), M, K, N);
+            int dt_idx = static_cast<int>(b->dtype());
+            if (dt_idx < 16 && cuda::gemv_batch_dispatch[dt_idx]) {
+                cuda::gemv_batch_dispatch[dt_idx](static_cast<const float*>(a->data()), b->data(),
+                                                  static_cast<float*>(out->data()), M, K, N, 0);
             } else if (is_quantized_type(b->dtype())) {
                 auto dequant_fn = get_dequant_row_fn(b->dtype());
                 if (!dequant_fn)
@@ -1059,22 +982,11 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                                           static_cast<float*>(out->data()), M, K, N, true);
             }
         } else {
-            // M == 1: single GEMV
-            if (b->dtype() == DataType::Q4_0) {
-                cuda::launch_gemv_q4_0_transB(static_cast<const float*>(a->data()), b->data(),
-                                              static_cast<float*>(out->data()), K, N);
-            } else if (b->dtype() == DataType::Q4_1) {
-                cuda::launch_gemv_q4_1_transB(static_cast<const float*>(a->data()), b->data(),
-                                              static_cast<float*>(out->data()), K, N);
-            } else if (b->dtype() == DataType::Q4_K) {
-                cuda::launch_gemv_q4_k_transB(static_cast<const float*>(a->data()), b->data(),
-                                              static_cast<float*>(out->data()), K, N);
-            } else if (b->dtype() == DataType::Q6_K) {
-                cuda::launch_gemv_q6_k_transB(static_cast<const float*>(a->data()), b->data(),
-                                              static_cast<float*>(out->data()), K, N);
-            } else if (b->dtype() == DataType::Q3_K) {
-                cuda::launch_gemv_q3_k_transB(static_cast<const float*>(a->data()), b->data(),
-                                              static_cast<float*>(out->data()), K, N);
+            // M == 1: single GEMV — use dispatch table for supported types
+            int dt_idx = static_cast<int>(b->dtype());
+            if (dt_idx < 16 && cuda::gemv_dispatch[dt_idx]) {
+                cuda::gemv_dispatch[dt_idx](static_cast<const float*>(a->data()), b->data(),
+                                            static_cast<float*>(out->data()), K, N, 0);
             } else if (is_quantized_type(b->dtype())) {
                 auto dequant_fn = get_dequant_row_fn(b->dtype());
                 if (!dequant_fn)
@@ -1142,8 +1054,8 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 if (!dequant_fn)
                     throw std::runtime_error("Unsupported quantized type in matmul_transB: " + dtype_name(b->dtype()));
                 const uint8_t* q_data = static_cast<const uint8_t*>(b->data());
-                int block_el = get_row_block_elements(b->dtype());
-                int block_bytes = get_row_block_bytes(b->dtype());
+                int block_el = dtype_block_elements(b->dtype());
+                int block_bytes = dtype_block_size(b->dtype());
                 int blocks_per_row = (K + block_el - 1) / block_el;
                 size_t row_bytes = (size_t)blocks_per_row * block_bytes;
                 size_t expected_total = (size_t)N * row_bytes;

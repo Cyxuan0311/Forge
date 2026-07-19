@@ -78,5 +78,19 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
     }
 }
 
+// Device helper: Q3_K scale unpacking (12 packed bytes → 16 signed 6-bit scales)
+__device__ __forceinline__ void q3_k_unpack_scales(const uint8_t* scales_raw, int8_t* scales_out) {
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    memcpy(aux, scales_raw, 12);
+    uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    memcpy(scales_out, aux, 16);
+}
+
 }  // namespace cuda
 }  // namespace forge
