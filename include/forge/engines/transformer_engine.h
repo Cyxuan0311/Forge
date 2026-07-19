@@ -30,7 +30,8 @@ class TransformerEngine : public InferenceEngine {
 public:
     explicit TransformerEngine(Model& model, InferenceContext& ctx);
 
-    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos) override;
+    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) override;
+    TensorPtr forward_batch(const InferenceBatch& batch) override;
     TensorPtr forward_from_hidden(const TensorPtr& hidden, int64_t start_pos) override;
     void reset() override;
     void set_gpu_layers(int gpu_layers) override;
@@ -38,8 +39,10 @@ public:
     void set_kv_cache_dtype(KVCacheDType dtype) { kv_cache_dtype_ = dtype; }
     KVCacheDType kv_cache_dtype() const { return kv_cache_dtype_; }
 
-    KVCache& kv_cache() { return kv_cache_; }
-    const KVCache& kv_cache() const { return kv_cache_; }
+    KVCache* kv_cache() override { return &kv_cache_; }
+    const KVCache* kv_cache() const override { return &kv_cache_; }
+    KVCache& kv_cache_ref() { return kv_cache_; }
+    const KVCache& kv_cache_ref() const { return kv_cache_; }
 
     // Access to unified model weights
     const ModelWeights& weights() const { return weights_; }
@@ -51,12 +54,13 @@ public:
 
 protected:
     virtual TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                    int64_t start_pos, DeviceType dev) = 0;
+                                    int64_t start_pos, DeviceType dev, int seq_id = 0) = 0;
     virtual bool init_weights() = 0;
 
     virtual void init_kv_cache(const ModelConfig& cfg);
-    TensorPtr forward_layers(const TensorPtr& hidden, int seq_len, int64_t start_pos);
-    TensorPtr forward_layers_graph(const TensorPtr& hidden, int seq_len, int64_t start_pos);
+    TensorPtr forward_layers(const TensorPtr& hidden, int seq_len, int64_t start_pos, int seq_id = 0);
+    TensorPtr forward_layers_graph(const TensorPtr& hidden, int seq_len, int64_t start_pos,
+                                   int seq_id = 0);
 
     DeviceType layer_device(int layer_idx) const;
     TensorPtr transfer_hidden(const TensorPtr& hidden, DeviceType target) const;

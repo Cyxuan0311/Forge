@@ -9,7 +9,9 @@
 
 #include "forge/backend.h"
 #include "forge/backend_scheduler.h"
+#include "forge/context.h"
 #include "forge/cuda_kernels.h"
+#include "forge/inference_batch.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
@@ -72,7 +74,7 @@ TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceType
     return transferred;
 }
 
-TensorPtr TransformerEngine::forward(const TensorPtr& input_ids, int64_t start_pos) {
+TensorPtr TransformerEngine::forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id) {
     const auto& cfg = model_.config();
     int seq_len = static_cast<int>(input_ids->numel());
 
@@ -99,7 +101,99 @@ TensorPtr TransformerEngine::forward(const TensorPtr& input_ids, int64_t start_p
         return nullptr;
     }
 
-    return forward_layers(hidden, seq_len, start_pos);
+    return forward_layers(hidden, seq_len, start_pos, seq_id);
+}
+
+TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
+    if (batch.empty())
+        return nullptr;
+
+    const auto& cfg = model_.config();
+    init_kv_cache(cfg);
+
+    int n_ubatch = ctx_.params().n_ubatch;
+    if (n_ubatch <= 0)
+        n_ubatch = 256;
+
+    // Split into micro-batches if needed
+    auto micros = split_batch(batch, n_ubatch);
+
+    // For each micro-batch, call forward() per sequence chunk.
+    // Collect last-token logits from sequences that need them.
+    struct SeqResult {
+        int batch_idx;   // index in original batch
+        int vocab_size;
+        std::vector<float> logits;  // last-token logits for this sequence
+    };
+    std::vector<SeqResult> results;
+    int vocab_size = -1;
+
+    for (const auto& ubatch : micros) {
+        for (const auto& item : ubatch.items) {
+            int seq_len = static_cast<int>(item.tokens.size());
+            auto input_ids =
+                std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{seq_len},
+                                         DeviceType::CPU);
+            std::memcpy(input_ids->data(), item.tokens.data(), seq_len * sizeof(int32_t));
+
+            auto logits = forward(input_ids, item.start_pos, item.seq_id);
+            if (!logits)
+                continue;
+
+            // Bring logits to CPU
+            TensorPtr logits_cpu = logits;
+            if (logits->device() == DeviceType::CUDA) {
+                logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(),
+                                                       DeviceType::CPU);
+                logits_cpu->copy_from(*logits);
+            }
+
+            vocab_size = static_cast<int>(logits_cpu->shape().back());
+            int seq_len_out = static_cast<int>(logits_cpu->shape()[0]);
+
+            // Only collect logits if this item requested them (i.e., last chunk of a sequence)
+            if (item.logits) {
+                // Find the sequence's index in the original batch
+                int batch_idx = -1;
+                for (int i = 0; i < batch.size(); i++) {
+                    if (batch.items[i].seq_id == item.seq_id) {
+                        batch_idx = i;
+                        break;
+                    }
+                }
+
+                // Extract last-token logits
+                const float* src = static_cast<const float*>(logits_cpu->data()) +
+                                   (seq_len_out - 1) * vocab_size;
+                SeqResult res;
+                res.batch_idx = batch_idx;
+                res.vocab_size = vocab_size;
+                res.logits.assign(src, src + vocab_size);
+                results.push_back(std::move(res));
+            }
+        }
+    }
+
+    if (results.empty() || vocab_size <= 0)
+        return nullptr;
+
+    // Assemble [n_seq, vocab_size] result in original batch order
+    int n_seq = batch.size();
+    auto result = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{n_seq, vocab_size},
+                                            DeviceType::CPU);
+    float* dst = static_cast<float*>(result->data());
+    // Zero-initialize in case some sequences didn't produce logits
+    std::memset(dst, 0, n_seq * vocab_size * sizeof(float));
+
+    for (auto& res : results) {
+        if (res.batch_idx >= 0 && res.batch_idx < n_seq) {
+            std::memcpy(dst + res.batch_idx * vocab_size,
+                        res.logits.data(), vocab_size * sizeof(float));
+        }
+    }
+
+    return result;
 }
 
 TensorPtr TransformerEngine::forward_from_hidden(const TensorPtr& hidden, int64_t start_pos) {
@@ -108,7 +202,7 @@ TensorPtr TransformerEngine::forward_from_hidden(const TensorPtr& hidden, int64_
 
     init_kv_cache(cfg);
 
-    return forward_layers(hidden, seq_len, start_pos);
+    return forward_layers(hidden, seq_len, start_pos, /*seq_id=*/0);
 }
 
 void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
@@ -169,10 +263,10 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
 }
 
 TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len,
-                                            int64_t start_pos) {
+                                            int64_t start_pos, int seq_id) {
     // Try graph-based execution if a graph builder is available
     if (use_graph_ && graph_builder_) {
-        return forward_layers_graph(hidden, seq_len, start_pos);
+        return forward_layers_graph(hidden, seq_len, start_pos, seq_id);
     }
 
     // Fallback: try to create a graph builder from registry
@@ -182,7 +276,7 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
         if (builder) {
             graph_builder_ = std::move(builder);
             LOG_INFO("Using graph-based execution for arch: " + cfg.arch_type);
-            return forward_layers_graph(hidden, seq_len, start_pos);
+            return forward_layers_graph(hidden, seq_len, start_pos, seq_id);
         } else {
             LOG_WARN("No graph builder for arch: " + cfg.arch_type +
                      ", falling back to imperative mode");
@@ -201,7 +295,7 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
         {
             std::string perf_name = "forward/layer_" + std::to_string(layer);
             PERF_SCOPE(perf_name.c_str());
-            cur_hidden = forward_layer(cur_hidden, layer, seq_len, start_pos, layer_dev);
+            cur_hidden = forward_layer(cur_hidden, layer, seq_len, start_pos, layer_dev, seq_id);
         }
         if (!cur_hidden) {
             fprintf(stderr, "[FATAL] Layer %d returned NULL!\n", layer);
@@ -256,7 +350,7 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
 }
 
 TensorPtr TransformerEngine::forward_layers_graph(const TensorPtr& hidden, int seq_len,
-                                                  int64_t start_pos) {
+                                                  int64_t start_pos, int seq_id) {
     const auto& cfg = model_.config();
     auto t0 = std::chrono::steady_clock::now();
 
