@@ -304,7 +304,7 @@ TensorPtr VisionEncoder::forward_vit_block(const TensorPtr& hidden, const ViTLay
 
     // Self-attention (non-causal for ViT)
     auto attn_out =
-        ops::scaled_dot_product_attention_2d(q, k, v, num_patches, num_heads, head_dim, false);
+        ops::scaled_dot_product_attention_2d(q, k, v, num_patches, num_heads, head_dim, nullptr, false);
 
     // Output projection
     auto attn_proj = ops::matmul_transB(attn_out, lw.attn_out_weight, lw.attn_out_bias);

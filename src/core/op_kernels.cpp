@@ -138,20 +138,20 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
             cuda::launch_flash_attention_gqa_decode(
                 static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
                 static_cast<const float*>(v->data()), static_cast<float*>(attn_out->data()),
-                total_len, num_heads, num_kv_heads, head_dim);
+                total_len, num_heads, num_kv_heads, head_dim, nullptr);
 #endif
         } else {
 #ifdef USE_CUDA
             cuda::launch_flash_attention_gqa(
                 static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
                 static_cast<const float*>(v->data()), static_cast<float*>(attn_out->data()),
-                seq_len_q, total_len, num_heads, num_kv_heads, head_dim, true);
+                seq_len_q, total_len, num_heads, num_kv_heads, head_dim, nullptr, true);
 #endif
         }
         return attn_out;
     } else if (dev == DeviceType::CUDA) {
         return ops::scaled_dot_product_attention_2d(q, k, v, seq_len_q, total_len, num_heads,
-                                                    head_dim, causal);
+                                                    head_dim, nullptr, causal);
     } else {
         // CPU path: GQA expand if needed
         TensorPtr k_expanded, v_expanded;
@@ -181,7 +181,7 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
             v_expanded = v;
         }
         return ops::scaled_dot_product_attention_2d(q, k_expanded, v_expanded, seq_len_q, total_len,
-                                                    num_heads, head_dim, causal);
+                                                    num_heads, head_dim, nullptr, causal);
     }
 }
 

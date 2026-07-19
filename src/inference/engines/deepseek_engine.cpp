@@ -97,7 +97,7 @@ TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden, int layer_i
     }
 
     auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_expanded, v_expanded, seq_len,
-                                                         total_len, num_heads, head_dim, true);
+                                                         total_len, num_heads, head_dim, nullptr, true);
 
     auto attn_proj = ops::matmul_transB(attn_out, lw.wo());
 
@@ -187,7 +187,7 @@ TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden, int layer_i
     }
 
     auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_sliced, v_sliced, seq_len,
-                                                         total_len, num_heads, kv_lora_rank, true);
+                                                         total_len, num_heads, kv_lora_rank, nullptr, true);
 
     auto attn_proj = ops::matmul_transB(attn_out, lw.wo());
 

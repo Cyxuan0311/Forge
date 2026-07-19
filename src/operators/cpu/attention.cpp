@@ -79,7 +79,7 @@ TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k, c
         cuda::launch_flash_attention(
             static_cast<const float*>(q_2d->data()), static_cast<const float*>(k_2d->data()),
             static_cast<const float*>(v_2d->data()), static_cast<float*>(out_2d->data()), seq_len,
-            seq_len, num_heads, head_dim, causal);
+            seq_len, num_heads, head_dim, nullptr, causal);
 
         auto out_3d = out_2d->view(std::vector<int64_t>{seq_len, num_heads, head_dim});
         *out = std::move(out_3d);
@@ -133,13 +133,13 @@ TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k, c
 
 TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k,
                                           const TensorPtr& v, int seq_len, int num_heads,
-                                          int head_dim, bool causal) {
-    return scaled_dot_product_attention_2d(q, k, v, seq_len, seq_len, num_heads, head_dim, causal);
+                                          int head_dim, const TensorPtr& mask, bool causal) {
+    return scaled_dot_product_attention_2d(q, k, v, seq_len, seq_len, num_heads, head_dim, mask, causal);
 }
 
 TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k,
                                           const TensorPtr& v, int q_len, int kv_len, int num_heads,
-                                          int head_dim, bool causal) {
+                                          int head_dim, const TensorPtr& mask, bool causal) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     auto out = std::make_shared<Tensor>(
@@ -147,164 +147,192 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
 
     if (q->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
+        // If mask is on CPU, copy it to CUDA first
+        const float* mask_ptr = nullptr;
+        auto mask_cuda = mask;
+        if (mask && mask->device() == DeviceType::CPU) {
+            mask_cuda = std::make_shared<Tensor>(DataType::FP32, mask->shape(), DeviceType::CUDA);
+            mask_cuda->copy_from(*mask);
+        }
+        if (mask_cuda) {
+            mask_ptr = static_cast<const float*>(mask_cuda->data());
+        }
         cuda::launch_flash_attention(
             static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
             static_cast<const float*>(v->data()), static_cast<float*>(out->data()), q_len, kv_len,
-            num_heads, head_dim, causal);
+            num_heads, head_dim, mask_ptr, causal);
+        return out;
 #endif
-    } else {
-        const float* q_data = static_cast<const float*>(q->data());
-        const float* k_data = static_cast<const float*>(k->data());
-        const float* v_data = static_cast<const float*>(v->data());
+    }
+    const float* q_data = static_cast<const float*>(q->data());
+    const float* k_data = static_cast<const float*>(k->data());
+    const float* v_data = static_cast<const float*>(v->data());
+    const float* mask_data = mask ? static_cast<const float*>(mask->data()) : nullptr;
 
-        std::vector<float> host_out(out->numel());
+    std::vector<float> host_out(out->numel());
 
-        // For decode (q_len=1), causal mask is irrelevant since all KV positions
-        // are visible. Use online softmax to avoid allocating a scores vector
-        // per head and reduce memory traffic.
-        if (q_len == 1) {
-            PERF_SCOPE("attention/qk_dot");
+    // For decode (q_len=1), causal mask is irrelevant since all KV positions
+    // are visible. Use online softmax to avoid allocating a scores vector
+    // per head and reduce memory traffic.
+    if (q_len == 1) {
+        PERF_SCOPE("attention/qk_dot");
 #pragma omp parallel for schedule(static)
-            for (int h = 0; h < num_heads; ++h) {
-                const float* q_row = q_data + h * head_dim;
-                float* out_row = host_out.data() + h * head_dim;
+        for (int h = 0; h < num_heads; ++h) {
+            const float* q_row = q_data + h * head_dim;
+            float* out_row = host_out.data() + h * head_dim;
 
-                // Online softmax: process one KV position at a time
-                float max_val = -1e30f;
-                float sum_exp = 0.0f;
+            // Online softmax: process one KV position at a time
+            float max_val = -1e30f;
+            float sum_exp = 0.0f;
 #ifdef USE_AVX2
-                const int NV = head_dim / 8;  // number of __m256 vectors per head
+            const int NV = head_dim / 8;  // number of __m256 vectors per head
 #endif
-                std::memset(out_row, 0, head_dim * sizeof(float));
+            std::memset(out_row, 0, head_dim * sizeof(float));
 
-                for (int j = 0; j < kv_len; ++j) {
-                    const float* k_row = k_data + j * num_heads * head_dim + h * head_dim;
+            for (int j = 0; j < kv_len; ++j) {
+                const float* k_row = k_data + j * num_heads * head_dim + h * head_dim;
 #ifdef USE_AVX2
-                    float dot = dot_avx2(q_row, k_row, head_dim);
+                float dot = dot_avx2(q_row, k_row, head_dim);
 #else
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim; ++d)
-                        dot += q_row[d] * k_row[d];
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d)
+                    dot += q_row[d] * k_row[d];
 #endif
-                    float score = dot * scale;
-                    float new_max = std::max(max_val, score);
-                    float rescale = std::exp(max_val - new_max);
+                float score = dot * scale;
 
-                    // Rescale existing accumulator
-                    if (new_max > max_val) {
-                        sum_exp *= rescale;
-#ifdef USE_AVX2
-                        __m256 r = _mm256_set1_ps(rescale);
-                        for (int v = 0; v < NV; ++v) {
-                            __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                            _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, r));
-                        }
-#else
-                        for (int d = 0; d < head_dim; ++d)
-                            out_row[d] *= rescale;
-#endif
-                    }
-
-                    float exp_score = std::exp(score - new_max);
-                    sum_exp += exp_score;
-
-                    const float* v_row = v_data + j * num_heads * head_dim + h * head_dim;
-#ifdef USE_AVX2
-                    __m256 w_vec = _mm256_set1_ps(exp_score);
-                    for (int v = 0; v < NV; ++v) {
-                        __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                        __m256 vr = _mm256_loadu_ps(v_row + v * 8);
-                        _mm256_storeu_ps(out_row + v * 8, _mm256_fmadd_ps(w_vec, vr, a));
-                    }
-#else
-                    for (int d = 0; d < head_dim; ++d)
-                        out_row[d] += exp_score * v_row[d];
-#endif
-                    max_val = new_max;
+                // Apply mask bias for decode (single row: mask[j])
+                if (mask_data) {
+                    float m = mask_data[j];
+                    if (m < -1e20f) continue;  // skip masked positions
+                    score += m;
                 }
 
-                // Final normalization
-                float inv_sum = 1.0f / (sum_exp + 1e-30f);
+                float new_max = std::max(max_val, score);
+                float rescale = std::exp(max_val - new_max);
+
+                // Rescale existing accumulator
+                if (new_max > max_val) {
+                    sum_exp *= rescale;
 #ifdef USE_AVX2
-                __m256 inv_vec = _mm256_set1_ps(inv_sum);
+                    __m256 r = _mm256_set1_ps(rescale);
+                    for (int v = 0; v < NV; ++v) {
+                        __m256 a = _mm256_loadu_ps(out_row + v * 8);
+                        _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, r));
+                    }
+#else
+                    for (int d = 0; d < head_dim; ++d)
+                        out_row[d] *= rescale;
+#endif
+                }
+
+                float exp_score = std::exp(score - new_max);
+                sum_exp += exp_score;
+
+                const float* v_row = v_data + j * num_heads * head_dim + h * head_dim;
+#ifdef USE_AVX2
+                __m256 w_vec = _mm256_set1_ps(exp_score);
                 for (int v = 0; v < NV; ++v) {
                     __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                    _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, inv_vec));
+                    __m256 vr = _mm256_loadu_ps(v_row + v * 8);
+                    _mm256_storeu_ps(out_row + v * 8, _mm256_fmadd_ps(w_vec, vr, a));
                 }
 #else
                 for (int d = 0; d < head_dim; ++d)
-                    out_row[d] *= inv_sum;
+                    out_row[d] += exp_score * v_row[d];
 #endif
+                max_val = new_max;
             }
-        } else {
-            // General path: prefill or causal attention
-            PERF_SCOPE("attention/qk_dot");
+
+            // Final normalization
+            float inv_sum = 1.0f / (sum_exp + 1e-30f);
+#ifdef USE_AVX2
+            __m256 inv_vec = _mm256_set1_ps(inv_sum);
+            for (int v = 0; v < NV; ++v) {
+                __m256 a = _mm256_loadu_ps(out_row + v * 8);
+                _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, inv_vec));
+            }
+#else
+            for (int d = 0; d < head_dim; ++d)
+                out_row[d] *= inv_sum;
+#endif
+        }
+    } else {
+        // General path: prefill or causal attention
+        PERF_SCOPE("attention/qk_dot");
 // Pre-allocate scores buffer per thread to avoid heap allocation per iteration
 #pragma omp parallel
-            {
-                std::vector<float> scores_buf(kv_len);
+        {
+            std::vector<float> scores_buf(kv_len);
 
 #pragma omp for schedule(dynamic) collapse(2)
-                for (int h = 0; h < num_heads; ++h) {
-                    for (int i = 0; i < q_len; ++i) {
-                        int q_pos = kv_len - q_len + i;
-                        float max_val = -1e30f;
-                        const float* q_row = q_data + i * num_heads * head_dim + h * head_dim;
-                        for (int j = 0; j < kv_len; ++j) {
-                            if (causal && j > q_pos) {
+            for (int h = 0; h < num_heads; ++h) {
+                for (int i = 0; i < q_len; ++i) {
+                    int q_pos = kv_len - q_len + i;
+                    float max_val = -1e30f;
+                    const float* q_row = q_data + i * num_heads * head_dim + h * head_dim;
+                    for (int j = 0; j < kv_len; ++j) {
+                        // Mask-aware masking: if mask is present, use it;
+                        // otherwise fall back to causal mask
+                        float m = 0.0f;
+                        if (mask_data) {
+                            m = mask_data[i * kv_len + j];
+                            if (m < -1e20f) {
                                 scores_buf[j] = -1e30f;
                                 continue;
                             }
-                            const float* k_row = k_data + j * num_heads * head_dim + h * head_dim;
+                        } else if (causal && j > q_pos) {
+                            scores_buf[j] = -1e30f;
+                            continue;
+                        }
+                        const float* k_row = k_data + j * num_heads * head_dim + h * head_dim;
 #ifdef USE_AVX2
-                            float dot = dot_avx2(q_row, k_row, head_dim);
+                        float dot = dot_avx2(q_row, k_row, head_dim);
 #else
-                            float dot = 0.0f;
-                            for (int d = 0; d < head_dim; ++d) {
-                                dot += q_row[d] * k_row[d];
-                            }
+                        float dot = 0.0f;
+                        for (int d = 0; d < head_dim; ++d) {
+                            dot += q_row[d] * k_row[d];
+                        }
 #endif
-                            scores_buf[j] = dot * scale;
-                            max_val = std::max(max_val, scores_buf[j]);
-                        }
+                        scores_buf[j] = dot * scale + m;
+                        max_val = std::max(max_val, scores_buf[j]);
+                    }
 
-                        float sum = 0.0f;
-                        for (int j = 0; j < kv_len; ++j) {
-                            scores_buf[j] = std::exp(scores_buf[j] - max_val);
-                            sum += scores_buf[j];
-                        }
-                        float inv_sum = 1.0f / (sum + 1e-30f);
+                    float sum = 0.0f;
+                    for (int j = 0; j < kv_len; ++j) {
+                        scores_buf[j] = std::exp(scores_buf[j] - max_val);
+                        sum += scores_buf[j];
+                    }
+                    float inv_sum = 1.0f / (sum + 1e-30f);
 
-                        float* out_row = host_out.data() + i * num_heads * head_dim + h * head_dim;
-                        std::memset(out_row, 0, head_dim * sizeof(float));
-                        for (int j = 0; j < kv_len; ++j) {
-                            float w = scores_buf[j] * inv_sum;
-                            const float* v_row = v_data + j * num_heads * head_dim + h * head_dim;
+                    float* out_row = host_out.data() + i * num_heads * head_dim + h * head_dim;
+                    std::memset(out_row, 0, head_dim * sizeof(float));
+                    for (int j = 0; j < kv_len; ++j) {
+                        float w = scores_buf[j] * inv_sum;
+                        const float* v_row = v_data + j * num_heads * head_dim + h * head_dim;
 #ifdef USE_AVX2
-                            __m256 w_vec = _mm256_set1_ps(w);
-                            int d = 0;
-                            for (; d + 8 <= head_dim; d += 8) {
-                                __m256 v_v = _mm256_loadu_ps(v_row + d);
-                                __m256 o_v = _mm256_loadu_ps(out_row + d);
-                                o_v = _mm256_fmadd_ps(w_vec, v_v, o_v);
-                                _mm256_storeu_ps(out_row + d, o_v);
-                            }
-                            for (; d < head_dim; ++d) {
-                                out_row[d] += w * v_row[d];
-                            }
-#else
-                            for (int d = 0; d < head_dim; ++d) {
-                                out_row[d] += w * v_row[d];
-                            }
-#endif
+                        __m256 w_vec = _mm256_set1_ps(w);
+                        int d = 0;
+                        for (; d + 8 <= head_dim; d += 8) {
+                            __m256 v_v = _mm256_loadu_ps(v_row + d);
+                            __m256 o_v = _mm256_loadu_ps(out_row + d);
+                            o_v = _mm256_fmadd_ps(w_vec, v_v, o_v);
+                            _mm256_storeu_ps(out_row + d, o_v);
                         }
+                        for (; d < head_dim; ++d) {
+                            out_row[d] += w * v_row[d];
+                        }
+#else
+                        for (int d = 0; d < head_dim; ++d) {
+                            out_row[d] += w * v_row[d];
+                        }
+#endif
                     }
                 }
             }
         }
-
-        std::memcpy(out->data(), host_out.data(), host_out.size() * sizeof(float));
     }
+
+    std::memcpy(out->data(), host_out.data(), host_out.size() * sizeof(float));
 
     return out;
 }
@@ -380,7 +408,7 @@ TensorPtr scaled_dot_product_attention_2d_masked(const TensorPtr& q, const Tenso
 TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPtr& k,
                                               const TensorPtr& v, int q_len, int kv_len,
                                               int num_heads, int num_kv_heads, int head_dim,
-                                              bool causal) {
+                                              const TensorPtr& mask, bool causal) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     auto out = std::make_shared<Tensor>(
@@ -394,78 +422,34 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
         const float* v_data = static_cast<const float*>(v->data());
         float* out_data = static_cast<float*>(out->data());
 
+        // If mask is on CPU, copy it to CUDA first
+        const float* mask_ptr = nullptr;
+        auto mask_cuda = mask;
+        if (mask && mask->device() == DeviceType::CPU) {
+            mask_cuda = std::make_shared<Tensor>(DataType::FP32, mask->shape(), DeviceType::CUDA);
+            mask_cuda->copy_from(*mask);
+        }
+        if (mask_cuda) {
+            mask_ptr = static_cast<const float*>(mask_cuda->data());
+        }
+
         bool cuda_decode_supported = (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
                                        head_dim == 256 || head_dim == 512);
 
         if (q_len == 1 && cuda_decode_supported) {
             // Decode path (supported head_dim)
             cuda::launch_flash_attention_gqa_decode(q_data, k_data, v_data, out_data,
-                                                     kv_len, num_heads, num_kv_heads, head_dim);
+                                                     kv_len, num_heads, num_kv_heads, head_dim,
+                                                     mask_ptr);
             return out;
         } else if (q_len > 1) {
             // Prefill path
             cuda::launch_flash_attention_gqa(q_data, k_data, v_data, out_data,
-                                              q_len, kv_len, num_heads, num_kv_heads, head_dim, causal);
+                                              q_len, kv_len, num_heads, num_kv_heads, head_dim,
+                                              mask_ptr, causal);
             return out;
         }
         // Fall through to CPU path for unsupported head_dim in decode mode
-        // Copy tensors to CPU, compute, then copy result back
-        auto q_cpu = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
-        q_cpu->copy_from(*q);
-        auto k_cpu = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
-        k_cpu->copy_from(*k);
-        auto v_cpu = std::make_shared<Tensor>(DataType::FP32, v->shape(), DeviceType::CPU);
-        v_cpu->copy_from(*v);
-        auto out_cpu = std::make_shared<Tensor>(DataType::FP32, out->shape(), DeviceType::CPU);
-
-        // Run CPU GQA attention on the CPU copies
-        const float* q_cpu_data = static_cast<const float*>(q_cpu->data());
-        const float* k_cpu_data = static_cast<const float*>(k_cpu->data());
-        const float* v_cpu_data = static_cast<const float*>(v_cpu->data());
-        float* out_cpu_data = static_cast<float*>(out_cpu->data());
-
-        int kv_group_size = num_heads / num_kv_heads;
-
-        if (q_len == 1) {
-            // Decode path: online softmax
-            for (int h = 0; h < num_heads; ++h) {
-                const float* q_row = q_cpu_data + h * head_dim;
-                float* out_row = out_cpu_data + h * head_dim;
-                int kv_h = h / kv_group_size;
-
-                float max_val = -1e30f;
-                float sum_exp = 0.0f;
-                std::memset(out_row, 0, head_dim * sizeof(float));
-
-                for (int j = 0; j < kv_len; ++j) {
-                    const float* k_row = k_cpu_data + j * num_kv_heads * head_dim + kv_h * head_dim;
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim; ++d)
-                        dot += q_row[d] * k_row[d];
-                    float score = dot * scale;
-                    float new_max = std::max(max_val, score);
-                    float rescale = std::exp(max_val - new_max);
-                    if (new_max > max_val) {
-                        sum_exp *= rescale;
-                        for (int d = 0; d < head_dim; ++d)
-                            out_row[d] *= rescale;
-                    }
-                    float exp_score = std::exp(score - new_max);
-                    sum_exp += exp_score;
-                    const float* v_row = v_cpu_data + j * num_kv_heads * head_dim + kv_h * head_dim;
-                    for (int d = 0; d < head_dim; ++d)
-                        out_row[d] += exp_score * v_row[d];
-                    max_val = new_max;
-                }
-                float inv_sum = 1.0f / (sum_exp + 1e-30f);
-                for (int d = 0; d < head_dim; ++d)
-                    out_row[d] *= inv_sum;
-            }
-        }
-
-        // Copy result back to CUDA
-        out->copy_from(*out_cpu);
-        return out;
 #endif
     }
 
@@ -473,6 +457,7 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
     const float* q_data = static_cast<const float*>(q->data());
     const float* k_data = static_cast<const float*>(k->data());
     const float* v_data = static_cast<const float*>(v->data());
+    const float* mask_data = mask ? static_cast<const float*>(mask->data()) : nullptr;
 
     std::vector<float> host_out(out->numel());
 
@@ -508,6 +493,14 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                     dot += q_row[d] * k_row[d];
 #endif
                 float score = dot * scale;
+
+                // Apply mask bias for decode (single row: mask[j])
+                if (mask_data) {
+                    float m = mask_data[j];
+                    if (m < -1e20f) continue;  // skip masked positions
+                    score += m;
+                }
+
                 float new_max = std::max(max_val, score);
                 float rescale = std::exp(max_val - new_max);
 
@@ -569,7 +562,16 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                     float max_val = -1e30f;
                     const float* q_row = q_data + i * num_heads * head_dim + h * head_dim;
                     for (int j = 0; j < kv_len; ++j) {
-                        if (causal && j > q_pos) {
+                        // Mask-aware masking: if mask is present, use it;
+                        // otherwise fall back to causal mask
+                        float m = 0.0f;
+                        if (mask_data) {
+                            m = mask_data[i * kv_len + j];
+                            if (m < -1e20f) {
+                                scores_buf[j] = -1e30f;
+                                continue;
+                            }
+                        } else if (causal && j > q_pos) {
                             scores_buf[j] = -1e30f;
                             continue;
                         }
@@ -582,7 +584,7 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                             dot += q_row[d] * k_row[d];
                         }
 #endif
-                        scores_buf[j] = dot * scale;
+                        scores_buf[j] = dot * scale + m;
                         max_val = std::max(max_val, scores_buf[j]);
                     }
 
@@ -622,6 +624,7 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
     }
 
     std::memcpy(out->data(), host_out.data(), host_out.size() * sizeof(float));
+
     return out;
 }
 

@@ -390,7 +390,7 @@ int DeepSeekGraphBuilder::build_mla_layer(ComputeGraph& graph, int hidden_idx,
             int seq_len_q = static_cast<int>(q_rope->shape()[0]);
             int total_len = static_cast<int>(k_sliced->shape()[0]);
             return ops::scaled_dot_product_attention_2d(q_rope, k_sliced, v_sliced, seq_len_q,
-                                                        total_len, num_heads, kv_lora_rank, true);
+                                                        total_len, num_heads, kv_lora_rank, nullptr, true);
         },
         dev);
 

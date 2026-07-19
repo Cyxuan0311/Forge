@@ -375,7 +375,7 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
     }
 
     auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_expanded, v_expanded, seq_len,
-                                                         total_len, num_heads, head_dim, true);
+                                                         total_len, num_heads, head_dim, nullptr, true);
 
     // Move attn_out to CPU for gating
     auto attn_out_cpu = attn_out;

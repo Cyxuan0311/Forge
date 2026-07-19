@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "forge/cuda_kernels.h"
+#include "forge/inference_batch.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
@@ -499,10 +500,10 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
         if (attn_num_kv_heads < num_heads) {
             attn_out = ops::scaled_dot_product_attention_2d_gqa(q_rope, k_sliced, v_sliced, seq_len,
                                                                 total_len, num_heads, attn_num_kv_heads,
-                                                                attn_head_dim, true);
+                                                                attn_head_dim, nullptr, true);
         } else {
             attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_sliced, v_sliced, seq_len,
-                                                            total_len, num_heads, attn_head_dim, true);
+                                                            total_len, num_heads, attn_head_dim, nullptr, true);
         }
     }
 
@@ -775,6 +776,66 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
     }
 
     return output;
+}
+
+TensorPtr Gemma4Engine::forward_batch(const InferenceBatch& batch) {
+    // Gemma4 has custom embedding scaling + per-layer projection that
+    // the flat hidden state path doesn't handle. Fall back to per-sequence forward().
+    if (batch.empty())
+        return nullptr;
+
+    const auto& cfg = model_.config();
+    init_kv_cache(cfg);
+
+    int n_seq = batch.size();
+    int vocab_size = -1;
+
+    // Process all sequences and collect logits
+    struct SeqLogits { int idx; std::vector<float> data; };
+    std::vector<SeqLogits> all_logits;
+
+    for (int i = 0; i < n_seq; i++) {
+        const auto& item = batch.items[i];
+        int seq_len = static_cast<int>(item.tokens.size());
+        auto input_ids = std::make_shared<Tensor>(DataType::INT32,
+                                                   std::vector<int64_t>{seq_len}, DeviceType::CPU);
+        std::memcpy(input_ids->data(), item.tokens.data(), seq_len * sizeof(int32_t));
+
+        auto logits = forward(input_ids, item.start_pos, item.seq_id);
+        if (!logits)
+            continue;
+
+        TensorPtr logits_cpu = logits;
+        if (logits->device() == DeviceType::CUDA) {
+            logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(), DeviceType::CPU);
+            logits_cpu->copy_from(*logits);
+        }
+
+        vocab_size = static_cast<int>(logits_cpu->shape().back());
+        int seq_len_out = static_cast<int>(logits_cpu->shape()[0]);
+        const float* src = static_cast<const float*>(logits_cpu->data()) +
+                           (seq_len_out - 1) * vocab_size;
+
+        SeqLogits sl;
+        sl.idx = i;
+        sl.data.assign(src, src + vocab_size);
+        all_logits.push_back(std::move(sl));
+    }
+
+    if (all_logits.empty() || vocab_size <= 0)
+        return nullptr;
+
+    auto result = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{n_seq, vocab_size},
+                                            DeviceType::CPU);
+    float* dst = static_cast<float*>(result->data());
+    std::memset(dst, 0, n_seq * vocab_size * sizeof(float));
+
+    for (auto& sl : all_logits) {
+        std::memcpy(dst + sl.idx * vocab_size, sl.data.data(), vocab_size * sizeof(float));
+    }
+
+    return result;
 }
 
 }  // namespace forge
