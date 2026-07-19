@@ -12,6 +12,11 @@ public:
 
     TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) override;
 
+    // Gemma4 has custom embedding scaling + per-layer projection;
+    // override forward_batch to use per-sequence forward() instead of
+    // the flat hidden state path (which doesn't apply Gemma4-specific transforms).
+    TensorPtr forward_batch(const InferenceBatch& batch) override;
+
 protected:
     TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len, int64_t start_pos,
                             DeviceType dev, int seq_id = 0) override;

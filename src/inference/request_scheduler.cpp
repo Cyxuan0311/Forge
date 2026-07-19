@@ -125,14 +125,32 @@ void RequestScheduler::preserve_prefix_cache(int seq_id, int prompt_len) {
 
 RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seqs)
     : model_(model), ctx_(model), sampler_(SamplerConfig{}), max_num_seqs_(max_num_seqs) {
-    const auto& cfg = model_.config();
-    DeviceType dev = model_.device();
-    paged_cache_.init(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, cfg.max_seq_len, block_size,
-                      max_num_seqs, dev);
+    (void)block_size;  // block_size no longer needed with engine KVCache
 
-    auto engine = EngineRegistry::instance().create(cfg.arch_type, model_, ctx_);
+    auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, ctx_);
     if (engine) {
         ctx_.set_engine(std::move(engine));
+    }
+}
+
+// ---- KV cache cleanup ----
+
+void RequestScheduler::release_seq_kv(int seq_id, int prompt_len) {
+    auto* engine = ctx_.engine();
+    if (!engine)
+        return;
+    KVCache* kv = engine->kv_cache();
+    if (!kv)
+        return;
+
+    // Remove the sequence from all its KV cells
+    // Use prompt_len to know the range, or scan all positions
+    int max_pos = kv->max_seq_len();
+    if (prompt_len > 0) {
+        kv->seq_rm(seq_id, 0, prompt_len);
+    } else {
+        // No position info: scan all positions
+        kv->seq_rm(seq_id, 0, max_pos);
     }
 }
 
@@ -248,7 +266,7 @@ bool RequestScheduler::step() {
             if (it != requests_.end()) {
                 it->second.status = RequestStatus::Failed;
                 it->second.finish_reason = "error";
-                paged_cache_.release_seq(rid);
+                release_seq_kv(rid);
             }
         }
         active_ids_.clear();
@@ -258,6 +276,13 @@ bool RequestScheduler::step() {
     // Sample per-sequence tokens and update state
     std::vector<int> still_active;
 
+    // Bring logits to CPU if needed (already on CPU from forward_batch, but just in case)
+    TensorPtr logits_cpu = logits_batch;
+    if (logits_batch && logits_batch->device() == DeviceType::CUDA) {
+        logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits_batch->shape(), DeviceType::CPU);
+        logits_cpu->copy_from(*logits_batch);
+    }
+
     for (int i = 0; i < batch.size(); i++) {
         int rid = batch_rid[i];
         auto it = requests_.find(rid);
@@ -266,21 +291,27 @@ bool RequestScheduler::step() {
 
         auto& req = it->second;
 
-        // Extract this sequence's logits from batch result
+        // Extract this sequence's logits from batch result [n_seq, vocab_size]
         TensorPtr seq_logits;
-        if (logits_batch && logits_batch->ndim() >= 2 &&
-            static_cast<int>(logits_batch->shape()[0]) == batch.size()) {
-            seq_logits = std::make_shared<Tensor>(logits_batch->slice(0, i, i + 1));
-        } else if (logits_batch) {
+        if (logits_cpu && logits_cpu->ndim() >= 2 &&
+            static_cast<int>(logits_cpu->shape()[0]) == batch.size()) {
+            int vocab_size = static_cast<int>(logits_cpu->shape()[1]);
+            seq_logits = std::make_shared<Tensor>(DataType::FP32,
+                                                   std::vector<int64_t>{1, vocab_size},
+                                                   DeviceType::CPU);
+            const float* src = static_cast<const float*>(logits_cpu->data()) + i * vocab_size;
+            std::memcpy(seq_logits->data(), src, vocab_size * sizeof(float));
+        } else if (logits_cpu) {
+            // Fallback: only last sequence's logits available
             if (i != batch.size() - 1) {
                 still_active.push_back(rid);
                 continue;
             }
-            seq_logits = logits_batch;
+            seq_logits = logits_cpu;
         } else {
             req.status = RequestStatus::Failed;
             req.finish_reason = "error";
-            paged_cache_.release_seq(rid);
+            release_seq_kv(rid);
             continue;
         }
 
@@ -341,7 +372,7 @@ bool RequestScheduler::step() {
                 preserve_prefix_cache(rid, static_cast<int>(req.prompt_tokens.size()));
             }
 
-            paged_cache_.release_seq(rid);
+            release_seq_kv(rid);
             continue;
         }
 
@@ -353,19 +384,29 @@ bool RequestScheduler::step() {
 }
 
 void RequestScheduler::schedule() {
-    while (!waiting_queue_.empty() && static_cast<int>(active_ids_.size()) < max_num_seqs_ &&
-           paged_cache_.num_free_blocks() > 0) {
+    auto* engine = ctx_.engine();
+    KVCache* kv = engine ? engine->kv_cache() : nullptr;
+
+    while (!waiting_queue_.empty() && static_cast<int>(active_ids_.size()) < max_num_seqs_) {
+        // Check KV cache capacity: need at least some free slots.
+        // If KV cache is not yet initialized (max_seq_len == 0), allow admission
+        // since it will be initialized on first forward.
+        bool has_capacity = true;
+        if (kv && kv->max_seq_len() > 0) {
+            int free_slots = kv->max_seq_len() - kv->filled(0);
+            if (free_slots <= 0)
+                has_capacity = false;
+        }
+
+        if (!has_capacity)
+            break;
+
         int rid = waiting_queue_.front();
         waiting_queue_.pop();
 
         auto it = requests_.find(rid);
         if (it == requests_.end())
             continue;
-
-        if (paged_cache_.allocate_seq(rid) < 0) {
-            waiting_queue_.push(rid);
-            break;
-        }
 
         it->second.status = RequestStatus::Prefilling;
         active_ids_.push_back(rid);
@@ -425,7 +466,7 @@ void RequestScheduler::abort(int request_id) {
 
     it->second.status = RequestStatus::Failed;
     it->second.finish_reason = "aborted";
-    paged_cache_.release_seq(request_id);
+    release_seq_kv(request_id);
 
     active_ids_.erase(std::remove(active_ids_.begin(), active_ids_.end(), request_id),
                       active_ids_.end());
@@ -436,7 +477,7 @@ void RequestScheduler::reset() {
 
     for (auto& [rid, req] : requests_) {
         if (req.status != RequestStatus::Finished && req.status != RequestStatus::Failed) {
-            paged_cache_.release_seq(rid);
+            release_seq_kv(rid);
         }
     }
 

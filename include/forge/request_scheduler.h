@@ -10,7 +10,6 @@
 
 #include "context.h"
 #include "model.h"
-#include "paged_kv_cache.h"
 #include "sampler.h"
 
 namespace forge {
@@ -73,9 +72,6 @@ public:
     void abort(int request_id);
     void reset();
 
-    PagedKVCache& paged_cache() { return paged_cache_; }
-    const PagedKVCache& paged_cache() const { return paged_cache_; }
-
     Model& model() { return model_; }
     InferenceContext& context() { return ctx_; }
     const InferenceContext& context() const { return ctx_; }
@@ -93,9 +89,11 @@ private:
     void evict_prefix_cache(int seq_id);
     void preserve_prefix_cache(int seq_id, int prompt_len);
 
+    // Release a sequence's KV cache entries
+    void release_seq_kv(int seq_id, int prompt_len = 0);
+
     Model& model_;
     InferenceContext ctx_;
-    PagedKVCache paged_cache_;
     Sampler sampler_;
 
     std::queue<int> waiting_queue_;

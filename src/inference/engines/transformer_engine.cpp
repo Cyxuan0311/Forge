@@ -24,6 +24,10 @@
 #    include <immintrin.h>
 #endif
 
+#ifdef _OPENMP
+#    include <omp.h>
+#endif
+
 namespace forge {
 
 TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
@@ -78,6 +82,11 @@ TensorPtr TransformerEngine::forward(const TensorPtr& input_ids, int64_t start_p
     const auto& cfg = model_.config();
     int seq_len = static_cast<int>(input_ids->numel());
 
+    // Decode path: use fewer threads (memory-bandwidth bound)
+#ifdef _OPENMP
+    omp_set_num_threads(ctx_.params().n_threads);
+#endif
+
     init_kv_cache(cfg);
 
     DeviceType first_dev = layer_device(0);
@@ -109,6 +118,12 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         return nullptr;
 
     const auto& cfg = model_.config();
+
+    // Prefill/batch path: use more threads (compute-bound)
+#ifdef _OPENMP
+    omp_set_num_threads(ctx_.params().n_threads_batch);
+#endif
+
     init_kv_cache(cfg);
 
     int n_ubatch = ctx_.params().n_ubatch;
@@ -118,59 +133,164 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
     // Split into micro-batches if needed
     auto micros = split_batch(batch, n_ubatch);
 
-    // For each micro-batch, call forward() per sequence chunk.
-    // Collect last-token logits from sequences that need them.
+    // Collect per-sequence logits results
     struct SeqResult {
         int batch_idx;   // index in original batch
         int vocab_size;
-        std::vector<float> logits;  // last-token logits for this sequence
+        std::vector<float> logits;
     };
     std::vector<SeqResult> results;
     int vocab_size = -1;
 
     for (const auto& ubatch : micros) {
+        int total_tokens = ubatch.n_tokens();
+        if (total_tokens == 0)
+            continue;
+
+        // ==== Step 1: Fused embedding for all tokens ====
+        DeviceType first_dev = layer_device(0);
+
+        // Build flat [total_tokens] token ID tensor
+        auto flat_ids = std::make_shared<Tensor>(DataType::INT32,
+                                                  std::vector<int64_t>{total_tokens},
+                                                  DeviceType::CPU);
+        int32_t* ids_ptr = static_cast<int32_t*>(flat_ids->data());
         for (const auto& item : ubatch.items) {
-            int seq_len = static_cast<int>(item.tokens.size());
-            auto input_ids =
-                std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{seq_len},
-                                         DeviceType::CPU);
-            std::memcpy(input_ids->data(), item.tokens.data(), seq_len * sizeof(int32_t));
+            std::memcpy(ids_ptr, item.tokens.data(), item.tokens.size() * sizeof(int32_t));
+            ids_ptr += item.tokens.size();
+        }
 
-            auto logits = forward(input_ids, item.start_pos, item.seq_id);
-            if (!logits)
-                continue;
+        auto ids_on_dev = transfer_hidden(flat_ids, first_dev);
+        auto token_emb = model_.weights().get("token_embedding");
+        if (!token_emb) {
+            LOG_ERROR("forward_batch: token_embedding is NULL");
+            return nullptr;
+        }
 
-            // Bring logits to CPU
-            TensorPtr logits_cpu = logits;
-            if (logits->device() == DeviceType::CUDA) {
-                logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(),
-                                                       DeviceType::CPU);
-                logits_cpu->copy_from(*logits);
-            }
+        TensorPtr hidden;
+        {
+            PERF_SCOPE("forward_batch/embedding");
+            hidden = ops::embedding(token_emb, ids_on_dev, weights_.token_embedding_fp32);
+        }
+        if (!hidden) {
+            LOG_ERROR("forward_batch: embedding returned NULL");
+            return nullptr;
+        }
+        // hidden shape: [total_tokens, hidden_dim]
 
-            vocab_size = static_cast<int>(logits_cpu->shape().back());
-            int seq_len_out = static_cast<int>(logits_cpu->shape()[0]);
+        // ==== Step 2: Per-layer forward (split by sequence, forward_layer, concat) ====
+        for (int layer = 0; layer < cfg.num_layers; ++layer) {
+            DeviceType layer_dev = layer_device(layer);
+            hidden = transfer_hidden(hidden, layer_dev);
 
-            // Only collect logits if this item requested them (i.e., last chunk of a sequence)
-            if (item.logits) {
-                // Find the sequence's index in the original batch
-                int batch_idx = -1;
-                for (int i = 0; i < batch.size(); i++) {
-                    if (batch.items[i].seq_id == item.seq_id) {
-                        batch_idx = i;
-                        break;
-                    }
+            // Split hidden by sequence, forward_layer per sequence, concat back
+            auto offsets = ubatch.token_offsets();
+            int hidden_dim = static_cast<int>(hidden->shape().back());
+            auto layer_out = std::make_shared<Tensor>(DataType::FP32,
+                                                       std::vector<int64_t>{total_tokens, hidden_dim},
+                                                       layer_dev);
+            float* dst = static_cast<float*>(layer_out->data());
+
+            for (int i = 0; i < ubatch.size(); i++) {
+                const auto& item = ubatch.items[i];
+                int seq_len = static_cast<int>(item.tokens.size());
+                int offset = offsets[i];
+
+                // Extract this sequence's slice from flat hidden
+                TensorPtr seq_hidden = std::make_shared<Tensor>(hidden->slice(0, offset, offset + seq_len));
+
+                // Forward through this layer for this sequence
+                {
+                    std::string perf_name = "forward_batch/layer_" + std::to_string(layer);
+                    PERF_SCOPE(perf_name.c_str());
+                    seq_hidden = forward_layer(seq_hidden, layer, seq_len, item.start_pos,
+                                               layer_dev, item.seq_id);
                 }
 
-                // Extract last-token logits
-                const float* src = static_cast<const float*>(logits_cpu->data()) +
-                                   (seq_len_out - 1) * vocab_size;
-                SeqResult res;
-                res.batch_idx = batch_idx;
-                res.vocab_size = vocab_size;
-                res.logits.assign(src, src + vocab_size);
-                results.push_back(std::move(res));
+                if (!seq_hidden) {
+                    LOG_ERROR("forward_batch: layer " + std::to_string(layer) + " returned NULL");
+                    return nullptr;
+                }
+
+                // Copy result back into flat output
+                TensorPtr seq_cpu = seq_hidden;
+                if (seq_hidden->device() == DeviceType::CUDA && layer_dev == DeviceType::CUDA) {
+                    // Same device, direct copy
+                    const float* src = static_cast<const float*>(seq_hidden->data());
+                    size_t bytes = seq_len * hidden_dim * sizeof(float);
+                    std::memcpy(dst + offset * hidden_dim, src, bytes);
+                } else if (seq_hidden->device() != layer_dev) {
+                    seq_cpu = transfer_hidden(seq_hidden, layer_dev);
+                    const float* src = static_cast<const float*>(seq_cpu->data());
+                    size_t bytes = seq_len * hidden_dim * sizeof(float);
+                    std::memcpy(dst + offset * hidden_dim, src, bytes);
+                } else {
+                    const float* src = static_cast<const float*>(seq_hidden->data());
+                    size_t bytes = seq_len * hidden_dim * sizeof(float);
+                    std::memcpy(dst + offset * hidden_dim, src, bytes);
+                }
             }
+
+            hidden = layer_out;
+        }
+
+        // ==== Step 3: Fused output norm + projection ====
+        {
+            PERF_SCOPE("forward_batch/output_norm");
+            auto output_norm = weights_.output_norm;
+            hidden = ops::rms_norm(hidden, output_norm, cfg.rms_norm_eps);
+        }
+
+        auto output_weight = weights_.output_weight;
+        if (!output_weight && cfg.tie_embeddings) {
+            output_weight = weights_.token_embedding;
+        }
+
+        TensorPtr logits;
+        {
+            PERF_SCOPE("forward_batch/output_proj");
+            if (output_weight) {
+                hidden = transfer_hidden(hidden, output_weight->device());
+            }
+            logits = ops::matmul_transB(hidden, output_weight);
+        }
+
+        // ==== Step 4: Extract per-sequence last-token logits ====
+        if (!logits)
+            continue;
+
+        TensorPtr logits_cpu = logits;
+        if (logits->device() == DeviceType::CUDA) {
+            logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(), DeviceType::CPU);
+            logits_cpu->copy_from(*logits);
+        }
+
+        vocab_size = static_cast<int>(logits_cpu->shape().back());
+        const float* logits_data = static_cast<const float*>(logits_cpu->data());
+        auto offsets = ubatch.token_offsets();
+
+        for (int i = 0; i < ubatch.size(); i++) {
+            if (!ubatch.items[i].logits)
+                continue;
+
+            int seq_len = static_cast<int>(ubatch.items[i].tokens.size());
+            int last_row = offsets[i] + seq_len - 1;
+
+            // Find original batch index
+            int batch_idx = -1;
+            for (int j = 0; j < batch.size(); j++) {
+                if (batch.items[j].seq_id == ubatch.items[i].seq_id) {
+                    batch_idx = j;
+                    break;
+                }
+            }
+
+            SeqResult res;
+            res.batch_idx = batch_idx;
+            res.vocab_size = vocab_size;
+            res.logits.assign(logits_data + last_row * vocab_size,
+                              logits_data + (last_row + 1) * vocab_size);
+            results.push_back(std::move(res));
         }
     }
 
@@ -183,7 +303,6 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                                             std::vector<int64_t>{n_seq, vocab_size},
                                             DeviceType::CPU);
     float* dst = static_cast<float*>(result->data());
-    // Zero-initialize in case some sequences didn't produce logits
     std::memset(dst, 0, n_seq * vocab_size * sizeof(float));
 
     for (auto& res : results) {
