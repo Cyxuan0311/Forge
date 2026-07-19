@@ -12,7 +12,8 @@ namespace cuda {
 
 template <int HEAD_DIM, int BLOCK_SIZE>
 __global__ void flash_attn_kernel(const float* Q, const float* K, const float* V, float* O,
-                                  int q_len, int kv_len, int num_heads, bool causal) {
+                                  int q_len, int kv_len, int num_heads,
+                                  const float* mask, bool causal) {
     int h = blockIdx.y;
     int qi = blockIdx.x;
 
@@ -30,14 +31,16 @@ __global__ void flash_attn_kernel(const float* Q, const float* K, const float* V
     float thread_max = -1e30f;
 
     for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        if (causal && j > q_pos)
-            continue;
+        float m = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
+        if (m < -1e20f) continue;
+        if (!mask && causal && j > q_pos) continue;
         float dot = 0.0f;
         const float* k_row = K + j * num_heads * HEAD_DIM + h * HEAD_DIM;
         for (int d = 0; d < HEAD_DIM; ++d) {
             dot += q_row[d] * k_row[d];
         }
         dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+        dot += m;
         thread_max = fmaxf(thread_max, dot);
     }
 
@@ -60,14 +63,16 @@ __global__ void flash_attn_kernel(const float* Q, const float* K, const float* V
         thread_acc[d] = 0.0f;
 
     for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        if (causal && j > q_pos)
-            continue;
+        float m = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
+        if (m < -1e20f) continue;
+        if (!mask && causal && j > q_pos) continue;
         float dot = 0.0f;
         const float* k_row = K + j * num_heads * HEAD_DIM + h * HEAD_DIM;
         for (int d = 0; d < HEAD_DIM; ++d) {
             dot += q_row[d] * k_row[d];
         }
         dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+        dot += m;
 
         float weight = expf(dot - max_val);
         thread_sum += weight;
@@ -100,14 +105,15 @@ __global__ void flash_attn_kernel(const float* Q, const float* K, const float* V
 }
 
 void launch_flash_attention(const float* Q, const float* K, const float* V, float* O, int q_len,
-                            int kv_len, int num_heads, int head_dim, bool causal,
+                            int kv_len, int num_heads, int head_dim,
+                            const float* mask, bool causal,
                             cudaStream_t stream) {
     dim3 grid(q_len, num_heads);
     int threads = 128;
 
 #define LAUNCH_FLASH_ATTN(HD)  \
     flash_attn_kernel<HD, 128> \
-        <<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, causal)
+        <<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, mask, causal)
 
     switch (head_dim) {
     case 16:
@@ -148,7 +154,7 @@ void launch_flash_attention(const float* Q, const float* K, const float* V, floa
 template <int HEAD_DIM, int BLOCK_SIZE>
 __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const float* V, float* O,
                                       int q_len, int kv_len, int num_heads, int num_kv_heads,
-                                      bool causal) {
+                                      const float* mask, bool causal) {
     int h = blockIdx.y;
     int qi = blockIdx.x;
 
@@ -168,14 +174,16 @@ __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const floa
     float thread_max = -1e30f;
 
     for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        if (causal && j > q_pos)
-            continue;
+        float m_val = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
+        if (m_val < -1e20f) continue;
+        if (!mask && causal && j > q_pos) continue;
         float dot = 0.0f;
         const float* k_row = K + j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
         for (int d = 0; d < HEAD_DIM; ++d) {
             dot += q_row[d] * k_row[d];
         }
         dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+        dot += m_val;
         thread_max = fmaxf(thread_max, dot);
     }
 
@@ -198,14 +206,16 @@ __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const floa
         thread_acc[d] = 0.0f;
 
     for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        if (causal && j > q_pos)
-            continue;
+        float m_val = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
+        if (m_val < -1e20f) continue;
+        if (!mask && causal && j > q_pos) continue;
         float dot = 0.0f;
         const float* k_row = K + j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
         for (int d = 0; d < HEAD_DIM; ++d) {
             dot += q_row[d] * k_row[d];
         }
         dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+        dot += m_val;
 
         float weight = expf(dot - max_val);
         thread_sum += weight;
@@ -239,13 +249,13 @@ __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const floa
 
 void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, float* O, int q_len,
                                 int kv_len, int num_heads, int num_kv_heads, int head_dim,
-                                bool causal, cudaStream_t stream) {
+                                const float* mask, bool causal, cudaStream_t stream) {
     dim3 grid(q_len, num_heads);
     int threads = 128;
 
 #define LAUNCH_FLASH_ATTN_GQA(HD)  \
     flash_attn_gqa_kernel<HD, 128> \
-        <<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, causal)
+        <<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, mask, causal)
 
     switch (head_dim) {
     case 16:
@@ -288,7 +298,8 @@ template <int HEAD_DIM, int NUM_WARPS>
 __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
                                              const float* __restrict__ K,
                                              const float* __restrict__ V, float* __restrict__ O,
-                                             int kv_len, int num_heads, int num_kv_heads) {
+                                             int kv_len, int num_heads, int num_kv_heads,
+                                             const float* __restrict__ mask_row) {
     int h = blockIdx.x;
     if (h >= num_heads)
         return;
@@ -319,6 +330,11 @@ __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
         local_acc[d] = 0.0f;
 
     for (int j = tid; j < kv_len; j += block_size) {
+        // Check mask BEFORE computing dot product
+        if (mask_row != nullptr && mask_row[j] < -1e20f) {
+            continue;
+        }
+
         const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
         const float* v_row = V + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
 
@@ -330,6 +346,7 @@ __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
             dot += kv.x * qv.x + kv.y * qv.y + kv.z * qv.z + kv.w * qv.w;
         }
         dot *= scale;
+        if (mask_row != nullptr) dot += mask_row[j];
 
         float new_max = fmaxf(local_max, dot);
         float correction = expf(local_max - new_max);
@@ -446,7 +463,8 @@ __global__ void flash_attn_gqa_decode_large_kernel(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
-    int kv_len, int num_heads, int num_kv_heads) {
+    int kv_len, int num_heads, int num_kv_heads,
+    const float* __restrict__ mask_row) {
 
     int h = blockIdx.x;
     if (h >= num_heads)
@@ -474,6 +492,8 @@ __global__ void flash_attn_gqa_decode_large_kernel(
     float local_max = -1e30f;
 
     for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
+        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+
         const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
 
         float dot = 0.0f;
@@ -481,6 +501,7 @@ __global__ void flash_attn_gqa_decode_large_kernel(
             dot += s_q[d] * k_row[d];
         }
         dot *= scale;
+        if (mask_row != nullptr) dot += mask_row[j];
         local_max = fmaxf(local_max, dot);
     }
 
@@ -509,6 +530,8 @@ __global__ void flash_attn_gqa_decode_large_kernel(
     float local_sum = 0.0f;
 
     for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
+        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+
         const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
         const float* v_row = V + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
 
@@ -517,6 +540,7 @@ __global__ void flash_attn_gqa_decode_large_kernel(
             dot += s_q[d] * k_row[d];
         }
         dot *= scale;
+        if (mask_row != nullptr) dot += mask_row[j];
 
         float weight = expf(dot - global_max);
         local_sum += weight;
@@ -544,16 +568,17 @@ __global__ void flash_attn_gqa_decode_large_kernel(
 
 void launch_flash_attention_gqa_decode(const float* Q, const float* K, const float* V, float* O,
                                        int kv_len, int num_heads, int num_kv_heads, int head_dim,
+                                       const float* mask_row,
                                        cudaStream_t stream) {
     int blocks = num_heads;
 
 #define LAUNCH_DECODE(HD, NW)            \
     flash_attn_gqa_decode_kernel<HD, NW> \
-        <<<blocks, 128, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads)
+        <<<blocks, 128, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads, mask_row)
 
 #define LAUNCH_DECODE_LARGE(HD)                    \
     flash_attn_gqa_decode_large_kernel<HD, 256>    \
-        <<<blocks, 256, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads)
+        <<<blocks, 256, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads, mask_row)
 
     switch (head_dim) {
     case 64:
