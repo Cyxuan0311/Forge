@@ -358,4 +358,77 @@ void Sampler::clear_history() {
     token_history_.clear();
 }
 
+std::vector<BatchSampleResult> Sampler::sample_batch(const TensorPtr& logits_batch,
+                                                      const InferenceBatch& batch) {
+    std::vector<BatchSampleResult> results;
+    if (!logits_batch || batch.empty())
+        return results;
+
+    // Determine vocab_size from logits shape
+    auto& shape = logits_batch->shape();
+    int vocab_size = static_cast<int>(shape.back());
+    int total_rows = static_cast<int>(logits_batch->numel()) / vocab_size;
+
+    // For the default sequential fallback, forward_batch() returns only
+    // the last sequence's logits [1, vocab_size]. In that case we need
+    // to call forward() individually per sequence.
+    //
+    // For a true batch implementation that returns [total_tokens, vocab],
+    // we extract each sequence's last-token logits.
+    //
+    // Heuristic: if total_rows == 1, it's the sequential fallback.
+    // If total_rows == batch.n_tokens(), it's a true batch result.
+    if (total_rows == 1) {
+        // Sequential fallback: only the last sequence's logits are available.
+        // Sample only the last item that requested logits.
+        for (int i = static_cast<int>(batch.items.size()) - 1; i >= 0; --i) {
+            if (batch.items[i].logits) {
+                BatchSampleResult r;
+                r.seq_index = i;
+                r.seq_id = batch.items[i].seq_id;
+                r.token_id = static_cast<int32_t>(sample(logits_batch, batch.items[i].start_pos));
+                results.push_back(r);
+                break;  // only last sequence's logits available
+            }
+        }
+    } else {
+        // True batch: extract each sequence's last-token logits.
+        // Logits are [total_tokens, vocab_size], and we need the last token
+        // of each sequence.
+        auto offsets = batch.token_offsets();
+
+        // Ensure logits are on CPU for extraction
+        TensorPtr logits_cpu = logits_batch;
+        if (logits_batch->device() == DeviceType::CUDA) {
+            logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits_batch->shape(),
+                                                   DeviceType::CPU);
+            logits_cpu->copy_from(*logits_batch);
+        }
+        const float* data = static_cast<const float*>(logits_cpu->data());
+
+        for (int i = 0; i < batch.size(); ++i) {
+            if (!batch.items[i].logits)
+                continue;
+
+            int seq_len = static_cast<int>(batch.items[i].tokens.size());
+            int last_row = offsets[i] + seq_len - 1;
+
+            // Extract last-token logits for this sequence
+            auto seq_logits = std::make_shared<Tensor>(DataType::FP32,
+                                                        std::vector<int64_t>{vocab_size},
+                                                        DeviceType::CPU);
+            std::memcpy(seq_logits->data(), data + last_row * vocab_size,
+                        vocab_size * sizeof(float));
+
+            BatchSampleResult r;
+            r.seq_index = i;
+            r.seq_id = batch.items[i].seq_id;
+            r.token_id = static_cast<int32_t>(sample(seq_logits, batch.items[i].start_pos + seq_len - 1));
+            results.push_back(r);
+        }
+    }
+
+    return results;
+}
+
 }  // namespace forge

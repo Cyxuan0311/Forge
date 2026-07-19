@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "inference_batch.h"
 #include "tensor.h"
 
 namespace forge {
@@ -17,6 +18,13 @@ struct SamplerConfig {
     uint64_t seed = 0;
 };
 
+// Result of sampling a single sequence within a batch
+struct BatchSampleResult {
+    int seq_index;     // index into InferenceBatch.items
+    int seq_id;        // sequence ID
+    int32_t token_id;  // sampled token
+};
+
 class Sampler {
 public:
     explicit Sampler(const SamplerConfig& config = SamplerConfig{});
@@ -27,6 +35,14 @@ public:
     int sample_greedy(const TensorPtr& logits);
 
     int sample_temperature(const TensorPtr& logits, float temperature);
+
+    // Sample a token for each sequence in the batch.
+    // logits_batch: [n_sequences, vocab_size] or [total_tokens, vocab_size]
+    // For decode (1 token/seq), logits are [n_seq, vocab].
+    // For prefill, each sequence's last-token logits are extracted.
+    // Returns one token per sequence that requested logits.
+    std::vector<BatchSampleResult> sample_batch(const TensorPtr& logits_batch,
+                                                 const InferenceBatch& batch);
 
     void set_config(const SamplerConfig& config);
     const SamplerConfig& config() const;
