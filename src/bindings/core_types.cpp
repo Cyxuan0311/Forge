@@ -44,7 +44,16 @@ void register_core_types(py::module_& m) {
         .value("None", RopeType::None)
         .value("Standard", RopeType::Standard)
         .value("LinearScaling", RopeType::LinearScaling)
-        .value("NTK_Scaled", RopeType::NTK_Scaled);
+        .value("NTK_Scaled", RopeType::NTK_Scaled)
+        .value("NeoX", RopeType::NeoX)
+        .value("MRoPE", RopeType::MRoPE)
+        .value("Proportional", RopeType::Proportional);
+
+    py::enum_<FFNType>(m, "FFNType")
+        .value("SiLUGated", FFNType::SiLUGated)
+        .value("GeGLU", FFNType::GeGLU)
+        .value("SimpleGELU", FFNType::SimpleGELU)
+        .value("MoE", FFNType::MoE);
 
     py::enum_<KVCacheDType>(m, "KVCacheDType")
         .value("FP32", KVCacheDType::FP32)
@@ -112,7 +121,12 @@ void register_core_types(py::module_& m) {
         .def_readwrite("head_dim_swa", &ModelConfig::head_dim_swa)
         .def_readwrite("num_heads_swa", &ModelConfig::num_heads_swa)
         .def_readwrite("num_kv_heads_swa", &ModelConfig::num_kv_heads_swa)
-        .def_readwrite("suppress_tokens", &ModelConfig::suppress_tokens);
+        .def_readwrite("suppress_tokens", &ModelConfig::suppress_tokens)
+        .def_readwrite("rope_type", &ModelConfig::rope_type)
+        .def_readwrite("ffn_type", &ModelConfig::ffn_type)
+        .def_readwrite("rope_q_scale", &ModelConfig::rope_q_scale)
+        .def_readwrite("has_post_attention_norm", &ModelConfig::has_post_attention_norm)
+        .def_readwrite("has_post_ffn_norm", &ModelConfig::has_post_ffn_norm);
 
     // ---- VisionConfig ----
     py::class_<VisionConfig>(m, "VisionConfig")
