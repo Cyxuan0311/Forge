@@ -31,6 +31,12 @@ size_t KVCache::q4_0_block_nbytes(int n) {
     return num_blocks * (sizeof(float) + 16);
 }
 
+// ---- Initialization ----
+
+void KVCache::init_cells(int layer) {
+    layers_[layer].cells.assign(max_seq_len_, KVCellMeta{});
+}
+
 bool KVCache::init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
                    DeviceType device) {
     return init_quantized(num_layers, num_kv_heads, head_dim, max_seq_len, device,
@@ -63,6 +69,8 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
             layers_[i].q_key_cache.resize(max_seq_len * q_size_per_row, 0);
             layers_[i].q_value_cache.resize(max_seq_len * q_size_per_row, 0);
         }
+
+        init_cells(i);
     }
 
     LOG_INFO("KVCache initialized: " + std::to_string(num_layers) + " layers, " +
@@ -96,6 +104,8 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
         }
         // dim == 0 layers: no KV cache allocated, key_cache/value_cache stay nullptr
         layers_[i].filled = 0;
+
+        init_cells(i);
     }
 
     LOG_INFO("KVCache init_per_layer: " + std::to_string(num_layers) + " layers, max_seq_len=" +
@@ -103,11 +113,20 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
     return true;
 }
 
+// ---- Reset ----
+
 void KVCache::reset() {
     for (auto& layer : layers_) {
         layer.filled = 0;
+        // Reset cell metadata
+        for (auto& cell : layer.cells) {
+            cell.pos = -1;
+            cell.seq_id_mask = 0;
+        }
     }
 }
+
+// ---- Quantize helpers (static) ----
 
 static void quantize_q4_0_cpu(const float* data, uint8_t* q_data, int n) {
     int block_size = 32;
@@ -178,26 +197,71 @@ static void dequantize_q4_0_cpu(const uint8_t* q_data, float* out, int n) {
     }
 }
 
-int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
-    if (kv_dtype_ == KVCacheDType::Q4_0) {
-        return update_quantized(layer, new_key, new_value, seq_len);
-    }
+// ---- Update (legacy single-seq) ----
 
+int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
     if (layer < 0 || layer >= static_cast<int>(layers_.size())) {
         LOG_ERROR("KVCache::update: invalid layer " + std::to_string(layer));
         return -1;
     }
+    // Delegate to sequence-aware update with seq_id=0, pos=filled
+    int64_t start_pos = static_cast<int64_t>(layers_[layer].filled);
+    return update(layer, 0, start_pos, new_key, new_value, seq_len);
+}
 
-    auto& kv = layers_[layer];
-    int filled = kv.filled;
+// ---- Update (sequence-aware) ----
 
-    if (filled + seq_len > max_seq_len_) {
-        LOG_ERROR("KVCache::update: cache overflow, filled=" + std::to_string(filled) +
+int KVCache::update(int layer, int seq_id, int64_t pos,
+                    const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+    if (layer < 0 || layer >= static_cast<int>(layers_.size())) {
+        LOG_ERROR("KVCache::update: invalid layer " + std::to_string(layer));
+        return -1;
+    }
+    if (seq_id < 0 || seq_id >= max_seqs_) {
+        LOG_ERROR("KVCache::update: invalid seq_id " + std::to_string(seq_id) +
+                  ", max=" + std::to_string(max_seqs_));
+        return -1;
+    }
+    if (pos + seq_len > max_seq_len_) {
+        LOG_ERROR("KVCache::update: cache overflow, pos=" + std::to_string(pos) +
                   " seq_len=" + std::to_string(seq_len) + " max=" + std::to_string(max_seq_len_));
         return -1;
     }
 
+    // Write KV data
+    int result;
+    if (kv_dtype_ == KVCacheDType::Q4_0) {
+        result = update_quantized(layer, pos, new_key, new_value, seq_len);
+    } else {
+        result = update_fp32(layer, pos, new_key, new_value, seq_len);
+    }
+    if (result < 0)
+        return result;
+
+    // Update cell metadata
+    auto& kv = layers_[layer];
+    for (int s = 0; s < seq_len; ++s) {
+        int slot = static_cast<int>(pos + s);
+        kv.cells[slot].pos = pos + s;
+        kv.cells[slot].add_seq(seq_id);
+    }
+
+    // Update filled counter (max of all occupied positions + 1)
+    int new_end = static_cast<int>(pos + seq_len);
+    if (new_end > kv.filled) {
+        kv.filled = new_end;
+    }
+
+    return kv.filled;
+}
+
+// ---- FP32 update (internal) ----
+
+int KVCache::update_fp32(int layer, int64_t start_pos,
+                         const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+    auto& kv = layers_[layer];
     int kv_dim = this->kv_dim(layer);
+    int filled = static_cast<int>(start_pos);
 
     if (device_ == DeviceType::CUDA) {
 #ifdef USE_CUDA
@@ -236,15 +300,16 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
         }
     }
 
-    kv.filled = filled + seq_len;
-    return kv.filled;
+    return static_cast<int>(start_pos + seq_len);
 }
 
-int KVCache::update_quantized(int layer, const TensorPtr& new_key, const TensorPtr& new_value,
-                              int seq_len) {
+// ---- Quantized update (internal, CPU path) ----
+
+int KVCache::update_quantized(int layer, int64_t start_pos,
+                              const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
     // Use CUDA path if device is CUDA
     if (device_ == DeviceType::CUDA) {
-        int result = update_quantized_cuda(layer, new_key, new_value, seq_len);
+        int result = update_quantized_cuda(layer, start_pos, new_key, new_value, seq_len);
         if (result >= 0)
             return result;
         // Fall through to CPU path if CUDA path fails
@@ -254,7 +319,7 @@ int KVCache::update_quantized(int layer, const TensorPtr& new_key, const TensorP
         return -1;
 
     auto& kv = layers_[layer];
-    int filled = kv.filled;
+    int filled = static_cast<int>(start_pos);
     if (filled + seq_len > max_seq_len_)
         return -1;
 
@@ -282,9 +347,10 @@ int KVCache::update_quantized(int layer, const TensorPtr& new_key, const TensorP
         quantize_q4_0_cpu(h_value.data() + s * kv_dim, qv_dst, kv_dim);
     }
 
-    kv.filled = filled + seq_len;
-    return kv.filled;
+    return static_cast<int>(start_pos + seq_len);
 }
+
+// ---- Dequantize ----
 
 void KVCache::dequantize_layer(int layer) {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
@@ -334,6 +400,8 @@ void KVCache::dequantize_layer(int layer) {
         std::memcpy(kv.value_cache->data(), h_out.data(), filled * kv_dim * sizeof(float));
     }
 }
+
+// ---- Accessors ----
 
 TensorPtr KVCache::get_key(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
@@ -399,6 +467,8 @@ size_t KVCache::nbytes() const {
     return per_layer * layers_.size();
 }
 
+// ---- CUDA quantized helpers ----
+
 void KVCache::alloc_cuda_q_cache(int layer, size_t bytes) {
 #ifdef USE_CUDA
     auto& kv = layers_[layer];
@@ -414,14 +484,15 @@ void KVCache::alloc_cuda_q_cache(int layer, size_t bytes) {
 #endif
 }
 
-int KVCache::update_quantized_cuda(int layer, const TensorPtr& new_key, const TensorPtr& new_value,
+int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
+                                   const TensorPtr& new_key, const TensorPtr& new_value,
                                    int seq_len) {
 #ifdef USE_CUDA
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return -1;
 
     auto& kv = layers_[layer];
-    int filled = kv.filled;
+    int filled = static_cast<int>(start_pos);
     if (filled + seq_len > max_seq_len_)
         return -1;
 
@@ -465,8 +536,7 @@ int KVCache::update_quantized_cuda(int layer, const TensorPtr& new_key, const Te
         cuda::launch_quantize_q4_0_matrix(v_src, q_val_dst, seq_len, kv_dim);
     }
 
-    kv.filled = filled + seq_len;
-    return kv.filled;
+    return static_cast<int>(start_pos + seq_len);
 #else
     return -1;
 #endif
@@ -494,6 +564,131 @@ void KVCache::dequantize_layer_cuda(int layer) {
     cuda::launch_dequant_q4_0_matrix(kv.d_q_key_cache, k_out, filled, kv_dim);
     cuda::launch_dequant_q4_0_matrix(kv.d_q_value_cache, v_out, filled, kv_dim);
 #endif
+}
+
+// ---- Sequence operations ----
+
+void KVCache::seq_rm(int seq_id, int64_t p0, int64_t p1) {
+    if (seq_id < 0 || seq_id >= max_seqs_) {
+        LOG_ERROR("KVCache::seq_rm: invalid seq_id " + std::to_string(seq_id));
+        return;
+    }
+    uint32_t bit = 1u << seq_id;
+
+    for (auto& layer : layers_) {
+        for (int i = 0; i < static_cast<int>(layer.cells.size()); ++i) {
+            auto& cell = layer.cells[i];
+            if (cell.is_free())
+                continue;
+            if (cell.pos < p0 || cell.pos >= p1)
+                continue;
+            if (!(cell.seq_id_mask & bit))
+                continue;
+
+            // Remove seq_id ownership
+            cell.seq_id_mask &= ~bit;
+
+            // If cell has no remaining owners, free it
+            if (cell.no_seqs()) {
+                cell.pos = -1;
+            }
+        }
+
+        // Recompute filled = max(pos) + 1 across all occupied cells, or 0 if none
+        int max_pos = -1;
+        for (const auto& cell : layer.cells) {
+            if (!cell.is_free() && cell.pos > max_pos) {
+                max_pos = static_cast<int>(cell.pos);
+            }
+        }
+        layer.filled = (max_pos >= 0) ? max_pos + 1 : 0;
+    }
+}
+
+void KVCache::seq_cp(int src_seq, int dst_seq, int64_t p0, int64_t p1) {
+    if (src_seq < 0 || src_seq >= max_seqs_ || dst_seq < 0 || dst_seq >= max_seqs_) {
+        LOG_ERROR("KVCache::seq_cp: invalid seq_id src=" + std::to_string(src_seq) +
+                  " dst=" + std::to_string(dst_seq));
+        return;
+    }
+    uint32_t src_bit = 1u << src_seq;
+    uint32_t dst_bit = 1u << dst_seq;
+
+    // Zero-copy: just add dst_seq ownership to cells owned by src_seq in [p0, p1)
+    for (auto& layer : layers_) {
+        for (auto& cell : layer.cells) {
+            if (cell.is_free())
+                continue;
+            if (cell.pos < p0 || cell.pos >= p1)
+                continue;
+            if (!(cell.seq_id_mask & src_bit))
+                continue;
+
+            cell.seq_id_mask |= dst_bit;
+        }
+    }
+}
+
+void KVCache::seq_keep(int seq_id) {
+    if (seq_id < 0 || seq_id >= max_seqs_) {
+        LOG_ERROR("KVCache::seq_keep: invalid seq_id " + std::to_string(seq_id));
+        return;
+    }
+    uint32_t keep_bit = 1u << seq_id;
+
+    for (auto& layer : layers_) {
+        for (auto& cell : layer.cells) {
+            if (cell.is_free())
+                continue;
+
+            if (cell.seq_id_mask & keep_bit) {
+                // This cell belongs to seq_id — remove all other sequences
+                cell.seq_id_mask = keep_bit;
+            } else {
+                // This cell does NOT belong to seq_id — free it
+                cell.pos = -1;
+                cell.seq_id_mask = 0;
+            }
+        }
+
+        // Recompute filled
+        int max_pos = -1;
+        for (const auto& cell : layer.cells) {
+            if (!cell.is_free() && cell.pos > max_pos) {
+                max_pos = static_cast<int>(cell.pos);
+            }
+        }
+        layer.filled = (max_pos >= 0) ? max_pos + 1 : 0;
+    }
+}
+
+int KVCache::find_slot(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return -1;
+
+    const auto& cells = layers_[layer].cells;
+    // Linear scan for first free cell
+    for (int i = 0; i < static_cast<int>(cells.size()); ++i) {
+        if (cells[i].is_free())
+            return i;
+    }
+    return -1;  // Cache full
+}
+
+int KVCache::seq_filled(int layer, int seq_id) const {
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return 0;
+    if (seq_id < 0 || seq_id >= max_seqs_)
+        return 0;
+
+    uint32_t bit = 1u << seq_id;
+    int count = 0;
+    for (const auto& cell : layers_[layer].cells) {
+        if (!cell.is_free() && (cell.seq_id_mask & bit)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 }  // namespace forge
