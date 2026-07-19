@@ -26,17 +26,17 @@ bool DeepSeekEngine::init_weights() {
 }
 
 TensorPtr DeepSeekEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                        int64_t start_pos, DeviceType dev) {
+                                        int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& lw = weights_.layers[layer_idx];
     if (lw.layer_type == LayerType::MLA) {
-        return forward_layer_mla(hidden, layer_idx, seq_len, start_pos, dev);
+        return forward_layer_mla(hidden, layer_idx, seq_len, start_pos, dev, seq_id);
     } else {
-        return forward_layer_gqa(hidden, layer_idx, seq_len, start_pos, dev);
+        return forward_layer_gqa(hidden, layer_idx, seq_len, start_pos, dev, seq_id);
     }
 }
 
 TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                            int64_t start_pos, DeviceType dev) {
+                                            int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -66,7 +66,7 @@ TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden, int layer_i
             num_heads, num_kv_heads, head_dim, start_pos, cfg.rope_theta);
     }
 
-    kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
+    kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v, seq_len);
 
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(layer_idx);
@@ -117,7 +117,7 @@ TensorPtr DeepSeekEngine::forward_layer_gqa(const TensorPtr& hidden, int layer_i
 }
 
 TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                            int64_t start_pos, DeviceType dev) {
+                                            int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int head_dim = cfg.head_dim;
@@ -156,7 +156,7 @@ TensorPtr DeepSeekEngine::forward_layer_mla(const TensorPtr& hidden, int layer_i
             num_heads, 1, head_dim, start_pos, cfg.rope_theta);
     }
 
-    kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v_latent, seq_len);
+    kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v_latent, seq_len);
 
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(layer_idx);

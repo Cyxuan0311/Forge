@@ -12,14 +12,14 @@ public:
 
 protected:
     TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len, int64_t start_pos,
-                            DeviceType dev) override;
+                            DeviceType dev, int seq_id = 0) override;
     bool init_weights() override;
 
 private:
     TensorPtr forward_layer_gqa(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                int64_t start_pos, DeviceType dev);
+                                int64_t start_pos, DeviceType dev, int seq_id = 0);
     TensorPtr forward_layer_mla(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                int64_t start_pos, DeviceType dev);
+                                int64_t start_pos, DeviceType dev, int seq_id = 0);
 };
 
 }  // namespace forge

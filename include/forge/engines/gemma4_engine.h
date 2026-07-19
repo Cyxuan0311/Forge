@@ -10,11 +10,11 @@ public:
 
     std::string name() const override { return "Gemma4Engine"; }
 
-    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos) override;
+    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) override;
 
 protected:
     TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len, int64_t start_pos,
-                            DeviceType dev) override;
+                            DeviceType dev, int seq_id = 0) override;
     bool init_weights() override;
     void init_kv_cache(const ModelConfig& cfg) override;
 

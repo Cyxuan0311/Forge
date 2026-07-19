@@ -14,16 +14,16 @@ public:
 
 protected:
     TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len, int64_t start_pos,
-                            DeviceType dev) override;
+                            DeviceType dev, int seq_id = 0) override;
     bool init_weights() override;
 
 private:
     // Forward pass for Linear Attention (Gated Delta Net) layers
     TensorPtr forward_linear_attn_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                        int64_t start_pos, DeviceType dev);
+                                        int64_t start_pos, DeviceType dev, int seq_id = 0);
     // Forward pass for Full Attention layers (with gated Q)
     TensorPtr forward_full_attn_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                      int64_t start_pos, DeviceType dev);
+                                      int64_t start_pos, DeviceType dev, int seq_id = 0);
 
     // Gated Delta Net autoregressive step (single token)
     void gated_delta_net_ar_cpu(const float* q, const float* k, const float* v, const float* gate,

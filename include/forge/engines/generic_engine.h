@@ -18,7 +18,7 @@ public:
     std::string name() const override { return "generic"; }
 
     // Override forward() to handle embedding scaling and logit softcapping
-    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos) override;
+    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) override;
 
 protected:
     bool init_weights() override;
@@ -55,7 +55,7 @@ protected:
 
     // ---- Main forward_layer (dispatches by ModelConfig) ----
     TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                            int64_t start_pos, DeviceType dev) override;
+                            int64_t start_pos, DeviceType dev, int seq_id = 0) override;
 
     // ---- Gemma4-specific overrides ----
     void init_kv_cache(const ModelConfig& cfg) override;

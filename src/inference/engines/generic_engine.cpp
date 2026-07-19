@@ -182,7 +182,7 @@ bool GenericEngine::init_weights() {
 // forward() — override to handle embedding scaling and logit softcapping
 // ============================================================================
 
-TensorPtr GenericEngine::forward(const TensorPtr& input_ids, int64_t start_pos) {
+TensorPtr GenericEngine::forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id) {
     const auto& cfg = model_.config();
     int seq_len = static_cast<int>(input_ids->numel());
 
@@ -836,7 +836,7 @@ TensorPtr GenericEngine::qk_norm_forward(const TensorPtr& x, const TensorPtr& no
 // ============================================================================
 
 TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                       int64_t start_pos, DeviceType dev) {
+                                       int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -892,7 +892,7 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden, int layer_idx, i
     // ---- 5. KV cache update ----
     {
         PERF_SCOPE("layer/kv_cache_update");
-        kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
+        kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v, seq_len);
 
         if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
             kv_cache_.dequantize_layer(layer_idx);

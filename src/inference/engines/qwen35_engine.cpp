@@ -150,13 +150,13 @@ void Qwen35Engine::reset() {
 // Layer dispatch
 // ============================================================================
 TensorPtr Qwen35Engine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                      int64_t start_pos, DeviceType dev) {
+                                      int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& lw = weights_.layers[layer_idx];
 
     if (lw.layer_type == LayerType::FullAttention) {
-        return forward_full_attn_layer(hidden, layer_idx, seq_len, start_pos, dev);
+        return forward_full_attn_layer(hidden, layer_idx, seq_len, start_pos, dev, seq_id);
     } else {
-        return forward_linear_attn_layer(hidden, layer_idx, seq_len, start_pos, dev);
+        return forward_linear_attn_layer(hidden, layer_idx, seq_len, start_pos, dev, seq_id);
     }
 }
 
@@ -164,7 +164,7 @@ TensorPtr Qwen35Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
 // Full Attention Layer (with gated Q, Q/K norm, MRoPE)
 // ============================================================================
 TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                                int64_t start_pos, DeviceType dev) {
+                                                int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -329,7 +329,7 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
                      seq_len, num_heads, num_kv_heads, head_dim, n_rot, start_pos, cfg.rope_theta);
 
     // KV cache
-    kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
+    kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v, seq_len);
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(layer_idx);
     }
@@ -425,7 +425,7 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
 // Linear Attention Layer (Gated Delta Net)
 // ============================================================================
 TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int layer_idx,
-                                                  int seq_len, int64_t start_pos, DeviceType dev) {
+                                                  int seq_len, int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     const auto& lw = weights_.layers[layer_idx];
     int hidden_dim = cfg.hidden_dim;

@@ -110,7 +110,7 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
              std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
 }
 
-TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos) {
+TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id) {
     const auto& cfg = model_.config();
     int seq_len = static_cast<int>(input_ids->numel());
 
@@ -204,7 +204,7 @@ TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos) {
         per_layer_input_cache_ = ple;
     }
 
-    auto logits = forward_layers(hidden, seq_len, start_pos);
+    auto logits = forward_layers(hidden, seq_len, start_pos, seq_id);
 
     // Gemma4 final logit softcapping (need CPU access for scalar loop)
     if (cfg.f_final_logit_softcapping > 0.0f && logits) {
@@ -250,7 +250,7 @@ TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos) {
 }
 
 TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                      int64_t start_pos, DeviceType dev) {
+                                      int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     const auto& lw = weights_.layers[layer_idx];
 
@@ -397,7 +397,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
         // ---- KV Cache update (on CPU, then copy to cache device) ----
         {
             PERF_SCOPE("layer/kv_cache_update");
-            kv_cache_.update(layer_idx, /*seq_id=*/0, start_pos, k_rope, v, seq_len);
+            kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v, seq_len);
         }
     } else {
         // Non-KV layer: reuse KV cache from the last two KV layers
