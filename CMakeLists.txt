@@ -174,6 +174,7 @@ add_library(
   src/model/arch_config_parser.cpp
   src/model/arch_weight_init.cpp
   src/model/arch_capability.cpp
+  src/model/arch_registrations.cpp
   src/model/model_weights.cpp
   src/model/weight_store.cpp
   src/model/weight_mapper.cpp

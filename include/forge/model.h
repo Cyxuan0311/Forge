@@ -423,6 +423,7 @@ public:
     void register_capability(const std::string& arch, const ArchCapability& cap);
     bool has(const std::string& arch) const;
     ArchCapability get(const std::string& arch) const;
+    const std::unordered_map<std::string, ArchCapability>& all() const { return capabilities_; }
 
 private:
     ArchCapabilityRegistry() = default;
@@ -450,14 +451,22 @@ struct ArchCapabilityAutoRegister {
 //
 // Usage example (in a single .cpp file):
 //   FORGE_REGISTER_ARCH("gemma",
-//       /*engine=*/[](Model& m, InferenceContext& ctx) { return std::make_unique<LlamaEngine>(m,
+//       /*engine=*/[](Model& m, InferenceContext& ctx) { return std::make_unique<GenericEngine>(m,
 //       ctx); },
-//       /*config_parser=*/[](ModelLoader& loader, const std::string& arch) -> ModelConfig { ... },
-//       /*weight_init=*/[](LayerWeightInitContext& ctx) { ... },
+//       /*config_parser=*/parse_gemma_config,
+//       /*weight_init=*/init_gqa_layer_weights,
 //       /*capability=*/ArchCapability{.use_gqa = true, .use_neox_rope = true}
+//   );
+//
+// For architectures without a dedicated engine (falls back to capability-based lookup):
+//   FORGE_REGISTER_ARCH_NO_ENGINE("phi3",
+//       parse_phi3_config,
+//       init_gqa_layer_weights,
+//       ArchCapability{.use_gqa = true, .use_neox_rope = true}
 //   );
 // ============================================================================
 
+// Full registration (with engine)
 #define FORGE_REGISTER_ARCH_IMPL2(line, arch, engine_creator, config_fn, weight_init_fn, cap) \
     static ::forge::EngineAutoRegister _engine_reg_##line(arch, engine_creator);              \
     static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn);      \
@@ -469,6 +478,18 @@ struct ArchCapabilityAutoRegister {
 
 #define FORGE_REGISTER_ARCH(arch, engine_creator, config_fn, weight_init_fn, cap) \
     FORGE_REGISTER_ARCH_IMPL(__LINE__, arch, engine_creator, config_fn, weight_init_fn, cap)
+
+// Registration without engine (for architectures that fall back to capability-based lookup)
+#define FORGE_REGISTER_ARCH_NO_ENGINE_IMPL2(line, arch, config_fn, weight_init_fn, cap)  \
+    static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn); \
+    static ::forge::WeightInitAutoRegister _weight_init_reg_##line(arch, weight_init_fn);\
+    static ::forge::ArchCapabilityAutoRegister _arch_cap_reg_##line(arch, cap)
+
+#define FORGE_REGISTER_ARCH_NO_ENGINE_IMPL(line, arch, config_fn, weight_init_fn, cap) \
+    FORGE_REGISTER_ARCH_NO_ENGINE_IMPL2(line, arch, config_fn, weight_init_fn, cap)
+
+#define FORGE_REGISTER_ARCH_NO_ENGINE(arch, config_fn, weight_init_fn, cap) \
+    FORGE_REGISTER_ARCH_NO_ENGINE_IMPL(__LINE__, arch, config_fn, weight_init_fn, cap)
 
 class Model {
 public:
