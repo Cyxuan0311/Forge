@@ -23,6 +23,13 @@ enum class RequestStatus {
     Failed,
 };
 
+// Cached prompt entry for prefix caching via seq_cp zero-copy sharing.
+struct CachedPrompt {
+    std::vector<int32_t> tokens;  // the cached prompt tokens
+    int seq_id = -1;              // seq_id owning the cached KV cells
+    bool valid = false;
+};
+
 struct GenerateRequest {
     int request_id;
     std::vector<int32_t> prompt_tokens;
@@ -35,6 +42,11 @@ struct GenerateRequest {
     int num_generated = 0;
     int current_pos = 0;
     std::string finish_reason;
+
+    // Prefix cache fields
+    int prefix_len = 0;        // number of tokens shared from cache (0 = no prefix hit)
+    int prefix_seq_id = -1;    // seq_id of the cached prefix (-1 = no cache)
+    bool from_cache = false;   // true if this request used a prefix cache hit
 
     using Callback =
         std::function<void(int request_id, int32_t token_id, int step, RequestStatus status)>;
@@ -66,11 +78,20 @@ public:
 
     Model& model() { return model_; }
     InferenceContext& context() { return ctx_; }
+    const InferenceContext& context() const { return ctx_; }
+
+    // Prefix cache stats
+    int prefix_cache_hits() const { return prefix_cache_hits_; }
+    int prefix_cache_misses() const { return prefix_cache_misses_; }
 
 private:
     void schedule();
-    bool prefill_request(GenerateRequest& req);
-    bool decode_step(GenerateRequest& req);
+
+    // Prefix cache helpers
+    static size_t hash_prompt(const std::vector<int32_t>& tokens);
+    bool try_prefix_cache(GenerateRequest& req);
+    void evict_prefix_cache(int seq_id);
+    void preserve_prefix_cache(int seq_id, int prompt_len);
 
     Model& model_;
     InferenceContext ctx_;
@@ -82,6 +103,12 @@ private:
     std::vector<int> active_ids_;
     int next_request_id_ = 0;
     int max_num_seqs_ = 4;
+
+    // Prefix cache: keyed by hash of prompt tokens
+    static constexpr int MIN_CACHE_PROMPT_LEN = 16;
+    std::unordered_map<size_t, CachedPrompt> prompt_cache_;
+    int prefix_cache_hits_ = 0;
+    int prefix_cache_misses_ = 0;
 
     mutable std::mutex mutex_;
 };
