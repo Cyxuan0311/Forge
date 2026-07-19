@@ -14,7 +14,8 @@ namespace forge {
 
 enum class NormType : int { RMSNorm, LayerNorm };
 enum class ActivationType : int { SiLU_GELU, GELU, ReLU, GeGLU };
-enum class RopeType : int { None, Standard, LinearScaling, NTK_Scaled };
+enum class RopeType : int { None, Standard, LinearScaling, NTK_Scaled, NeoX, MRoPE, Proportional };
+enum class FFNType : int { SiLUGated, GeGLU, SimpleGELU, MoE };
 
 struct ModelConfig {
     int vocab_size = 0;
@@ -66,6 +67,12 @@ struct ModelConfig {
     float f_final_logit_softcapping = 0.0f;
 
     bool use_parallel_residual = false;
+
+    // GenericEngine: FFN type and rope Q-scaling
+    FFNType ffn_type = FFNType::SiLUGated;
+    float rope_q_scale = 0.0f;  // >0 means apply 1/sqrt(head_dim) scaling to Q after RoPE
+    bool has_post_attention_norm = false;
+    bool has_post_ffn_norm = false;
 
     // Gemma4-specific fields
     int n_embd_per_layer = 0;            // per-layer embedding dimension (0 = disabled)

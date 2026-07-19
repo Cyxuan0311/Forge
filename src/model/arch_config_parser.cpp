@@ -2,6 +2,8 @@
 #include "forge/logger.h"
 #include "forge/model_loader.h"
 
+#include <cmath>
+
 namespace forge {
 
 // ============================================================================
@@ -82,6 +84,8 @@ static ConfigParserAutoRegister _reg_cfg_llama(
     "llama", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
         cfg.use_neox_rope = true;
+        cfg.rope_type = RopeType::NeoX;
+        cfg.ffn_type = FFNType::SiLUGated;
         return cfg;
     });
 
@@ -89,6 +93,8 @@ static ConfigParserAutoRegister _reg_cfg_mistral(
     "mistral", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
         cfg.use_neox_rope = true;
+        cfg.rope_type = RopeType::NeoX;
+        cfg.ffn_type = FFNType::SiLUGated;
         return cfg;
     });
 
@@ -97,6 +103,7 @@ static ConfigParserAutoRegister _reg_cfg_qwen("qwen",
                                                  const std::string& arch) -> ModelConfig {
                                                   auto cfg = parse_common_gguf_config(loader, arch);
                                                   cfg.tie_embeddings = true;
+                                                  cfg.ffn_type = FFNType::SiLUGated;
                                                   return cfg;
                                               });
 
@@ -104,6 +111,7 @@ static ConfigParserAutoRegister _reg_cfg_qwen2(
     "qwen2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
         cfg.tie_embeddings = true;
+        cfg.ffn_type = FFNType::SiLUGated;
         return cfg;
     });
 
@@ -112,7 +120,9 @@ static ConfigParserAutoRegister _reg_cfg_qwen3vl(
         auto cfg = parse_common_gguf_config(loader, arch);
         cfg.tie_embeddings = true;
         cfg.use_mrope = true;
+        cfg.rope_type = RopeType::MRoPE;
         cfg.use_qk_norm = true;
+        cfg.ffn_type = FFNType::SiLUGated;
 
         // MRoPE: rope_dimension_count defaults to head_dim (same as llama.cpp).
         // The sections array defines how the n_rot/2 pairs are distributed among
@@ -136,13 +146,17 @@ static ConfigParserAutoRegister _reg_cfg_yi("yi",
                                                const std::string& arch) -> ModelConfig {
                                                 auto cfg = parse_common_gguf_config(loader, arch);
                                                 cfg.use_neox_rope = true;
+                                                cfg.rope_type = RopeType::NeoX;
+                                                cfg.ffn_type = FFNType::SiLUGated;
                                                 return cfg;
                                             });
 
 static ConfigParserAutoRegister _reg_cfg_deepseek("deepseek",
                                                   [](ModelLoader& loader,
                                                      const std::string& arch) -> ModelConfig {
-                                                      return parse_common_gguf_config(loader, arch);
+                                                      auto cfg = parse_common_gguf_config(loader, arch);
+                                                      cfg.ffn_type = FFNType::SiLUGated;
+                                                      return cfg;
                                                   });
 
 static ConfigParserAutoRegister _reg_cfg_deepseek_v2(
@@ -217,6 +231,8 @@ static ConfigParserAutoRegister _reg_cfg_phi3("phi3",
                                                  const std::string& arch) -> ModelConfig {
                                                   auto cfg = parse_common_gguf_config(loader, arch);
                                                   cfg.use_neox_rope = true;
+                                                  cfg.rope_type = RopeType::NeoX;
+                                                  cfg.ffn_type = FFNType::SiLUGated;
                                                   return cfg;
                                               });
 
@@ -225,8 +241,11 @@ static ConfigParserAutoRegister _reg_cfg_gemma(
     "gemma", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
         cfg.use_neox_rope = true;
+        cfg.rope_type = RopeType::NeoX;
         cfg.tie_embeddings = true;
         cfg.ffn_activation = ActivationType::GeGLU;
+        cfg.ffn_type = FFNType::GeGLU;
+        cfg.rope_q_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
         return cfg;
     });
 
@@ -235,12 +254,17 @@ static ConfigParserAutoRegister _reg_cfg_gemma2(
     "gemma2", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
         cfg.use_neox_rope = true;
+        cfg.rope_type = RopeType::NeoX;
         cfg.tie_embeddings = true;
         cfg.ffn_activation = ActivationType::GeGLU;
+        cfg.ffn_type = FFNType::GeGLU;
+        cfg.rope_q_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
         cfg.f_attn_logit_softcapping =
             static_cast<float>(loader.get_metadata_float(arch + ".attn_logit_softcapping", 50.0f));
         cfg.f_final_logit_softcapping =
             static_cast<float>(loader.get_metadata_float(arch + ".final_logit_softcapping", 30.0f));
+        cfg.has_post_attention_norm = true;
+        cfg.has_post_ffn_norm = true;
         return cfg;
     });
 
@@ -252,6 +276,7 @@ static ConfigParserAutoRegister _reg_cfg_falcon(
         cfg.layer_norm_eps = static_cast<float>(
             loader.get_metadata_float(arch + ".attention.layer_norm_epsilon", 1e-5f));
         cfg.ffn_activation = ActivationType::GELU;
+        cfg.ffn_type = FFNType::SimpleGELU;
         cfg.use_parallel_residual = true;
         return cfg;
     });
@@ -261,9 +286,12 @@ static ConfigParserAutoRegister _reg_cfg_gemma4(
     "gemma4", [](ModelLoader& loader, const std::string& arch) -> ModelConfig {
         auto cfg = parse_common_gguf_config(loader, arch);
         cfg.use_neox_rope = false;  // Gemma4 GGUF already stores weights in half-split format
+        cfg.rope_type = RopeType::Standard;  // Half-split format → standard RoPE pairing
         cfg.tie_embeddings = true;
         cfg.ffn_activation = ActivationType::GeGLU;
+        cfg.ffn_type = FFNType::MoE;
         cfg.use_qk_norm = true;
+        cfg.rope_q_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
 
         // Per-layer embeddings
         cfg.n_embd_per_layer =
