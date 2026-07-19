@@ -513,11 +513,11 @@ int main(int argc, char** argv) {
 
     ctx.init_kv_cache();
     if (tfm_eng) {
-        const auto& cache = tfm_eng->kv_cache();
+        const KVCache* cache = tfm_eng->kv_cache();
         std::cout << "KV Cache: dtype="
-                  << (cache.kv_dtype() == KVCacheDType::Q4_0 ? "q4_0" : "fp32")
-                  << ", size=" << format_bytes(cache.nbytes())
-                  << ", max_seq=" << cache.max_seq_len() << "\n";
+                  << (cache->kv_dtype() == KVCacheDType::Q4_0 ? "q4_0" : "fp32")
+                  << ", size=" << format_bytes(cache->nbytes())
+                  << ", max_seq=" << cache->max_seq_len() << "\n";
     }
 
     if (device == DeviceType::CUDA) {
