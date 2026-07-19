@@ -60,27 +60,28 @@ void launch_dequant_q4_k(const void* q_data, float* out, int n, cudaStream_t str
 void launch_dequant_q4_k_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
 
-void launch_gemv_q4_k_transB(const float* x, const void* q_weight, float* out, int K, int N,
-                             cudaStream_t stream = 0);
-
-void launch_gemv_q4_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
-                                   int N, cudaStream_t stream = 0);
-
+// ---- FP32 GEMV ----
 void launch_gemv_transB(const float* x, const float* W, float* out, int K, int N,
                         cudaStream_t stream = 0);
 
 void launch_gemv(const float* x, const float* W, float* out, int K, int N, cudaStream_t stream = 0);
 
+// ---- Q4_0 special GEMV (smem + splitK + dual) ----
 void launch_gemv_q4_0_transB(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
-
-void launch_gemv_q4_0_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
-                                   int N, cudaStream_t stream = 0);
 
 void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
                                   const void* q_weight2, int N2, float* out, int K,
                                   cudaStream_t stream = 0);
 
+// ---- Typed GEMV dispatch tables (indexed by DataType enum value) ----
+using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
+using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
+
+extern const GemvFn gemv_dispatch[16];
+extern const GemvBatchFn gemv_batch_dispatch[16];
+
+// ---- Fused kernels ----
 void launch_qkv_fused_q4_0(const float* x, const void* q_wq, int N_q, const void* q_wk, int N_k,
                            const void* q_wv, int N_v, float* out_q, float* out_k, float* out_v,
                            int K, cudaStream_t stream = 0);
@@ -99,24 +100,6 @@ void launch_ffn_up_fused_q4_k_batch(const float* x, const void* q_w1, const void
 
 void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
                               int intermediate_dim, cudaStream_t stream = 0);
-
-void launch_gemv_q4_1_transB(const float* x, const void* q_weight, float* out, int K, int N,
-                             cudaStream_t stream = 0);
-
-void launch_gemv_q4_1_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
-                                   int N, cudaStream_t stream = 0);
-
-void launch_gemv_q6_k_transB(const float* x, const void* q_weight, float* out, int K, int N,
-                             cudaStream_t stream = 0);
-
-void launch_gemv_q6_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
-                                   int N, cudaStream_t stream = 0);
-
-void launch_gemv_q3_k_transB(const float* x, const void* q_weight, float* out, int K, int N,
-                             cudaStream_t stream = 0);
-
-void launch_gemv_q3_k_transB_batch(const float* x, const void* q_weight, float* out, int M, int K,
-                                   int N, cudaStream_t stream = 0);
 
 void launch_dequant_q6_k_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
