@@ -94,6 +94,7 @@ public:
     int filled(int layer) const;
     int max_seq_len() const { return max_seq_len_; }
     int num_layers() const { return static_cast<int>(layers_.size()); }
+    const std::vector<KVCacheLayer>& layers() const { return layers_; }
     DeviceType device() const { return device_; }
     KVCacheDType kv_dtype() const { return kv_dtype_; }
     int max_seqs() const { return max_seqs_; }

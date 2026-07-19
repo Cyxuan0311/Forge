@@ -221,6 +221,7 @@ add_library(
   src/inference/sampler.cpp
   src/inference/generator.cpp
   src/inference/paged_kv_cache.cpp
+  src/inference/attention_mask.cpp
   src/inference/request_scheduler.cpp)
 target_include_directories(
   forge_infer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
