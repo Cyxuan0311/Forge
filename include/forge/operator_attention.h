@@ -10,11 +10,15 @@ TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k, c
 
 TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k,
                                           const TensorPtr& v, int seq_len, int num_heads,
-                                          int head_dim, bool causal = true);
+                                          int head_dim,
+                                          const TensorPtr& mask = nullptr,
+                                          bool causal = true);
 
 TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k,
                                           const TensorPtr& v, int q_len, int kv_len, int num_heads,
-                                          int head_dim, bool causal = true);
+                                          int head_dim,
+                                          const TensorPtr& mask = nullptr,
+                                          bool causal = true);
 
 // Attention with additive mask (mask values: 0 = attend, -inf = mask out)
 TensorPtr scaled_dot_product_attention_2d_masked(const TensorPtr& q, const TensorPtr& k,
@@ -28,6 +32,7 @@ TensorPtr scaled_dot_product_attention_2d_masked(const TensorPtr& q, const Tenso
 TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPtr& k,
                                               const TensorPtr& v, int q_len, int kv_len,
                                               int num_heads, int num_kv_heads, int head_dim,
+                                              const TensorPtr& mask = nullptr,
                                               bool causal = true);
 
 }  // namespace ops
