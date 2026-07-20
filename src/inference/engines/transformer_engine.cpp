@@ -45,6 +45,15 @@ void TransformerEngine::set_gpu_layers(int gpu_layers) {
     const auto& cfg = model_.config();
     int num_layers = cfg.num_layers;
 
+    // Build per-layer device vector
+    layer_devices_.resize(num_layers);
+    for (int i = 0; i < num_layers; ++i) {
+        layer_devices_[i] = (gpu_layers_ < 0) ? model_.device()
+                         : (i < gpu_layers_)  ? DeviceType::CUDA
+                                              : DeviceType::CPU;
+    }
+
+    // Move model weights to per-layer devices
     DeviceType first_dev = layer_device(0);
     auto token_emb = model_.weights().get("token_embedding");
     if (token_emb && token_emb->device() != first_dev) {
@@ -52,17 +61,26 @@ void TransformerEngine::set_gpu_layers(int gpu_layers) {
     }
 
     for (int i = 0; i < num_layers; ++i) {
-        weights_.move_layer_weights(i, layer_device(i));
+        weights_.move_layer_weights(i, layer_devices_[i]);
     }
 
-    DeviceType last_dev = layer_device(num_layers - 1);
+    DeviceType last_dev = layer_devices_[num_layers - 1];
     weights_.move_output_weights(last_dev);
 
+    // Update KV cache per-layer devices (if already initialized)
+    if (kv_cache_initialized_) {
+        kv_cache_.set_layer_devices(layer_devices_);
+    }
+
+    int num_cuda = 0;
+    for (auto d : layer_devices_) if (d == DeviceType::CUDA) ++num_cuda;
     LOG_INFO("CPU offload configured: gpu_layers=" + std::to_string(gpu_layers) + "/" +
-             std::to_string(num_layers));
+             std::to_string(num_layers) + ", CUDA layers=" + std::to_string(num_cuda));
 }
 
 DeviceType TransformerEngine::layer_device(int layer_idx) const {
+    if (!layer_devices_.empty() && layer_idx >= 0 && layer_idx < static_cast<int>(layer_devices_.size()))
+        return layer_devices_[layer_idx];
     if (gpu_layers_ < 0)
         return model_.device();
     if (layer_idx < gpu_layers_)
@@ -141,6 +159,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
     };
     std::vector<SeqResult> results;
     int vocab_size = -1;
+    TensorPtr all_logits_result;  // all_logits 模式下的完整 logits
 
     for (const auto& ubatch : micros) {
         int total_tokens = ubatch.n_tokens();
@@ -255,7 +274,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
             logits = ops::matmul_transB(hidden, output_weight);
         }
 
-        // ==== Step 4: Extract per-sequence last-token logits ====
+        // ==== Step 4: Extract logits ====
         if (!logits)
             continue;
 
@@ -263,6 +282,27 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         if (logits->device() == DeviceType::CUDA) {
             logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(), DeviceType::CPU);
             logits_cpu->copy_from(*logits);
+        }
+
+        // all_logits 模式：直接返回完整 [total_tokens, vocab] 张量
+        if (batch.all_logits) {
+            // 保存第一个 micro-batch 的完整 logits 用于返回
+            if (!all_logits_result) {
+                all_logits_result = logits_cpu;
+            } else {
+                // 拼接多个 micro-batch 的 logits
+                int prev_rows = static_cast<int>(all_logits_result->shape()[0]);
+                int cur_rows = static_cast<int>(logits_cpu->shape()[0]);
+                int vs = static_cast<int>(logits_cpu->shape()[1]);
+                auto merged = std::make_shared<Tensor>(DataType::FP32,
+                                                        std::vector<int64_t>{prev_rows + cur_rows, vs},
+                                                        DeviceType::CPU);
+                std::memcpy(merged->data(), all_logits_result->data(), prev_rows * vs * sizeof(float));
+                std::memcpy(static_cast<float*>(merged->data()) + prev_rows * vs,
+                            logits_cpu->data(), cur_rows * vs * sizeof(float));
+                all_logits_result = merged;
+            }
+            continue;
         }
 
         vocab_size = static_cast<int>(logits_cpu->shape().back());
@@ -294,8 +334,11 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         }
     }
 
-    if (results.empty() || vocab_size <= 0)
+    if (results.empty() || vocab_size <= 0) {
+        if (batch.all_logits && all_logits_result)
+            return all_logits_result;
         return nullptr;
+    }
 
     // Assemble [n_seq, vocab_size] result in original batch order
     int n_seq = batch.size();
@@ -336,6 +379,7 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         kv_max_seq = KV_MAX_SEQ_CAP;
     }
 
+    // Determine the primary KV device and check CUDA memory
     DeviceType kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
 
     // If CUDA, check available memory and reduce if needed
@@ -374,8 +418,25 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
                       cfg.head_dim * sizeof(float);
     LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024 * 1024)) + " MB");
+
+    // Allocate KV cache on the primary device
     kv_cache_.init_quantized(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq, kv_dev,
                              kv_cache_dtype_);
+
+    // Enable ring buffer for SWA layers — window_size = n_swa
+    // Generic arch: if n_swa > 0, enable ring buffer for all layers (uniform arch).
+    // Per-layer control is done by Gemma4Engine override.
+    if (cfg.n_swa > 0) {
+        kv_cache_.set_ring_buffer(cfg.n_swa);  // -1 = all layers
+    }
+
+    // Place each layer's KV cache on the corresponding device
+    // If layer_devices_ is populated (from set_gpu_layers), use it.
+    // Otherwise, all layers stay on kv_dev.
+    if (!layer_devices_.empty()) {
+        kv_cache_.set_layer_devices(layer_devices_);
+    }
+
     kv_cache_initialized_ = true;
     LOG_INFO("KV cache initialized successfully, actual size: " +
              std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");

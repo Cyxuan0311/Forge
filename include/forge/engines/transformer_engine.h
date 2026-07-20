@@ -63,6 +63,7 @@ protected:
                                    int seq_id = 0);
 
     DeviceType layer_device(int layer_idx) const;
+    const std::vector<DeviceType>& layer_devices() const { return layer_devices_; }
     TensorPtr transfer_hidden(const TensorPtr& hidden, DeviceType target) const;
 
     void apply_rope_standard(const float* q_data, const float* k_data, float* q_out, float* k_out,
@@ -80,6 +81,7 @@ protected:
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
     MemoryPool workspace_pool_;
     int gpu_layers_ = -1;
+    std::vector<DeviceType> layer_devices_;  // per-layer device assignment
     bool use_graph_ = false;
     std::unique_ptr<LayerGraphBuilder> graph_builder_;
     GraphCache graph_cache_;

@@ -105,6 +105,21 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
              ", head_dim_swa=" + std::to_string(cfg.head_dim_swa));
 
     kv_cache_.init_per_layer(cfg.num_layers, kv_dims, kv_max_seq, kv_dev);
+    // Enable ring buffer for SWA layers only — window_size = n_swa
+    // Only SWA layers (swa_layers[i] == 1) use ring buffer eviction;
+    // full-attention layers grow linearly without windowing.
+    if (cfg.n_swa > 0) {
+        kv_cache_.set_ring_buffer(cfg.n_swa);  // init window_size and per-layer arrays (all false)
+        for (int i = 0; i < cfg.num_layers; ++i) {
+            if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1) {
+                kv_cache_.set_ring_buffer(cfg.n_swa, i);  // enable ring buffer for this SWA layer
+            }
+        }
+    }
+    // Place each layer's KV cache on the corresponding device
+    if (!layer_devices_.empty()) {
+        kv_cache_.set_layer_devices(layer_devices_);
+    }
     kv_cache_initialized_ = true;
 
     LOG_INFO("KV cache initialized successfully, actual size: " +
@@ -479,14 +494,10 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
             attn_head_dim = reuse_is_swa ? cfg.head_dim_swa : cfg.head_dim;
         }
 
-        // ---- SWA sliding window: restrict KV cache to last n_swa positions ----
-        if (is_swa_layer && cfg.n_swa > 0 && total_len > cfg.n_swa) {
-            int swa_start = total_len - cfg.n_swa;
-            // Slice K and V to only include positions [swa_start, total_len)
-            if (k_sliced) k_sliced = std::make_shared<Tensor>(k_sliced->slice(0, swa_start, total_len));
-            if (v_sliced) v_sliced = std::make_shared<Tensor>(v_sliced->slice(0, swa_start, total_len));
-            total_len = cfg.n_swa;
-        }
+        // ---- SWA sliding window handled by ring buffer ----
+        // When ring buffer is active (set via kv_cache_.set_ring_buffer()),
+        // get_key_filled() and filled() automatically return only the last
+        // window_size positions. No manual slice needed.
 
         if (dev == DeviceType::CUDA && k_sliced && k_sliced->device() == DeviceType::CPU) {
             auto k_cuda = std::make_shared<Tensor>(DataType::FP32, k_sliced->shape(), DeviceType::CUDA);

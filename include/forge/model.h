@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "model_loader.h"
+#include "quant_policy.h"
 #include "tensor.h"
 #include "types.h"
 
@@ -513,6 +514,7 @@ public:
 
     void set_config(const ModelConfig& config);
     void set_device(DeviceType device);
+    void set_quant_policy(const QuantPolicy& policy);
 
     TensorPtr get_weight(const std::string& name) const;
 
@@ -526,6 +528,7 @@ private:
     ModelConfig config_;
     WeightStore weight_store_;
     DeviceType device_ = DeviceType::CPU;
+    QuantPolicy quant_policy_;
     std::string model_path_;
     std::string format_name_;
     bool is_loaded_ = false;
