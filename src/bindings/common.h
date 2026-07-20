@@ -27,6 +27,7 @@
 #include "forge/tensor.h"
 #include "forge/tokenizer.h"
 #include "forge/vision_encoder.h"
+#include "forge/vision_registry.h"
 
 namespace py = pybind11;
 using namespace forge;
@@ -52,6 +53,13 @@ inline void ensure_loaders_registered() {
         "ninf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<NinfModel>(); });
     reg.register_loader(
         "gguf", []() -> std::unique_ptr<ModelLoader> { return std::make_unique<GgufModel>(); });
+}
+
+// Force-link vision_registry.cpp (contains all vision auto-registrations).
+inline void ensure_vision_registered() {
+    (void)forge::_vision_registrations_linked;
+    (void)VisionEncoderRegistry::instance().registered_encoders();
+    (void)VisionConfigParserRegistry::instance().registered_parsers();
 }
 
 // Force static initializers in shared libraries by touching registry instances.
@@ -298,11 +306,16 @@ public:
         }
     }
 
-    void load_gguf(const std::string& path, const std::string& device_str) {
+    void load_gguf(const std::string& path, const std::string& device_str,
+                   const QuantPolicy& policy = QuantPolicy{}) {
         ensure_loaders_registered();
         ensure_engines_registered();
         DeviceType dev =
             (device_str == "cuda" || device_str == "cuda:0") ? DeviceType::CUDA : DeviceType::CPU;
+
+        if (policy.enabled()) {
+            model_.set_quant_policy(policy);
+        }
 
         if (!model_.load(path, dev)) {
             throw std::runtime_error("Failed to load GGUF model from: " + path);
@@ -460,7 +473,10 @@ public:
                          const std::vector<int32_t>& stop_token_ids = {});
 
     const ModelConfig& config() const { return model_.config(); }
-    const VisionConfig& vision_config() const { return vision_.config(); }
+    const VisionConfig& vision_config() const {
+        static const VisionConfig empty{};
+        return vision_ ? vision_->config() : empty;
+    }
 
     PyInferenceContext* create_context(const std::string& kv_cache_dtype_str = "fp32",
                                        int gpu_layers = -1) {
@@ -485,7 +501,7 @@ public:
 
 private:
     Model model_;
-    VisionEncoder vision_;
+    std::unique_ptr<VisionEncoder> vision_;
 };
 
 // ---- Module registration functions ----
