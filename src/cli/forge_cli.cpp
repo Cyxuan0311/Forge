@@ -36,6 +36,7 @@
 #include "forge/tokenizer.h"
 #include "forge/types.h"
 #include "forge/vision_encoder.h"
+#include "forge/vision_registry.h"
 
 // Engine headers
 #include "forge/engines/deepseek_engine.h"
@@ -452,34 +453,32 @@ int main(int argc, char** argv) {
     // ---- Load vision encoder (multimodal) ----
     std::unique_ptr<VisionEncoder> vision;
     if (!args.mmproj_path.empty()) {
-        vision = std::make_unique<VisionEncoder>();
+        // Force-link vision registry (auto-registrations for siglip, etc.)
+        (void)forge::_vision_registrations_linked;
+        (void)VisionEncoderRegistry::instance().registered_encoders();
+
         if (!model.load_vision_weights(args.mmproj_path, DeviceType::CPU)) {
             std::cerr << "Warning: Failed to load vision encoder: " << args.mmproj_path << "\n";
-            vision.reset();
         } else {
             VisionConfig vis_cfg;
+            std::string vis_arch = "siglip";
             auto loader = ModelLoaderRegistry::instance().create_loader(args.mmproj_path);
             if (loader && loader->load(args.mmproj_path)) {
-                vis_cfg.image_size =
-                    static_cast<int>(loader->get_metadata_int("clip.vision.image_size", 448));
-                vis_cfg.patch_size =
-                    static_cast<int>(loader->get_metadata_int("clip.vision.patch_size", 14));
-                vis_cfg.embedding_length =
-                    static_cast<int>(loader->get_metadata_int("v.embedding_length", 1152));
-                vis_cfg.feed_forward_length =
-                    static_cast<int>(loader->get_metadata_int("v.feed_forward_length", 4304));
-                vis_cfg.block_count =
-                    static_cast<int>(loader->get_metadata_int("v.block_count", 27));
-                vis_cfg.head_count =
-                    static_cast<int>(loader->get_metadata_int("v.attention.head_count", 16));
-                vis_cfg.projection_dim = cfg.hidden_dim;
+                vis_arch = detect_vision_arch(*loader);
+                vis_cfg = VisionConfigParserRegistry::instance().parse(*loader, vis_arch);
                 loader->close();
             }
-            if (!vision->init(model.weights(), vis_cfg)) {
+            vis_cfg.projection_dim = cfg.hidden_dim;
+
+            vision = VisionEncoderRegistry::instance().create(vis_arch);
+            if (!vision) {
+                std::cerr << "Warning: No vision encoder registered for arch '" << vis_arch << "'\n";
+            } else if (!vision->init(model.weights(), vis_cfg)) {
                 std::cerr << "Warning: Vision encoder initialization failed\n";
                 vision.reset();
             } else {
-                std::cout << "Vision encoder loaded: image_size=" << vis_cfg.image_size
+                std::cout << "Vision encoder loaded: arch=" << vis_arch
+                          << ", image_size=" << vis_cfg.image_size
                           << ", patches=" << vis_cfg.patch_size
                           << ", blocks=" << vis_cfg.block_count << "\n";
             }

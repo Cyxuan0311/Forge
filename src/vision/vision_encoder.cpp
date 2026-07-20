@@ -11,6 +11,8 @@
 #include "forge/model.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
+#include "forge/vit_shared.h"
+#include "forge/vision_registry.h"
 
 #ifdef _OPENMP
 #    include <omp.h>
@@ -63,56 +65,59 @@ static TensorPtr to_device(const TensorPtr& t, DeviceType dev) {
     return out;
 }
 
-bool VisionWeights::init(const WeightStore& store, const VisionConfig& config) {
-    patch_embd_weight = store.get("v.patch_embd.weight");
-    patch_embd_bias = store.get("v.patch_embd.bias");
-    position_embd_weight = store.get("v.position_embd.weight");
-    post_ln_weight = store.get("v.post_ln.weight");
-    post_ln_bias = store.get("v.post_ln.bias");
+bool VisionWeights::init(const WeightStore& store, const VisionConfig& config,
+                         const VisionWeightMapping& m) {
+    patch_embd_weight = store.get(m.patch_embd_weight);
+    patch_embd_bias = store.get(m.patch_embd_bias);
+    position_embd_weight = store.get(m.position_embd_weight);
+    post_ln_weight = store.get(m.post_ln_weight);
+    post_ln_bias = store.get(m.post_ln_bias);
 
-    merger_ln1_weight = store.get("v.vit_merger.ln1.weight");
-    merger_ln1_bias = store.get("v.vit_merger.ln1.bias");
-    merger_attn_q_weight = store.get("v.vit_merger.attn_q.weight");
-    merger_attn_q_bias = store.get("v.vit_merger.attn_q.bias");
-    merger_attn_k_weight = store.get("v.vit_merger.attn_k.weight");
-    merger_attn_k_bias = store.get("v.vit_merger.attn_k.bias");
-    merger_attn_v_weight = store.get("v.vit_merger.attn_v.weight");
-    merger_attn_v_bias = store.get("v.vit_merger.attn_v.bias");
-    merger_attn_out_weight = store.get("v.vit_merger.attn_out.weight");
-    merger_attn_out_bias = store.get("v.vit_merger.attn_out.bias");
-    merger_ds_ln_weight = store.get("v.vit_merger.ds_ln.weight");
-    merger_ds_ln_bias = store.get("v.vit_merger.ds_ln.bias");
-    merger_ds_ffn_up_weight = store.get("v.vit_merger.ds_ffn_up.weight");
-    merger_ds_ffn_up_bias = store.get("v.vit_merger.ds_ffn_up.bias");
-    merger_ds_ffn_down_weight = store.get("v.vit_merger.ds_ffn_down.weight");
-    merger_ds_ffn_down_bias = store.get("v.vit_merger.ds_ffn_down.bias");
+    const std::string& mp = m.merger_prefix;
+    merger_ln1_weight = store.get(mp + ".ln1.weight");
+    merger_ln1_bias = store.get(mp + ".ln1.bias");
+    merger_attn_q_weight = store.get(mp + ".attn_q.weight");
+    merger_attn_q_bias = store.get(mp + ".attn_q.bias");
+    merger_attn_k_weight = store.get(mp + ".attn_k.weight");
+    merger_attn_k_bias = store.get(mp + ".attn_k.bias");
+    merger_attn_v_weight = store.get(mp + ".attn_v.weight");
+    merger_attn_v_bias = store.get(mp + ".attn_v.bias");
+    merger_attn_out_weight = store.get(mp + ".attn_out.weight");
+    merger_attn_out_bias = store.get(mp + ".attn_out.bias");
+    merger_ds_ln_weight = store.get(mp + ".ds_ln.weight");
+    merger_ds_ln_bias = store.get(mp + ".ds_ln.bias");
+    merger_ds_ffn_up_weight = store.get(mp + ".ds_ffn_up.weight");
+    merger_ds_ffn_up_bias = store.get(mp + ".ds_ffn_up.bias");
+    merger_ds_ffn_down_weight = store.get(mp + ".ds_ffn_down.weight");
+    merger_ds_ffn_down_bias = store.get(mp + ".ds_ffn_down.bias");
 
-    mm_input_norm_weight = store.get("mm.input_norm.weight");
-    mm_input_norm_bias = store.get("mm.input_norm.bias");
-    mm_up_weight = store.get("mm.up.weight");
-    mm_up_bias = store.get("mm.up.bias");
-    mm_down_weight = store.get("mm.down.weight");
-    mm_down_bias = store.get("mm.down.bias");
+    const std::string& pp = m.projector_prefix;
+    mm_input_norm_weight = store.get(pp + ".input_norm.weight");
+    mm_input_norm_bias = store.get(pp + ".input_norm.bias");
+    mm_up_weight = store.get(pp + ".up.weight");
+    mm_up_bias = store.get(pp + ".up.bias");
+    mm_down_weight = store.get(pp + ".down.weight");
+    mm_down_bias = store.get(pp + ".down.bias");
 
     layers.resize(config.block_count);
     for (int i = 0; i < config.block_count; ++i) {
-        std::string blk = "v.blk." + std::to_string(i);
-        layers[i].ln1_weight = store.get(blk + ".ln1.weight");
-        layers[i].ln1_bias = store.get(blk + ".ln1.bias");
-        layers[i].ln2_weight = store.get(blk + ".ln2.weight");
-        layers[i].ln2_bias = store.get(blk + ".ln2.bias");
-        layers[i].attn_q_weight = store.get(blk + ".attn_q.weight");
-        layers[i].attn_q_bias = store.get(blk + ".attn_q.bias");
-        layers[i].attn_k_weight = store.get(blk + ".attn_k.weight");
-        layers[i].attn_k_bias = store.get(blk + ".attn_k.bias");
-        layers[i].attn_v_weight = store.get(blk + ".attn_v.weight");
-        layers[i].attn_v_bias = store.get(blk + ".attn_v.bias");
-        layers[i].attn_out_weight = store.get(blk + ".attn_out.weight");
-        layers[i].attn_out_bias = store.get(blk + ".attn_out.bias");
-        layers[i].ffn_up_weight = store.get(blk + ".ffn_up.weight");
-        layers[i].ffn_up_bias = store.get(blk + ".ffn_up.bias");
-        layers[i].ffn_down_weight = store.get(blk + ".ffn_down.weight");
-        layers[i].ffn_down_bias = store.get(blk + ".ffn_down.bias");
+        std::string blk = VisionWeightMapper::format_layer_prefix(m.block_prefix, i);
+        layers[i].ln1_weight = store.get(blk + m.blk_ln1_w);
+        layers[i].ln1_bias = store.get(blk + m.blk_ln1_b);
+        layers[i].ln2_weight = store.get(blk + m.blk_ln2_w);
+        layers[i].ln2_bias = store.get(blk + m.blk_ln2_b);
+        layers[i].attn_q_weight = store.get(blk + m.blk_q_w);
+        layers[i].attn_q_bias = store.get(blk + m.blk_q_b);
+        layers[i].attn_k_weight = store.get(blk + m.blk_k_w);
+        layers[i].attn_k_bias = store.get(blk + m.blk_k_b);
+        layers[i].attn_v_weight = store.get(blk + m.blk_v_w);
+        layers[i].attn_v_bias = store.get(blk + m.blk_v_b);
+        layers[i].attn_out_weight = store.get(blk + m.blk_o_w);
+        layers[i].attn_out_bias = store.get(blk + m.blk_o_b);
+        layers[i].ffn_up_weight = store.get(blk + m.blk_ffn_up_w);
+        layers[i].ffn_up_bias = store.get(blk + m.blk_ffn_up_b);
+        layers[i].ffn_down_weight = store.get(blk + m.blk_ffn_down_w);
+        layers[i].ffn_down_bias = store.get(blk + m.blk_ffn_down_b);
     }
 
     if (!patch_embd_weight) {
@@ -122,9 +127,10 @@ bool VisionWeights::init(const WeightStore& store, const VisionConfig& config) {
     return true;
 }
 
-bool VisionEncoder::init(const WeightStore& store, const VisionConfig& config) {
+bool SiglipViTEncoder::init(const WeightStore& store, const VisionConfig& config) {
     config_ = config;
-    if (!weights_.init(store, config)) {
+    const auto& mapping = VisionWeightMapper::get_mapping(name());
+    if (!weights_.init(store, config, mapping)) {
         LOG_ERROR("VisionEncoder: failed to initialize weights");
         return false;
     }
@@ -135,7 +141,7 @@ bool VisionEncoder::init(const WeightStore& store, const VisionConfig& config) {
     return true;
 }
 
-void VisionEncoder::prepare_weights(DeviceType dev) {
+void SiglipViTEncoder::prepare_weights(DeviceType dev) {
     if (weights_prepared_ && weights_device_ == dev)
         return;
 
@@ -204,8 +210,8 @@ void VisionEncoder::prepare_weights(DeviceType dev) {
     weights_prepared_ = true;
 }
 
-TensorPtr VisionEncoder::preprocess(const float* rgb_data, int width, int height,
-                                    int channels) const {
+TensorPtr SiglipViTEncoder::preprocess(const float* rgb_data, int width, int height,
+                                       int channels) const {
     int img_size = config_.image_size;
     auto pixels = std::make_shared<Tensor>(
         DataType::FP32, std::vector<int64_t>{3, img_size, img_size}, DeviceType::CPU);
@@ -240,93 +246,19 @@ TensorPtr VisionEncoder::preprocess(const float* rgb_data, int width, int height
     return pixels;
 }
 
-TensorPtr VisionEncoder::patch_embedding(const TensorPtr& pixel_values) {
-    int img_size = config_.image_size;
-    int ps = config_.patch_size;
-    int embed_dim = config_.embedding_length;
-    int num_patches_h = img_size / ps;
-    int num_patches_w = img_size / ps;
-    int num_patches = num_patches_h * num_patches_w;
-
-    auto output = std::make_shared<Tensor>(
-        DataType::FP32, std::vector<int64_t>{num_patches, embed_dim}, DeviceType::CPU);
-
-    const float* px = static_cast<const float*>(pixel_values->data());
-    float* out = static_cast<float*>(output->data());
-
-    auto weight = dequant_to_fp32_cpu(weights_.patch_embd_weight);
-    const float* w_data = static_cast<const float*>(weight->data());
-
-    std::vector<float> bias(embed_dim, 0.0f);
-    if (weights_.patch_embd_bias) {
-        auto b = dequant_to_fp32_cpu(weights_.patch_embd_bias);
-        std::memcpy(bias.data(), b->data(), embed_dim * sizeof(float));
-    }
-
-#pragma omp parallel for schedule(dynamic) if (num_patches > 4)
-    for (int patch_idx = 0; patch_idx < num_patches; ++patch_idx) {
-        int ph = patch_idx / num_patches_w;
-        int pw = patch_idx % num_patches_w;
-        float* patch_out = out + patch_idx * embed_dim;
-        std::memcpy(patch_out, bias.data(), embed_dim * sizeof(float));
-        for (int dy = 0; dy < ps; ++dy) {
-            for (int dx = 0; dx < ps; ++dx) {
-                int img_y = ph * ps + dy;
-                int img_x = pw * ps + dx;
-                for (int c = 0; c < 3; ++c) {
-                    float pixel_val = px[c * img_size * img_size + img_y * img_size + img_x];
-                    // GGUF stores conv weight as [KW, KH, IC, OC] in column-major.
-                    // After shape reversal, logical shape is [OC, IC, KH, KW] = [1152, 3, 14, 14].
-                    // Data layout in memory (column-major equivalent to row-major of reversed
-                    // shape): w_data[d_out * (IC*KH*KW) + c * (KH*KW) + dy * KW + dx]
-                    for (int d = 0; d < embed_dim; ++d) {
-                        patch_out[d] +=
-                            pixel_val * w_data[d * 3 * ps * ps + c * ps * ps + dy * ps + dx];
-                    }
-                }
-            }
-        }
-    }
-    return output;
+TensorPtr SiglipViTEncoder::patch_embedding(const TensorPtr& pixel_values) {
+    // Delegate to shared toolkit
+    return vit_patch_embed(pixel_values, config_, weights_.patch_embd_weight,
+                           weights_.patch_embd_bias);
 }
 
-TensorPtr VisionEncoder::forward_vit_block(const TensorPtr& hidden, const ViTLayerWeights& lw,
-                                           int num_heads, int head_dim) {
-    int num_patches = static_cast<int>(hidden->shape()[0]);
-
-    // LayerNorm 1
-    auto normed = ops::layer_norm(hidden, lw.ln1_weight, lw.ln1_bias, config_.layer_norm_epsilon);
-
-    // QKV projections
-    auto q = ops::matmul_transB(normed, lw.attn_q_weight, lw.attn_q_bias);
-    auto k = ops::matmul_transB(normed, lw.attn_k_weight, lw.attn_k_bias);
-    auto v = ops::matmul_transB(normed, lw.attn_v_weight, lw.attn_v_bias);
-
-    // Self-attention (non-causal for ViT)
-    auto attn_out =
-        ops::scaled_dot_product_attention_2d(q, k, v, num_patches, num_heads, head_dim, nullptr, false);
-
-    // Output projection
-    auto attn_proj = ops::matmul_transB(attn_out, lw.attn_out_weight, lw.attn_out_bias);
-
-    // Residual
-    auto res1 = ops::add(hidden, attn_proj);
-
-    // LayerNorm 2
-    auto normed2 = ops::layer_norm(res1, lw.ln2_weight, lw.ln2_bias, config_.layer_norm_epsilon);
-
-    // FFN up + GELU (tanh-based)
-    auto ffn_up = ops::matmul_transB(normed2, lw.ffn_up_weight, lw.ffn_up_bias);
-    ffn_up = ops::gelu_tanh(ffn_up);
-
-    // FFN down
-    auto ffn_down = ops::matmul_transB(ffn_up, lw.ffn_down_weight, lw.ffn_down_bias);
-
-    // Residual
-    return ops::add(res1, ffn_down);
+TensorPtr SiglipViTEncoder::forward_vit_block(const TensorPtr& hidden, const ViTLayerWeights& lw,
+                                              int num_heads, int head_dim) {
+    // Delegate to shared toolkit (ViT blocks use tanh-approx GELU)
+    return vit_forward_block(hidden, lw, config_, num_heads, head_dim, ViTActivation::GELU_Tanh);
 }
 
-TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
+TensorPtr SiglipViTEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
     int num_patches = static_cast<int>(hidden->shape()[0]);
     int dim = config_.embedding_length;
 
@@ -505,7 +437,7 @@ TensorPtr VisionEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev) {
     return concat_tokens;
 }
 
-TensorPtr VisionEncoder::project(const TensorPtr& hidden, DeviceType dev) {
+TensorPtr SiglipViTEncoder::project(const TensorPtr& hidden, DeviceType dev) {
     int num_tokens = static_cast<int>(hidden->shape()[0]);
     int dim = static_cast<int>(hidden->shape()[1]);
 
@@ -552,8 +484,8 @@ TensorPtr VisionEncoder::project(const TensorPtr& hidden, DeviceType dev) {
     return ops::matmul_transB(up, p_down_w_, p_down_b_);
 }
 
-std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int height,
-                                         int channels) {
+std::vector<float> SiglipViTEncoder::encode(const float* rgb_data, int width, int height,
+                                            int channels) {
     if (!initialized_) {
         LOG_ERROR("VisionEncoder: not initialized");
         return {};
@@ -576,31 +508,9 @@ std::vector<float> VisionEncoder::encode(const float* rgb_data, int width, int h
     }
 
     // Step 3: Add position embedding (CPU, dequant once per encode, negligible overhead)
-    {
+    if (weights_.position_embd_weight && config_.pos_embed_type == PosEmbedType::Learned2D) {
         PERF_SCOPE("vision.pos_embd");
-        int num_patches = static_cast<int>(hidden->shape()[0]);
-        int dim = config_.embedding_length;
-        float* h_data = static_cast<float*>(hidden->data());
-
-        if (weights_.position_embd_weight) {
-            auto pos = dequant_to_fp32_cpu(weights_.position_embd_weight);
-            const float* pd = static_cast<const float*>(pos->data());
-            int grid_size = config_.image_size / config_.patch_size;
-            int n_embd_buckets = 70;
-#pragma omp parallel for schedule(static) if (num_patches > 4)
-            for (int i = 0; i < num_patches; ++i) {
-                int patch_h = i / grid_size;
-                int patch_w = i % grid_size;
-                int bucket_h = static_cast<int>(
-                    std::floor(static_cast<double>(n_embd_buckets) * patch_h / grid_size));
-                int bucket_w = static_cast<int>(
-                    std::floor(static_cast<double>(n_embd_buckets) * patch_w / grid_size));
-                int bucket_idx = bucket_h * n_embd_buckets + bucket_w;
-                for (int d = 0; d < dim; ++d) {
-                    h_data[i * dim + d] += pd[bucket_idx * dim + d];
-                }
-            }
-        }
+        vit_add_pos_embed_2d(hidden, config_, weights_.position_embd_weight);
     }
 
     // Move to CUDA for ViT blocks if available

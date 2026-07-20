@@ -6,6 +6,7 @@ void PyMultimodalModel::load(const std::string& model_path, const std::string& m
                              const std::string& device_str) {
     ensure_loaders_registered();
     ensure_engines_registered();
+    ensure_vision_registered();
 
     DeviceType dev =
         (device_str == "cuda" || device_str == "cuda:0") ? DeviceType::CUDA : DeviceType::CPU;
@@ -20,50 +21,36 @@ void PyMultimodalModel::load(const std::string& model_path, const std::string& m
         }
     }
 
-    VisionConfig vis_cfg;
     const auto& cfg = model_.config();
 
-    // Read vision config from mmproj file first (it has the most complete metadata)
-    // Then fall back to LLM file for any missing values
+    // Parse vision config from mmproj via the config parser registry.
+    // The registry selects the right parser by detected architecture name,
+    // so adding a new vision arch requires no changes here.
+    std::string vis_arch = "siglip";
+    VisionConfig vis_cfg;
     if (!mmproj_path.empty()) {
         auto mmproj_loader = ModelLoaderRegistry::instance().create_loader(mmproj_path);
         if (mmproj_loader && mmproj_loader->load(mmproj_path)) {
-            vis_cfg.image_size =
-                static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.image_size", 448));
-            vis_cfg.patch_size =
-                static_cast<int>(mmproj_loader->get_metadata_int("clip.vision.patch_size", 14));
-            vis_cfg.embedding_length =
-                static_cast<int>(mmproj_loader->get_metadata_int("v.embedding_length", 1152));
-            vis_cfg.feed_forward_length =
-                static_cast<int>(mmproj_loader->get_metadata_int("v.feed_forward_length", 4304));
-            vis_cfg.block_count =
-                static_cast<int>(mmproj_loader->get_metadata_int("v.block_count", 27));
-            vis_cfg.head_count =
-                static_cast<int>(mmproj_loader->get_metadata_int("v.attention.head_count", 16));
-            vis_cfg.projection_dim = cfg.hidden_dim;
-            vis_cfg.scale_factor = static_cast<int>(
-                mmproj_loader->get_metadata_int("clip.vision.projector.scale_factor", 4));
-            // wa_layer_indexes stores the ViT merger insertion point (insert_layer_id)
-            auto wa_layers =
-                mmproj_loader->get_metadata_int_array("clip.vision.wa_layer_indexes", {});
-            if (!wa_layers.empty()) {
-                vis_cfg.insert_layer_id = static_cast<int>(wa_layers[0]);
-            } else {
-                vis_cfg.insert_layer_id = static_cast<int>(
-                    mmproj_loader->get_metadata_int("clip.vision.insert_layer_id", 6));
-            }
+            vis_arch = detect_vision_arch(*mmproj_loader);
+            vis_cfg = VisionConfigParserRegistry::instance().parse(*mmproj_loader, vis_arch);
             mmproj_loader->close();
         }
     }
 
-    // Supplement from LLM file
+    // projection_dim always comes from the LLM hidden dim
+    vis_cfg.projection_dim = cfg.hidden_dim;
+
+    // Supplement from LLM file: MiniCPM-V mmproj files may omit image_size /
+    // patch_size, which are instead stored under "minicpmv.*" in the LLM file.
+    // (Matches pre-refactor behavior exactly.)
     auto loader = ModelLoaderRegistry::instance().create_loader(model_path);
     if (loader && loader->load(model_path)) {
-        // Override image_size from LLM if mmproj didn't set it
+        // image_size: if mmproj didn't override the default (448), try LLM
         if (vis_cfg.image_size == 448) {
             vis_cfg.image_size = static_cast<int>(
                 loader->get_metadata_int("minicpmv.image_size", vis_cfg.image_size));
         }
+        // patch_size: LLM file is authoritative, mmproj/default is fallback
         vis_cfg.patch_size =
             static_cast<int>(loader->get_metadata_int("minicpmv.patch_size", vis_cfg.patch_size));
         // If insert_layer_id still not set, try LLM file
@@ -76,8 +63,16 @@ void PyMultimodalModel::load(const std::string& model_path, const std::string& m
         loader->close();
     }
 
-    if (!vision_.init(model_.weights(), vis_cfg)) {
+    // Create encoder via registry and initialize
+    vision_ = VisionEncoderRegistry::instance().create(vis_arch);
+    if (!vision_) {
+        LOG_WARN("No vision encoder registered for arch '" + vis_arch +
+                 "' - model may not have vision components");
+        return;
+    }
+    if (!vision_->init(model_.weights(), vis_cfg)) {
         LOG_WARN("VisionEncoder initialization failed - model may not have vision components");
+        vision_.reset();
     }
 }
 
@@ -118,10 +113,14 @@ py::array_t<float> PyMultimodalModel::encode_image(py::array_t<uint8_t, py::arra
         }
     }
 
-    auto embeddings = vision_.encode(rgb.data(), width, height, 3);
-    int num_tokens = embeddings.size() / vision_.config().projection_dim;
+    if (!vision_) {
+        throw std::runtime_error("Vision encoder not initialized");
+    }
 
-    return py::array_t<float>({num_tokens, vision_.config().projection_dim}, embeddings.data());
+    auto embeddings = vision_->encode(rgb.data(), width, height, 3);
+    int num_tokens = embeddings.size() / vision_->config().projection_dim;
+
+    return py::array_t<float>({num_tokens, vision_->config().projection_dim}, embeddings.data());
 }
 
 py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> prompt_ids,
