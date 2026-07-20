@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "kv_cache.h"
+#include "quant_policy.h"
+#include "speculative.h"
 #include "tensor.h"
 #include "types.h"
 
@@ -25,6 +27,8 @@ struct ContextParams {
     int n_ubatch = 256;         // max tokens per internal micro-batch
     int n_threads = 4;          // decode (single-token) thread count
     int n_threads_batch = 8;    // prefill/batch (multi-token) thread count
+    QuantPolicy quant_policy;   // per-tensor 混合精度策略
+    SpeculativeConfig speculative_config;  // speculative decoding 配置
 
     KVCacheDType type_k() const { return kv_cache_config.type_k; }
     KVCacheDType type_v() const { return kv_cache_config.type_v; }

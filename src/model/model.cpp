@@ -10,6 +10,7 @@
 #include "forge/logger.h"
 #include "forge/ninf_model.h"
 #include "forge/operator_matmul.h"
+#include "forge/quant_policy.h"
 #include "forge/types.h"
 
 namespace forge {
@@ -219,7 +220,15 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
     auto load_tensor = [&](const std::string& name) -> TensorPtr {
         if (!loader.has_tensor(name))
             return nullptr;
-        return loader.get_tensor(name, device);
+        auto t = loader.get_tensor(name, device);
+        // Per-tensor 混合精度: 按 tensor 名称模式匹配重新量化
+        if (t && quant_policy_.enabled() && is_quantized_type(t->dtype())) {
+            DataType preferred = select_quant_type(quant_policy_, name);
+            if (t->dtype() != preferred && is_quantized_type(preferred)) {
+                t = requant_tensor(t, preferred);
+            }
+        }
+        return t;
     };
 
     auto resolve_weight = [&](const WeightAlias& alias,
@@ -491,6 +500,10 @@ void Model::set_config(const ModelConfig& config) {
 
 void Model::set_device(DeviceType device) {
     device_ = device;
+}
+
+void Model::set_quant_policy(const QuantPolicy& policy) {
+    quant_policy_ = policy;
 }
 
 TensorPtr Model::get_weight(const std::string& name) const {
