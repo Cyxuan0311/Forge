@@ -62,6 +62,26 @@ void register_core_types(py::module_& m) {
         .value("Q4_0", KVCacheDType::Q4_0)
         .value("Q4_K", KVCacheDType::Q4_K);
 
+    // ---- QuantPolicy ----
+    py::class_<QuantPolicy>(m, "QuantPolicy")
+        .def(py::init<>())
+        .def_readwrite("default_type", &QuantPolicy::default_type)
+        .def_readwrite("attn_wv_type", &QuantPolicy::attn_wv_type)
+        .def_readwrite("ffn_down_type", &QuantPolicy::ffn_down_type)
+        .def_readwrite("output_type", &QuantPolicy::output_type)
+        .def("enabled", &QuantPolicy::enabled)
+        .def_static("q4_k_m", &QuantPolicy::q4_k_m);
+
+    // ---- SpeculativeConfig ----
+    py::class_<SpeculativeConfig>(m, "SpeculativeConfig")
+        .def(py::init<>())
+        .def_readwrite("n_draft", &SpeculativeConfig::n_draft)
+        .def_readwrite("p_min", &SpeculativeConfig::p_min)
+        .def_readwrite("use_ngram", &SpeculativeConfig::use_ngram)
+        .def_readwrite("ngram_n", &SpeculativeConfig::ngram_n)
+        .def_readwrite("ngram_min", &SpeculativeConfig::ngram_min)
+        .def_readwrite("enabled", &SpeculativeConfig::enabled);
+
     // ---- Tensor ----
     py::class_<Tensor, TensorPtr>(m, "Tensor")
         .def(py::init<DataType, std::vector<int64_t>, DeviceType>())

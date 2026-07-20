@@ -89,7 +89,8 @@ void register_model(py::module_& m) {
              py::arg("arch_type") = "llama", py::arg("norm_type") = "rmsnorm",
              py::arg("activation") = "silu_gelu", py::arg("tie_embeddings") = false,
              py::arg("device") = "cuda")
-        .def("load_gguf", &PyModel::load_gguf, py::arg("path"), py::arg("device") = "cuda")
+        .def("load_gguf", &PyModel::load_gguf, py::arg("path"), py::arg("device") = "cuda",
+             py::arg("quant_policy") = QuantPolicy{})
         .def("load_auto", &PyModel::load_auto, py::arg("path"), py::arg("device") = "cuda")
         .def(
             "load_vision_weights",
