@@ -29,8 +29,8 @@ void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
 using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
 using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const GemvFn gemv_dispatch[16];
-extern const GemvBatchFn gemv_batch_dispatch[16];
+extern const GemvFn gemv_dispatch[18];
+extern const GemvBatchFn gemv_batch_dispatch[18];
 
 }  // namespace cuda
 }  // namespace forge

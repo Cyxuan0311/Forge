@@ -33,7 +33,7 @@ INST_GEMV(DataType::Q6_K)
 // Indexed by DataType enum value. nullptr for unsupported types.
 // ============================================================================
 
-const GemvFn gemv_dispatch[16] = {
+const GemvFn gemv_dispatch[18] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_gemv_q4_0_transB,                          // special smem/splitK
@@ -50,9 +50,11 @@ const GemvFn gemv_dispatch[16] = {
     /* Q6_K=13 */ launch_gemv_typed_transB<DataType::Q6_K>,
     /* IQ2_S=14*/ nullptr,
     /* BF16=15 */ nullptr,
+    /* IQ2_XXS=16 */ nullptr,
+    /* IQ4_NL=17  */ nullptr,
 };
 
-const GemvBatchFn gemv_batch_dispatch[16] = {
+const GemvBatchFn gemv_batch_dispatch[18] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_gemv_typed_transB_batch<DataType::Q4_0>,
@@ -69,6 +71,8 @@ const GemvBatchFn gemv_batch_dispatch[16] = {
     /* Q6_K=13 */ launch_gemv_typed_transB_batch<DataType::Q6_K>,
     /* IQ2_S=14*/ nullptr,
     /* BF16=15 */ nullptr,
+    /* IQ2_XXS=16 */ nullptr,
+    /* IQ4_NL=17  */ nullptr,
 };
 
 }  // namespace cuda
