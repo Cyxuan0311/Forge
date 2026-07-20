@@ -68,7 +68,27 @@ public:
     bool init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
                         DeviceType device);
 
+    // Per-layer device init: call after init_quantized/init_per_layer to place
+    // each layer's KV cache on its target device (CPU or CUDA).
+    // layer_devices[i] = device for layer i. Empty = all layers stay on `device`.
+    void set_layer_devices(const std::vector<DeviceType>& layer_devices);
+
+    // Per-layer device query
+    DeviceType layer_device(int layer) const;
+
     void reset();
+
+    // Roll back KV cache filled position to `to_pos` (for speculative decoding rejection)
+    void rollback(int64_t to_pos);
+
+    // --- Ring buffer mode ---
+    // Enable ring buffer per-layer: KV entries wrap around at window_size,
+    // so SWA attention automatically sees only the latest window_size positions.
+    // Call after init/init_per_layer. Pass the layer index to enable ring buffer
+    // for specific (SWA) layers only, or -1 to enable for all layers.
+    void set_ring_buffer(int window_size, int layer = -1);
+    bool use_ring_buffer(int layer) const;
+    int window_size() const { return window_size_; }
 
     // --- Legacy update (single-seq, seq_id=0, pos=filled) ---
     int update(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
@@ -101,9 +121,16 @@ public:
     TensorPtr get_key(int layer) const;
     TensorPtr get_value(int layer) const;
 
+    // Returns the "active" key/value tensor for attention.
+    // In ring buffer mode, returns a contiguous view of the last min(filled, window_size)
+    // entries, reordered so that older entries come first.
+    // In normal mode, returns slice [0, filled).
     TensorPtr get_key_filled(int layer) const;
     TensorPtr get_value_filled(int layer) const;
 
+    // Effective KV length for attention:
+    // - Normal mode: layers_[layer].filled
+    // - Ring buffer mode: min(layers_[layer].filled, window_size_)
     int filled(int layer) const;
     int max_seq_len() const { return max_seq_len_; }
     int num_layers() const { return static_cast<int>(layers_.size()); }
@@ -150,10 +177,19 @@ private:
     int head_dim_ = 0;
     std::vector<int> kv_dim_per_layer_;  // per-layer kv_dim for mixed-attention archs
     int max_seq_len_ = 0;
-    DeviceType device_ = DeviceType::CPU;
+    DeviceType device_ = DeviceType::CPU;               // fallback / primary device
+    std::vector<DeviceType> layer_devices_;             // per-layer device (empty = all on device_)
     KVCacheDType kv_dtype_ = KVCacheDType::FP32;       // legacy: max(type_k, type_v)
     KVCacheTypeConfig kv_config_;                        // per-K/V type config
     int max_seqs_ = 32;  // max concurrent sequences (uint32_t bitmask supports up to 32)
+
+    // Ring buffer mode (SWA sliding window)
+    int window_size_ = 0;       // maximum KV entries visible to attention
+    // Per-layer: whether ring buffer is active for this layer
+    std::vector<bool> use_ring_buffer_;
+    // Per-layer ring cursors: next slot to write (wraps at window_size_).
+    // Only meaningful for SWA layers; non-SWA layers use normal linear filling.
+    std::vector<int> ring_cursor_;
 };
 
 }  // namespace forge

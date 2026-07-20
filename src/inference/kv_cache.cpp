@@ -483,6 +483,106 @@ void KVCache::reset() {
             cell.seq_id_mask = 0;
         }
     }
+    // Reset ring cursors
+    for (auto& c : ring_cursor_)
+        c = 0;
+}
+
+void KVCache::rollback(int64_t to_pos) {
+    for (auto& layer : layers_) {
+        if (layer.filled > to_pos) {
+            // 清除 to_pos 之后位置的 cell 元数据
+            for (int64_t p = to_pos; p < layer.filled; ++p) {
+                if (p >= 0 && p < static_cast<int64_t>(layer.cells.size())) {
+                    layer.cells[p].pos = -1;
+                    layer.cells[p].seq_id_mask = 0;
+                }
+            }
+            layer.filled = static_cast<int>(to_pos);
+        }
+    }
+    // Ring buffer: 不调整 cursor（speculative decoding 通常在非 ring buffer 模式下使用）
+}
+
+// =========================================================================
+// Ring buffer mode
+// =========================================================================
+
+void KVCache::set_ring_buffer(int window_size, int layer) {
+    if (window_size <= 0) {
+        window_size_ = 0;
+        use_ring_buffer_.assign(layers_.size(), false);
+        ring_cursor_.assign(layers_.size(), 0);
+        return;
+    }
+    window_size_ = window_size;
+    // Ensure per-layer arrays are sized
+    if (use_ring_buffer_.size() != layers_.size()) {
+        use_ring_buffer_.assign(layers_.size(), false);
+        ring_cursor_.assign(layers_.size(), 0);
+    }
+    if (layer < 0) {
+        // Enable for all layers
+        use_ring_buffer_.assign(layers_.size(), true);
+    } else if (layer < static_cast<int>(layers_.size())) {
+        use_ring_buffer_[layer] = true;
+    }
+    int num_ring = 0;
+    for (auto b : use_ring_buffer_) if (b) ++num_ring;
+    LOG_INFO("KVCache ring buffer: window_size=" + std::to_string(window_size) +
+             ", ring_layers=" + std::to_string(num_ring) + "/" + std::to_string(layers_.size()));
+}
+
+bool KVCache::use_ring_buffer(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(use_ring_buffer_.size()))
+        return false;
+    return use_ring_buffer_[layer];
+}
+
+// =========================================================================
+// Per-layer device management
+// =========================================================================
+
+void KVCache::set_layer_devices(const std::vector<DeviceType>& layer_devices) {
+    if (layer_devices.empty()) {
+        // All layers stay on the fallback device (device_)
+        layer_devices_.clear();
+        return;
+    }
+    layer_devices_ = layer_devices;
+    // Resize to match layers_ if needed
+    if (static_cast<int>(layer_devices_.size()) < static_cast<int>(layers_.size())) {
+        layer_devices_.resize(layers_.size(), device_);
+    }
+
+    // Move each layer's KV tensors to its target device
+    for (int i = 0; i < static_cast<int>(layers_.size()); ++i) {
+        DeviceType target = layer_devices_[i];
+        auto& kv = layers_[i];
+        if (kv.key_cache && kv.key_cache->device() != target) {
+            auto new_key = std::make_shared<Tensor>(kv.key_cache->dtype(), kv.key_cache->shape(),
+                                                    target);
+            new_key->copy_from(*kv.key_cache);
+            kv.key_cache = new_key;
+        }
+        if (kv.value_cache && kv.value_cache->device() != target) {
+            auto new_val = std::make_shared<Tensor>(kv.value_cache->dtype(), kv.value_cache->shape(),
+                                                    target);
+            new_val->copy_from(*kv.value_cache);
+            kv.value_cache = new_val;
+        }
+    }
+
+    int num_cuda = 0;
+    for (auto d : layer_devices_) if (d == DeviceType::CUDA) ++num_cuda;
+    LOG_INFO("KVCache per-layer device: " + std::to_string(num_cuda) + "/" +
+             std::to_string(layers_.size()) + " layers on CUDA");
+}
+
+DeviceType KVCache::layer_device(int layer) const {
+    if (layer_devices_.empty() || layer < 0 || layer >= static_cast<int>(layer_devices_.size()))
+        return device_;
+    return layer_devices_[layer];
 }
 
 // =========================================================================
@@ -513,17 +613,30 @@ int KVCache::update(int layer, int seq_id, int64_t pos,
                   ", max=" + std::to_string(max_seqs_));
         return -1;
     }
-    if (pos + seq_len > max_seq_len_) {
-        LOG_ERROR("KVCache::update: cache overflow, pos=" + std::to_string(pos) +
+
+    // In ring buffer mode, compute the write position from the ring cursor.
+    // Prefill (seq_len > 1): write at ring_cursor_[layer] = 0 initially,
+    //   filling [0, seq_len). After prefill, cursor = seq_len.
+    // Decode (seq_len == 1): write at cursor, cursor = (cursor + 1) % window_size.
+    //   Once cursor wraps, we overwrite old entries (ring eviction).
+    // Only applies to layers with ring buffer enabled.
+    bool layer_uses_ring = use_ring_buffer(layer);
+    int64_t write_pos = pos;
+    if (layer_uses_ring) {
+        write_pos = static_cast<int64_t>(ring_cursor_[layer]);
+    }
+
+    if (write_pos + seq_len > max_seq_len_) {
+        LOG_ERROR("KVCache::update: cache overflow, write_pos=" + std::to_string(write_pos) +
                   " seq_len=" + std::to_string(seq_len) + " max=" + std::to_string(max_seq_len_));
         return -1;
     }
 
     int result;
     if (kv_config_.type_k == KVCacheDType::FP32 && kv_config_.type_v == KVCacheDType::FP32) {
-        result = update_fp32(layer, pos, new_key, new_value, seq_len);
+        result = update_fp32(layer, write_pos, new_key, new_value, seq_len);
     } else {
-        result = update_quantized(layer, pos, new_key, new_value, seq_len);
+        result = update_quantized(layer, write_pos, new_key, new_value, seq_len);
     }
     if (result < 0)
         return result;
@@ -531,16 +644,27 @@ int KVCache::update(int layer, int seq_id, int64_t pos,
     // Update cell metadata
     auto& kv = layers_[layer];
     for (int s = 0; s < seq_len; ++s) {
-        int slot = static_cast<int>(pos + s);
-        kv.cells[slot].pos = pos + s;
+        int slot = static_cast<int>(write_pos + s);
+        kv.cells[slot].pos = pos + s;  // actual sequence position (for RoPE)
         kv.cells[slot].add_seq(seq_id);
     }
 
-    int new_end = static_cast<int>(pos + seq_len);
+    // Advance filled counter (tracks total tokens ever written)
+    int new_end = static_cast<int>(write_pos + seq_len);
     if (new_end > kv.filled) {
         kv.filled = new_end;
     }
 
+    // Advance ring cursor (only for ring-buffer layers)
+    if (layer_uses_ring) {
+        ring_cursor_[layer] = (ring_cursor_[layer] + seq_len) % window_size_;
+    }
+
+    // Return effective KV length for attention:
+    // ring buffer: min(total_written, window_size); normal: filled
+    if (layer_uses_ring) {
+        return std::min(kv.filled, window_size_);
+    }
     return kv.filled;
 }
 
@@ -554,7 +678,7 @@ int KVCache::update_fp32(int layer, int64_t start_pos,
     int kv_dim = this->kv_dim(layer);
     int filled = static_cast<int>(start_pos);
 
-    if (device_ == DeviceType::CUDA) {
+    if (this->layer_device(layer) == DeviceType::CUDA) {
 #ifdef USE_CUDA
         float* k_dst = static_cast<float*>(kv.key_cache->data()) + filled * kv_dim;
         float* v_dst = static_cast<float*>(kv.value_cache->data()) + filled * kv_dim;
@@ -624,8 +748,9 @@ static void dequantize_cpu(KVCacheDType dtype, const uint8_t* q_data, float* out
 
 int KVCache::update_quantized(int layer, int64_t start_pos,
                               const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
-    // Use CUDA path if device is CUDA
-    if (device_ == DeviceType::CUDA) {
+    // Use CUDA path if this layer's device is CUDA
+    DeviceType layer_dev = this->layer_device(layer);
+    if (layer_dev == DeviceType::CUDA) {
         int result = update_quantized_cuda(layer, start_pos, new_key, new_value, seq_len);
         if (result >= 0)
             return result;
@@ -685,8 +810,8 @@ void KVCache::dequantize_layer(int layer) {
     if (!need_k && !need_v)
         return;
 
-    // Use CUDA path if device is CUDA and CUDA quantized cache exists
-    if (device_ == DeviceType::CUDA && layers_[layer].d_q_key_cache) {
+    // Use CUDA path if this layer's device is CUDA and CUDA quantized cache exists
+    if (this->layer_device(layer) == DeviceType::CUDA && layers_[layer].d_q_key_cache) {
         dequantize_layer_cuda(layer);
         return;
     }
@@ -753,9 +878,31 @@ TensorPtr KVCache::get_key_filled(int layer) const {
     if (!kv.key_cache)
         return nullptr;
     int f = kv.filled;
-    if (f == max_seq_len_)
+
+    if (use_ring_buffer(layer) && f > window_size_) {
+        // Ring buffer has wrapped: need to reorder the two segments
+        // [cursor, window_size) + [0, cursor) → contiguous [0, window_size)
+        int cursor = ring_cursor_[layer];
+        int kvd = this->kv_dim(layer);
+        auto out = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{window_size_, kvd}, device_);
+        float* dst = static_cast<float*>(out->data());
+        const float* src = static_cast<const float*>(kv.key_cache->data());
+        // Segment 1: [cursor, window_size) — older entries
+        int seg1_len = window_size_ - cursor;
+        if (seg1_len > 0)
+            std::memcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float));
+        // Segment 2: [0, cursor) — newer entries
+        if (cursor > 0)
+            std::memcpy(dst + seg1_len * kvd, src, cursor * kvd * sizeof(float));
+        return out;
+    }
+
+    // Normal mode or ring buffer not yet wrapped
+    int eff = use_ring_buffer(layer) ? std::min(f, window_size_) : f;
+    if (eff == max_seq_len_)
         return kv.key_cache;
-    return std::make_shared<Tensor>(kv.key_cache->slice(0, 0, f));
+    return std::make_shared<Tensor>(kv.key_cache->slice(0, 0, eff));
 }
 
 TensorPtr KVCache::get_value_filled(int layer) const {
@@ -765,15 +912,35 @@ TensorPtr KVCache::get_value_filled(int layer) const {
     if (!kv.value_cache)
         return nullptr;
     int f = kv.filled;
-    if (f == max_seq_len_)
+
+    if (use_ring_buffer(layer) && f > window_size_) {
+        int cursor = ring_cursor_[layer];
+        int kvd = this->kv_dim(layer);
+        auto out = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{window_size_, kvd}, device_);
+        float* dst = static_cast<float*>(out->data());
+        const float* src = static_cast<const float*>(kv.value_cache->data());
+        int seg1_len = window_size_ - cursor;
+        if (seg1_len > 0)
+            std::memcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float));
+        if (cursor > 0)
+            std::memcpy(dst + seg1_len * kvd, src, cursor * kvd * sizeof(float));
+        return out;
+    }
+
+    int eff = use_ring_buffer(layer) ? std::min(f, window_size_) : f;
+    if (eff == max_seq_len_)
         return kv.value_cache;
-    return std::make_shared<Tensor>(kv.value_cache->slice(0, 0, f));
+    return std::make_shared<Tensor>(kv.value_cache->slice(0, 0, eff));
 }
 
 int KVCache::filled(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return 0;
-    return layers_[layer].filled;
+    int raw = layers_[layer].filled;
+    if (use_ring_buffer(layer))
+        return std::min(raw, window_size_);
+    return raw;
 }
 
 size_t KVCache::nbytes() const {
