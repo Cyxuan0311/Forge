@@ -161,5 +161,53 @@ void launch_ffn_down_fused_q4_0(const float* ffn_mid, const void* q_w2, const fl
 void launch_output_proj_q4_0(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
 
+// ---- KV Cache quantization kernels: F16, Q8_0, Q4_K ----
+
+void launch_quantize_f16_matrix(const float* data, void* q_data, int num_rows, int row_len,
+                                cudaStream_t stream = 0);
+void launch_dequant_f16_matrix(const void* q_data, float* out, int num_rows, int row_len,
+                               cudaStream_t stream = 0);
+
+void launch_quantize_q8_0_matrix(const float* data, void* q_data, int num_rows, int row_len,
+                                 cudaStream_t stream = 0);
+void launch_dequant_q8_0_matrix(const void* q_data, float* out, int num_rows, int row_len,
+                                cudaStream_t stream = 0);
+
+void launch_quantize_q4_k_matrix(const float* data, void* q_data, int num_rows, int row_len,
+                                 cudaStream_t stream = 0);
+// launch_dequant_q4_k_matrix already declared above
+
+// ---- Fused Flash Attention (decode) ----
+// Read quantized KV cache directly without dequantizing the entire layer to FP32.
+// Q is FP32; K and V remain in their quantized block format and are dequantized on-the-fly.
+//
+// q_row_size: bytes per KV row (for the entire kv_dim = num_kv_heads * head_dim)
+
+void launch_fused_flash_attention_gqa_decode_q4_0(
+    const float* Q, const void* q_K, const void* q_V, float* O,
+    int kv_len, int num_heads, int num_kv_heads, int head_dim,
+    size_t q_row_size, const float* mask_row = nullptr,
+    cudaStream_t stream = 0);
+
+void launch_fused_flash_attention_gqa_decode_f16(
+    const float* Q, const void* q_K, const void* q_V, float* O,
+    int kv_len, int num_heads, int num_kv_heads, int head_dim,
+    size_t q_row_size, const float* mask_row = nullptr,
+    cudaStream_t stream = 0);
+
+void launch_fused_flash_attention_gqa_decode_q8_0(
+    const float* Q, const void* q_K, const void* q_V, float* O,
+    int kv_len, int num_heads, int num_kv_heads, int head_dim,
+    size_t q_row_size, const float* mask_row = nullptr,
+    cudaStream_t stream = 0);
+
+// ---- I-Quant Dequantization (IQ2_XXS, IQ4_NL) ----
+
+void launch_dequant_iq2_xxs_matrix(const void* q_data, float* out, int N, int K,
+                                    cudaStream_t stream = 0);
+
+void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
+                                   cudaStream_t stream = 0);
+
 }  // namespace cuda
 }  // namespace forge

@@ -666,12 +666,56 @@ TensorPtr GenericEngine::attention_forward(const TensorPtr& q, const TensorPtr& 
                                             DeviceType::CUDA);
         if (seq_len == 1) {
 #ifdef USE_CUDA
-            cuda::launch_flash_attention_gqa_decode(
-                static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
-                static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
-                total_len, num_heads, num_kv_heads, head_dim,
-                mask_row,  // decode mask row
-                0);
+            // Fused path: read quantized KV cache directly (no dequantize_layer needed)
+            const auto& kv_cfg = kv_cache_.kv_config();
+            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
+            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
+
+            if (d_q_K && d_q_V && kv_cfg.type_k == kv_cfg.type_v) {
+                if (kv_cfg.type_k == KVCacheDType::Q4_0) {
+                    size_t q_row_size =
+                        KVCache::block_nbytes(KVCacheDType::Q4_0, num_kv_heads * head_dim);
+                    cuda::launch_fused_flash_attention_gqa_decode_q4_0(
+                        static_cast<const float*>(q->data()), d_q_K, d_q_V,
+                        static_cast<float*>(attn_out->data()),
+                        total_len, num_heads, num_kv_heads, head_dim,
+                        q_row_size, mask_row, 0);
+                } else if (kv_cfg.type_k == KVCacheDType::F16) {
+                    size_t q_row_size =
+                        KVCache::block_nbytes(KVCacheDType::F16, num_kv_heads * head_dim);
+                    cuda::launch_fused_flash_attention_gqa_decode_f16(
+                        static_cast<const float*>(q->data()), d_q_K, d_q_V,
+                        static_cast<float*>(attn_out->data()),
+                        total_len, num_heads, num_kv_heads, head_dim,
+                        q_row_size, mask_row, 0);
+                } else if (kv_cfg.type_k == KVCacheDType::Q8_0) {
+                    size_t q_row_size =
+                        KVCache::block_nbytes(KVCacheDType::Q8_0, num_kv_heads * head_dim);
+                    cuda::launch_fused_flash_attention_gqa_decode_q8_0(
+                        static_cast<const float*>(q->data()), d_q_K, d_q_V,
+                        static_cast<float*>(attn_out->data()),
+                        total_len, num_heads, num_kv_heads, head_dim,
+                        q_row_size, mask_row, 0);
+                } else {
+                    // Unsupported symmetric type — fallback
+                    cuda::launch_flash_attention_gqa_decode(
+                        static_cast<const float*>(q->data()),
+                        static_cast<const float*>(k_sliced->data()),
+                        static_cast<const float*>(v_sliced->data()),
+                        static_cast<float*>(attn_out->data()),
+                        total_len, num_heads, num_kv_heads, head_dim,
+                        mask_row, 0);
+                }
+            } else {
+                // Fallback: FP32 attention kernel with dequantized KV
+                cuda::launch_flash_attention_gqa_decode(
+                    static_cast<const float*>(q->data()),
+                    static_cast<const float*>(k_sliced->data()),
+                    static_cast<const float*>(v_sliced->data()),
+                    static_cast<float*>(attn_out->data()),
+                    total_len, num_heads, num_kv_heads, head_dim,
+                    mask_row, 0);
+            }
 #endif
         } else {
 #ifdef USE_CUDA
@@ -928,7 +972,18 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden, int layer_idx, i
         PERF_SCOPE("layer/kv_cache_update");
         kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v, seq_len);
 
-        if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
+        // Fused decode path: skip dequantize_layer() when the fused attention
+        // kernel will read the quantized KV cache directly (Q4_0/F16/Q8_0 on CUDA, seq_len==1).
+        const auto& kv_cfg = kv_cache_.kv_config();
+        bool use_fused_decode =
+            (dev == DeviceType::CUDA && seq_len == 1 &&
+             kv_cache_.d_q_key_cache(layer_idx) != nullptr &&
+             ((kv_cfg.type_k == KVCacheDType::Q4_0 && kv_cfg.type_v == KVCacheDType::Q4_0) ||
+              (kv_cfg.type_k == KVCacheDType::F16 && kv_cfg.type_v == KVCacheDType::F16) ||
+              (kv_cfg.type_k == KVCacheDType::Q8_0 && kv_cfg.type_v == KVCacheDType::Q8_0)));
+
+        // For non-fused paths with quantized KV, dequantize the layer into FP32 shadow cache.
+        if (!use_fused_decode && kv_cache_.kv_dtype() != KVCacheDType::FP32) {
             kv_cache_.dequantize_layer(layer_idx);
         }
     }
