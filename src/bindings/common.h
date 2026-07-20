@@ -94,6 +94,17 @@ inline py::array_t<float> tensor_to_numpy(const TensorPtr& tensor) {
                               py::cast(cpu_tensor));
 }
 
+// ---- Utility ----
+
+// Parse KV cache dtype string. Supports: fp32, f16, q8_0, q4_0, q4_k
+inline KVCacheDType parse_kv_dtype(const std::string& s) {
+    if (s == "f16")  return KVCacheDType::F16;
+    if (s == "q8_0") return KVCacheDType::Q8_0;
+    if (s == "q4_0") return KVCacheDType::Q4_0;
+    if (s == "q4_k") return KVCacheDType::Q4_K;
+    return KVCacheDType::FP32;  // default
+}
+
 // ---- Wrapper classes ----
 
 class PyInferenceContext {
@@ -217,7 +228,20 @@ public:
 
         const KVCache* cache = tfm_eng->kv_cache();
         stats["kv_cache_nbytes"] = static_cast<int64_t>(cache->nbytes());
-        stats["kv_cache_dtype"] = (cache->kv_dtype() == KVCacheDType::Q4_0) ? "q4_0" : "fp32";
+        // Report per-K/V types
+        auto dtype_str = [](KVCacheDType dt) -> const char* {
+            switch (dt) {
+            case KVCacheDType::FP32: return "fp32";
+            case KVCacheDType::F16:  return "f16";
+            case KVCacheDType::Q8_0: return "q8_0";
+            case KVCacheDType::Q4_0: return "q4_0";
+            case KVCacheDType::Q4_K: return "q4_k";
+            default: return "unknown";
+            }
+        };
+        stats["kv_cache_dtype"] = dtype_str(cache->kv_dtype());
+        stats["kv_cache_type_k"] = dtype_str(cache->type_k());
+        stats["kv_cache_type_v"] = dtype_str(cache->type_v());
         return stats;
     }
 
@@ -309,10 +333,7 @@ public:
 
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
         if (tfm_eng) {
-            KVCacheDType kv_dtype = KVCacheDType::FP32;
-            if (kv_cache_dtype_str == "q4_0")
-                kv_dtype = KVCacheDType::Q4_0;
-            tfm_eng->set_kv_cache_dtype(kv_dtype);
+            tfm_eng->set_kv_cache_dtype(parse_kv_dtype(kv_cache_dtype_str));
             tfm_eng->set_gpu_layers(gpu_layers);
         }
 
@@ -454,10 +475,7 @@ public:
 
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
         if (tfm_eng) {
-            KVCacheDType kv_dtype = KVCacheDType::FP32;
-            if (kv_cache_dtype_str == "q4_0")
-                kv_dtype = KVCacheDType::Q4_0;
-            tfm_eng->set_kv_cache_dtype(kv_dtype);
+            tfm_eng->set_kv_cache_dtype(parse_kv_dtype(kv_cache_dtype_str));
             tfm_eng->set_gpu_layers(gpu_layers);
         }
 

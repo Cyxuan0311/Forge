@@ -138,10 +138,7 @@ py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> pr
 
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
     if (tfm_eng) {
-        KVCacheDType kv_dtype = KVCacheDType::FP32;
-        if (kv_cache_dtype_str == "q4_0")
-            kv_dtype = KVCacheDType::Q4_0;
-        tfm_eng->set_kv_cache_dtype(kv_dtype);
+        tfm_eng->set_kv_cache_dtype(parse_kv_dtype(kv_cache_dtype_str));
         tfm_eng->set_gpu_layers(gpu_layers);
     }
     ctx->set_engine(std::move(engine));
@@ -188,10 +185,7 @@ void PyMultimodalModel::generate_stream(py::array_t<int32_t, py::array::c_style>
 
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
     if (tfm_eng) {
-        KVCacheDType kv_dtype = KVCacheDType::FP32;
-        if (kv_cache_dtype_str == "q4_0")
-            kv_dtype = KVCacheDType::Q4_0;
-        tfm_eng->set_kv_cache_dtype(kv_dtype);
+        tfm_eng->set_kv_cache_dtype(parse_kv_dtype(kv_cache_dtype_str));
         tfm_eng->set_gpu_layers(gpu_layers);
     }
     ctx->set_engine(std::move(engine));

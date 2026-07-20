@@ -17,13 +17,17 @@ class InferenceEngine;
 struct ContextParams {
     int max_seq_len = 4096;
     int gpu_layers = -1;
-    KVCacheDType kv_cache_dtype = KVCacheDType::FP32;
+    KVCacheDType kv_cache_dtype = KVCacheDType::FP32;  // legacy: sets both K and V
+    KVCacheTypeConfig kv_cache_config;                  // per-K/V type config
     DeviceType device = DeviceType::CUDA;
     int batch_size = 1;
     int n_batch = 512;          // max tokens per forward_batch() call
     int n_ubatch = 256;         // max tokens per internal micro-batch
     int n_threads = 4;          // decode (single-token) thread count
     int n_threads_batch = 8;    // prefill/batch (multi-token) thread count
+
+    KVCacheDType type_k() const { return kv_cache_config.type_k; }
+    KVCacheDType type_v() const { return kv_cache_config.type_v; }
 };
 
 class InferenceContext {

@@ -10,7 +10,16 @@ namespace forge {
 
 enum class KVCacheDType : int {
     FP32 = 0,
-    Q4_0 = 1,
+    F16  = 1,
+    Q8_0 = 2,
+    Q4_0 = 3,  // renumbered, was 1
+    Q4_K = 4,
+};
+
+// K/V can have different quantization types (asymmetric KV cache).
+struct KVCacheTypeConfig {
+    KVCacheDType type_k = KVCacheDType::FP32;
+    KVCacheDType type_v = KVCacheDType::FP32;
 };
 
 // Per-cell metadata for sequence-aware KV cache.
@@ -50,6 +59,10 @@ public:
 
     bool init_quantized(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
                         DeviceType device, KVCacheDType kv_dtype);
+
+    // Per-K/V-type init (asymmetric KV cache)
+    bool init_quantized(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
+                        DeviceType device, const KVCacheTypeConfig& kv_config);
 
     // Per-layer KV cache init (for mixed-attention architectures like Gemma 4)
     bool init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
@@ -95,8 +108,18 @@ public:
     int max_seq_len() const { return max_seq_len_; }
     int num_layers() const { return static_cast<int>(layers_.size()); }
     const std::vector<KVCacheLayer>& layers() const { return layers_; }
+    // Access quantized CUDA cache pointers for fused attention kernels
+    void* d_q_key_cache(int layer) const {
+        return (layer >= 0 && layer < (int)layers_.size()) ? layers_[layer].d_q_key_cache : nullptr;
+    }
+    void* d_q_value_cache(int layer) const {
+        return (layer >= 0 && layer < (int)layers_.size()) ? layers_[layer].d_q_value_cache : nullptr;
+    }
     DeviceType device() const { return device_; }
     KVCacheDType kv_dtype() const { return kv_dtype_; }
+    KVCacheDType type_k() const { return kv_config_.type_k; }
+    KVCacheDType type_v() const { return kv_config_.type_v; }
+    const KVCacheTypeConfig& kv_config() const { return kv_config_; }
     int max_seqs() const { return max_seqs_; }
     int kv_dim(int layer) const {
         if (!kv_dim_per_layer_.empty() && layer >= 0 && layer < (int)kv_dim_per_layer_.size())
@@ -107,6 +130,7 @@ public:
     size_t nbytes() const;
 
     static size_t q4_0_block_nbytes(int n);
+    static size_t block_nbytes(KVCacheDType dtype, int n);
 
     void dequantize_layer(int layer);
 
@@ -127,7 +151,8 @@ private:
     std::vector<int> kv_dim_per_layer_;  // per-layer kv_dim for mixed-attention archs
     int max_seq_len_ = 0;
     DeviceType device_ = DeviceType::CPU;
-    KVCacheDType kv_dtype_ = KVCacheDType::FP32;
+    KVCacheDType kv_dtype_ = KVCacheDType::FP32;       // legacy: max(type_k, type_v)
+    KVCacheTypeConfig kv_config_;                        // per-K/V type config
     int max_seqs_ = 32;  // max concurrent sequences (uint32_t bitmask supports up to 32)
 };
 

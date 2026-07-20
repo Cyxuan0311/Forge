@@ -57,7 +57,10 @@ void register_core_types(py::module_& m) {
 
     py::enum_<KVCacheDType>(m, "KVCacheDType")
         .value("FP32", KVCacheDType::FP32)
-        .value("Q4_0", KVCacheDType::Q4_0);
+        .value("F16", KVCacheDType::F16)
+        .value("Q8_0", KVCacheDType::Q8_0)
+        .value("Q4_0", KVCacheDType::Q4_0)
+        .value("Q4_K", KVCacheDType::Q4_K);
 
     // ---- Tensor ----
     py::class_<Tensor, TensorPtr>(m, "Tensor")
