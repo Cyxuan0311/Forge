@@ -20,6 +20,7 @@ struct InferenceBatchItem {
 // but groups by sequence for clarity.
 struct InferenceBatch {
     std::vector<InferenceBatchItem> items;
+    bool all_logits = false;  // true = 返回所有位置的 logits [total_tokens, vocab]
 
     // Total number of tokens across all sequences
     int n_tokens() const {

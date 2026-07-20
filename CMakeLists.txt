@@ -179,6 +179,7 @@ add_library(
   src/model/model_weights.cpp
   src/model/weight_store.cpp
   src/model/weight_mapper.cpp
+  src/model/quant_policy.cpp
   src/inference/engine_factory.cpp)
 target_include_directories(
   forge_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -195,7 +196,10 @@ target_include_directories(forge_tokenizer
 target_link_libraries(forge_tokenizer PUBLIC forge_core)
 
 # ---- Vision library (static) ----
-add_library(forge_vision STATIC src/vision/vision_encoder.cpp)
+add_library(
+  forge_vision STATIC
+  src/vision/vision_encoder.cpp src/vision/vision_registry.cpp
+  src/vision/vit_shared.cpp src/vision/qwen3vl_encoder.cpp)
 target_include_directories(
   forge_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                       ${CUDAToolkit_INCLUDE_DIRS})
@@ -223,7 +227,8 @@ add_library(
   src/inference/generator.cpp
   src/inference/paged_kv_cache.cpp
   src/inference/attention_mask.cpp
-  src/inference/request_scheduler.cpp)
+  src/inference/request_scheduler.cpp
+  src/inference/speculative.cpp)
 target_include_directories(
   forge_infer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CUDAToolkit_INCLUDE_DIRS})

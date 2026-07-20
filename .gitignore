@@ -14,6 +14,7 @@ flower.png
 lion.png
 TOM_and_JERRY.mp4
 .mimocode/
+.trae/
 
 # Compiled objects
 *.o
