@@ -47,5 +47,40 @@ void launch_rms_norm_fp16(const void* x, const void* weight, void* out, int rows
                     static_cast<float*>(out), rows, cols, eps, stream);
 }
 
+// Unweighted RMSNorm: out = x * rsqrt(mean(x^2) + eps) — no learned weight
+__global__ void rms_norm_unweighted_kernel(const float* x, float* out, int rows, int cols,
+                                           float eps) {
+    int row = blockIdx.x;
+    if (row >= rows)
+        return;
+
+    const float* x_row = x + row * cols;
+    float* out_row = out + row * cols;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        sum_sq += x_row[i] * x_row[i];
+    }
+
+    __shared__ float s_sum;
+    s_sum = 0.0f;
+    __syncthreads();
+
+    atomicAdd(&s_sum, sum_sq);
+    __syncthreads();
+
+    float rms = rsqrtf(s_sum / cols + eps);
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        out_row[i] = x_row[i] * rms;
+    }
+}
+
+void launch_rms_norm_unweighted(const float* x, float* out, int rows, int cols, float eps,
+                                cudaStream_t stream) {
+    int threads = std::min(cols, 1024);
+    rms_norm_unweighted_kernel<<<rows, threads, 0, stream>>>(x, out, rows, cols, eps);
+}
+
 }  // namespace cuda
 }  // namespace forge
