@@ -1306,6 +1306,10 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 PERF_SCOPE("matmul_transB/q4_k_fused_gemv");
                 cpu::gemv_q4_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
                                            M, K, N);
+            } else if (b->dtype() == DataType::Q6_K) {
+                PERF_SCOPE("matmul_transB/q6_k_fused_gemv");
+                cpu::gemv_q6_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                           M, K, N);
             } else
 #endif
             {
