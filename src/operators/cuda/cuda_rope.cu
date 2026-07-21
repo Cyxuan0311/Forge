@@ -90,5 +90,78 @@ void launch_expand_kv(const float* kv, float* out, int seq_len, int num_heads, i
                                                      head_dim);
 }
 
+// Gemma4-style RoPE: supports freq_factors (proportional RoPE) and q_scale (sqrt(head_dim))
+__global__ void rope_gemma4_kernel(
+    const float* x, float* x_out,
+    int seq_len, int num_heads, int head_dim,
+    int64_t pos, float theta,
+    const float* freq_factors,  // nullptr or [head_dim/2] per-dim scale
+    float scale)                // 1.0 for K, sqrt(head_dim) for Q
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * num_heads * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int half_dim = head_dim / 2;
+    if (d >= half_dim)
+        return;
+
+    int h = (idx / head_dim) % num_heads;
+    int s = idx / (num_heads * head_dim);
+
+    float base_freq = 1.0f / powf(theta, (2.0f * d) / head_dim);
+    float freq = freq_factors ? base_freq / freq_factors[d] : base_freq;
+    float angle = (pos + s) * freq;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+
+    int i0 = idx;
+    int i1 = s * num_heads * head_dim + h * head_dim + d + half_dim;
+
+    float x0 = x[i0], x1 = x[i1];
+    x_out[i0] = (x0 * cos_a - x1 * sin_a) * scale;
+    x_out[i1] = (x0 * sin_a + x1 * cos_a) * scale;
+}
+
+void launch_rope_gemma4_gqa(
+    const float* q, const float* k, float* q_out, float* k_out,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    int seq_len, int64_t pos, float theta,
+    const float* freq_factors,  // nullptr or [head_dim/2]
+    cudaStream_t stream)
+{
+    int threads = 256;
+    float q_scale = sqrtf(static_cast<float>(head_dim));
+
+    int q_total = seq_len * num_q_heads * head_dim;
+    int q_blocks = (q_total + threads - 1) / threads;
+    rope_gemma4_kernel<<<q_blocks, threads, 0, stream>>>(q, q_out, seq_len, num_q_heads,
+        head_dim, pos, theta, freq_factors, q_scale);
+
+    int k_total = seq_len * num_kv_heads * head_dim;
+    int k_blocks = (k_total + threads - 1) / threads;
+    rope_gemma4_kernel<<<k_blocks, threads, 0, stream>>>(k, k_out, seq_len, num_kv_heads,
+        head_dim, pos, theta, freq_factors, 1.0f);
+}
+
+// Q-only RoPE for non-KV layers (Gemma4)
+void launch_rope_gemma4_q_only(
+    const float* q, float* q_out,
+    int num_heads, int head_dim,
+    int seq_len, int64_t pos, float theta,
+    const float* freq_factors,  // nullptr or [head_dim/2]
+    cudaStream_t stream)
+{
+    int threads = 256;
+    float q_scale = sqrtf(static_cast<float>(head_dim));
+
+    int q_total = seq_len * num_heads * head_dim;
+    int q_blocks = (q_total + threads - 1) / threads;
+    rope_gemma4_kernel<<<q_blocks, threads, 0, stream>>>(q, q_out, seq_len, num_heads,
+        head_dim, pos, theta, freq_factors, q_scale);
+}
+
 }  // namespace cuda
 }  // namespace forge

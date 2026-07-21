@@ -15,6 +15,16 @@ void launch_rope_gqa(const float* q, const float* k, float* q_out, float* k_out,
                      int num_kv_heads, int head_dim, int seq_len, int64_t pos, float theta,
                      cudaStream_t stream = 0);
 
+void launch_rope_gemma4_gqa(const float* q, const float* k, float* q_out, float* k_out,
+                             int num_q_heads, int num_kv_heads, int head_dim,
+                             int seq_len, int64_t pos, float theta,
+                             const float* freq_factors, cudaStream_t stream = 0);
+
+void launch_rope_gemma4_q_only(const float* q, float* q_out,
+                                int num_heads, int head_dim,
+                                int seq_len, int64_t pos, float theta,
+                                const float* freq_factors, cudaStream_t stream = 0);
+
 void launch_expand_kv(const float* kv, float* out, int seq_len, int num_heads, int num_kv_heads,
                       int head_dim, cudaStream_t stream = 0);
 
