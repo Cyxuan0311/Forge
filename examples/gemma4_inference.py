@@ -17,12 +17,17 @@ Interactive commands:
 import gc
 import argparse
 
+import forge
+import chat_utils as chat_utils_mod
+
 from chat_utils import (
     add_common_args,
     generate_streaming,
     generate_batch,
     load_model_and_tokenize,
+    print_full_profile,
     resolve_model_path,
+    perf,
 )
 
 
@@ -92,9 +97,11 @@ def interactive_chat_gemma4(model, tokenizer, args):
     print("\n" + "=" * 60)
     print("  Gemma-4-12B Interactive Chat (Forge)")
     print(f"  Device: {args.device}")
+    if chat_utils_mod.profiling_enabled:
+        print("  Profiling: ON (Python + C++ PerfProfiler)")
     if args.think:
         print("  Thinking mode: ON")
-    print("  Commands: /quit, /clear, /help")
+    print("  Commands: /quit, /clear, /help, /profile")
     print("=" * 60 + "\n")
 
     while True:
@@ -112,19 +119,36 @@ def interactive_chat_gemma4(model, tokenizer, args):
             break
         elif user_input == "/clear":
             conversation = []
+            perf.reset()
             print("[Conversation cleared]\n")
             continue
         elif user_input == "/help":
             print("  /quit    - Exit the chat")
             print("  /clear   - Clear conversation history")
-            print("  /help    - Show this help message\n")
+            print("  /help    - Show this help message")
+            print("  /profile - Toggle profiling on/off\n")
+            continue
+        elif user_input == "/profile":
+            chat_utils_mod.profiling_enabled = not chat_utils_mod.profiling_enabled
+            if chat_utils_mod.profiling_enabled:
+                forge.profiler_enable()
+                forge.profiler_reset()
+                perf.reset()
+            else:
+                forge.profiler_disable()
+            print(f"[Profiling {'enabled' if chat_utils_mod.profiling_enabled else 'disabled'}]\n")
             continue
 
         conversation.append({"role": "user", "content": user_input})
+
+        if chat_utils_mod.profiling_enabled:
+            perf.start("template/encode")
         input_ids = apply_chat_template(
             tokenizer, conversation, add_generation_prompt=True,
             enable_thinking=args.think,
         )
+        if chat_utils_mod.profiling_enabled:
+            perf.stop("template/encode")
 
         print("Assistant: ", end="", flush=True)
 
@@ -171,6 +195,11 @@ def interactive_chat_gemma4(model, tokenizer, args):
             prompt_len = len(input_ids)
             print(f"[{num_generated} tokens, {elapsed:.2f}s, {speed:.1f} tok/s, prompt={prompt_len} tokens]")
 
+        if chat_utils_mod.profiling_enabled:
+            print_full_profile()
+            perf.reset()
+            forge.profiler_reset()
+
         conversation.append({"role": "assistant", "content": assistant_text})
         print()
 
@@ -184,6 +213,10 @@ def main():
         help="Single-turn prompt (if omitted, enters interactive chat mode)",
     )
     args = parser.parse_args()
+
+    if args.profile:
+        chat_utils_mod.profiling_enabled = True
+        print("[Profiling enabled - Python timing + C++ PerfProfiler]")
 
     model_path = resolve_model_path(args, [GGUF_MODEL_PATH])
     model, tokenizer = load_model_and_tokenize(args, model_path)
