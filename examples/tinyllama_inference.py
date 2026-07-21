@@ -31,6 +31,7 @@ Interactive commands:
 import os
 import sys
 
+import chat_utils as chat_utils_mod
 from chat_utils import (
     add_common_args,
     interactive_chat,
@@ -117,14 +118,12 @@ def download_model(model_path):
 
 
 def main():
-    global profiling_enabled
-
     parser = __import__("argparse").ArgumentParser(description="TinyLlama-1.1B-Chat inference with Forge")
     add_common_args(parser, gpu_layers_default=22, temperature_default=0.7)
     args = parser.parse_args()
 
     if args.profile:
-        profiling_enabled = True
+        chat_utils_mod.profiling_enabled = True
         print("[Profiling enabled - Python timing + C++ PerfProfiler]")
 
     model_path = args.model_path

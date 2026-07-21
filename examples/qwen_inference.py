@@ -17,6 +17,7 @@ Interactive commands:
 
 import os
 
+import chat_utils as chat_utils_mod
 from chat_utils import (
     add_common_args,
     interactive_chat,
@@ -51,14 +52,12 @@ def apply_chat_template(tokenizer, messages, add_generation_prompt=True):
 
 
 def main():
-    global profiling_enabled
-
     parser = __import__("argparse").ArgumentParser(description="Qwen2.5-7B-Instruct inference with Forge")
     add_common_args(parser, gpu_layers_default=28, temperature_default=0.7)
     args = parser.parse_args()
 
     if args.profile:
-        profiling_enabled = True
+        chat_utils_mod.profiling_enabled = True
         print("[Profiling enabled - Python timing + C++ PerfProfiler]")
 
     model_path = resolve_model_path(args, [GGUF_MODEL_PATH])

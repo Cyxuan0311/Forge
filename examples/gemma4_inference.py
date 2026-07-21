@@ -17,8 +17,8 @@ Interactive commands:
 import gc
 import argparse
 
-import forge
 import chat_utils as chat_utils_mod
+import forge
 
 from chat_utils import (
     add_common_args,

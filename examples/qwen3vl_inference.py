@@ -22,9 +22,12 @@ import gc
 import argparse
 import numpy as np
 
+import chat_utils as chat_utils_mod
 from chat_utils import (
     add_common_args,
     load_tokenizer,
+    print_full_profile,
+    perf,
 )
 
 import forge
@@ -245,7 +248,12 @@ def interactive_chat_vl(mm_model, tokenizer, args):
     print(f"  Device: {args.device}")
     print("  Vision: Forge built-in ViT (no HuggingFace transformers)")
     print(f"  Mode: {'Multimodal' if multimodal else 'Text-only'}")
-    print("  Commands: /clear, /quit, /help" + (", /image <path>, /video <path>" if multimodal else ""))
+    if chat_utils_mod.profiling_enabled:
+        print("  Profiling: ON (Python + C++ PerfProfiler)")
+    cmd_list = "/quit, /clear, /help, /profile"
+    if multimodal:
+        cmd_list += ", /image <path>, /video <path>"
+    print(f"  Commands: {cmd_list}")
     print("=" * 60 + "\n")
 
     while True:
@@ -267,8 +275,18 @@ def interactive_chat_vl(mm_model, tokenizer, args):
             pending_image_content = None
             print("[Conversation cleared]\n")
             continue
+        elif user_input == "/profile":
+            chat_utils_mod.profiling_enabled = not chat_utils_mod.profiling_enabled
+            if chat_utils_mod.profiling_enabled:
+                forge.profiler_enable()
+                forge.profiler_reset()
+                perf.reset()
+            else:
+                forge.profiler_disable()
+            print(f"[Profiling {'enabled' if chat_utils_mod.profiling_enabled else 'disabled'}]\n")
+            continue
         elif user_input == "/help":
-            print("  /clear, /quit, /help")
+            print("  /clear, /quit, /help, /profile")
             if multimodal:
                 print("  /image <path>  - Load an image for the next query")
                 print("  /video <path>  - Load a video for the next query")
@@ -349,7 +367,11 @@ def interactive_chat_vl(mm_model, tokenizer, args):
         else:
             conversation.append({"role": "user", "content": user_input})
 
+        if chat_utils_mod.profiling_enabled:
+            perf.start("template/encode")
         input_ids = apply_chat_template(tokenizer, conversation, add_generation_prompt=True)
+        if chat_utils_mod.profiling_enabled:
+            perf.stop("template/encode")
 
         if ctx is not None:
             del ctx
@@ -378,6 +400,11 @@ def interactive_chat_vl(mm_model, tokenizer, args):
             speed = num_generated / elapsed
             print(f"[{num_generated} tokens, {elapsed:.2f}s, {speed:.1f} tok/s]")
 
+        if chat_utils_mod.profiling_enabled:
+            print_full_profile()
+            perf.reset()
+            forge.profiler_reset()
+
         conversation.append({"role": "assistant", "content": response_text})
         image_embeddings_list = []
         pending_image_content = None
@@ -392,6 +419,13 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--trace", action="store_true", help="Enable TRACE logging")
     args = parser.parse_args()
+
+    if args.profile:
+        chat_utils_mod.profiling_enabled = True
+        perf.reset()
+        print("[Profiling enabled - Python timing + C++ PerfProfiler]")
+
+    t0 = time.time()
 
     # Resolve model paths
     model_path = args.model_path if args.model_path else GGUF_MODEL_PATH
@@ -432,6 +466,8 @@ def main():
         print("  Multimodal support will not be available.")
         mmproj_path = ""
 
+    if chat_utils_mod.profiling_enabled:
+        perf.start("startup.model_load")
     mm_model = forge.MultimodalModel()
     try:
         mm_model.load_with_mmproj(model_path, mmproj_path, args.device)
@@ -440,12 +476,20 @@ def main():
         args.device = "cpu"
         args.gpu_layers = 0
         mm_model.load_with_mmproj(model_path, mmproj_path, args.device)
+    if chat_utils_mod.profiling_enabled:
+        perf.stop("startup.model_load")
 
     cfg = mm_model.config
     print(
         f"Model loaded! arch={cfg.arch_type}, hidden_dim={cfg.hidden_dim}, "
         f"num_layers={cfg.num_layers}, num_heads={cfg.num_heads}"
     )
+
+    # Enable C++ profiler after model load
+    if chat_utils_mod.profiling_enabled:
+        forge.profiler_enable()
+        forge.profiler_reset()
+        forge.profiler_set_cuda_events(args.device == "cuda")
 
     # Context + warmup
     cuda_ok = True
@@ -455,10 +499,16 @@ def main():
         print(f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB")
         if args.device == "cuda":
             print("Warming up CUDA kernels...")
+            if chat_utils_mod.profiling_enabled:
+                perf.start("startup.warmup")
             try:
                 ctx.warmup()
+                if chat_utils_mod.profiling_enabled:
+                    perf.stop("startup.warmup")
                 print("Warmup done!")
             except RuntimeError as e:
+                if chat_utils_mod.profiling_enabled:
+                    perf.stop("startup.warmup")
                 print(f"Warmup skipped ({e})")
                 cuda_ok = False
         del ctx
@@ -471,6 +521,13 @@ def main():
         print("CUDA out of memory, falling back to CPU")
         args.device = "cpu"
         args.gpu_layers = 0
+
+    t5 = time.time()
+    if chat_utils_mod.profiling_enabled:
+        print(f"\n--- Startup: [{t5 - t0:.2f}s] ---")
+        perf.print_summary()
+        perf.reset()
+        forge.profiler_reset()
 
     interactive_chat_vl(mm_model, tokenizer, args)
     print("\nDone!")

@@ -147,7 +147,9 @@ if(CUDAToolkit_FOUND)
             src/operators/cuda/cuda_fused.cu
             src/operators/cuda/cuda_quant.cu
             src/operators/cuda/cuda_gemm.cu
-            src/operators/cuda/cuda_fused_attn.cu)
+            src/operators/cuda/cuda_fused_attn.cu
+            src/operators/cuda/cuda_logit_softcap.cu
+            src/operators/cuda/cuda_moe.cu)
   target_compile_definitions(forge_ops PUBLIC USE_CUDA)
 endif()
 

@@ -504,17 +504,41 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
     TensorPtr logits;
     {
         PERF_SCOPE("forward/output_proj");
-        // Use specialized output_proj kernel for Q4_0 decode (M=1, large N)
-        if (output_weight && output_weight->device() == DeviceType::CUDA &&
-            output_weight->dtype() == DataType::Q4_0 && seq_len == 1) {
+        // Use specialized output_proj kernel for decode (M=1, large N)
+        if (output_weight && output_weight->device() == DeviceType::CUDA && seq_len == 1) {
             int K = static_cast<int>(output_weight->shape()[1]);
             int N = static_cast<int>(output_weight->shape()[0]);
             logits = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N},
                                               DeviceType::CUDA);
 #ifdef USE_CUDA
-            cuda::launch_output_proj_q4_0(static_cast<const float*>(cur_hidden->data()),
-                                          output_weight->data(),
-                                          static_cast<float*>(logits->data()), K, N);
+            auto dtype = output_weight->dtype();
+            if (dtype == DataType::Q4_0) {
+                cuda::launch_output_proj_q4_0(static_cast<const float*>(cur_hidden->data()),
+                                              output_weight->data(),
+                                              static_cast<float*>(logits->data()), K, N);
+            } else if (dtype == DataType::Q4_K) {
+                // Use cooperative kernel for small K where split-K wastes lanes
+                // (e.g., K=1536 → 6 Q4_K blocks → only 6/32 lanes active in split-K)
+                constexpr int Q4_K_BLOCK_ELEMS = 256;
+                int num_blocks_row = (K + Q4_K_BLOCK_ELEMS - 1) / Q4_K_BLOCK_ELEMS;
+                if (num_blocks_row < 32) {
+                    cuda::launch_output_proj_q4_k_cooperative(
+                        static_cast<const float*>(cur_hidden->data()),
+                        output_weight->data(),
+                        static_cast<float*>(logits->data()), K, N);
+                } else {
+                    cuda::launch_output_proj_q4_k(
+                        static_cast<const float*>(cur_hidden->data()),
+                        output_weight->data(),
+                        static_cast<float*>(logits->data()), K, N);
+                }
+            } else if (dtype == DataType::Q6_K) {
+                cuda::launch_output_proj_q6_k(static_cast<const float*>(cur_hidden->data()),
+                                              output_weight->data(),
+                                              static_cast<float*>(logits->data()), K, N);
+            } else {
+                logits = ops::matmul_transB(cur_hidden, output_weight);
+            }
 #endif
         } else {
             logits = ops::matmul_transB(cur_hidden, output_weight);
