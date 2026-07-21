@@ -31,6 +31,9 @@ private:
     // Proportional RoPE frequency factors for full-attention layers
     TensorPtr rope_freqs_;            // [head_dim/2] per-dimension frequency scale
     TensorPtr rope_freqs_cpu_;        // CPU copy for RoPE computation when rope_freqs_ is on CUDA
+
+    // GPU-side cache for suppress tokens (used by logit softcap kernel)
+    TensorPtr suppress_tokens_gpu_;   // [num_suppress] int32 on CUDA
 };
 
 }  // namespace forge
