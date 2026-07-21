@@ -2,6 +2,7 @@
 #include "cuda_elementwise.h"
 #include "cuda_fused.h"
 #include "cuda_quant.h"
+#include "cuda_gemv_tmpl.cuh"
 
 namespace forge {
 namespace cuda {
@@ -664,11 +665,12 @@ __global__ void ffn_up_fused_q4_k_v2_kernel(const float* __restrict__ x,
             const uint8_t* scales = block_ptr + 4;
             const uint8_t* qs = block_ptr + 16;
 
-            int is = 0;
+            int si = 0;  // scale index (0,2,4,6)
+            int xi = 0;  // x_vals index (0,1,2,3)
             for (int j = 0; j < QK_K; j += 64) {
                 uint8_t sc1, m1, sc2, m2;
-                get_scale_min_k4(is, scales, &sc1, &m1);
-                get_scale_min_k4(is + 1, scales, &sc2, &m2);
+                get_scale_min_k4(si, scales, &sc1, &m1);
+                get_scale_min_k4(si + 1, scales, &sc2, &m2);
                 float d1 = d * sc1;
                 float m1_val = dmin * m1;
                 float d2 = d * sc2;
@@ -677,11 +679,12 @@ __global__ void ffn_up_fused_q4_k_v2_kernel(const float* __restrict__ x,
                 int q_low = qs[lane] & 0xF;
                 int q_high = qs[lane] >> 4;
 
-                gate_sum += x_vals[is * 2 + 0] * (d1 * q_low - m1_val);
-                gate_sum += x_vals[is * 2 + 1] * (d2 * q_high - m2_val);
+                gate_sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+                gate_sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
 
                 qs += 32;
-                is += 2;
+                si += 2;
+                xi += 1;
             }
         }
 
@@ -696,11 +699,12 @@ __global__ void ffn_up_fused_q4_k_v2_kernel(const float* __restrict__ x,
             const uint8_t* scales = block_ptr + 4;
             const uint8_t* qs = block_ptr + 16;
 
-            int is = 0;
+            int si = 0;  // scale index (0,2,4,6)
+            int xi = 0;  // x_vals index (0,1,2,3)
             for (int j = 0; j < QK_K; j += 64) {
                 uint8_t sc1, m1, sc2, m2;
-                get_scale_min_k4(is, scales, &sc1, &m1);
-                get_scale_min_k4(is + 1, scales, &sc2, &m2);
+                get_scale_min_k4(si, scales, &sc1, &m1);
+                get_scale_min_k4(si + 1, scales, &sc2, &m2);
                 float d1 = d * sc1;
                 float m1_val = dmin * m1;
                 float d2 = d * sc2;
@@ -709,11 +713,12 @@ __global__ void ffn_up_fused_q4_k_v2_kernel(const float* __restrict__ x,
                 int q_low = qs[lane] & 0xF;
                 int q_high = qs[lane] >> 4;
 
-                up_sum += x_vals[is * 2 + 0] * (d1 * q_low - m1_val);
-                up_sum += x_vals[is * 2 + 1] * (d2 * q_high - m2_val);
+                up_sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+                up_sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
 
                 qs += 32;
-                is += 2;
+                si += 2;
+                xi += 1;
             }
         }
     }
@@ -745,6 +750,147 @@ void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3
     ffn_up_fused_q4_k_v2_kernel<<<blocks, threads, 0, stream>>>(
         x, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3), out, K,
         intermediate_dim);
+}
+
+// ============================================================================
+// FFN gate+up fused kernel with GELU(tanh) activation (for Gemma4)
+// Identical to ffn_up_fused_q4_k_v2_kernel but uses GELU_tanh instead of SiLU
+// ============================================================================
+
+__global__ void ffn_up_fused_q4_k_geglu_kernel(const float* __restrict__ x,
+                                                 const uint8_t* __restrict__ q_w1,
+                                                 const uint8_t* __restrict__ q_w3,
+                                                 float* __restrict__ out, int K, int N) {
+    const int QK_K = 256;
+    const int Q4_K_BLOCK_SIZE = 144;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    if (warp_id >= N)
+        return;
+
+    const uint8_t* w1_row = q_w1 + (size_t)warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
+    const uint8_t* w3_row = q_w3 + (size_t)warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        // Read x values for this super-block (shared by gate and up)
+        float x_vals[8];
+        {
+            int is = 0;
+            for (int j = 0; j < QK_K; j += 64) {
+                int idx0 = bi * QK_K + j + lane;
+                int idx1 = bi * QK_K + j + 32 + lane;
+                x_vals[is * 2 + 0] = (idx0 < K) ? x[idx0] : 0.0f;
+                x_vals[is * 2 + 1] = (idx1 < K) ? x[idx1] : 0.0f;
+                is++;
+            }
+        }
+
+        // Process w1 (gate) block
+        {
+            const uint8_t* block_ptr = w1_row + bi * Q4_K_BLOCK_SIZE;
+            uint16_t d_bits, dmin_bits;
+            memcpy(&d_bits, block_ptr, 2);
+            memcpy(&dmin_bits, block_ptr + 2, 2);
+            float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+            float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+            const uint8_t* scales = block_ptr + 4;
+            const uint8_t* qs = block_ptr + 16;
+
+            int si = 0;  // scale index (0,2,4,6)
+            int xi = 0;  // x_vals index (0,1,2,3)
+            for (int j = 0; j < QK_K; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                get_scale_min_k4(si, scales, &sc1, &m1);
+                get_scale_min_k4(si + 1, scales, &sc2, &m2);
+                float d1 = d * sc1;
+                float m1_val = dmin * m1;
+                float d2 = d * sc2;
+                float m2_val = dmin * m2;
+
+                int q_low = qs[lane] & 0xF;
+                int q_high = qs[lane] >> 4;
+
+                gate_sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+                gate_sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+                qs += 32;
+                si += 2;
+                xi += 1;
+            }
+        }
+
+        // Process w3 (up) block
+        {
+            const uint8_t* block_ptr = w3_row + bi * Q4_K_BLOCK_SIZE;
+            uint16_t d_bits, dmin_bits;
+            memcpy(&d_bits, block_ptr, 2);
+            memcpy(&dmin_bits, block_ptr + 2, 2);
+            float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+            float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+            const uint8_t* scales = block_ptr + 4;
+            const uint8_t* qs = block_ptr + 16;
+
+            int si = 0;  // scale index (0,2,4,6)
+            int xi = 0;  // x_vals index (0,1,2,3)
+            for (int j = 0; j < QK_K; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                get_scale_min_k4(si, scales, &sc1, &m1);
+                get_scale_min_k4(si + 1, scales, &sc2, &m2);
+                float d1 = d * sc1;
+                float m1_val = dmin * m1;
+                float d2 = d * sc2;
+                float m2_val = dmin * m2;
+
+                int q_low = qs[lane] & 0xF;
+                int q_high = qs[lane] >> 4;
+
+                up_sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+                up_sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+                qs += 32;
+                si += 2;
+                xi += 1;
+            }
+        }
+    }
+
+    // Warp reduce
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 16);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 8);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 4);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 2);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 1);
+
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 16);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 8);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 4);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 2);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 1);
+
+    if (lane == 0) {
+        // GELU(tanh) activation instead of SiLU
+        float x_tmp = gate_sum;
+        float tanh_in = 0.7978845608f * (x_tmp + 0.044715f * x_tmp * x_tmp * x_tmp);
+        float gelu_gate = 0.5f * x_tmp * (1.0f + tanhf(tanh_in));
+        out[warp_id] = gelu_gate * up_sum;
+    }
+}
+
+void launch_ffn_up_fused_q4_k_geglu(const float* x, const void* q_w1, const void* q_w3,
+                                     float* out, int K, int intermediate_dim,
+                                     cudaStream_t stream) {
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
+    ffn_up_fused_q4_k_geglu_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3),
+        out, K, intermediate_dim);
 }
 
 template <int ROWS_PER_WARP>
@@ -915,7 +1061,285 @@ void launch_output_proj_q4_0(const float* x, const void* q_weight, float* out, i
         x, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
 }
 
-// ---- QKV Fused GEMV Q4_0 (M=1, decode) ----
+// ---- Output Proj Q4_K/Q6_K (M=1, decode, large N) ----
+// Templated output projection using CudaQuantTraits with split-K (multiple warps per row)
+
+template <DataType DT>
+__global__ void output_proj_typed_kernel(const float* __restrict__ x,
+                                          const uint8_t* __restrict__ q_weight,
+                                          float* __restrict__ out,
+                                          int K, int N, int warps_per_row) {
+    constexpr int BE = CudaQuantTraits<DT>::block_elements;
+    constexpr int BS = CudaQuantTraits<DT>::block_size;
+    int num_blocks_row = (K + BE - 1) / BE;
+
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    int row = global_warp_id / warps_per_row;
+    int sub_warp = global_warp_id % warps_per_row;
+
+    if (row >= N) return;
+
+    const uint8_t* row_ptr = q_weight + (size_t)row * num_blocks_row * BS;
+
+    int blocks_per_sub = (num_blocks_row + warps_per_row - 1) / warps_per_row;
+    int start_block = sub_warp * blocks_per_sub;
+    int end_block = min(start_block + blocks_per_sub, num_blocks_row);
+
+    float sum = 0.0f;
+
+    for (int bi = start_block + lane; bi < end_block; bi += 32) {
+        const uint8_t* block_ptr = row_ptr + bi * BS;
+        int base = bi * BE;
+        sum += CudaQuantTraits<DT>::dot_block(block_ptr, x, base, K);
+    }
+
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        atomicAdd(&out[row], sum);
+    }
+}
+
+void launch_output_proj_q4_k(const float* x, const void* q_weight, float* out, int K, int N,
+                              cudaStream_t stream) {
+    constexpr int BE = CudaQuantTraits<DataType::Q4_K>::block_elements;
+    int num_blocks_row = (K + BE - 1) / BE;
+
+    int warps_per_row = (num_blocks_row + 31) / 32;
+    if (warps_per_row < 1) warps_per_row = 1;
+    if (warps_per_row > 16) warps_per_row = 16;
+
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int total_warps = N * warps_per_row;
+    int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
+    cudaMemsetAsync(out, 0, N * sizeof(float), stream);
+    output_proj_typed_kernel<DataType::Q4_K><<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
+}
+
+void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, int K, int N,
+                              cudaStream_t stream) {
+    constexpr int BE = CudaQuantTraits<DataType::Q6_K>::block_elements;
+    int num_blocks_row = (K + BE - 1) / BE;
+
+    int warps_per_row = (num_blocks_row + 31) / 32;
+    if (warps_per_row < 1) warps_per_row = 1;
+    if (warps_per_row > 16) warps_per_row = 16;
+
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int total_warps = N * warps_per_row;
+    int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
+    cudaMemsetAsync(out, 0, N * sizeof(float), stream);
+    output_proj_typed_kernel<DataType::Q6_K><<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
+}
+
+// ---- Output Proj Q4_K Cooperative (M=1, decode, small K) ----
+// For small K (e.g., 1536 → 6 Q4_K blocks), the standard split-K kernel
+// wastes 26/32 lanes per warp. This kernel uses cooperative processing:
+// all 32 lanes work together on each Q4_K block, then warp-reduce the final sum.
+// Each warp handles one output row (vocab row).
+
+__global__ void output_proj_q4_k_cooperative_kernel(
+        const float* __restrict__ x,
+        const uint8_t* __restrict__ q_weight,
+        float* __restrict__ out,
+        int K, int N) {
+    const int QK_K = 256;
+    const int Q4_K_BLOCK_SIZE = 144;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    if (warp_id >= N)
+        return;
+
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        // Load x values for this super-block
+        float x_vals[8];
+        {
+            int is = 0;
+            for (int j = 0; j < QK_K; j += 64) {
+                int idx0 = bi * QK_K + j + lane;
+                int idx1 = bi * QK_K + j + 32 + lane;
+                x_vals[is * 2 + 0] = (idx0 < K) ? x[idx0] : 0.0f;
+                x_vals[is * 2 + 1] = (idx1 < K) ? x[idx1] : 0.0f;
+                is++;
+            }
+        }
+
+        // Process weight block
+        const uint8_t* block_ptr = row_ptr + bi * Q4_K_BLOCK_SIZE;
+        uint16_t d_bits, dmin_bits;
+        memcpy(&d_bits, block_ptr, 2);
+        memcpy(&dmin_bits, block_ptr + 2, 2);
+        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+        const uint8_t* scales = block_ptr + 4;
+        const uint8_t* qs = block_ptr + 16;
+
+        int si = 0;  // scale index (0,2,4,6)
+        int xi = 0;  // x_vals index (0,1,2,3)
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(si, scales, &sc1, &m1);
+            get_scale_min_k4(si + 1, scales, &sc2, &m2);
+            float d1 = d * sc1;
+            float m1_val = dmin * m1;
+            float d2 = d * sc2;
+            float m2_val = dmin * m2;
+
+            int q_low = qs[lane] & 0xF;
+            int q_high = qs[lane] >> 4;
+
+            sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+            sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+            qs += 32;
+            si += 2;
+            xi += 1;
+        }
+    }
+
+    // Warp reduce
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        out[warp_id] = sum;
+    }
+}
+
+// Same as above but with fused logit softcap + suppress tokens
+__global__ void output_proj_q4_k_cooperative_softcap_kernel(
+        const float* __restrict__ x,
+        const uint8_t* __restrict__ q_weight,
+        float* __restrict__ out,
+        int K, int N,
+        float softcap, bool apply_softcap,
+        const int* __restrict__ suppress_tokens, int num_suppress) {
+    const int QK_K = 256;
+    const int Q4_K_BLOCK_SIZE = 144;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    if (warp_id >= N)
+        return;
+
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * blocks_per_row * Q4_K_BLOCK_SIZE;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        float x_vals[8];
+        {
+            int is = 0;
+            for (int j = 0; j < QK_K; j += 64) {
+                int idx0 = bi * QK_K + j + lane;
+                int idx1 = bi * QK_K + j + 32 + lane;
+                x_vals[is * 2 + 0] = (idx0 < K) ? x[idx0] : 0.0f;
+                x_vals[is * 2 + 1] = (idx1 < K) ? x[idx1] : 0.0f;
+                is++;
+            }
+        }
+
+        const uint8_t* block_ptr = row_ptr + bi * Q4_K_BLOCK_SIZE;
+        uint16_t d_bits, dmin_bits;
+        memcpy(&d_bits, block_ptr, 2);
+        memcpy(&dmin_bits, block_ptr + 2, 2);
+        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+        const uint8_t* scales = block_ptr + 4;
+        const uint8_t* qs = block_ptr + 16;
+
+        int si = 0;
+        int xi = 0;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(si, scales, &sc1, &m1);
+            get_scale_min_k4(si + 1, scales, &sc2, &m2);
+            float d1 = d * sc1;
+            float m1_val = dmin * m1;
+            float d2 = d * sc2;
+            float m2_val = dmin * m2;
+
+            int q_low = qs[lane] & 0xF;
+            int q_high = qs[lane] >> 4;
+
+            sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+            sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+            qs += 32;
+            si += 2;
+            xi += 1;
+        }
+    }
+
+    // Warp reduce
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        if (apply_softcap) {
+            sum = tanhf(sum / softcap) * softcap;
+        }
+        // Suppress tokens: check if this row (token) should be suppressed
+        if (num_suppress > 0) {
+            for (int i = 0; i < num_suppress; ++i) {
+                if (warp_id == suppress_tokens[i]) {
+                    sum = -INFINITY;
+                    break;
+                }
+            }
+        }
+        out[warp_id] = sum;
+    }
+}
+
+void launch_output_proj_q4_k_cooperative(const float* x, const void* q_weight, float* out,
+                                          int K, int N, cudaStream_t stream) {
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (N + warps_per_block - 1) / warps_per_block;
+    output_proj_q4_k_cooperative_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, K, N);
+}
+
+void launch_output_proj_q4_k_cooperative_softcap(const float* x, const void* q_weight, float* out,
+                                                   int K, int N,
+                                                   float softcap, bool apply_softcap,
+                                                   const int* suppress_tokens, int num_suppress,
+                                                   cudaStream_t stream) {
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (N + warps_per_block - 1) / warps_per_block;
+    output_proj_q4_k_cooperative_softcap_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, K, N,
+        softcap, apply_softcap, suppress_tokens, num_suppress);
+}
+
+// ---- QKV Fused Q4_0 (M=1, decode) ----
 // Fuses Q, K, V projections into a single kernel:
 // - Input x is loaded once into shared memory and reused by all warps
 // - Each warp computes one output row of Q, K, or V

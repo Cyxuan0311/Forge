@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "forge/types.h"
 
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
@@ -11,6 +12,9 @@ namespace cuda {
 
 void launch_rms_norm(const float* x, const float* weight, float* out, int rows, int cols, float eps,
                      cudaStream_t stream = 0);
+
+void launch_rms_norm_unweighted(const float* x, float* out, int rows, int cols, float eps,
+                                cudaStream_t stream = 0);
 
 void launch_rms_norm_fp16(const void* x, const void* weight, void* out, int rows, int cols,
                           float eps, cudaStream_t stream = 0);
@@ -22,6 +26,9 @@ void launch_silu_fp16(const void* x, void* out, int n, cudaStream_t stream = 0);
 void launch_gelu(const float* x, float* out, int n, cudaStream_t stream = 0);
 
 void launch_gelu_tanh(const float* x, float* out, int n, cudaStream_t stream = 0);
+
+void launch_gelu_multiply(const float* gate, const float* up, float* out, int n,
+                          cudaStream_t stream = 0);
 
 void launch_embedding_fp32(const float* weight, const int32_t* indices, float* out, int num_indices,
                            int embed_dim, int vocab_size, bool transposed, cudaStream_t stream = 0);
@@ -48,6 +55,16 @@ void launch_rope_fp32(const float* q, const float* k, float* q_out, float* k_out
 void launch_rope_gqa(const float* q, const float* k, float* q_out, float* k_out, int num_q_heads,
                      int num_kv_heads, int head_dim, int seq_len, int64_t pos, float theta,
                      cudaStream_t stream = 0);
+
+void launch_rope_gemma4_gqa(const float* q, const float* k, float* q_out, float* k_out,
+                             int num_q_heads, int num_kv_heads, int head_dim,
+                             int seq_len, int64_t pos, float theta,
+                             const float* freq_factors, cudaStream_t stream = 0);
+
+void launch_rope_gemma4_q_only(const float* q, float* q_out,
+                                int num_heads, int head_dim,
+                                int seq_len, int64_t pos, float theta,
+                                const float* freq_factors, cudaStream_t stream = 0);
 
 void launch_expand_kv(const float* kv, float* out, int seq_len, int num_heads, int num_kv_heads,
                       int head_dim, cudaStream_t stream = 0);
@@ -102,6 +119,10 @@ void launch_ffn_up_fused_q4_k_batch(const float* x, const void* q_w1, const void
 void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
                               int intermediate_dim, cudaStream_t stream = 0);
 
+void launch_ffn_up_fused_q4_k_geglu(const float* x, const void* q_w1, const void* q_w3,
+                                     float* out, int K, int intermediate_dim,
+                                     cudaStream_t stream = 0);
+
 void launch_dequant_q6_k_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
 
@@ -139,10 +160,20 @@ void launch_add_bias(const float* data, const float* bias, float* out, int n,
 
 void launch_multiply(const float* a, const float* b, float* out, int n, cudaStream_t stream = 0);
 
+void launch_scale(float* data, float s, int n, cudaStream_t stream = 0);
+
+void launch_gelu_tanh_multiply(float* x, const float* y, int n_per, int n_layer,
+                               int layer_idx, int seq_len, cudaStream_t stream = 0);
+
 void launch_silu_multiply(const float* gate, const float* up, float* out, int n,
                           cudaStream_t stream = 0);
 
 void launch_argmax(const float* data, int32_t* out_idx, int n, cudaStream_t stream = 0);
+
+// ---- Logit Softcap ----
+void launch_logit_softcap(float* logits, float cap, bool apply_softcap,
+                          const int* suppress_tokens, int num_suppress,
+                          int vocab_size, cudaStream_t stream = 0);
 
 void launch_dequant_q4_0_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
@@ -161,6 +192,24 @@ void launch_ffn_down_fused_q4_0(const float* ffn_mid, const void* q_w2, const fl
 
 void launch_output_proj_q4_0(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
+
+void launch_output_proj_q4_k(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+
+void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+
+// ---- Output Proj Q4_K Cooperative (small K, e.g., K=1536) ----
+// Uses cooperative warp processing instead of split-K for better lane utilization
+void launch_output_proj_q4_k_cooperative(const float* x, const void* q_weight, float* out,
+                                          int K, int N, cudaStream_t stream = 0);
+
+// Same but with fused logit softcap + suppress tokens (saves one kernel launch)
+void launch_output_proj_q4_k_cooperative_softcap(const float* x, const void* q_weight, float* out,
+                                                   int K, int N,
+                                                   float softcap, bool apply_softcap,
+                                                   const int* suppress_tokens, int num_suppress,
+                                                   cudaStream_t stream = 0);
 
 // ---- KV Cache quantization kernels: F16, Q8_0, Q4_K ----
 
@@ -201,6 +250,26 @@ void launch_fused_flash_attention_gqa_decode_q8_0(
     int kv_len, int num_heads, int num_kv_heads, int head_dim,
     size_t q_row_size, const float* mask_row = nullptr,
     cudaStream_t stream = 0);
+
+// ---- MoE Router ----
+void launch_moe_router(const float* logits, int* expert_indices, float* expert_weights,
+                       float* softmax_buf, int n_expert, int n_expert_used, int seq_len,
+                       cudaStream_t stream = 0);
+
+void launch_moe_router_scale(const float* x, const float* scale, float* out,
+                             int hidden_dim, float inv_sqrt, float eps, int seq_len,
+                             cudaStream_t stream = 0);
+
+// ---- MoE Expert GEMV ----
+template <DataType DT>
+void launch_moe_expert_gemv(const float* x, const void* q_w_3d, float* out,
+                             const int* expert_indices, const float* expert_weights,
+                             int K, int N, int n_expert, int n_expert_used, int n_tokens,
+                             cudaStream_t stream = 0);
+
+// ---- GeGLU Split ----
+void launch_gelu_tanh_multiply_split(const float* gate_up, float* out, int half_dim,
+                                     int n_tokens, cudaStream_t stream = 0);
 
 // ---- I-Quant Dequantization (IQ2_XXS, IQ4_NL) ----
 
