@@ -1131,6 +1131,12 @@ TensorPtr matmul(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias) 
     return out;
 }
 
+// Q5_K fused GEMV forward declaration (implemented after mixed-precision QKV)
+#ifdef USE_AVX2
+static void gemv_q5_k_transB_avx2(const float* a, const uint8_t* w, float* out, int M, int K,
+                                    int N);
+#endif
+
 TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias) {
     if (a->ndim() != 2 || b->ndim() != 2)
         throw std::runtime_error("matmul_transB expects 2D tensors");
@@ -1303,13 +1309,39 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 cpu::gemv_q4_1_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
                                            M, K, N);
             } else if (b->dtype() == DataType::Q4_K) {
-                PERF_SCOPE("matmul_transB/q4_k_fused_gemv");
-                cpu::gemv_q4_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
-                                           M, K, N);
+                if (M == 1) {
+                    PERF_SCOPE("matmul_transB/q4_k_fused_gemv");
+                    cpu::gemv_q4_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                               M, K, N);
+                } else {
+                    PERF_SCOPE("matmul_transB/q4_k_batch_gemv");
+                    cpu::gemv_q4_K_transB_batch_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                      M, K, N);
+                }
             } else if (b->dtype() == DataType::Q6_K) {
-                PERF_SCOPE("matmul_transB/q6_k_fused_gemv");
-                cpu::gemv_q6_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
-                                           M, K, N);
+                if (M == 1) {
+                    PERF_SCOPE("matmul_transB/q6_k_fused_gemv");
+                    cpu::gemv_q6_K_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                               M, K, N);
+                } else {
+                    PERF_SCOPE("matmul_transB/q6_k_batch_gemv");
+                    cpu::gemv_q6_K_transB_batch_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                      M, K, N);
+                }
+            } else if (b->dtype() == DataType::Q3_K) {
+                PERF_SCOPE("matmul_transB/q3_k_fused_gemv");
+                cpu::gemv_q3_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                            M, K, N);
+            } else if (b->dtype() == DataType::Q5_K) {
+                if (M == 1) {
+                    PERF_SCOPE("matmul_transB/q5_k_fused_gemv");
+                    gemv_q5_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                          M, K, N);
+                } else {
+                    PERF_SCOPE("matmul_transB/q5_k_batch_gemv");
+                    gemv_q5_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                          M, K, N);
+                }
             } else
 #endif
             {
@@ -1521,6 +1553,30 @@ TensorPtr ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const Tensor
                     static_cast<const float*>(input->data()), w1->data(), w3->data(),
                     static_cast<float*>(out->data()), M, K, intermediate_dim);
             }
+        } else if (w1->dtype() == DataType::Q3_K && w3->dtype() == DataType::Q3_K) {
+            if (M == 1) {
+                // Decode: Q3_K gate + Q3_K up fused with shared Q8_1 quantization
+                cuda::launch_ffn_up_fused_q3k_q3k(static_cast<const float*>(input->data()), w1->data(),
+                                                   w3->data(), static_cast<float*>(out->data()), K,
+                                                   intermediate_dim);
+            } else {
+                // Batch: separate matmul + silu_multiply
+                auto gate = ops::matmul_transB(input, w1);
+                auto up = ops::matmul_transB(input, w3);
+                out = ops::silu_multiply(gate, up);
+            }
+        } else if (w1->dtype() == DataType::Q3_K && w3->dtype() == DataType::Q4_K) {
+            if (M == 1) {
+                // Decode: Q3_K gate + Q4_K up fused with shared Q8_1 quantization
+                cuda::launch_ffn_up_fused_q3k_q4k(static_cast<const float*>(input->data()), w1->data(),
+                                                   w3->data(), static_cast<float*>(out->data()), K,
+                                                   intermediate_dim);
+            } else {
+                // Batch: separate matmul + silu_multiply
+                auto gate = ops::matmul_transB(input, w1);
+                auto up = ops::matmul_transB(input, w3);
+                out = ops::silu_multiply(gate, up);
+            }
         } else {
             auto gate = ops::matmul_transB(input, w1);
             auto up = ops::matmul_transB(input, w3);
@@ -1640,6 +1696,84 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_0(const TensorPtr& input,
     return out;
 }
 
+TensorPtr matmul_transB_fused_ffn_down_residual_q4_1(const TensorPtr& input,
+                                                     const TensorPtr& weight,
+                                                     const TensorPtr& residual) {
+    if (input->ndim() != 2 || weight->ndim() != 2 || residual->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_ffn_down_residual_q4_1 expects 2D tensors");
+    if (weight->dtype() != DataType::Q4_1)
+        throw std::runtime_error(
+            "matmul_transB_fused_ffn_down_residual_q4_1 requires Q4_1 weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_ffn_down_residual_q4_1 is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N = static_cast<int>(weight->shape()[0]);
+
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q4_1");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_1_ffn_down_residual_avx2(a_data + m * K,
+                                               static_cast<const uint8_t*>(weight->data()),
+                                               r_data + m * N, o_data + m * N, K, N);
+    }
+#else
+    out = ops::matmul_transB(input, weight);
+    out = ops::add(residual, out);
+#endif
+
+    return out;
+}
+
+// Fused attention output projection + residual for Q4_0 decode.
+// Computes: out = attn_out @ wo + hidden_residual  (single pass)
+TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual) {
+    if (input->ndim() != 2 || weight->ndim() != 2 || residual->ndim() != 2)
+        throw std::runtime_error(
+            "matmul_transB_fused_attn_proj_residual_q4_0 expects 2D tensors");
+    if (weight->dtype() != DataType::Q4_0)
+        throw std::runtime_error(
+            "matmul_transB_fused_attn_proj_residual_q4_0 requires Q4_0 weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error(
+            "matmul_transB_fused_attn_proj_residual_q4_0 is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N = static_cast<int>(weight->shape()[0]);
+
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q4_0");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_0_attn_proj_residual_avx2(a_data + m * K,
+                                                static_cast<const uint8_t*>(weight->data()),
+                                                r_data + m * N, o_data + m * N, K, N);
+    }
+#else
+    out = ops::matmul_transB(input, weight);
+    out = ops::add(residual, out);
+#endif
+
+    return out;
+}
+
 TensorPtr matmul_transB_fused_qkv_q4_k(const TensorPtr& input, const TensorPtr& wq,
                                        const TensorPtr& wk, const TensorPtr& wv) {
     if (input->ndim() != 2 || wq->ndim() != 2 || wk->ndim() != 2 || wv->ndim() != 2)
@@ -1730,6 +1864,444 @@ TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPt
     return out;
 }
 
+TensorPtr matmul_transB_fused_ffn_up_q3_k(const TensorPtr& input, const TensorPtr& w_gate,
+                                         const TensorPtr& w_up) {
+    if (input->ndim() != 2 || w_gate->ndim() != 2 || w_up->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_q3_k expects 2D tensors");
+    if (w_gate->dtype() != DataType::Q3_K || w_up->dtype() != DataType::Q3_K)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_q3_k requires Q3_K weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_q3_k is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N = static_cast<int>(w_gate->shape()[0]);
+
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q3_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q3_k_fused_ffn_up_avx2(
+            a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+            static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+    }
+#else
+    auto gate = ops::matmul_transB(input, w_gate);
+    auto up = ops::matmul_transB(input, w_up);
+    out = ops::silu_multiply(gate, up);
+#endif
+
+    return out;
+}
+
+TensorPtr matmul_transB_fused_qk_q3_k(const TensorPtr& input, const TensorPtr& wq,
+                                       const TensorPtr& wk) {
+    if (input->ndim() != 2 || wq->ndim() != 2 || wk->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_qk_q3_k expects 2D tensors");
+    if (wq->dtype() != DataType::Q3_K || wk->dtype() != DataType::Q3_K)
+        throw std::runtime_error("matmul_transB_fused_qk_q3_k requires Q3_K weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_qk_q3_k is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N_q = static_cast<int>(wq->shape()[0]);
+    int N_k = static_cast<int>(wk->shape()[0]);
+
+    auto q_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_q}, DeviceType::CPU);
+    auto k_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_k}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/fused_qk_q3_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q3_k_fused_qk_avx2(
+            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+            static_cast<const uint8_t*>(wk->data()),
+            static_cast<float*>(q_out->data()) + m * N_q,
+            static_cast<float*>(k_out->data()) + m * N_k, K, N_q, N_k);
+    }
+#else
+    q_out = ops::matmul_transB(input, wq);
+    k_out = ops::matmul_transB(input, wk);
+#endif
+
+    int total_N = N_q + N_k;
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, total_N}, DeviceType::CPU);
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        std::memcpy(o_data + m * total_N, static_cast<float*>(q_out->data()) + m * N_q,
+                    N_q * sizeof(float));
+        std::memcpy(o_data + m * total_N + N_q, static_cast<float*>(k_out->data()) + m * N_k,
+                    N_k * sizeof(float));
+    }
+    return out;
+}
+
+TensorPtr matmul_transB_fused_qkv_q3_k(const TensorPtr& input, const TensorPtr& wq,
+                                       const TensorPtr& wk, const TensorPtr& wv) {
+    if (input->ndim() != 2 || wq->ndim() != 2 || wk->ndim() != 2 || wv->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_qkv_q3_k expects 2D tensors");
+    if (wq->dtype() != DataType::Q3_K || wk->dtype() != DataType::Q3_K ||
+        wv->dtype() != DataType::Q3_K)
+        throw std::runtime_error("matmul_transB_fused_qkv_q3_k requires Q3_K weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_qkv_q3_k is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N_q = static_cast<int>(wq->shape()[0]);
+    int N_k = static_cast<int>(wk->shape()[0]);
+    int N_v = static_cast<int>(wv->shape()[0]);
+
+    auto q_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_q}, DeviceType::CPU);
+    auto k_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_k}, DeviceType::CPU);
+    auto v_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_v}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/fused_qkv_q3_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q3_k_fused_qkv_avx2(
+            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+            static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
+            static_cast<float*>(q_out->data()) + m * N_q,
+            static_cast<float*>(k_out->data()) + m * N_k,
+            static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+    }
+#else
+    q_out = ops::matmul_transB(input, wq);
+    k_out = ops::matmul_transB(input, wk);
+    v_out = ops::matmul_transB(input, wv);
+#endif
+
+    int total_N = N_q + N_k + N_v;
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, total_N}, DeviceType::CPU);
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        std::memcpy(o_data + m * total_N, static_cast<float*>(q_out->data()) + m * N_q,
+                    N_q * sizeof(float));
+        std::memcpy(o_data + m * total_N + N_q, static_cast<float*>(k_out->data()) + m * N_k,
+                    N_k * sizeof(float));
+        std::memcpy(o_data + m * total_N + N_q + N_k, static_cast<float*>(v_out->data()) + m * N_v,
+                    N_v * sizeof(float));
+    }
+    return out;
+}
+
+// ---- Mixed-precision Q3_K (Q,K) + Q4_K (V) fused QKV projection ----
+// Quantizes activation to Q8_K once, shares across Q3_K Q/K and Q4_K V rows.
+// Saves 1 Q8_K quantization + 1 matmul dispatch per layer per decode token.
+#ifdef USE_AVX2
+static float dot_q4_K_q8_K_row_avx2(const uint8_t* q4_row, const cpu::block_q8_K* q8, int nb) {
+    constexpr int QK_K = 256;
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 acc_m = _mm_setzero_ps();
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    for (int i = 0; i < nb; ++i) {
+        const cpu::block_q4_K* x = reinterpret_cast<const cpu::block_q4_K*>(q4_row) + i;
+        const cpu::block_q8_K* y = q8 + i;
+
+        _mm_prefetch((const char*)((const cpu::block_q4_K*)q4_row + i + 1), _MM_HINT_T0);
+        _mm_prefetch((const char*)(q8 + i + 1), _MM_HINT_T0);
+
+        const float d = y->d * cpu::fp16_to_float_scalar(x->d);
+        const float dmin = -y->d * cpu::fp16_to_float_scalar(x->dmin);
+
+        uint32_t utmp[4];
+        memcpy(utmp, x->scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
+            _mm_set_epi32((int)utmp[3], (int)utmp[2], (int)utmp[1], (int)utmp[0]));
+
+        const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y->bsums);
+        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
+                                           _mm256_extracti128_si256(q8sums, 1));
+        const __m128i mins128 = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m128i prod = _mm_madd_epi16(mins128, q8s);
+        acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = _mm256_set_m128i(sc128, sc128);
+
+        const uint8_t* q4 = x->qs;
+        const int8_t* q8d = y->qs;
+        __m256i sumi = _mm256_setzero_si256();
+
+        for (int j = 0; j < QK_K / 64; ++j) {
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, cpu::get_scale_shuffle_k4(2 * j + 0));
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, cpu::get_scale_shuffle_k4(2 * j + 1));
+
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4);
+            q4 += 32;
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8d);
+            q8d += 32;
+            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+            p16l = _mm256_madd_epi16(scale_l, p16l);
+
+            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8d);
+            q8d += 32;
+            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
+            p16h = _mm256_madd_epi16(scale_h, p16h);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+    return cpu::hsum_avx2(acc) + _mm_cvtss_f32(acc_m);
+}
+
+static void gemv_q3_k_q4_k_fused_qkv_avx2(const float* a, const uint8_t* wq, const uint8_t* wk,
+                                           const uint8_t* wv, float* out_q, float* out_k,
+                                           float* out_v, int K, int N_q, int N_k, int N_v) {
+    constexpr int QK_K = 256;
+    constexpr int Q3_K_BLOCK_BYTES = 110;
+    constexpr int Q4_K_BLOCK_BYTES = 144;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    std::vector<cpu::block_q8_K> q8_buf(nb);
+    cpu::quantize_row_q8_K(a, q8_buf.data(), K);
+
+    // Q and K use Q3_K Q8_K dot product
+    auto dot_q3_rows = [&](const uint8_t* w, float* out, int N) {
+#    pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* q3_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
+            __m256 acc = _mm256_setzero_ps();
+            for (int i = 0; i < nb; ++i) {
+                _mm_prefetch((const char*)(q3_row + (i + 1) * Q3_K_BLOCK_BYTES), _MM_HINT_T0);
+                _mm_prefetch((const char*)(q8_buf.data() + i + 1), _MM_HINT_T0);
+                acc = _mm256_add_ps(
+                    acc, cpu::q3_k_sb_dot_avx2(q3_row + (size_t)i * Q3_K_BLOCK_BYTES, &q8_buf[i]));
+            }
+            out[n] = cpu::hsum_avx2(acc);
+        }
+    };
+
+    dot_q3_rows(wq, out_q, N_q);
+    dot_q3_rows(wk, out_k, N_k);
+
+    // V uses Q4_K Q8_K dot product (inline, shares same q8_buf)
+#    pragma omp parallel for schedule(static)
+    for (int n = 0; n < N_v; ++n) {
+        const uint8_t* q4_row = wv + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+        out_v[n] = dot_q4_K_q8_K_row_avx2(q4_row, q8_buf.data(), nb);
+    }
+}
+#endif
+
+TensorPtr matmul_transB_fused_qkv_q3_k_q4_k(const TensorPtr& input, const TensorPtr& wq,
+                                             const TensorPtr& wk, const TensorPtr& wv) {
+    if (input->ndim() != 2 || wq->ndim() != 2 || wk->ndim() != 2 || wv->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_qkv_q3_k_q4_k expects 2D tensors");
+    if (wq->dtype() != DataType::Q3_K || wk->dtype() != DataType::Q3_K ||
+        wv->dtype() != DataType::Q4_K)
+        throw std::runtime_error("matmul_transB_fused_qkv_q3_k_q4_k requires Q3_K (Q,K) + Q4_K (V)");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_qkv_q3_k_q4_k is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N_q = static_cast<int>(wq->shape()[0]);
+    int N_k = static_cast<int>(wk->shape()[0]);
+    int N_v = static_cast<int>(wv->shape()[0]);
+
+    auto q_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_q}, DeviceType::CPU);
+    auto k_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_k}, DeviceType::CPU);
+    auto v_out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_v}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/fused_qkv_q3_k_q4_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        gemv_q3_k_q4_k_fused_qkv_avx2(
+            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+            static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
+            static_cast<float*>(q_out->data()) + m * N_q,
+            static_cast<float*>(k_out->data()) + m * N_k,
+            static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+    }
+#else
+    q_out = ops::matmul_transB(input, wq);
+    k_out = ops::matmul_transB(input, wk);
+    v_out = ops::matmul_transB(input, wv);
+#endif
+
+    int total_N = N_q + N_k + N_v;
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, total_N}, DeviceType::CPU);
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        std::memcpy(o_data + m * total_N, static_cast<float*>(q_out->data()) + m * N_q,
+                    N_q * sizeof(float));
+        std::memcpy(o_data + m * total_N + N_q, static_cast<float*>(k_out->data()) + m * N_k,
+                    N_k * sizeof(float));
+        std::memcpy(o_data + m * total_N + N_q + N_k, static_cast<float*>(v_out->data()) + m * N_v,
+                    N_v * sizeof(float));
+    }
+    return out;
+}
+
+// ---- Q5_K fused GEMV (M=1 decode) using Q8_K dot product ----
+// Quantizes activation to Q8_K once, then uses inline Q5_K×Q8_K dot product.
+// Saves full dequantization + FP32 dot product overhead.
+#ifdef USE_AVX2
+static float dot_q5_K_q8_K_row_avx2(const uint8_t* q5_row, const cpu::block_q8_K* q8, int nb) {
+    constexpr int QK_K = 256;
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 acc_m = _mm_setzero_ps();
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    for (int i = 0; i < nb; ++i) {
+        const cpu::block_q5_K* x = reinterpret_cast<const cpu::block_q5_K*>(q5_row) + i;
+        const cpu::block_q8_K* y = q8 + i;
+
+        _mm_prefetch((const char*)((const cpu::block_q5_K*)q5_row + i + 1), _MM_HINT_T0);
+        _mm_prefetch((const char*)(q8 + i + 1), _MM_HINT_T0);
+
+        const float d = y->d * cpu::fp16_to_float_scalar(x->d);
+        const float dmin = -y->d * cpu::fp16_to_float_scalar(x->dmin);
+
+        uint32_t utmp[4];
+        memcpy(utmp, x->scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
+            _mm_set_epi32((int)utmp[3], (int)utmp[2], (int)utmp[1], (int)utmp[0]));
+
+        const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y->bsums);
+        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
+                                           _mm256_extracti128_si256(q8sums, 1));
+        const __m128i mins128 = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m128i prod = _mm_madd_epi16(mins128, q8s);
+        acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = _mm256_set_m128i(sc128, sc128);
+
+        const __m256i qh_vec = _mm256_loadu_si256((const __m256i*)x->qh);
+
+        const uint8_t* ql = x->ql;
+        const int8_t* q8d = y->qs;
+        __m256i sumi = _mm256_setzero_si256();
+
+        for (int j = 0; j < QK_K / 64; ++j) {
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, cpu::get_scale_shuffle_k4(2 * j + 0));
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, cpu::get_scale_shuffle_k4(2 * j + 1));
+
+            const __m256i ql_vec = _mm256_loadu_si256((const __m256i*)(ql + j * 32));
+            const __m256i ql_low = _mm256_and_si256(ql_vec, m4);
+            const __m256i ql_high = _mm256_and_si256(_mm256_srli_epi16(ql_vec, 4), m4);
+
+            const __m256i qh_mask_low = _mm256_set1_epi8(1 << (j * 2));
+            const __m256i qh_mask_high = _mm256_set1_epi8(1 << (j * 2 + 1));
+
+            __m256i qh_test_low = _mm256_and_si256(qh_vec, qh_mask_low);
+            __m256i qh_cmp_low = _mm256_cmpeq_epi8(qh_test_low, _mm256_setzero_si256());
+            __m256i qh_add_low = _mm256_andnot_si256(qh_cmp_low, _mm256_set1_epi8(16));
+
+            __m256i qh_test_high = _mm256_and_si256(qh_vec, qh_mask_high);
+            __m256i qh_cmp_high = _mm256_cmpeq_epi8(qh_test_high, _mm256_setzero_si256());
+            __m256i qh_add_high = _mm256_andnot_si256(qh_cmp_high, _mm256_set1_epi8(16));
+
+            const __m256i q5_low = _mm256_add_epi8(ql_low, qh_add_low);
+            const __m256i q5_high = _mm256_add_epi8(ql_high, qh_add_high);
+
+            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8d);
+            q8d += 32;
+            __m256i p16l = _mm256_maddubs_epi16(q5_low, q8l);
+            p16l = _mm256_madd_epi16(scale_l, p16l);
+
+            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8d);
+            q8d += 32;
+            __m256i p16h = _mm256_maddubs_epi16(q5_high, q8h);
+            p16h = _mm256_madd_epi16(scale_h, p16h);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+    return cpu::hsum_avx2(acc) + _mm_cvtss_f32(acc_m);
+}
+
+static void gemv_q5_k_transB_avx2(const float* a, const uint8_t* w, float* out, int M, int K,
+                                    int N) {
+    constexpr int QK_K = 256;
+    constexpr int Q5_K_BLOCK_BYTES = 176;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    if (M == 1) {
+        std::vector<cpu::block_q8_K> q8_buf(nb);
+        cpu::quantize_row_q8_K(a, q8_buf.data(), K);
+
+#    pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* q5_row = w + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+            out[n] = dot_q5_K_q8_K_row_avx2(q5_row, q8_buf.data(), nb);
+        }
+    } else {
+        std::vector<cpu::block_q8_K> q8_all(M * nb);
+        for (int m = 0; m < M; ++m) {
+            cpu::quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
+        }
+
+#    pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* q5_row = w + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+            for (int m = 0; m < M; ++m) {
+                out[m * N + n] = dot_q5_K_q8_K_row_avx2(q5_row, q8_all.data() + m * nb, nb);
+            }
+        }
+    }
+}
+#endif
+
 TensorPtr matmul_transB_fused_ffn_down_residual_q6_k(const TensorPtr& input,
                                                      const TensorPtr& weight,
                                                      const TensorPtr& residual) {
@@ -1758,6 +2330,43 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q6_k(const TensorPtr& input,
         cpu::gemv_q6_k_ffn_down_residual_avx2(a_data + m * K,
                                               static_cast<const uint8_t*>(weight->data()),
                                               r_data + m * N, o_data + m * N, K, N);
+    }
+#else
+    out = ops::matmul_transB(input, weight);
+    out = ops::add(residual, out);
+#endif
+
+    return out;
+}
+
+TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
+                                                     const TensorPtr& weight,
+                                                     const TensorPtr& residual) {
+    if (input->ndim() != 2 || weight->ndim() != 2 || residual->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_ffn_down_residual_q4_k expects 2D tensors");
+    if (weight->dtype() != DataType::Q4_K)
+        throw std::runtime_error(
+            "matmul_transB_fused_ffn_down_residual_q4_k requires Q4_K weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_ffn_down_residual_q4_k is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N = static_cast<int>(weight->shape()[0]);
+
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q4_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_k_ffn_down_residual_avx2(a_data + m * K,
+                                               static_cast<const uint8_t*>(weight->data()),
+                                               r_data + m * N, o_data + m * N, K, N);
     }
 #else
     out = ops::matmul_transB(input, weight);

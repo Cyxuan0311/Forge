@@ -20,6 +20,16 @@ struct block_q8_K {
     int16_t bsums[16];
 };
 
+// Q3_K block structure (256 elements, 110 bytes)
+// Layout: hmask[32] + qs[64] + scales[12] + d[2]
+struct block_q3_K {
+    uint8_t hmask[32];   // high bit mask
+    uint8_t qs[64];      // low 2-bit quants
+    uint8_t scales[12];  // scales, quantized with 6 bits
+    uint16_t d;          // super-block scale (fp16)
+};
+static_assert(sizeof(block_q3_K) == 110, "block_q3_K must be 110 bytes");
+
 // Q6_K block structure (256 elements, 210 bytes)
 struct block_q6_K {
     uint8_t ql[128];
@@ -107,6 +117,21 @@ static inline __m128i get_scale_shuffle(int i) {
         11, 11, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13,
         13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15};
     return _mm_loadu_si128((const __m128i*)k_shuffle + i);
+}
+
+// Helper: generate 256-bit shuffle mask for Q3_K scale extraction
+// Used by dot_q3_K_q8_K_avx2 to broadcast 16-bit scales across 32-byte vectors
+static inline __m256i get_scale_shuffle_q3k(int i) {
+    static const uint8_t k_shuffle[128] = {
+         0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,
+         2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,
+         4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,
+         6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,
+         8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,
+        10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+        12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15};
+    return _mm256_loadu_si256((const __m256i*)k_shuffle + i);
 }
 #endif  // USE_AVX2
 
