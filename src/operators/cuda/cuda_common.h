@@ -92,5 +92,34 @@ __device__ __forceinline__ void q3_k_unpack_scales(const uint8_t* scales_raw, in
     memcpy(scales_out, aux, 16);
 }
 
+// ---- dp4a helper (sm_61+) ----
+// 4-way int8 dot product: a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3] + c
+__device__ __forceinline__ int forge_dp4a(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    int r = c;
+    for (int i = 0; i < 4; i++)
+        r += ((a >> (i * 8)) & 0xFF) * ((b >> (i * 8)) & 0xFF);
+    return r;
+#endif
+}
+
+// Pack 4 int8 values into a 32-bit integer for dp4a
+__device__ __forceinline__ int pack_int8_4(int8_t v0, int8_t v1, int8_t v2, int8_t v3) {
+    // Note: use unsigned cast to avoid sign-extension during shift
+    return (static_cast<uint32_t>(static_cast<uint8_t>(v0))) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(v1)) << 8) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(v2)) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(v3)) << 24);
+}
+
+// Read 4 consecutive int8 values from memory and pack into 32-bit for dp4a
+__device__ __forceinline__ int load_pack_int8_4(const int8_t* ptr) {
+    int result;
+    memcpy(&result, ptr, 4);  // prevents the compiler from assuming alignment
+    return result;
+}
+
 }  // namespace cuda
 }  // namespace forge

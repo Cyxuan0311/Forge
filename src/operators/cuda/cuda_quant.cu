@@ -163,7 +163,48 @@ void launch_dequant_q4_0_matrix(const void* q_data, float* out, int N, int K, cu
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     dequant_q4_0_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
-                                                               out, N, K);
+                                                                out, N, K);
+}
+
+// ---- Q4_0 Matrix Dequantization to FP16 ----
+
+__global__ void dequant_q4_0_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
+                                                 __half* __restrict__ out, int N, int K) {
+    const int Q4_0_BLOCK_SIZE = 18;
+    const int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / BLOCK_ELEMS;
+    int j = col % BLOCK_ELEMS;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * num_blocks_row * Q4_0_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q4_0_BLOCK_SIZE;
+
+    uint16_t scale_bits;
+    memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
+    float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
+
+    const uint8_t* qs = block_ptr + sizeof(uint16_t);
+    int val = q4_unpack(qs, j);
+
+    out[idx] = __float2half(static_cast<float>(val) * scale);
+}
+
+void launch_dequant_q4_0_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q4_0_matrix_fp16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), static_cast<__half*>(out), N, K);
 }
 
 // ---- Q4_1 Matrix Dequantization ----
@@ -594,6 +635,27 @@ void launch_cublas_sgemm(const float* A, const float* B, float* C, int M, int K,
                  CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 #else
     launch_gemm_tiled(A, B, C, M, N, K, transB, stream);
+#endif
+}
+
+// ---- cuBLAS FP16 × FP32 → FP32 GEMM ----
+// A: [M, K] FP32, B: [N, K] FP16 (transposed), C: [M, N] FP32
+void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M, int K, int N,
+                                   bool transB, cudaStream_t stream) {
+#if FORGE_USE_CUBLAS
+    cublasHandle_t handle = get_cublas_handle(stream);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    cublasGemmEx(handle, opB, CUBLAS_OP_N, N, M, K, &alpha,
+                 B, transB ? CUDA_R_16F : CUDA_R_16F, transB ? K : N,
+                 A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#else
+    (void)A; (void)B; (void)C; (void)M; (void)K; (void)N; (void)transB; (void)stream;
 #endif
 }
 
