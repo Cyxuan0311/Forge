@@ -542,127 +542,167 @@ static void gemv_q8_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
     constexpr int BLOCK_SIZE = 32;
     constexpr int BLOCK_BYTES = 34;
     const int blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int full_blocks = K / BLOCK_SIZE;
 
-    // Process one weight block for a single output row.
-    // Computes unscaled dot product: sum(a[k] * qs[k]) for 32 elements,
-    // then applies scale once and accumulates into acc.
-    // This saves 3 mul_ps vs multiplying each sub-block by scale separately.
-    auto process_block = [&](const float* a_row, const uint8_t* w_row, int bi, __m256& acc) {
-        const uint8_t* block = w_row + bi * BLOCK_BYTES;
+    // Process one weight block for a single output row, using dual accumulators.
+    // This breaks the 5-cycle FMA dependency chain, allowing 2 independent
+    // FMA pipelines to execute in parallel on Zen2+ and Ice Lake.
+    auto process_block = [&](const float* a_row, const uint8_t* w_row, int bi,
+                             __m256& acc_a, __m256& acc_b) {
+        const uint8_t* block = w_row + (size_t)bi * BLOCK_BYTES;
         uint16_t scale_bits;
         memcpy(&scale_bits, block, 2);
         __m256 scale = fp16_to_fp32_broadcast_avx2(scale_bits);
         const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
         int base = bi * BLOCK_SIZE;
 
-        // Accumulate unscaled: partial = sum(a[k] * qs[k])
-        __m256 partial = _mm256_mul_ps(_mm256_loadu_ps(a_row + base),
-                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                                           _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs)))));
-        partial = _mm256_fmadd_ps(_mm256_loadu_ps(a_row + base + 8),
-                                  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                                      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8)))),
-                                  partial);
-        partial = _mm256_fmadd_ps(_mm256_loadu_ps(a_row + base + 16),
-                                  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                                      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 16)))),
-                                  partial);
-        partial = _mm256_fmadd_ps(_mm256_loadu_ps(a_row + base + 24),
-                                  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                                      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 24)))),
-                                  partial);
+        // Even sub-blocks → acc_a, odd sub-blocks → acc_b
+        __m256 p0 = _mm256_mul_ps(_mm256_loadu_ps(a_row + base),
+                                   _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                                       _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs)))));
+        __m256 p1 = _mm256_mul_ps(_mm256_loadu_ps(a_row + base + 8),
+                                   _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                                       _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8)))));
+        __m256 p2 = _mm256_mul_ps(_mm256_loadu_ps(a_row + base + 16),
+                                   _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                                       _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 16)))));
+        __m256 p3 = _mm256_mul_ps(_mm256_loadu_ps(a_row + base + 24),
+                                   _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                                       _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 24)))));
 
-        // Apply scale once for the entire block
-        acc = _mm256_fmadd_ps(scale, partial, acc);
+        // Accumulate into dual chains
+        __m256 partial_a = _mm256_add_ps(p0, p2);
+        __m256 partial_b = _mm256_add_ps(p1, p3);
+        acc_a = _mm256_fmadd_ps(scale, partial_a, acc_a);
+        acc_b = _mm256_fmadd_ps(scale, partial_b, acc_b);
     };
 
     if (M == 1) {
-        // Decode path: single input vector, optimize by processing NR rows at a time
-        constexpr int NR = 4;
+        // Decode path: single input vector, optimize by processing NR=8 rows at a time
+        // with dual accumulators + prefetch for better ILP and memory latency hiding.
+        constexpr int NR = 8;
         const float* a_row = a;
 
-        // Use dynamic scheduling for large N (e.g., output_proj N=262144)
-        // to reduce thread synchronization overhead and improve load balance.
-        // Chunk size 64 = 64*NR=256 rows per chunk.
-#    pragma omp parallel for schedule(dynamic, 64)
-        for (int n = 0; n < N; n += NR) {
-            int rows = (n + NR <= N) ? NR : (N - n);
-            __m256 acc0 = _mm256_setzero_ps();
-            __m256 acc1 = _mm256_setzero_ps();
-            __m256 acc2 = _mm256_setzero_ps();
-            __m256 acc3 = _mm256_setzero_ps();
+#    pragma omp parallel
+        {
+            // Thread-local max for fused max reduction
+            float thread_max = -1e30f;
 
-            const uint8_t* w_row0 = w + (size_t)(n + 0) * blocks_per_row * BLOCK_BYTES;
-            const uint8_t* w_row1 =
-                (rows > 1) ? w + (size_t)(n + 1) * blocks_per_row * BLOCK_BYTES : nullptr;
-            const uint8_t* w_row2 =
-                (rows > 2) ? w + (size_t)(n + 2) * blocks_per_row * BLOCK_BYTES : nullptr;
-            const uint8_t* w_row3 =
-                (rows > 3) ? w + (size_t)(n + 3) * blocks_per_row * BLOCK_BYTES : nullptr;
+#    pragma omp for schedule(dynamic, 32) nowait
+            for (int n = 0; n < N; n += NR) {
+                int rows = (n + NR <= N) ? NR : (N - n);
 
-            for (int bi = 0; bi < blocks_per_row; ++bi) {
-                int base = bi * BLOCK_SIZE;
-                if (K - base < BLOCK_SIZE)
-                    break;
+                __m256 acc0_a = _mm256_setzero_ps(), acc0_b = _mm256_setzero_ps();
+                __m256 acc1_a = _mm256_setzero_ps(), acc1_b = _mm256_setzero_ps();
+                __m256 acc2_a = _mm256_setzero_ps(), acc2_b = _mm256_setzero_ps();
+                __m256 acc3_a = _mm256_setzero_ps(), acc3_b = _mm256_setzero_ps();
+                __m256 acc4_a = _mm256_setzero_ps(), acc4_b = _mm256_setzero_ps();
+                __m256 acc5_a = _mm256_setzero_ps(), acc5_b = _mm256_setzero_ps();
+                __m256 acc6_a = _mm256_setzero_ps(), acc6_b = _mm256_setzero_ps();
+                __m256 acc7_a = _mm256_setzero_ps(), acc7_b = _mm256_setzero_ps();
 
-                process_block(a_row, w_row0, bi, acc0);
-                if (rows > 1)
-                    process_block(a_row, w_row1, bi, acc1);
-                if (rows > 2)
-                    process_block(a_row, w_row2, bi, acc2);
-                if (rows > 3)
-                    process_block(a_row, w_row3, bi, acc3);
-            }
+                const uint8_t* w_rows[NR];
+                for (int r = 0; r < NR; ++r) {
+                    w_rows[r] = (n + r < N) ? w + (size_t)(n + r) * blocks_per_row * BLOCK_BYTES : nullptr;
+                }
 
-            // Handle partial last block
-            {
-                int bi = blocks_per_row - 1;
-                int base = bi * BLOCK_SIZE;
-                int remaining = K - base;
-                if (remaining > 0 && remaining < BLOCK_SIZE) {
-                    auto process_partial = [&](const uint8_t* w_row, __m256& acc_ref) {
-                        const uint8_t* block = w_row + bi * BLOCK_BYTES;
-                        uint16_t sb;
-                        memcpy(&sb, block, 2);
-                        uint32_t sign = (sb >> 15) & 1;
-                        uint32_t exponent = (sb >> 10) & 0x1F;
-                        uint32_t mantissa = sb & 0x3FF;
-                        float scale_f;
-                        if (exponent == 0) {
-                            scale_f =
-                                mantissa == 0
-                                    ? 0.0f
-                                    : (sign ? -1 : 1) *
-                                          std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
-                        } else {
-                            scale_f = (sign ? -1 : 1) *
-                                      std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                                                 static_cast<int>(exponent) - 15);
+                // Prefetch first two blocks
+                for (int r = 0; r < rows; ++r) {
+                    _mm_prefetch((const char*)w_rows[r], _MM_HINT_T0);
+                }
+
+                int bi = 0;
+                for (; bi + 1 < full_blocks; bi += 2) {
+                    // Prefetch next pair of blocks
+                    if (bi + 2 < full_blocks) {
+                        for (int r = 0; r < rows; ++r) {
+                            _mm_prefetch((const char*)(w_rows[r] + (size_t)(bi + 2) * BLOCK_BYTES), _MM_HINT_T0);
                         }
-                        const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
-                        for (int j = 0; j < remaining; ++j) {
-                            acc_ref = _mm256_fmadd_ps(
-                                _mm256_set1_ps(a_row[base + j]),
-                                _mm256_set1_ps(static_cast<float>(qs[j]) * scale_f), acc_ref);
-                        }
-                    };
-                    process_partial(w_row0, acc0);
-                    if (rows > 1 && w_row1)
-                        process_partial(w_row1, acc1);
-                    if (rows > 2 && w_row2)
-                        process_partial(w_row2, acc2);
-                    if (rows > 3 && w_row3)
-                        process_partial(w_row3, acc3);
+                    }
+
+                    process_block(a_row, w_rows[0], bi, acc0_a, acc0_b);
+                    if (rows > 1) process_block(a_row, w_rows[1], bi, acc1_a, acc1_b);
+                    if (rows > 2) process_block(a_row, w_rows[2], bi, acc2_a, acc2_b);
+                    if (rows > 3) process_block(a_row, w_rows[3], bi, acc3_a, acc3_b);
+                    if (rows > 4) process_block(a_row, w_rows[4], bi, acc4_a, acc4_b);
+                    if (rows > 5) process_block(a_row, w_rows[5], bi, acc5_a, acc5_b);
+                    if (rows > 6) process_block(a_row, w_rows[6], bi, acc6_a, acc6_b);
+                    if (rows > 7) process_block(a_row, w_rows[7], bi, acc7_a, acc7_b);
+
+                    process_block(a_row, w_rows[0], bi + 1, acc0_a, acc0_b);
+                    if (rows > 1) process_block(a_row, w_rows[1], bi + 1, acc1_a, acc1_b);
+                    if (rows > 2) process_block(a_row, w_rows[2], bi + 1, acc2_a, acc2_b);
+                    if (rows > 3) process_block(a_row, w_rows[3], bi + 1, acc3_a, acc3_b);
+                    if (rows > 4) process_block(a_row, w_rows[4], bi + 1, acc4_a, acc4_b);
+                    if (rows > 5) process_block(a_row, w_rows[5], bi + 1, acc5_a, acc5_b);
+                    if (rows > 6) process_block(a_row, w_rows[6], bi + 1, acc6_a, acc6_b);
+                    if (rows > 7) process_block(a_row, w_rows[7], bi + 1, acc7_a, acc7_b);
+                }
+
+                if (bi < full_blocks) {
+                    process_block(a_row, w_rows[0], bi, acc0_a, acc0_b);
+                    if (rows > 1) process_block(a_row, w_rows[1], bi, acc1_a, acc1_b);
+                    if (rows > 2) process_block(a_row, w_rows[2], bi, acc2_a, acc2_b);
+                    if (rows > 3) process_block(a_row, w_rows[3], bi, acc3_a, acc3_b);
+                    if (rows > 4) process_block(a_row, w_rows[4], bi, acc4_a, acc4_b);
+                    if (rows > 5) process_block(a_row, w_rows[5], bi, acc5_a, acc5_b);
+                    if (rows > 6) process_block(a_row, w_rows[6], bi, acc6_a, acc6_b);
+                    if (rows > 7) process_block(a_row, w_rows[7], bi, acc7_a, acc7_b);
+                }
+
+                // Handle partial last block (scalar fallback)
+                if (full_blocks < blocks_per_row) {
+                    int bi_last = blocks_per_row - 1;
+                    int base = bi_last * BLOCK_SIZE;
+                    int remaining = K - base;
+                    if (remaining > 0 && remaining < BLOCK_SIZE) {
+                        auto process_partial = [&](const uint8_t* w_row, __m256& acc_a_ref, __m256& acc_b_ref) {
+                            const uint8_t* block = w_row + (size_t)bi_last * BLOCK_BYTES;
+                            uint16_t sb;
+                            memcpy(&sb, block, 2);
+                            __m256 scale = fp16_to_fp32_broadcast_avx2(sb);
+                            const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
+                            __m256 partial = _mm256_setzero_ps();
+                            for (int j = 0; j < remaining; ++j) {
+                                partial = _mm256_fmadd_ps(
+                                    _mm256_set1_ps(a_row[base + j]),
+                                    _mm256_set1_ps(static_cast<float>(qs[j])), partial);
+                            }
+                            // Apply scale and add to both accumulators
+                            __m256 scaled = _mm256_mul_ps(scale, partial);
+                            acc_a_ref = _mm256_add_ps(acc_a_ref, scaled);
+                        };
+                        process_partial(w_rows[0], acc0_a, acc0_b);
+                        if (rows > 1 && w_rows[1]) process_partial(w_rows[1], acc1_a, acc1_b);
+                        if (rows > 2 && w_rows[2]) process_partial(w_rows[2], acc2_a, acc2_b);
+                        if (rows > 3 && w_rows[3]) process_partial(w_rows[3], acc3_a, acc3_b);
+                        if (rows > 4 && w_rows[4]) process_partial(w_rows[4], acc4_a, acc4_b);
+                        if (rows > 5 && w_rows[5]) process_partial(w_rows[5], acc5_a, acc5_b);
+                        if (rows > 6 && w_rows[6]) process_partial(w_rows[6], acc6_a, acc6_b);
+                        if (rows > 7 && w_rows[7]) process_partial(w_rows[7], acc7_a, acc7_b);
+                    }
+                }
+
+                // Horizontal sum with dual accumulator merge
+                float vals[NR];
+                vals[0] = hsum_avx2(_mm256_add_ps(acc0_a, acc0_b));
+                if (rows > 1) vals[1] = hsum_avx2(_mm256_add_ps(acc1_a, acc1_b));
+                if (rows > 2) vals[2] = hsum_avx2(_mm256_add_ps(acc2_a, acc2_b));
+                if (rows > 3) vals[3] = hsum_avx2(_mm256_add_ps(acc3_a, acc3_b));
+                if (rows > 4) vals[4] = hsum_avx2(_mm256_add_ps(acc4_a, acc4_b));
+                if (rows > 5) vals[5] = hsum_avx2(_mm256_add_ps(acc5_a, acc5_b));
+                if (rows > 6) vals[6] = hsum_avx2(_mm256_add_ps(acc6_a, acc6_b));
+                if (rows > 7) vals[7] = hsum_avx2(_mm256_add_ps(acc7_a, acc7_b));
+
+                // Write results + track thread-local max
+                for (int r = 0; r < rows; ++r) {
+                    out[n + r] = vals[r];
+                    if (vals[r] > thread_max) thread_max = vals[r];
                 }
             }
 
-            out[n + 0] = hsum_avx2(acc0);
-            if (rows > 1)
-                out[n + 1] = hsum_avx2(acc1);
-            if (rows > 2)
-                out[n + 2] = hsum_avx2(acc2);
-            if (rows > 3)
-                out[n + 3] = hsum_avx2(acc3);
+            // Fused max reduction across threads (optional, saved back to out[0] area if needed)
+            // For now the sampler does its own max; this just reduces per-thread overhead
         }
     } else {
 // Prefill path: M > 1, use original per-row approach
@@ -671,41 +711,29 @@ static void gemv_q8_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
             const uint8_t* w_row = w + (size_t)n * blocks_per_row * BLOCK_BYTES;
             for (int m = 0; m < M; ++m) {
                 const float* a_row = a + m * K;
-                __m256 acc = _mm256_setzero_ps();
+                __m256 acc_a = _mm256_setzero_ps(), acc_b = _mm256_setzero_ps();
 
                 for (int bi = 0; bi < blocks_per_row; ++bi) {
                     int base = bi * BLOCK_SIZE;
                     int remaining = K - base;
                     if (remaining >= BLOCK_SIZE) {
-                        process_block(a_row, w_row, bi, acc);
+                        process_block(a_row, w_row, bi, acc_a, acc_b);
                     } else if (remaining > 0) {
-                        const uint8_t* block = w_row + bi * BLOCK_BYTES;
+                        const uint8_t* block = w_row + (size_t)bi * BLOCK_BYTES;
                         uint16_t sb;
                         memcpy(&sb, block, 2);
-                        uint32_t sign = (sb >> 15) & 1;
-                        uint32_t exponent = (sb >> 10) & 0x1F;
-                        uint32_t mantissa = sb & 0x3FF;
-                        float scale_f;
-                        if (exponent == 0) {
-                            scale_f =
-                                mantissa == 0
-                                    ? 0.0f
-                                    : (sign ? -1 : 1) *
-                                          std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
-                        } else {
-                            scale_f = (sign ? -1 : 1) *
-                                      std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                                                 static_cast<int>(exponent) - 15);
-                        }
+                        __m256 scale = fp16_to_fp32_broadcast_avx2(sb);
                         const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
+                        __m256 partial = _mm256_setzero_ps();
                         for (int j = 0; j < remaining; ++j) {
-                            acc = _mm256_fmadd_ps(
+                            partial = _mm256_fmadd_ps(
                                 _mm256_set1_ps(a_row[base + j]),
-                                _mm256_set1_ps(static_cast<float>(qs[j]) * scale_f), acc);
+                                _mm256_set1_ps(static_cast<float>(qs[j])), partial);
                         }
+                        acc_a = _mm256_add_ps(acc_a, _mm256_mul_ps(scale, partial));
                     }
                 }
-                out[m * N + n] = hsum_avx2(acc);
+                out[m * N + n] = hsum_avx2(_mm256_add_ps(acc_a, acc_b));
             }
         }
     }
@@ -2886,6 +2914,43 @@ static inline float dot_q4_K_q8_K_avx2(const uint8_t* q4_row, const block_q8_K* 
     acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
 
     return hsum_avx2(acc) + _mm_cvtss_f32(acc_m);
+}
+
+// ---- Q4_K GEMV using Q8_K fused dot product (replaces FP32-domain fused GEMV) ----
+// Strategy: quantize input to Q8_K once, then use dot_q4_K_q8_K_avx2 for each row.
+// Uses _mm256_maddubs_epi16 for int8×int8 fused multiply-add, avoiding FP32 intermediate.
+// For decode (M=1): quantize once, parallel over N rows.
+// For prefill (M>1): quantize each row, parallel over N.
+
+static void gemv_q4_k_q8k_transB_avx2(const float* a, const uint8_t* w, float* out, int M, int K,
+                                        int N) {
+    constexpr int QK_K = 256;
+    constexpr int Q4_K_BLOCK_BYTES = 144;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    if (M == 1) {
+        std::vector<block_q8_K> q8_buf(nb);
+        quantize_row_q8_K(a, q8_buf.data(), K);
+
+#    pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* q4_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+            out[n] = dot_q4_K_q8_K_avx2(q4_row, q8_buf.data(), nb);
+        }
+    } else {
+        std::vector<block_q8_K> q8_all(M * nb);
+        for (int m = 0; m < M; ++m) {
+            quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
+        }
+
+#    pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* q4_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+            for (int m = 0; m < M; ++m) {
+                out[m * N + n] = dot_q4_K_q8_K_avx2(q4_row, q8_all.data() + m * nb, nb);
+            }
+        }
+    }
 }
 
 // ---- Q4_K fused FFN gate+up ----
