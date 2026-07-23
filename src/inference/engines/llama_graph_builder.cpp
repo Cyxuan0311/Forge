@@ -269,8 +269,9 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
 
     // FFN core: fused or split gate/up/silu path
     int ffn_mid_idx;
-    bool use_ffn_up_fused = (dev == DeviceType::CUDA && lw.w1()->dtype() == DataType::Q4_0 &&
-                             lw.w3()->dtype() == DataType::Q4_0);
+    bool use_ffn_up_fused = (dev == DeviceType::CUDA &&
+                             ((lw.w1()->dtype() == DataType::Q4_0 && lw.w3()->dtype() == DataType::Q4_0) ||
+                              (lw.w1()->dtype() == DataType::Q4_K && lw.w3()->dtype() == DataType::Q4_K)));
     if (use_ffn_up_fused) {
         ffn_mid_idx = graph.add_node(
             "ffn_up_fused", "ffn_up_fused", {ref(ffn_normed_idx)},
@@ -295,7 +296,11 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
     }
 
     // FFN down: fused or regular matmul + residual
-    bool use_ffn_down_fused = (dev == DeviceType::CUDA && lw.w2()->dtype() == DataType::Q4_0);
+    bool use_ffn_down_fused = (dev == DeviceType::CUDA &&
+        (lw.w2()->dtype() == DataType::Q4_0 ||
+         lw.w2()->dtype() == DataType::Q4_K ||
+         lw.w2()->dtype() == DataType::Q5_K ||
+         lw.w2()->dtype() == DataType::Q6_K));
     int last_idx;
     if (use_ffn_down_fused) {
         last_idx = graph.add_node(
@@ -306,10 +311,28 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
                 auto ffn_out = std::make_shared<Tensor>(
                     DataType::FP32, std::vector<int64_t>{1, N_down}, DeviceType::CUDA);
 #ifdef USE_CUDA
-                cuda::launch_ffn_down_fused_q4_0(
-                    static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
-                    static_cast<const float*>(inputs[1]->data()),
-                    static_cast<float*>(ffn_out->data()), K_down, N_down);
+                auto w2_dtype = lw.w2()->dtype();
+                if (w2_dtype == DataType::Q4_0) {
+                    cuda::launch_ffn_down_fused_q4_0(
+                        static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
+                        static_cast<const float*>(inputs[1]->data()),
+                        static_cast<float*>(ffn_out->data()), K_down, N_down);
+                } else if (w2_dtype == DataType::Q4_K) {
+                    cuda::launch_ffn_down_fused_q4_k(
+                        static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
+                        static_cast<const float*>(inputs[1]->data()),
+                        static_cast<float*>(ffn_out->data()), K_down, N_down);
+                } else if (w2_dtype == DataType::Q5_K) {
+                    cuda::launch_ffn_down_fused_q5_k(
+                        static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
+                        static_cast<const float*>(inputs[1]->data()),
+                        static_cast<float*>(ffn_out->data()), K_down, N_down);
+                } else if (w2_dtype == DataType::Q6_K) {
+                    cuda::launch_ffn_down_fused_q6_k(
+                        static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
+                        static_cast<const float*>(inputs[1]->data()),
+                        static_cast<float*>(ffn_out->data()), K_down, N_down);
+                }
 #endif
                 return ffn_out;
             },

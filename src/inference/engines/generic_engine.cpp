@@ -402,6 +402,66 @@ GenericEngine::QKVProjResult GenericEngine::qkv_proj_forward(const TensorPtr& x,
             for (int i = 0; i < N_v; ++i) vd[i] += bd[i];
         }
     }
+    // CPU mixed-precision fused Q3_K+Q4_K QKV: Q,K are Q3_K, V is Q4_K
+    // Shares Q8_K quantization of activation across all three projections.
+    else if (dev == DeviceType::CPU && seq_len == 1 && wq->dtype() == DataType::Q3_K &&
+             wk->dtype() == DataType::Q3_K && wv->dtype() == DataType::Q4_K) {
+        int N_q = static_cast<int>(wq->shape()[0]);
+        int N_k = static_cast<int>(wk->shape()[0]);
+        int N_v = static_cast<int>(wv->shape()[0]);
+        auto qkv = ops::matmul_transB_fused_qkv_q3_k_q4_k(x, wq, wk, wv);
+        result.q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_q},
+                                            DeviceType::CPU);
+        result.k = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_k},
+                                            DeviceType::CPU);
+        result.v = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_v},
+                                            DeviceType::CPU);
+        float* src = static_cast<float*>(qkv->data());
+        std::memcpy(result.q->data(), src, N_q * sizeof(float));
+        std::memcpy(result.k->data(), src + N_q, N_k * sizeof(float));
+        std::memcpy(result.v->data(), src + N_q + N_k, N_v * sizeof(float));
+        if (bq && bq->numel() > 0) {
+            float* qd = static_cast<float*>(result.q->data());
+            const float* bd = static_cast<const float*>(bq->data());
+            for (int i = 0; i < N_q; ++i) qd[i] += bd[i];
+        }
+        if (bk && bk->numel() > 0) {
+            float* kd = static_cast<float*>(result.k->data());
+            const float* bd = static_cast<const float*>(bk->data());
+            for (int i = 0; i < N_k; ++i) kd[i] += bd[i];
+        }
+        if (bv && bv->numel() > 0) {
+            float* vd = static_cast<float*>(result.v->data());
+            const float* bd = static_cast<const float*>(bv->data());
+            for (int i = 0; i < N_v; ++i) vd[i] += bd[i];
+        }
+    }
+    // CPU Q3_K fused Q+K path (wq=Q3_K, wk=Q3_K; wv is Q5_K or other)
+    // Shares Q8_K quantization of activation across Q and K projections.
+    else if (dev == DeviceType::CPU && seq_len == 1 && wq->dtype() == DataType::Q3_K &&
+             wk->dtype() == DataType::Q3_K) {
+        int N_q = static_cast<int>(wq->shape()[0]);
+        int N_k = static_cast<int>(wk->shape()[0]);
+        auto qk = ops::matmul_transB_fused_qk_q3_k(x, wq, wk);
+        result.q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_q},
+                                            DeviceType::CPU);
+        result.k = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_k},
+                                            DeviceType::CPU);
+        float* src = static_cast<float*>(qk->data());
+        std::memcpy(result.q->data(), src, N_q * sizeof(float));
+        std::memcpy(result.k->data(), src + N_q, N_k * sizeof(float));
+        result.v = ops::matmul_transB(x, wv, bv);
+        if (bq && bq->numel() > 0) {
+            float* qd = static_cast<float*>(result.q->data());
+            const float* bd = static_cast<const float*>(bq->data());
+            for (int i = 0; i < N_q; ++i) qd[i] += bd[i];
+        }
+        if (bk && bk->numel() > 0) {
+            float* kd = static_cast<float*>(result.k->data());
+            const float* bd = static_cast<const float*>(bk->data());
+            for (int i = 0; i < N_k; ++i) kd[i] += bd[i];
+        }
+    }
     // Generic fallback
     else {
         result.q = ops::matmul_transB(x, wq, bq);
@@ -764,6 +824,21 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
                     lw.w3()->dtype() == DataType::Q4_0) {
                     ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
                 }
+                // Fused CUDA Q3_K gate+up (shared Q8_1 quantization of x)
+                else if (dev == DeviceType::CUDA && seq_len == 1 &&
+                         lw.w1()->dtype() == DataType::Q3_K && lw.w3()->dtype() == DataType::Q3_K) {
+                    ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
+                }
+                // Fused CUDA Q4_K gate+up (shared Q8_1 quantization of x)
+                else if (dev == DeviceType::CUDA && seq_len == 1 &&
+                         lw.w1()->dtype() == DataType::Q4_K && lw.w3()->dtype() == DataType::Q4_K) {
+                    ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
+                }
+                // Fused CUDA Q3_K gate + Q4_K up (mixed quantization, shared Q8_1)
+                else if (dev == DeviceType::CUDA && seq_len == 1 &&
+                         lw.w1()->dtype() == DataType::Q3_K && lw.w3()->dtype() == DataType::Q4_K) {
+                    ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
+                }
                 // Fused CPU Q4_0 gate+up
                 else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
                          lw.w1()->dtype() == DataType::Q4_0 && lw.w3()->dtype() == DataType::Q4_0) {
@@ -773,6 +848,11 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
                 else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
                          lw.w1()->dtype() == DataType::Q4_K && lw.w3()->dtype() == DataType::Q4_K) {
                     ffn_mid = ops::matmul_transB_fused_ffn_up_q4_k(x, lw.w1(), lw.w3());
+                }
+                // Fused CPU Q3_K gate+up
+                else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
+                         lw.w1()->dtype() == DataType::Q3_K && lw.w3()->dtype() == DataType::Q3_K) {
+                    ffn_mid = ops::matmul_transB_fused_ffn_up_q3_k(x, lw.w1(), lw.w3());
                 } else {
                     auto gate = ops::matmul_transB(x, lw.w1());
                     auto up = ops::matmul_transB(x, lw.w3());
@@ -784,26 +864,53 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
             {
                 PERF_SCOPE("layer/ffn_down");
                 // Fused down_proj + residual add for decode (M=1)
-                if (dev == DeviceType::CUDA && seq_len == 1 &&
-                    lw.w2()->dtype() == DataType::Q4_0) {
+                if (dev == DeviceType::CUDA && seq_len == 1) {
                     int K_down = static_cast<int>(lw.w2()->shape()[1]);
                     int N_down = static_cast<int>(lw.w2()->shape()[0]);
                     ffn_out = std::make_shared<Tensor>(DataType::FP32,
                                                        std::vector<int64_t>{1, N_down},
                                                        DeviceType::CUDA);
 #ifdef USE_CUDA
-                    cuda::launch_ffn_down_fused_q4_0(
-                        static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
-                        static_cast<const float*>(residual->data()),
-                        static_cast<float*>(ffn_out->data()), K_down, N_down);
+                    auto w2_dtype = lw.w2()->dtype();
+                    if (w2_dtype == DataType::Q4_0) {
+                        cuda::launch_ffn_down_fused_q4_0(
+                            static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
+                            static_cast<const float*>(residual->data()),
+                            static_cast<float*>(ffn_out->data()), K_down, N_down);
+                    } else if (w2_dtype == DataType::Q4_K) {
+                        cuda::launch_ffn_down_fused_q4_k(
+                            static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
+                            static_cast<const float*>(residual->data()),
+                            static_cast<float*>(ffn_out->data()), K_down, N_down);
+                    } else if (w2_dtype == DataType::Q5_K) {
+                        cuda::launch_ffn_down_fused_q5_k(
+                            static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
+                            static_cast<const float*>(residual->data()),
+                            static_cast<float*>(ffn_out->data()), K_down, N_down);
+                    } else if (w2_dtype == DataType::Q6_K) {
+                        cuda::launch_ffn_down_fused_q6_k(
+                            static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
+                            static_cast<const float*>(residual->data()),
+                            static_cast<float*>(ffn_out->data()), K_down, N_down);
+                    } else {
+                        ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
+                    }
 #endif
                 } else if (dev == DeviceType::CPU && seq_len == 1 &&
                            lw.w2()->dtype() == DataType::Q4_0) {
                     ffn_out = ops::matmul_transB_fused_ffn_down_residual_q4_0(ffn_mid, lw.w2(),
                                                                               residual);
                 } else if (dev == DeviceType::CPU && seq_len == 1 &&
+                           lw.w2()->dtype() == DataType::Q4_1) {
+                    ffn_out = ops::matmul_transB_fused_ffn_down_residual_q4_1(ffn_mid, lw.w2(),
+                                                                              residual);
+                } else if (dev == DeviceType::CPU && seq_len == 1 &&
                            lw.w2()->dtype() == DataType::Q6_K) {
                     ffn_out = ops::matmul_transB_fused_ffn_down_residual_q6_k(ffn_mid, lw.w2(),
+                                                                              residual);
+                } else if (dev == DeviceType::CPU && seq_len == 1 &&
+                           lw.w2()->dtype() == DataType::Q4_K) {
+                    ffn_out = ops::matmul_transB_fused_ffn_down_residual_q4_k(ffn_mid, lw.w2(),
                                                                               residual);
                 } else {
                     ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
@@ -995,11 +1102,17 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden, int layer_idx, i
         attn_out = attention_forward(q_rope, k_rope, v, layer_idx, start_pos, seq_len, dev);
     }
 
-    // ---- 7. Attention output projection ----
+    // ---- 7. Attention output projection (optionally fused with residual) ----
     TensorPtr attn_proj;
+    bool fused_attn_residual = false;
     {
         PERF_SCOPE("layer/attn_proj");
-        attn_proj = ops::matmul_transB(attn_out, lw.wo());
+        if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q4_0) {
+            attn_proj = ops::matmul_transB_fused_attn_proj_residual_q4_0(attn_out, lw.wo(), hidden);
+            fused_attn_residual = true;
+        } else {
+            attn_proj = ops::matmul_transB(attn_out, lw.wo());
+        }
     }
 
     // ---- 8. Post-attention norm (Gemma2) ----
@@ -1035,14 +1148,17 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden, int layer_idx, i
         }
 
         // Parallel residual: attn_proj + ffn_out + hidden
+        // If attn_proj already has hidden fused in, skip second add.
         {
             PERF_SCOPE("layer/residual");
             output = ops::add(attn_proj, ffn_out);
-            output = ops::add(output, hidden);
+            if (!fused_attn_residual)
+                output = ops::add(output, hidden);
         }
     } else {
         // Sequential: norm→attn→residual→norm→ffn→residual
-        auto hidden_after_attn = ops::add(hidden, attn_proj);
+        auto hidden_after_attn =
+            fused_attn_residual ? attn_proj : ops::add(hidden, attn_proj);
 
         TensorPtr ffn_normed;
         {
@@ -1070,9 +1186,13 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden, int layer_idx, i
         // Only skip residual add if a fused SiLUGated kernel already added it
         bool fused_residual =
             (cfg.ffn_type == FFNType::SiLUGated) &&
-            ((dev == DeviceType::CUDA && seq_len == 1 && lw.w2()->dtype() == DataType::Q4_0) ||
+            ((dev == DeviceType::CUDA && seq_len == 1 &&
+              (lw.w2()->dtype() == DataType::Q4_0 || lw.w2()->dtype() == DataType::Q4_K ||
+               lw.w2()->dtype() == DataType::Q5_K || lw.w2()->dtype() == DataType::Q6_K)) ||
              (dev == DeviceType::CPU && seq_len == 1 &&
-              (lw.w2()->dtype() == DataType::Q4_0 || lw.w2()->dtype() == DataType::Q6_K)));
+               (lw.w2()->dtype() == DataType::Q4_0 || lw.w2()->dtype() == DataType::Q4_1 ||
+                lw.w2()->dtype() == DataType::Q4_K ||
+                lw.w2()->dtype() == DataType::Q6_K)));
 
         if (fused_residual) {
             output = ffn_out;  // residual already added in fused kernel

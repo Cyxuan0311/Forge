@@ -35,11 +35,48 @@ TensorPtr matmul_transB_fused_ffn_up_q4_0(const TensorPtr& input, const TensorPt
 TensorPtr matmul_transB_fused_ffn_down_residual_q4_0(const TensorPtr& input,
                                                      const TensorPtr& weight,
                                                      const TensorPtr& residual);
+TensorPtr matmul_transB_fused_ffn_down_residual_q4_1(const TensorPtr& input,
+                                                     const TensorPtr& weight,
+                                                     const TensorPtr& residual);
+
+// Fused attention output projection + residual: computes attn_out @ wo + residual.
+// Fuses the attention output projection with the pre-attention residual add.
+// Weight must be Q4_0.
+TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual);
 
 // Q4_K fused FFN gate+up: reads input once, produces SiLU(gate)*up directly.
 // Both weight tensors must be Q4_K with the same K and N.
 TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPtr& w_gate,
                                           const TensorPtr& w_up);
+
+// Q3_K fused FFN gate+up: reads input once, quantizes to Q8_K one time,
+// then computes gate and up dot products in parallel, producing SiLU(gate)*up.
+// Both weight tensors must be Q3_K with the same K and N.
+TensorPtr matmul_transB_fused_ffn_up_q3_k(const TensorPtr& input, const TensorPtr& w_gate,
+                                          const TensorPtr& w_up);
+
+// Q3_K fused QK projection: reads input once, shares Q8_K quantization
+// across Q and K projections. Returns concatenated [1, N_q+N_k].
+// V projection is kept separate (often different quantization in practice).
+TensorPtr matmul_transB_fused_qk_q3_k(const TensorPtr& input, const TensorPtr& wq,
+                                       const TensorPtr& wk);
+
+// Q3_K fused QKV projection (all-three Q3_K): reads input once, shares Q8_K
+// quantization across Q, K, V projections. Returns concatenated [1, N_q+N_k+N_v].
+TensorPtr matmul_transB_fused_qkv_q3_k(const TensorPtr& input, const TensorPtr& wq,
+                                       const TensorPtr& wk, const TensorPtr& wv);
+// Mixed-precision fused QKV: Q3_K (Q,K) + Q4_K (V). Shares Q8_K quantization
+// across all three. Returns concatenated [1, N_q+N_k+N_v].
+TensorPtr matmul_transB_fused_qkv_q3_k_q4_k(const TensorPtr& input, const TensorPtr& wq,
+                                              const TensorPtr& wk, const TensorPtr& wv);
+
+// Q4_K fused FFN down-projection + residual: computes input @ weight + residual.
+// Weight tensor must be Q4_K.
+TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
+                                                     const TensorPtr& weight,
+                                                     const TensorPtr& residual);
 
 // Q6_K fused FFN down-projection + residual: computes input @ weight + residual.
 // Weight tensor must be Q6_K.

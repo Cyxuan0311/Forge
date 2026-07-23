@@ -513,9 +513,20 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
 #ifdef USE_CUDA
             auto dtype = output_weight->dtype();
             if (dtype == DataType::Q4_0) {
-                cuda::launch_output_proj_q4_0(static_cast<const float*>(cur_hidden->data()),
-                                              output_weight->data(),
-                                              static_cast<float*>(logits->data()), K, N);
+                // Dequantize Q4_0 → FP16 once, then use cuBLAS (tensor core) for output_proj
+                if (!weights_.output_weight_fp16) {
+                    weights_.output_weight_fp16 = std::make_shared<Tensor>(
+                        DataType::FP16, output_weight->shape(), DeviceType::CUDA);
+                    cuda::launch_dequant_q4_0_matrix_fp16(
+                        output_weight->data(),
+                        weights_.output_weight_fp16->data(),
+                        N, K);
+                }
+                cuda::launch_cublas_gemm_fp16_fp32(
+                    static_cast<const float*>(cur_hidden->data()),
+                    weights_.output_weight_fp16->data(),
+                    static_cast<float*>(logits->data()),
+                    1, K, N, true);
             } else if (dtype == DataType::Q4_K) {
                 // Use cooperative kernel for small K where split-K wastes lanes
                 // (e.g., K=1536 → 6 Q4_K blocks → only 6/32 lanes active in split-K)

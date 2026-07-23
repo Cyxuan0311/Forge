@@ -255,16 +255,11 @@ TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos, i
                     static_cast<float*>(logits->data()),
                     cap, has_softcap, d_suppress, n_suppress, vocab_size);
             } else {
-                // CPU path
+                // CPU path: softcap is now fused into the sampler for efficiency
+                // (softcap + max/argmax done in one traversal). Only handle suppress tokens here.
                 logits = ensure_cpu(logits);
                 float* data = static_cast<float*>(logits->data());
                 int n = static_cast<int>(logits->numel());
-                if (has_softcap) {
-                    float cap = cfg.f_final_logit_softcapping;
-                    for (int i = 0; i < n; ++i) {
-                        data[i] = std::tanh(data[i] / cap) * cap;
-                    }
-                }
                 if (has_suppress) {
                     int num_rows = logits->numel() / vocab_size;
                     for (int tok_id : cfg.suppress_tokens) {
@@ -959,25 +954,18 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
 
                         TensorPtr expert_result;
 
+                        // Zero-copy expert extraction: slice the 3D weight along the
+                        // expert dimension then view as 2D. This avoids dequantizing
+                        // the entire 3D tensor (which wastes 99%+ of compute when
+                        // n_expert_used << n_expert). The quantized GEMV kernels
+                        // handle the sliced weight directly.
                         auto extract_expert_2d = [&](const TensorPtr& w3d) -> TensorPtr {
                             if (!w3d) return nullptr;
                             auto& shp = w3d->shape();
                             if (shp.size() < 2) return w3d;
-                            int64_t d1 = shp[0];
-                            int64_t d2 = shp[1];
                             if (shp.size() == 3 && expert_idx < shp[2]) {
-                                TensorPtr fp32_w = w3d;
-                                if (is_quantized_type(w3d->dtype())) {
-                                    fp32_w = ops::dequantize_weight(w3d);
-                                }
-                                fp32_w = ensure_cpu(fp32_w);
-                                int64_t expert_stride = d1 * d2;
-                                const float* src = static_cast<const float*>(fp32_w->data()) +
-                                                   expert_idx * expert_stride;
-                                auto slice = std::make_shared<Tensor>(DataType::FP32,
-                                    std::vector<int64_t>{d1, d2}, DeviceType::CPU);
-                                std::memcpy(slice->data(), src, expert_stride * sizeof(float));
-                                return slice;
+                                auto expert_slice = w3d->slice(2, expert_idx, expert_idx + 1);
+                                return std::make_shared<Tensor>(expert_slice.view({shp[0], shp[1]}));
                             }
                             return w3d;
                         };

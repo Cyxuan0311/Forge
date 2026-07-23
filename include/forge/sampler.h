@@ -16,6 +16,7 @@ struct SamplerConfig {
     float repeat_penalty = 1.0f;
     bool do_sample = true;
     uint64_t seed = 0;
+    float logit_softcapping = 0.0f;  // >0 means apply softcap: tanh(x/cap)*cap
 };
 
 // Result of sampling a single sequence within a batch

@@ -99,9 +99,65 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
     {
         PERF_SCOPE("sampler/argmax_cpu");
         int best = 0;
-        float best_val = host_logits[0];
+        float best_val;
+        bool has_softcap = (config_.logit_softcapping > 0.0f);
+
+        if (has_softcap) {
+            // Fused softcap + argmax: apply tanh(x/cap)*cap in-place while finding max
+            float cap = config_.logit_softcapping;
 #ifdef USE_AVX2
-        {
+            __m256 vcap = _mm256_set1_ps(cap);
+            __m256 vdiv = _mm256_set1_ps(1.0f / cap);
+            __m256 c27 = _mm256_set1_ps(27.0f);
+            __m256 c9 = _mm256_set1_ps(9.0f);
+            __m256 vminus_one = _mm256_set1_ps(-1.0f);
+            __m256 vone = _mm256_set1_ps(1.0f);
+            __m256 vmax = _mm256_set1_ps(-1e30f);
+            __m256i vidx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+            int i = 0;
+            for (; i + 8 <= vocab_size; i += 8) {
+                __m256 v = _mm256_loadu_ps(&host_logits[i]);
+                __m256 x = _mm256_mul_ps(v, vdiv);
+                __m256 x2 = _mm256_mul_ps(x, x);
+                __m256 num = _mm256_add_ps(c27, x2);
+                __m256 den = _mm256_add_ps(c27, _mm256_mul_ps(c9, x2));
+                __m256 th = _mm256_mul_ps(x, _mm256_div_ps(num, den));
+                th = _mm256_min_ps(_mm256_max_ps(th, vminus_one), vone);
+                __m256 sc = _mm256_mul_ps(th, vcap);
+                _mm256_storeu_ps(&host_logits[i], sc);
+                __m256 cmp = _mm256_cmp_ps(sc, vmax, _CMP_GT_OS);
+                vmax = _mm256_blendv_ps(vmax, sc, cmp);
+                __m256i new_idx = _mm256_add_epi32(_mm256_set1_epi32(i),
+                                                   _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+                vidx = _mm256_blendv_epi8(vidx, new_idx, _mm256_castps_si256(cmp));
+            }
+            float vals[8];
+            int idxs[8];
+            _mm256_storeu_ps(vals, vmax);
+            _mm256_storeu_si256((__m256i*)idxs, vidx);
+            best = idxs[0];
+            best_val = vals[0];
+            for (int j = 1; j < 8; ++j) {
+                if (vals[j] > best_val) { best_val = vals[j]; best = idxs[j]; }
+            }
+            for (; i < vocab_size; ++i) {
+                float xx = host_logits[i] / cap;
+                float x2 = xx * xx;
+                float t = xx * (27.0f + x2) / (27.0f + 9.0f * x2);
+                if (t > 1.0f) t = 1.0f; if (t < -1.0f) t = -1.0f;
+                host_logits[i] = t * cap;
+                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
+            }
+#else
+            best_val = host_logits[0];
+            for (int i = 0; i < vocab_size; ++i) {
+                host_logits[i] = std::tanh(host_logits[i] / cap) * cap;
+                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
+            }
+#endif
+        } else {
+#ifdef USE_AVX2
+            best_val = host_logits[0];
             __m256 vmax = _mm256_set1_ps(-1e30f);
             __m256i vidx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
             int i = 0;
@@ -113,32 +169,23 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
                                                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
                 vidx = _mm256_blendv_epi8(vidx, new_idx, _mm256_castps_si256(cmp));
             }
-            // Find max among the 8 remaining candidates
             float vals[8];
             int idxs[8];
             _mm256_storeu_ps(vals, vmax);
             _mm256_storeu_si256((__m256i*)idxs, vidx);
             for (int j = 0; j < 8; ++j) {
-                if (vals[j] > best_val) {
-                    best_val = vals[j];
-                    best = idxs[j];
-                }
+                if (vals[j] > best_val) { best_val = vals[j]; best = idxs[j]; }
             }
             for (; i < vocab_size; ++i) {
-                if (host_logits[i] > best_val) {
-                    best_val = host_logits[i];
-                    best = i;
-                }
+                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
             }
-        }
 #else
-        for (int i = 1; i < vocab_size; ++i) {
-            if (host_logits[i] > best_val) {
-                best_val = host_logits[i];
-                best = i;
+            best_val = host_logits[0];
+            for (int i = 1; i < vocab_size; ++i) {
+                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
             }
-        }
 #endif
+        }
         return best;
     }
 }
@@ -166,32 +213,75 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
     {
         PERF_SCOPE("sampler/softmax_sample");
 
-        // AVX2-accelerated max reduction
+        // AVX2-accelerated softcap + max reduction (fused when softcap is needed)
         float max_val;
+        bool has_softcap = (config_.logit_softcapping > 0.0f);
+        if (has_softcap) {
+            float cap = config_.logit_softcapping;
 #ifdef USE_AVX2
-        {
+            __m256 vcap = _mm256_set1_ps(cap);
+            __m256 vdiv = _mm256_set1_ps(1.0f / cap);
+            __m256 c27 = _mm256_set1_ps(27.0f);
+            __m256 c9 = _mm256_set1_ps(9.0f);
+            __m256 vminus_one = _mm256_set1_ps(-1.0f);
+            __m256 vone = _mm256_set1_ps(1.0f);
             __m256 vmax = _mm256_set1_ps(-1e30f);
             int i = 0;
             for (; i + 8 <= vocab_size; i += 8) {
                 __m256 v = _mm256_loadu_ps(&host_logits[i]);
-                vmax = _mm256_max_ps(vmax, v);
+                __m256 x = _mm256_mul_ps(v, vdiv);
+                __m256 x2 = _mm256_mul_ps(x, x);
+                __m256 num = _mm256_add_ps(c27, x2);
+                __m256 den = _mm256_add_ps(c27, _mm256_mul_ps(c9, x2));
+                __m256 th = _mm256_mul_ps(x, _mm256_div_ps(num, den));
+                th = _mm256_min_ps(_mm256_max_ps(th, vminus_one), vone);
+                __m256 sc = _mm256_mul_ps(th, vcap);
+                _mm256_storeu_ps(&host_logits[i], sc);
+                vmax = _mm256_max_ps(vmax, sc);
             }
-            // Horizontal max
-            __m128 hi = _mm256_extractf128_ps(vmax, 1);
-            __m128 lo = _mm256_castps256_ps128(vmax);
-            __m128 m = _mm256_castps256_ps128(
-                _mm256_max_ps(vmax, _mm256_permute2f128_ps(vmax, vmax, 0x01)));
+            __m128 m = _mm256_castps256_ps128(vmax);
+            m = _mm_max_ps(m, _mm256_extractf128_ps(vmax, 1));
             m = _mm_max_ps(m, _mm_movehl_ps(m, m));
             m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
             max_val = _mm_cvtss_f32(m);
             for (; i < vocab_size; ++i) {
-                if (host_logits[i] > max_val)
-                    max_val = host_logits[i];
+                float xx = host_logits[i] / cap;
+                float x2 = xx * xx;
+                float t = xx * (27.0f + x2) / (27.0f + 9.0f * x2);
+                if (t > 1.0f) t = 1.0f; if (t < -1.0f) t = -1.0f;
+                host_logits[i] = t * cap;
+                if (host_logits[i] > max_val) max_val = host_logits[i];
             }
-        }
 #else
-        max_val = *std::max_element(host_logits.begin(), host_logits.end());
+            max_val = host_logits[0];
+            for (int i = 0; i < vocab_size; ++i) {
+                host_logits[i] = std::tanh(host_logits[i] / cap) * cap;
+                if (host_logits[i] > max_val) max_val = host_logits[i];
+            }
 #endif
+        } else {
+#ifdef USE_AVX2
+            {
+                __m256 vmax = _mm256_set1_ps(-1e30f);
+                int i = 0;
+                for (; i + 8 <= vocab_size; i += 8) {
+                    __m256 v = _mm256_loadu_ps(&host_logits[i]);
+                    vmax = _mm256_max_ps(vmax, v);
+                }
+                __m128 m = _mm256_castps256_ps128(vmax);
+                m = _mm_max_ps(m, _mm256_extractf128_ps(vmax, 1));
+                m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+                m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+                max_val = _mm_cvtss_f32(m);
+                for (; i < vocab_size; ++i) {
+                    if (host_logits[i] > max_val)
+                        max_val = host_logits[i];
+                }
+            }
+#else
+            max_val = *std::max_element(host_logits.begin(), host_logits.end());
+#endif
+        }
 
         // AVX2-accelerated exp + sum
         std::vector<float> probs(vocab_size);
