@@ -138,30 +138,54 @@ def generate_response(ctx, tokenizer, prompt_ids, image_embeddings, image_insert
     in_thinking = False
     thinking_text = ""
 
-    for step in range(max_new_tokens):
-        logits_np = np.array(logits)
-        last_logits = logits_np[-1] if logits_np.ndim > 1 else logits_np
+    # First token: sample from prefill logits on CPU
+    logits_np = np.array(logits)
+    last_logits = logits_np[-1] if logits_np.ndim > 1 else logits_np
+    if temperature > 0:
+        shifted = last_logits - np.max(last_logits)
+        probs = np.exp(shifted / temperature)
+        probs = probs / probs.sum()
+        top_k_actual = min(top_k, len(probs))
+        top_indices = np.argsort(probs)[-top_k_actual:]
+        top_probs = probs[top_indices]
+        top_probs = top_probs / top_probs.sum()
+        next_token = int(np.random.choice(top_indices, p=top_probs))
+    else:
+        next_token = int(np.argmax(last_logits))
 
-        if temperature > 0:
-            if repeat_penalty != 1.0 and len(generated_ids) > 0:
-                for tid in set(generated_ids[-64:]):
-                    if last_logits[tid] > 0:
-                        last_logits[tid] /= repeat_penalty
-                    else:
-                        last_logits[tid] *= repeat_penalty
-            shifted = last_logits - np.max(last_logits)
-            probs = np.exp(shifted / temperature)
-            probs = probs / probs.sum()
-            top_k_actual = min(top_k, len(probs))
-            top_indices = np.argsort(probs)[-top_k_actual:]
-            top_probs = probs[top_indices]
-            top_probs = top_probs / top_probs.sum()
-            next_token = int(np.random.choice(top_indices, p=top_probs))
+    generated_ids.append(next_token)
+    if next_token != tokenizer.eos_token_id:
+        if think_start_id is not None and next_token == think_start_id:
+            in_thinking = True
+        elif think_end_id is not None and next_token == think_end_id:
+            if in_thinking and thinking_text:
+                print(f"\n[Thinking: {thinking_text.strip()}]\n", end="", flush=True)
+                thinking_text = ""
+            in_thinking = False
         else:
-            next_token = int(np.argmax(last_logits))
+            token_buffer.append(next_token)
+            if len(token_buffer) >= 4:
+                text = tokenizer.decode(token_buffer, skip_special=True, strip_leading_space=False)
+                if in_thinking:
+                    thinking_text += text
+                else:
+                    print(text, end="", flush=True)
+                    generated_text += text
+                token_buffer.clear()
+
+    # Remaining tokens: GPU forward + sample
+    next_ids = np.array([next_token], dtype=np.int32)
+    for step in range(1, max_new_tokens):
+        history = list(set(generated_ids[-64:])) if repeat_penalty != 1.0 else []
+        try:
+            next_token = ctx.forward_sample(
+                next_ids, start_pos, temperature, top_k, top_p, repeat_penalty, history
+            )
+        except Exception as e:
+            print(f"\nERROR at step {step}: {e}")
+            break
 
         generated_ids.append(next_token)
-
         if next_token == tokenizer.eos_token_id:
             break
 
@@ -186,11 +210,6 @@ def generate_response(ctx, tokenizer, prompt_ids, image_embeddings, image_insert
             token_buffer.clear()
 
         next_ids = np.array([next_token], dtype=np.int32)
-        try:
-            logits = ctx.forward(next_ids, start_pos)
-        except Exception as e:
-            print(f"\nERROR at step {step}: {e}")
-            break
         start_pos += 1
 
     if token_buffer:
