@@ -313,12 +313,12 @@ int LlamaGraphBuilder::build_layer_graph(ComputeGraph& graph, int hidden_idx,
 #ifdef USE_CUDA
                 auto w2_dtype = lw.w2()->dtype();
                 if (w2_dtype == DataType::Q4_0) {
-                    cuda::launch_ffn_down_fused_q4_0(
+                    cuda::launch_ffn_down_fused_q4_0_q8_1(
                         static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
                         static_cast<const float*>(inputs[1]->data()),
                         static_cast<float*>(ffn_out->data()), K_down, N_down);
                 } else if (w2_dtype == DataType::Q4_K) {
-                    cuda::launch_ffn_down_fused_q4_k(
+                    cuda::launch_ffn_down_fused_q4_k_q8_1(
                         static_cast<const float*>(inputs[0]->data()), lw.w2()->data(),
                         static_cast<const float*>(inputs[1]->data()),
                         static_cast<float*>(ffn_out->data()), K_down, N_down);
@@ -373,7 +373,7 @@ int LlamaGraphBuilder::build_output_graph(ComputeGraph& graph, int hidden_idx,
                 auto logits = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N},
                                                        DeviceType::CUDA);
 #ifdef USE_CUDA
-                cuda::launch_output_proj_q4_0(static_cast<const float*>(inputs[0]->data()),
+                cuda::launch_output_proj_q4_0_q8_1(static_cast<const float*>(inputs[0]->data()),
                                               output_weight->data(),
                                               static_cast<float*>(logits->data()), K, N);
 #endif

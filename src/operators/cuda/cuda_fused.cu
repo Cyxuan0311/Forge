@@ -753,6 +753,195 @@ void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3
 }
 
 // ============================================================================
+// FFN Up Fused Q4_K (Q8_1 pre-quantization + dp4a, M=1, decode)
+// ============================================================================
+// Replaces the FP32-domain ffn_up_fused_q4_k_v2_kernel with int8 dp4a.
+// Strategy: quantize FP32 x → Q8_1 once, then use dp4a for int8×int8 dot product.
+//
+// Q4_K block: 256 elements per super-block, 144 bytes/block
+//   Layout: dm(half2, 4B) + scales(12B) + qs(128B)
+// Q8_1 block: 32 elements, 36 bytes/block (half2 ds + int8 qs[32])
+
+// Constants for Q4_K dp4a (matching cuda_gemv.cu)
+#define FUSED_Q4K_BE 256   // elements per Q4_K super-block
+#define FUSED_Q4K_BS 144   // bytes per Q4_K block
+#define FUSED_QR4_K 2
+#define FUSED_QI4_K (FUSED_Q4K_BE / (4 * FUSED_QR4_K))  // 32
+#define FUSED_QI8_1 8
+
+struct block_q8_1_fused {
+    half2 ds;
+    int8_t qs[32];
+};
+
+// Quantize FP32 x to Q8_1 format (same as cuda_gemv.cu)
+__global__ void quantize_q8_1_fused_kernel(const float* __restrict__ x,
+                                            block_q8_1_fused* __restrict__ y, int k) {
+    int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = (k + 31) / 32;
+    if (bi >= num_blocks) return;
+
+    int base = bi * 32;
+    int end = min(base + 32, k);
+
+    float amax = 0.0f;
+    for (int j = base; j < end; ++j) {
+        float ax = fabsf(x[j]);
+        if (ax > amax) amax = ax;
+    }
+
+    float d_val = (amax > 1e-10f) ? (amax / 127.0f) : (1.0f / 127.0f);
+    float inv_d = 1.0f / d_val;
+
+    y[bi].ds = __halves2half2(__float2half(d_val), __float2half(0.0f));
+
+    int8_t* qs = y[bi].qs;
+    for (int j = 0; j < end - base; ++j) {
+        float v = x[base + j] * inv_d;
+        v = fminf(fmaxf(v, -128.0f), 127.0f);
+        qs[j] = static_cast<int8_t>(__float2int_rn(v));
+    }
+}
+
+// vec_dot for Q4_K × Q8_1 (duplicated from cuda_gemv.cu for kernel fusion)
+static __device__ __forceinline__ float vec_dot_q4_k_q8_1_fused(
+    const void* __restrict__ vbq, const block_q8_1_fused* __restrict__ bq8_1,
+    const int& kbx, const int& iqs)
+{
+    const uint8_t* bq4_K = (const uint8_t*)vbq + kbx * FUSED_Q4K_BS;
+
+    int v[2];
+    int u[2 * FUSED_QR4_K];
+    float d8[FUSED_QR4_K];
+
+    const int bq8_offset = FUSED_QR4_K * ((iqs / 2) / (FUSED_QI8_1 / 2));
+
+    const int* q4 = (const int*)(bq4_K + 16 + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    const uint16_t* scales = (const uint16_t*)(bq4_K + 4);
+    uint16_t aux[2];
+    const int j = bq8_offset / 2;
+    if (j < 2) {
+        aux[0] = scales[j + 0] & 0x3f3f;
+        aux[1] = scales[j + 2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+    }
+    const uint8_t* sc = (const uint8_t*)aux;
+    const uint8_t* m  = sc + 2;
+
+#pragma unroll
+    for (int i = 0; i < FUSED_QR4_K; ++i) {
+        const block_q8_1_fused* bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
+        u[2 * i + 0] = q8[0];
+        u[2 * i + 1] = q8[4];
+    }
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < FUSED_QR4_K; ++i) {
+        const int v0i = (v[0] >> (4 * i)) & 0x0F0F0F0F;
+        const int v1i = (v[1] >> (4 * i)) & 0x0F0F0F0F;
+
+        const int dot1 = forge_dp4a(v1i, u[2 * i + 1], forge_dp4a(v0i, u[2 * i + 0], 0));
+        const int dot2 = forge_dp4a(0x01010101, u[2 * i + 1], forge_dp4a(0x01010101, u[2 * i + 0], 0));
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+    }
+
+    const float2 dm4f = __half22float2(*(const half2*)bq4_K);
+    return dm4f.x * sumf_d - dm4f.y * sumf_m;
+}
+
+// FFN up fused Q4_K kernel: one warp per output row, Q8_1 + dp4a
+__global__ void ffn_up_fused_q4_k_q8_1_kernel(
+    const block_q8_1_fused* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_w1,
+    const uint8_t* __restrict__ q_w3,
+    float* __restrict__ out, int K, int N)
+{
+    int num_blocks_row = (K + FUSED_Q4K_BE - 1) / FUSED_Q4K_BE;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+
+    if (warp_id >= N) return;
+
+    const uint8_t* w1_row = q_w1 + (size_t)warp_id * num_blocks_row * FUSED_Q4K_BS;
+    const uint8_t* w3_row = q_w3 + (size_t)warp_id * num_blocks_row * FUSED_Q4K_BS;
+
+    const int q8_stride_per_q4k = FUSED_QR4_K * FUSED_QI4_K / FUSED_QI8_1;  // = 8
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+
+        const block_q8_1_fused* row_q8 = x_q8 + (size_t)bi * q8_stride_per_q4k;
+
+        // Process gate (w1) block
+        for (int iqs = 0; iqs < FUSED_QI4_K; iqs += 2) {
+            gate_sum += vec_dot_q4_k_q8_1_fused(w1_row, row_q8, bi, iqs);
+        }
+
+        // Process up (w3) block
+        for (int iqs = 0; iqs < FUSED_QI4_K; iqs += 2) {
+            up_sum += vec_dot_q4_k_q8_1_fused(w3_row, row_q8, bi, iqs);
+        }
+    }
+
+    // Warp reduce
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 16);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 8);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 4);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 2);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 1);
+
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 16);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 8);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 4);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 2);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 1);
+
+    if (lane == 0) {
+        float silu_gate = gate_sum / (1.0f + __expf(-gate_sum));
+        out[warp_id] = silu_gate * up_sum;
+    }
+}
+
+void launch_ffn_up_fused_q4_k_q8_1(const float* x, const void* q_w1, const void* q_w3,
+                                     float* out, int K, int intermediate_dim, cudaStream_t stream) {
+    // Step 1: Quantize x to Q8_1 format
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_fused);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_fused*>(q8_buf);
+
+    int q8_threads = 256;
+    int q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_fused_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, K);
+
+    // Step 2: Launch fused gate+up+SiLU kernel
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int grid_blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
+    ffn_up_fused_q4_k_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3),
+        out, K, intermediate_dim);
+}
+
+// ============================================================================
 // FFN gate+up fused kernel with GELU(tanh) activation (for Gemma4)
 // Identical to ffn_up_fused_q4_k_v2_kernel but uses GELU_tanh instead of SiLU
 // ============================================================================
@@ -1087,6 +1276,83 @@ void launch_ffn_down_fused_q4_k(const float* ffn_mid, const void* q_w2, const fl
     int blocks = (num_warps + warps_per_block - 1) / warps_per_block;
     ffn_down_fused_q4_k_tiled_kernel<ROWS_PER_WARP><<<blocks, threads, 0, stream>>>(
         ffn_mid, static_cast<const uint8_t*>(q_w2), residual, out, K, hidden_dim);
+}
+
+// ============================================================================
+// FFN Down Fused Q4_K (Q8_1 pre-quantization + dp4a, M=1, decode)
+// ============================================================================
+
+template <int ROWS_PER_WARP>
+__global__ void ffn_down_fused_q4_k_q8_1_tiled_kernel(
+    const block_q8_1_fused* __restrict__ ffn_mid_q8,
+    const uint8_t* __restrict__ q_w2,
+    const float* __restrict__ residual,
+    float* __restrict__ out, int K, int N)
+{
+    int num_blocks_row = (K + FUSED_Q4K_BE - 1) / FUSED_Q4K_BE;
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    int first_row = global_warp_id * ROWS_PER_WARP;
+    if (first_row >= N) return;
+
+    // Q8_1 blocks per Q4_K super-block: 256/32 = 8
+    const int q8_stride_per_q4k = FUSED_QR4_K * FUSED_QI4_K / FUSED_QI8_1;  // = 8
+
+    float sums[ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) sums[r] = 0.0f;
+
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+
+        // Offset Q8_1 pointer for this super-block
+        const block_q8_1_fused* row_q8 = ffn_mid_q8 + (size_t)bi * q8_stride_per_q4k;
+
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            int row = first_row + r;
+            if (row >= N) break;
+            const uint8_t* w2_row = q_w2 + (size_t)row * num_blocks_row * FUSED_Q4K_BS;
+            float dot = 0.0f;
+            for (int iqs = 0; iqs < FUSED_QI4_K; iqs += 2)
+                dot += vec_dot_q4_k_q8_1_fused(w2_row, row_q8, bi, iqs);
+            sums[r] += dot;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        int row = first_row + r;
+        if (row >= N) break;
+        float s = sums[r];
+        s += __shfl_down_sync(0xFFFFFFFF, s, 16);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 8);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 4);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 2);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 1);
+        if (lane == 0) out[row] = s + residual[row];
+    }
+}
+
+void launch_ffn_down_fused_q4_k_q8_1(const float* ffn_mid, const void* q_w2,
+                                       const float* residual, float* out,
+                                       int K, int hidden_dim, cudaStream_t stream) {
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_fused);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* ffn_mid_q8 = static_cast<block_q8_1_fused*>(q8_buf);
+    int q8_threads = 256;
+    int q8_blocks_grid = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_fused_kernel<<<q8_blocks_grid, q8_threads, 0, stream>>>(ffn_mid, ffn_mid_q8, K);
+
+    const int ROWS_PER_WARP = 4;
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int num_warps = (hidden_dim + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+    int blocks = (num_warps + warps_per_block - 1) / warps_per_block;
+    ffn_down_fused_q4_k_q8_1_tiled_kernel<ROWS_PER_WARP><<<blocks, threads, 0, stream>>>(
+        ffn_mid_q8, static_cast<const uint8_t*>(q_w2), residual, out, K, hidden_dim);
 }
 
 // ---- FFN Down Fused Q5_K (M=1, decode) ----
@@ -1633,7 +1899,6 @@ __global__ void output_proj_q4_k_cooperative_softcap_kernel(
         if (apply_softcap) {
             sum = tanhf(sum / softcap) * softcap;
         }
-        // Suppress tokens: check if this row (token) should be suppressed
         if (num_suppress > 0) {
             for (int i = 0; i < num_suppress; ++i) {
                 if (warp_id == suppress_tokens[i]) {
@@ -1656,10 +1921,10 @@ void launch_output_proj_q4_k_cooperative(const float* x, const void* q_weight, f
 }
 
 void launch_output_proj_q4_k_cooperative_softcap(const float* x, const void* q_weight, float* out,
-                                                   int K, int N,
-                                                   float softcap, bool apply_softcap,
-                                                   const int* suppress_tokens, int num_suppress,
-                                                   cudaStream_t stream) {
+                                                    int K, int N,
+                                                    float softcap, bool apply_softcap,
+                                                    const int* suppress_tokens, int num_suppress,
+                                                    cudaStream_t stream) {
     int warps_per_block = 8;
     int threads = warps_per_block * 32;
     int blocks = (N + warps_per_block - 1) / warps_per_block;
@@ -1774,6 +2039,81 @@ void launch_qkv_fused_q4_0(const float* x, const void* q_wq, int N_q, const void
     qkv_fused_q4_0_kernel<<<blocks, threads, smem_bytes, stream>>>(
         x, static_cast<const uint8_t*>(q_wq), N_q, static_cast<const uint8_t*>(q_wk), N_k,
         static_cast<const uint8_t*>(q_wv), N_v, out_q, out_k, out_v, K);
+}
+
+// ============================================================================
+// QKV Fused Q4_K (Q8_1 pre-quantization + dp4a, M=1, decode)
+// ============================================================================
+
+__global__ void qkv_fused_q4_k_kernel(
+    const block_q8_1_fused* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_wq, int N_q,
+    const uint8_t* __restrict__ q_wk, int N_k,
+    const uint8_t* __restrict__ q_wv, int N_v,
+    float* __restrict__ out_q, float* __restrict__ out_k, float* __restrict__ out_v, int K)
+{
+    int num_blocks_row = (K + FUSED_Q4K_BE - 1) / FUSED_Q4K_BE;
+    const int q8_stride = FUSED_QR4_K * FUSED_QI4_K / FUSED_QI8_1;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+    int total_N = N_q + N_k + N_v;
+    if (warp_id >= total_N) return;
+
+    const uint8_t* row_ptr;
+    float* out_ptr;
+    if (warp_id < N_q) {
+        row_ptr = q_wq + (size_t)warp_id * num_blocks_row * FUSED_Q4K_BS;
+        out_ptr = out_q + warp_id;
+    } else if (warp_id < N_q + N_k) {
+        int row = warp_id - N_q;
+        row_ptr = q_wk + (size_t)row * num_blocks_row * FUSED_Q4K_BS;
+        out_ptr = out_k + row;
+    } else {
+        int row = warp_id - N_q - N_k;
+        row_ptr = q_wv + (size_t)row * num_blocks_row * FUSED_Q4K_BS;
+        out_ptr = out_v + row;
+    }
+
+    float sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+        const block_q8_1_fused* row_q8 = x_q8 + (size_t)bi * q8_stride;
+        for (int iqs = 0; iqs < FUSED_QI4_K; iqs += 2)
+            sum += vec_dot_q4_k_q8_1_fused(row_ptr, row_q8, bi, iqs);
+    }
+
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+    if (lane == 0) *out_ptr = sum;
+}
+
+void launch_qkv_fused_q4_k(const float* x, const void* q_wq, int N_q,
+                             const void* q_wk, int N_k, const void* q_wv, int N_v,
+                             float* out_q, float* out_k, float* out_v, int K,
+                             cudaStream_t stream) {
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_fused);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_fused*>(q8_buf);
+    int q8_threads = 256;
+    int q8_blocks_grid = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_fused_kernel<<<q8_blocks_grid, q8_threads, 0, stream>>>(x, x_q8, K);
+
+    int total_N = N_q + N_k + N_v;
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (total_N + warps_per_block - 1) / warps_per_block;
+    qkv_fused_q4_k_kernel<<<blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_wq), N_q,
+        static_cast<const uint8_t*>(q_wk), N_k,
+        static_cast<const uint8_t*>(q_wv), N_v,
+        out_q, out_k, out_v, K);
 }
 
 }  // namespace cuda

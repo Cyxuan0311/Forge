@@ -104,8 +104,16 @@ void launch_qkv_fused_q4_0(const float* x, const void* q_wq, int N_q, const void
                            const void* q_wv, int N_v, float* out_q, float* out_k, float* out_v,
                            int K, cudaStream_t stream = 0);
 
+void launch_qkv_fused_q4_k(const float* x, const void* q_wq, int N_q,
+                             const void* q_wk, int N_k, const void* q_wv, int N_v,
+                             float* out_q, float* out_k, float* out_v, int K,
+                             cudaStream_t stream = 0);
+
 void launch_ffn_up_fused_q4_0(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
                               int intermediate_dim, cudaStream_t stream = 0);
+
+void launch_ffn_up_fused_q4_0_q8_1(const float* x, const void* q_w1, const void* q_w3, float* out,
+                                     int K, int intermediate_dim, cudaStream_t stream = 0);
 
 void launch_ffn_up_fused_q4_0_batch(const float* x, const void* q_w1, const void* q_w3, float* out,
                                     int M, int K, int intermediate_dim, cudaStream_t stream = 0);
@@ -118,6 +126,9 @@ void launch_ffn_up_fused_q4_k_batch(const float* x, const void* q_w1, const void
 
 void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
                               int intermediate_dim, cudaStream_t stream = 0);
+
+void launch_ffn_up_fused_q4_k_q8_1(const float* x, const void* q_w1, const void* q_w3,
+                                     float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
 
 void launch_ffn_up_fused_q4_k_geglu(const float* x, const void* q_w1, const void* q_w3,
                                      float* out, int K, int intermediate_dim,
@@ -174,7 +185,24 @@ void launch_gelu_tanh_multiply(float* x, const float* y, int n_per, int n_layer,
 void launch_silu_multiply(const float* gate, const float* up, float* out, int n,
                           cudaStream_t stream = 0);
 
+void launch_split_q_gate(const float* q_full, float* q, float* gate,
+                         int seq_len, int num_heads, int head_dim,
+                         cudaStream_t stream = 0);
+
+void launch_sigmoid_multiply(const float* gate, float* data, int n,
+                             cudaStream_t stream = 0);
+
 void launch_argmax(const float* data, int32_t* out_idx, int n, cudaStream_t stream = 0);
+
+// ---- Repeat Penalty ----
+void launch_repeat_penalty(float* logits, const int32_t* token_history,
+                           int n_history, float penalty, int vocab_size,
+                           cudaStream_t stream = 0);
+
+// ---- GPU Gumbel-max Sampling ----
+void launch_gumbel_sample(const float* logits, int32_t* out_token,
+                          float temperature, uint64_t seed,
+                          int vocab_size, cudaStream_t stream = 0);
 
 // ---- Logit Softcap ----
 void launch_logit_softcap(float* logits, float cap, bool apply_softcap,
@@ -185,6 +213,9 @@ void launch_dequant_q4_0_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
 
 void launch_dequant_q4_0_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream = 0);
+
+void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K,
                                      cudaStream_t stream = 0);
 
 void launch_dequant_q4_1_matrix(const void* q_data, float* out, int N, int K,
@@ -202,8 +233,15 @@ void launch_gemm_tiled(const float* A, const float* B, float* C, int M, int N, i
 void launch_ffn_down_fused_q4_0(const float* ffn_mid, const void* q_w2, const float* residual,
                                 float* out, int K, int hidden_dim, cudaStream_t stream = 0);
 
+void launch_ffn_down_fused_q4_0_q8_1(const float* ffn_mid, const void* q_w2, const float* residual,
+                                       float* out, int K, int hidden_dim, cudaStream_t stream = 0);
+
 void launch_ffn_down_fused_q4_k(const float* ffn_mid, const void* q_w2, const float* residual,
                                 float* out, int K, int hidden_dim, cudaStream_t stream = 0);
+
+void launch_ffn_down_fused_q4_k_q8_1(const float* ffn_mid, const void* q_w2,
+                                       const float* residual, float* out,
+                                       int K, int hidden_dim, cudaStream_t stream = 0);
 
 void launch_ffn_down_fused_q5_k(const float* ffn_mid, const void* q_w2, const float* residual,
                                 float* out, int K, int hidden_dim, cudaStream_t stream = 0);
@@ -213,6 +251,9 @@ void launch_ffn_down_fused_q6_k(const float* ffn_mid, const void* q_w2, const fl
 
 void launch_output_proj_q4_0(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
+
+void launch_output_proj_q4_0_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                                    cudaStream_t stream = 0);
 
 void launch_output_proj_q4_k(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
@@ -299,6 +340,45 @@ void launch_dequant_iq2_xxs_matrix(const void* q_data, float* out, int N, int K,
 
 void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
                                    cudaStream_t stream = 0);
+
+// ---- SSM kernels ----
+void launch_ssm_preprocess(
+    const float* alpha, const float* beta,
+    const float* dt_bias, const float* ssm_a,
+    float* gate_out, float* beta_out,
+    int seq_len, int num_v_heads,
+    cudaStream_t stream = 0);
+
+void launch_ssm_conv1d(
+    const float* x, const float* weight,
+    float* conv_state, float* y,
+    int seq_len, int conv_channels, int d_conv,
+    cudaStream_t stream = 0);
+
+void launch_ssm_silu_split(
+    const float* conv_out,
+    float* q, float* k, float* v,
+    int seq_len, int key_dim, int value_dim,
+    cudaStream_t stream = 0);
+
+void launch_ssm_per_head_l2norm(
+    float* data,
+    int seq_len, int num_heads, int head_dim, float eps,
+    cudaStream_t stream = 0);
+
+void launch_ssm_gated_delta_net(
+    const float* q, const float* k, const float* v,
+    const float* gate, const float* beta,
+    float* ssm_state, float* output,
+    int seq_len, int head_k_dim, int head_v_dim,
+    int num_k_heads, int num_v_heads,
+    cudaStream_t stream = 0);
+
+void launch_ssm_gated_norm(
+    float* delta_out,
+    const float* z, const float* norm_w,
+    int seq_len, int head_v_dim, int num_v_heads, float eps,
+    cudaStream_t stream = 0);
 
 }  // namespace cuda
 }  // namespace forge

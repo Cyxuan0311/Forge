@@ -1311,8 +1311,8 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
             } else if (b->dtype() == DataType::Q4_K) {
                 if (M == 1) {
                     PERF_SCOPE("matmul_transB/q4_k_fused_gemv");
-                    cpu::gemv_q4_k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
-                                               M, K, N);
+                    cpu::gemv_q4_k_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                    M, K, N);
                 } else {
                     PERF_SCOPE("matmul_transB/q4_k_batch_gemv");
                     cpu::gemv_q4_K_transB_batch_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
@@ -1522,10 +1522,10 @@ TensorPtr ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const Tensor
 #ifdef USE_CUDA
         if (w1->dtype() == DataType::Q4_0 && w3->dtype() == DataType::Q4_0) {
             if (M == 1) {
-                // Decode: single-token fused GEMV kernel
-                cuda::launch_ffn_up_fused_q4_0(static_cast<const float*>(input->data()), w1->data(),
-                                               w3->data(), static_cast<float*>(out->data()), K,
-                                               intermediate_dim);
+                // Decode: single-token fused GEMV kernel (Q8_1 + dp4a)
+                cuda::launch_ffn_up_fused_q4_0_q8_1(static_cast<const float*>(input->data()), w1->data(),
+                                                      w3->data(), static_cast<float*>(out->data()), K,
+                                                      intermediate_dim);
             } else if (M <= GEMV_THRESHOLD) {
                 // Small batch prefill: batched GEMV with on-the-fly dequant
                 cuda::launch_ffn_up_fused_q4_0_batch_gemv(
@@ -1539,10 +1539,10 @@ TensorPtr ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const Tensor
             }
         } else if (w1->dtype() == DataType::Q4_K && w3->dtype() == DataType::Q4_K) {
             if (M == 1) {
-                // Decode: single-token fused GEMV kernel (shares x vector read)
-                cuda::launch_ffn_up_fused_q4_k(static_cast<const float*>(input->data()), w1->data(),
-                                               w3->data(), static_cast<float*>(out->data()), K,
-                                               intermediate_dim);
+                // Decode: single-token fused GEMV kernel with Q8_1 + dp4a acceleration
+                cuda::launch_ffn_up_fused_q4_k_q8_1(static_cast<const float*>(input->data()), w1->data(),
+                                                     w3->data(), static_cast<float*>(out->data()), K,
+                                                     intermediate_dim);
             } else if (M <= GEMV_THRESHOLD) {
                 // Q4_K small batch: separate GEMV + silu_multiply
                 auto gate = ops::matmul_transB(input, w1);

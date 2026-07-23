@@ -336,6 +336,45 @@ GenericEngine::QKVProjResult GenericEngine::qkv_proj_forward(const TensorPtr& x,
         (void)0;
 #endif
     }
+    // CUDA Q4_K fused path
+    else if (dev == DeviceType::CUDA && seq_len == 1 && wq->dtype() == DataType::Q4_K &&
+             wk->dtype() == DataType::Q4_K && wv->dtype() == DataType::Q4_K) {
+#ifdef USE_CUDA
+        int K_proj = static_cast<int>(wq->shape()[1]);
+        int N_q = static_cast<int>(wq->shape()[0]);
+        int N_k = static_cast<int>(wk->shape()[0]);
+        int N_v = static_cast<int>(wv->shape()[0]);
+
+        result.q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_q},
+                                            DeviceType::CUDA);
+        result.k = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_k},
+                                            DeviceType::CUDA);
+        result.v = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_v},
+                                            DeviceType::CUDA);
+
+        cuda::launch_qkv_fused_q4_k(
+            static_cast<const float*>(x->data()), wq->data(), N_q, wk->data(), N_k, wv->data(),
+            N_v, static_cast<float*>(result.q->data()), static_cast<float*>(result.k->data()),
+            static_cast<float*>(result.v->data()), K_proj);
+
+        // Add bias terms
+        if (bq && bq->numel() > 0) {
+            cuda::launch_add_bias(static_cast<const float*>(result.q->data()),
+                                  static_cast<const float*>(bq->data()),
+                                  static_cast<float*>(result.q->data()), N_q);
+        }
+        if (bk && bk->numel() > 0) {
+            cuda::launch_add_bias(static_cast<const float*>(result.k->data()),
+                                  static_cast<const float*>(bk->data()),
+                                  static_cast<float*>(result.k->data()), N_k);
+        }
+        if (bv && bv->numel() > 0) {
+            cuda::launch_add_bias(static_cast<const float*>(result.v->data()),
+                                  static_cast<const float*>(bv->data()),
+                                  static_cast<float*>(result.v->data()), N_v);
+        }
+#endif
+    }
     // CPU Q4_0 fused path
     else if (dev == DeviceType::CPU && seq_len == 1 && wq->dtype() == DataType::Q4_0 &&
              wk->dtype() == DataType::Q4_0 && wv->dtype() == DataType::Q4_0) {
@@ -878,7 +917,7 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
                             static_cast<const float*>(residual->data()),
                             static_cast<float*>(ffn_out->data()), K_down, N_down);
                     } else if (w2_dtype == DataType::Q4_K) {
-                        cuda::launch_ffn_down_fused_q4_k(
+                        cuda::launch_ffn_down_fused_q4_k_q8_1(
                             static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
                             static_cast<const float*>(residual->data()),
                             static_cast<float*>(ffn_out->data()), K_down, N_down);
