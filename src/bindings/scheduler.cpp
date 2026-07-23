@@ -11,7 +11,8 @@ void register_scheduler(py::module_& m) {
         .def_readwrite("top_p", &SamplerConfig::top_p)
         .def_readwrite("repeat_penalty", &SamplerConfig::repeat_penalty)
         .def_readwrite("do_sample", &SamplerConfig::do_sample)
-        .def_readwrite("seed", &SamplerConfig::seed);
+        .def_readwrite("seed", &SamplerConfig::seed)
+        .def_readwrite("logit_softcapping", &SamplerConfig::logit_softcapping);
 
     py::enum_<RequestStatus>(m, "RequestStatus")
         .value("Waiting", RequestStatus::Waiting)

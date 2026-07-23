@@ -205,7 +205,15 @@ void PyMultimodalModel::generate_stream(py::array_t<int32_t, py::array::c_style>
     gen_cfg.eos_token_id = eos_token_id;
     gen_cfg.stop_token_ids = stop_token_ids;
 
-    Generator gen(*ctx);
+    SamplerConfig sampler_cfg;
+    sampler_cfg.temperature = temperature;
+    sampler_cfg.top_k = top_k;
+    sampler_cfg.top_p = top_p;
+    sampler_cfg.repeat_penalty = repeat_penalty;
+    sampler_cfg.do_sample = do_sample;
+    sampler_cfg.seed = seed;
+    sampler_cfg.logit_softcapping = model_.config().f_final_logit_softcapping;
+    Generator gen(*ctx, sampler_cfg);
 
     auto token_cb = [&callback](int32_t token_id, int step) {
         py::gil_scoped_acquire acquire;

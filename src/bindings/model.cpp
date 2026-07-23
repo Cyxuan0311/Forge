@@ -28,7 +28,15 @@ py::dict PyModel::generate(py::array_t<int32_t, py::array::c_style> prompt_ids, 
     gen_cfg.eos_token_id = eos_token_id;
     gen_cfg.stop_token_ids = stop_token_ids;
 
-    Generator gen(ctx->get());
+    SamplerConfig sampler_cfg;
+    sampler_cfg.temperature = temperature;
+    sampler_cfg.top_k = top_k;
+    sampler_cfg.top_p = top_p;
+    sampler_cfg.repeat_penalty = repeat_penalty;
+    sampler_cfg.do_sample = do_sample;
+    sampler_cfg.seed = seed;
+    sampler_cfg.logit_softcapping = model_.config().f_final_logit_softcapping;
+    Generator gen(ctx->get(), sampler_cfg);
     auto result = gen.generate(tokens, gen_cfg);
 
     py::dict out;
@@ -66,7 +74,15 @@ void PyModel::generate_stream(py::array_t<int32_t, py::array::c_style> prompt_id
     gen_cfg.eos_token_id = eos_token_id;
     gen_cfg.stop_token_ids = stop_token_ids;
 
-    Generator gen(ctx->get());
+    SamplerConfig sampler_cfg;
+    sampler_cfg.temperature = temperature;
+    sampler_cfg.top_k = top_k;
+    sampler_cfg.top_p = top_p;
+    sampler_cfg.repeat_penalty = repeat_penalty;
+    sampler_cfg.do_sample = do_sample;
+    sampler_cfg.seed = seed;
+    sampler_cfg.logit_softcapping = model_.config().f_final_logit_softcapping;
+    Generator gen(ctx->get(), sampler_cfg);
 
     auto token_cb = [&callback](int32_t token_id, int step) {
         py::gil_scoped_acquire acquire;

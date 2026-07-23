@@ -43,6 +43,7 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     sampler_cfg.repeat_penalty = repeat_penalty;
     sampler_cfg.do_sample = do_sample;
     sampler_cfg.seed = seed;
+    sampler_cfg.logit_softcapping = ctx.model().config().f_final_logit_softcapping;
     Sampler sampler(sampler_cfg);
 
     ctx.reset_kv_cache();
@@ -164,6 +165,7 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     sampler_cfg.repeat_penalty = repeat_penalty;
     sampler_cfg.do_sample = do_sample;
     sampler_cfg.seed = seed;
+    sampler_cfg.logit_softcapping = ctx.model().config().f_final_logit_softcapping;
 
     Generator gen(ctx, sampler_cfg);
 
