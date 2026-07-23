@@ -21,15 +21,33 @@ __global__ void rms_norm_kernel(const float* x, const float* weight, float* out,
         sum_sq += x_row[i] * x_row[i];
     }
 
-    __shared__ float s_sum;
-    s_sum = 0.0f;
+    // Warp-level reduction via shuffle
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+
+    // Cross-warp reduction via shared memory
+    __shared__ float s_sums[32];
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) {
+        s_sums[warp_id] = sum_sq;
+    }
     __syncthreads();
 
-    atomicAdd(&s_sum, sum_sq);
+    // First warp reduces across all warps
+    float final_sum = (threadIdx.x < blockDim.x / 32) ? s_sums[threadIdx.x] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        final_sum += __shfl_down_sync(0xFFFFFFFF, final_sum, offset);
+    }
+
+    __shared__ float s_rms;
+    if (threadIdx.x == 0) {
+        s_rms = rsqrtf(final_sum / cols + eps);
+    }
     __syncthreads();
 
-    float rms = rsqrtf(s_sum / cols + eps);
-
+    float rms = s_rms;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         out_row[i] = x_row[i] * rms * weight[i];
     }
@@ -62,15 +80,33 @@ __global__ void rms_norm_unweighted_kernel(const float* x, float* out, int rows,
         sum_sq += x_row[i] * x_row[i];
     }
 
-    __shared__ float s_sum;
-    s_sum = 0.0f;
+    // Warp-level reduction via shuffle
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+
+    // Cross-warp reduction via shared memory
+    __shared__ float s_sums[32];
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) {
+        s_sums[warp_id] = sum_sq;
+    }
     __syncthreads();
 
-    atomicAdd(&s_sum, sum_sq);
+    // First warp reduces across all warps
+    float final_sum = (threadIdx.x < blockDim.x / 32) ? s_sums[threadIdx.x] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        final_sum += __shfl_down_sync(0xFFFFFFFF, final_sum, offset);
+    }
+
+    __shared__ float s_rms;
+    if (threadIdx.x == 0) {
+        s_rms = rsqrtf(final_sum / cols + eps);
+    }
     __syncthreads();
 
-    float rms = rsqrtf(s_sum / cols + eps);
-
+    float rms = s_rms;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         out_row[i] = x_row[i] * rms;
     }
