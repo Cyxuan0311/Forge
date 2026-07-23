@@ -36,7 +36,7 @@ INST_GEMV(DataType::Q6_K)
 const GemvFn gemv_dispatch[18] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
-    /* Q4_0=2  */ launch_gemv_q4_0_transB,                          // special smem/splitK
+    /* Q4_0=2  */ launch_gemv_q4_0_q8_1,                          // Q8_1+dp4a
     /* Q4_1=3  */ launch_gemv_typed_transB<DataType::Q4_1>,
     /* Q4_K=4  */ launch_gemv_q4_k_q8_1,                            // special Q8_1+dp4a
     /* INT8=5  */ nullptr,
