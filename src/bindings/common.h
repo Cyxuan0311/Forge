@@ -169,6 +169,45 @@ public:
         return tensor_to_numpy(logits);
     }
 
+    int32_t forward_sample(py::array_t<int32_t, py::array::c_style> input_ids,
+                           int start_pos, float temperature, int top_k, float top_p,
+                           float repeat_penalty, const std::vector<int32_t>& token_history) {
+        auto buf = input_ids.request();
+        if (buf.ndim != 1)
+            throw std::runtime_error("input_ids must be 1D");
+
+        int seq_len = static_cast<int>(buf.shape[0]);
+        DeviceType dev = ctx_.device();
+
+        auto ids_tensor = std::make_shared<Tensor>(DataType::INT32,
+                                                    std::vector<int64_t>{seq_len},
+                                                    DeviceType::CPU);
+        std::memcpy(ids_tensor->data(), buf.ptr, seq_len * sizeof(int32_t));
+
+        if (dev == DeviceType::CUDA) {
+            ids_tensor->to_device(DeviceType::CUDA);
+        }
+
+        auto* engine = ctx_.engine();
+        if (!engine)
+            throw std::runtime_error("No inference engine available");
+
+        auto logits = engine->forward(ids_tensor, start_pos);
+
+        SamplerConfig sampler_cfg;
+        sampler_cfg.temperature = temperature;
+        sampler_cfg.top_k = top_k;
+        sampler_cfg.top_p = top_p;
+        sampler_cfg.repeat_penalty = repeat_penalty;
+        sampler_cfg.do_sample = (temperature > 0.0f);
+        sampler_cfg.logit_softcapping = ctx_.model().config().f_final_logit_softcapping;
+        Sampler sampler(sampler_cfg);
+        for (int32_t tid : token_history) {
+            sampler.add_token_to_history(tid);
+        }
+        return static_cast<int32_t>(sampler.sample(logits, start_pos));
+    }
+
     py::array_t<float> forward_with_embeddings(py::array_t<float, py::array::c_style> embeddings,
                                                int start_pos = 0) {
         auto buf = embeddings.request();

@@ -138,6 +138,10 @@ void register_model(py::module_& m) {
     py::class_<PyInferenceContext>(m, "InferenceContext")
         .def("forward", &PyInferenceContext::forward, py::arg("input_ids"),
              py::arg("start_pos") = 0)
+        .def("forward_sample", &PyInferenceContext::forward_sample,
+             py::arg("input_ids"), py::arg("start_pos"), py::arg("temperature"),
+             py::arg("top_k"), py::arg("top_p"), py::arg("repeat_penalty"),
+             py::arg("token_history"))
         .def("forward_with_embeddings", &PyInferenceContext::forward_with_embeddings,
              py::arg("embeddings"), py::arg("start_pos") = 0)
         .def("get_embeddings", &PyInferenceContext::get_embeddings, py::arg("input_ids"))
