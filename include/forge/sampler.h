@@ -54,12 +54,15 @@ public:
 
 private:
     void apply_repeat_penalty(std::vector<float>& logits) const;
+    void ensure_token_history_buffer(int n);
 
     SamplerConfig config_;
     uint64_t rng_state_ = 12345;
     std::vector<int32_t> token_history_;
 
     void* cuda_argmax_buf_ = nullptr;
+    int32_t* d_token_history_ = nullptr;
+    int d_token_history_capacity_ = 0;
 
     uint64_t next_rng();
     float next_uniform();

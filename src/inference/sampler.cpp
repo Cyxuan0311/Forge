@@ -29,6 +29,10 @@ Sampler::~Sampler() {
         cudaFree(cuda_argmax_buf_);
         cuda_argmax_buf_ = nullptr;
     }
+    if (d_token_history_) {
+        cudaFree(d_token_history_);
+        d_token_history_ = nullptr;
+    }
 #endif
 }
 
@@ -54,28 +58,43 @@ int Sampler::sample(const TensorPtr& logits, int64_t pos) {
     return token_id;
 }
 
+void Sampler::ensure_token_history_buffer(int n) {
+    if (n > d_token_history_capacity_) {
+        if (d_token_history_) cudaFree(d_token_history_);
+        cudaMalloc(&d_token_history_, n * sizeof(int32_t));
+        d_token_history_capacity_ = n;
+    }
+}
+
 int Sampler::sample_greedy(const TensorPtr& logits) {
     int vocab_size = static_cast<int>(logits->numel());
 
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        if (config_.repeat_penalty == 1.0f || token_history_.empty()) {
+        if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
+            PERF_SCOPE("sampler/repeat_penalty_gpu");
+            ensure_token_history_buffer(static_cast<int>(token_history_.size()));
+            cudaMemcpy(d_token_history_, token_history_.data(),
+                       token_history_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            cuda::launch_repeat_penalty(static_cast<float*>(logits->data()),
+                                         d_token_history_,
+                                         static_cast<int>(token_history_.size()),
+                                         config_.repeat_penalty, vocab_size);
+        }
+        {
+            PERF_SCOPE("sampler/argmax_gpu");
             if (!cuda_argmax_buf_) {
                 cudaMalloc(&cuda_argmax_buf_, sizeof(int32_t));
             }
-            {
-                PERF_SCOPE("sampler/argmax_gpu");
-                cuda::launch_argmax(static_cast<const float*>(logits->data()),
-                                    static_cast<int32_t*>(cuda_argmax_buf_), vocab_size);
-            }
-            int32_t result;
-            {
-                PERF_SCOPE("sampler/d2h_argmax");
-                cudaMemcpy(&result, cuda_argmax_buf_, sizeof(int32_t), cudaMemcpyDeviceToHost);
-            }
-            token_history_.push_back(result);
-            return result;
+            cuda::launch_argmax(static_cast<const float*>(logits->data()),
+                                static_cast<int32_t*>(cuda_argmax_buf_), vocab_size);
         }
+        int32_t result;
+        {
+            PERF_SCOPE("sampler/d2h_argmax");
+            cudaMemcpy(&result, cuda_argmax_buf_, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        }
+        return result;
 #endif
     }
 
@@ -193,6 +212,40 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
 int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
     int vocab_size = static_cast<int>(logits->numel());
 
+    // GPU sampling path: Gumbel-max trick on device
+    // Falls back to CPU when top_k > 0 or top_p < 1.0 (complex filtering)
+    if (logits->device() == DeviceType::CUDA && config_.top_k <= 0 && config_.top_p >= 1.0f) {
+#ifdef USE_CUDA
+        {
+            PERF_SCOPE("sampler/gumbel_gpu");
+            if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
+                ensure_token_history_buffer(static_cast<int>(token_history_.size()));
+                cudaMemcpy(d_token_history_, token_history_.data(),
+                           token_history_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                cuda::launch_repeat_penalty(static_cast<float*>(logits->data()),
+                                            d_token_history_,
+                                            static_cast<int>(token_history_.size()),
+                                            config_.repeat_penalty, vocab_size);
+            }
+            if (config_.logit_softcapping > 0.0f) {
+                cuda::launch_logit_softcap(static_cast<float*>(logits->data()),
+                                           config_.logit_softcapping, true,
+                                           nullptr, 0, vocab_size);
+            }
+            if (!cuda_argmax_buf_) {
+                cudaMalloc(&cuda_argmax_buf_, sizeof(int32_t));
+            }
+            cuda::launch_gumbel_sample(static_cast<const float*>(logits->data()),
+                                        static_cast<int32_t*>(cuda_argmax_buf_),
+                                        temperature, config_.seed, vocab_size);
+        }
+        int32_t result;
+        cudaMemcpy(&result, cuda_argmax_buf_, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        return result;
+#endif
+    }
+
+    // CPU fallback path
     std::vector<float> host_logits(vocab_size);
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
@@ -209,7 +262,6 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
         PERF_SCOPE("sampler/repeat_penalty");
         apply_repeat_penalty(host_logits);
     }
-
     {
         PERF_SCOPE("sampler/softmax_sample");
 
