@@ -49,6 +49,17 @@ Qwen35Engine::Qwen35Engine(Model& model, InferenceContext& ctx) : TransformerEng
     init_recurrent_states();
 }
 
+Qwen35Engine::~Qwen35Engine() {
+#ifdef USE_CUDA
+    for (auto& ds : device_states_) {
+        if (ds.conv_state)
+            cudaFree(ds.conv_state);
+        if (ds.ssm_state)
+            cudaFree(ds.ssm_state);
+    }
+#endif
+}
+
 bool Qwen35Engine::init_weights() {
     return weights_.init(model_.weights(), model_.config());
 }
@@ -126,11 +137,23 @@ void Qwen35Engine::init_recurrent_states() {
              std::to_string(conv_state_size * sizeof(float) / 1024) + " KB)");
     LOG_INFO("  Total SSM state: " + std::to_string(total_ssm_bytes / (1024 * 1024)) + " MB");
 
+    // Allocate CPU states (always needed for CPU fallback)
     recurrent_states_.resize(cfg.num_layers);
+    // Allocate GPU states if CUDA is available
+#ifdef USE_CUDA
+    device_states_.resize(cfg.num_layers);
+#endif
     for (int i = 0; i < cfg.num_layers; ++i) {
         if (weights_.layers[i].layer_type == LayerType::LinearAttention) {
             recurrent_states_[i].conv_state.resize(conv_state_size, 0.0f);
             recurrent_states_[i].ssm_state.resize(state_size, 0.0f);
+
+#ifdef USE_CUDA
+            cudaMalloc(&device_states_[i].conv_state, conv_state_size * sizeof(float));
+            cudaMalloc(&device_states_[i].ssm_state, state_size * sizeof(float));
+            cudaMemset(device_states_[i].conv_state, 0, conv_state_size * sizeof(float));
+            cudaMemset(device_states_[i].ssm_state, 0, state_size * sizeof(float));
+#endif
         }
     }
     states_initialized_ = true;
@@ -144,6 +167,18 @@ void Qwen35Engine::reset() {
         std::fill(state.conv_state.begin(), state.conv_state.end(), 0.0f);
         std::fill(state.ssm_state.begin(), state.ssm_state.end(), 0.0f);
     }
+#ifdef USE_CUDA
+    for (auto& ds : device_states_) {
+        if (ds.conv_state) {
+            int conv_state_size = (ssm_d_conv_ - 1) * ssm_conv_channels_;
+            cudaMemset(ds.conv_state, 0, conv_state_size * sizeof(float));
+        }
+        if (ds.ssm_state) {
+            int state_size = ssm_head_v_dim_ * ssm_head_v_dim_ * ssm_dt_rank_;
+            cudaMemset(ds.ssm_state, 0, state_size * sizeof(float));
+        }
+    }
+#endif
 }
 
 // ============================================================================
@@ -160,11 +195,191 @@ TensorPtr Qwen35Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
     }
 }
 
+TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int layer_idx,
+                                                    int seq_len, int64_t start_pos,
+                                                    DeviceType dev, int seq_id) {
+    if (dev == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        return forward_linear_attn_layer_cuda(hidden, layer_idx, seq_len, start_pos, seq_id);
+#else
+        LOG_WARN("CUDA requested but not compiled; falling back to CPU for SSM layer " +
+                 std::to_string(layer_idx));
+#endif
+    }
+    return forward_linear_attn_layer_cpu(hidden, layer_idx, seq_len, start_pos, dev, seq_id);
+}
+
+// ============================================================================
+// Linear Attention Layer (Gated Delta Net) — CUDA path
+// ============================================================================
+#ifdef USE_CUDA
+TensorPtr Qwen35Engine::forward_linear_attn_layer_cuda(const TensorPtr& hidden, int layer_idx,
+                                                        int seq_len, int64_t start_pos,
+                                                        int seq_id) {
+    const auto& cfg = model_.config();
+    const auto& lw = weights_.layers[layer_idx];
+    int hidden_dim = cfg.hidden_dim;
+
+    int head_k_dim = ssm_d_state_;
+    int num_k_heads = ssm_n_group_;
+    int num_v_heads = ssm_dt_rank_;
+    int head_v_dim = ssm_head_v_dim_;
+    int d_conv = ssm_d_conv_;
+    int conv_channels = ssm_conv_channels_;
+    int key_dim = head_k_dim * num_k_heads;
+    int value_dim = head_v_dim * num_v_heads;
+
+    // Validate required weights
+    if (!lw.attn_norm() || !lw.attn_qkv() || !lw.attn_gate() ||
+        !lw.ssm_conv1d() || !lw.ssm_alpha() || !lw.ssm_beta() ||
+        !lw.ssm_norm() || !lw.ssm_out()) {
+        QFATAL("[FATAL] Layer %d (LinearAttn CUDA): missing required weights\n", layer_idx);
+        return hidden;
+    }
+
+    // Step 1: RMS norm on GPU
+    auto normed = ops::rms_norm(hidden, lw.attn_norm(), cfg.rms_norm_eps);
+
+    // Step 2: Input projections (all happen on GPU)
+    auto qkv_mixed = ops::matmul_transB(normed, lw.attn_qkv());
+    auto z = ops::matmul_transB(normed, lw.attn_gate());
+    auto alpha = ops::matmul_transB(normed, lw.ssm_alpha());
+    auto beta = ops::matmul_transB(normed, lw.ssm_beta());
+
+    // Step 3: Allocate GPU temporary buffers
+    auto gate_out = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, num_v_heads}, DeviceType::CUDA);
+    auto beta_out = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, num_v_heads}, DeviceType::CUDA);
+    auto conv_out = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, conv_channels}, DeviceType::CUDA);
+    auto q_conv = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, key_dim}, DeviceType::CUDA);
+    auto k_conv = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, key_dim}, DeviceType::CUDA);
+    auto v_conv = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, value_dim}, DeviceType::CUDA);
+    auto delta_net_out = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, value_dim}, DeviceType::CUDA);
+
+    // Step 4: Ensure SSM weights are FP32 on GPU (convert if needed)
+    auto ensure_gpu_fp32 = [](const TensorPtr& t) -> std::pair<const float*, TensorPtr> {
+        if (!t) return {nullptr, nullptr};
+        if (t->device() == DeviceType::CUDA && t->dtype() == DataType::FP32) {
+            return {static_cast<const float*>(t->data()), nullptr};
+        }
+        auto gpu = std::make_shared<Tensor>(DataType::FP32, t->shape(), DeviceType::CUDA);
+        gpu->copy_from(*t);
+        return {static_cast<const float*>(gpu->data()), gpu};
+    };
+
+    auto [conv_weight, conv_holder] = ensure_gpu_fp32(lw.ssm_conv1d());
+    auto [dt_bias, dt_holder] = ensure_gpu_fp32(lw.ssm_dt());
+    auto [ssm_a_ptr, sa_holder] = ensure_gpu_fp32(lw.ssm_a());
+    auto [ssm_norm_w, sn_holder] = ensure_gpu_fp32(lw.ssm_norm());
+
+    cudaStream_t stream = 0;
+
+    // Step 5: Preprocess alpha (dt_bias + softplus + ssm_a -> exp gate) and beta (sigmoid)
+    const float* alpha_data = static_cast<const float*>(alpha->data());
+    const float* beta_data = static_cast<const float*>(beta->data());
+    float* gate_out_data = static_cast<float*>(gate_out->data());
+    float* beta_out_data = static_cast<float*>(beta_out->data());
+
+    forge::cuda::launch_ssm_preprocess(
+        alpha_data, beta_data, dt_bias, ssm_a_ptr,
+        gate_out_data, beta_out_data,
+        seq_len, num_v_heads, stream);
+
+    // Step 6: Causal conv1d on QKV
+    const float* qkv_data = static_cast<const float*>(qkv_mixed->data());
+    float* conv_out_data = static_cast<float*>(conv_out->data());
+
+    forge::cuda::launch_ssm_conv1d(
+        qkv_data, conv_weight,
+        device_states_[layer_idx].conv_state, conv_out_data,
+        seq_len, conv_channels, d_conv, stream);
+
+    // Step 7: SiLU + split into Q, K, V
+    float* q_conv_data = static_cast<float*>(q_conv->data());
+    float* k_conv_data = static_cast<float*>(k_conv->data());
+    float* v_conv_data = static_cast<float*>(v_conv->data());
+
+    forge::cuda::launch_ssm_silu_split(
+        conv_out_data, q_conv_data, k_conv_data, v_conv_data,
+        seq_len, key_dim, value_dim, stream);
+
+    // Step 8: Per-head L2 normalize Q and K
+    forge::cuda::launch_ssm_per_head_l2norm(
+        q_conv_data, seq_len, num_k_heads, head_k_dim, cfg.rms_norm_eps, stream);
+    forge::cuda::launch_ssm_per_head_l2norm(
+        k_conv_data, seq_len, num_k_heads, head_k_dim, cfg.rms_norm_eps, stream);
+
+    // Step 9: Gated Delta Net — autoregressive state update
+    float* dn_out_data = static_cast<float*>(delta_net_out->data());
+
+    forge::cuda::launch_ssm_gated_delta_net(
+        q_conv_data, k_conv_data, v_conv_data,
+        gate_out_data, beta_out_data,
+        device_states_[layer_idx].ssm_state, dn_out_data,
+        seq_len, head_k_dim, head_v_dim,
+        num_k_heads, num_v_heads, stream);
+
+    // Step 10: Gated norm — per-head RMSNorm + SiLU(z)
+    const float* z_data = static_cast<const float*>(z->data());
+    forge::cuda::launch_ssm_gated_norm(
+        dn_out_data, z_data, ssm_norm_w,
+        seq_len, head_v_dim, num_v_heads, cfg.rms_norm_eps, stream);
+
+    // Step 11: SSM output projection (delta_net_out is already on GPU — no copy needed)
+    TensorPtr ssm_output;
+    if (lw.ssm_out()) {
+        ssm_output = ops::matmul_transB(delta_net_out, lw.ssm_out());
+    } else {
+        ssm_output = delta_net_out;
+    }
+
+    // Step 12: Residual connection
+    auto hidden_after_attn = ops::add(hidden, ssm_output);
+
+    // Step 13: Post-attention norm + FFN
+    TensorPtr ffn_input;
+    if (lw.post_attention_norm()) {
+        ffn_input = ops::rms_norm(hidden_after_attn, lw.post_attention_norm(), cfg.rms_norm_eps);
+    } else {
+        ffn_input = hidden_after_attn;
+    }
+
+    if (lw.w1() && lw.w3() && lw.w2()) {
+        auto gate_ffn = ops::matmul_transB(ffn_input, lw.w1());
+        auto up = ops::matmul_transB(ffn_input, lw.w3());
+        auto ffn_mid = ops::silu_multiply(gate_ffn, up);
+        auto ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
+        return ops::add(hidden_after_attn, ffn_out);
+    }
+
+    return hidden_after_attn;
+}
+#endif
+
 // ============================================================================
 // Full Attention Layer (with gated Q, Q/K norm, MRoPE)
 // ============================================================================
 TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                                int64_t start_pos, DeviceType dev, int seq_id) {
+                                                  int64_t start_pos, DeviceType dev, int seq_id) {
+    if (dev == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        return forward_full_attn_layer_cuda(hidden, layer_idx, seq_len, start_pos, seq_id);
+#else
+        LOG_WARN("CUDA requested but not compiled; falling back to CPU for FullAttn layer " +
+                 std::to_string(layer_idx));
+#endif
+    }
+    return forward_full_attn_layer_cpu(hidden, layer_idx, seq_len, start_pos, dev, seq_id);
+}
+
+TensorPtr Qwen35Engine::forward_full_attn_layer_cpu(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                                      int64_t start_pos, DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -422,10 +637,141 @@ TensorPtr Qwen35Engine::forward_full_attn_layer(const TensorPtr& hidden, int lay
 }
 
 // ============================================================================
+// Full Attention Layer — CUDA path
+// ============================================================================
+#ifdef USE_CUDA
+TensorPtr Qwen35Engine::forward_full_attn_layer_cuda(const TensorPtr& hidden, int layer_idx,
+                                                      int seq_len, int64_t start_pos,
+                                                      int seq_id) {
+    const auto& cfg = model_.config();
+    const auto& lw = weights_.layers[layer_idx];
+    int num_heads = cfg.num_heads;
+    int num_kv_heads = cfg.num_kv_heads;
+    int head_dim = cfg.head_dim;
+    int q_dim = num_heads * head_dim;
+
+    cudaStream_t stream = 0;
+
+    // Helper: ensure tensor is on CUDA
+    auto to_gpu = [](const TensorPtr& t) -> TensorPtr {
+        if (!t) return t;
+        if (t->device() == DeviceType::CUDA) return t;
+        auto tmp = std::make_shared<Tensor>(DataType::FP32, t->shape(), DeviceType::CUDA);
+        tmp->copy_from(*t);
+        return tmp;
+    };
+
+    // Step 1: RMS norm (GPU)
+    auto normed = ops::rms_norm(hidden, lw.attn_norm(), cfg.rms_norm_eps);
+
+    // Step 2: Q, K, V projections (GPU)
+    auto q_full = ops::matmul_transB(normed, lw.attn_q());
+    auto k = ops::matmul_transB(normed, lw.attn_k());
+    auto v = ops::matmul_transB(normed, lw.attn_v());
+
+    // Step 3: Split q_full into q and gate (GPU kernel)
+    auto q = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, q_dim}, DeviceType::CUDA);
+    auto gate = std::make_shared<Tensor>(DataType::FP32,
+        std::vector<int64_t>{seq_len, q_dim}, DeviceType::CUDA);
+    forge::cuda::launch_split_q_gate(
+        static_cast<const float*>(q_full->data()),
+        static_cast<float*>(q->data()),
+        static_cast<float*>(gate->data()),
+        seq_len, num_heads, head_dim, stream);
+
+    // Step 4: Q/K RMSNorm (GPU)
+    if (lw.attn_q_norm()) {
+        auto q_norm_w = to_gpu(lw.attn_q_norm());
+        forge::cuda::launch_rms_norm(
+            static_cast<const float*>(q->data()),
+            static_cast<const float*>(q_norm_w->data()),
+            static_cast<float*>(q->data()),
+            seq_len * num_heads, head_dim, cfg.rms_norm_eps, stream);
+    }
+    if (lw.attn_k_norm()) {
+        auto k_norm_w = to_gpu(lw.attn_k_norm());
+        forge::cuda::launch_rms_norm(
+            static_cast<const float*>(k->data()),
+            static_cast<const float*>(k_norm_w->data()),
+            static_cast<float*>(k->data()),
+            seq_len * num_kv_heads, head_dim, cfg.rms_norm_eps, stream);
+    }
+
+    // Step 5: MRoPE (GPU)
+    int n_rot = cfg.use_mrope ? cfg.rope_dimension_count : head_dim;
+    if (n_rot <= 0) n_rot = head_dim;
+    auto q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
+    auto k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CUDA);
+    forge::cuda::launch_rope_gqa(
+        static_cast<const float*>(q->data()),
+        static_cast<const float*>(k->data()),
+        static_cast<float*>(q_rope->data()),
+        static_cast<float*>(k_rope->data()),
+        num_heads, num_kv_heads, head_dim, seq_len, start_pos,
+        cfg.rope_theta, stream);
+
+    // Step 6: KV cache update (GPU)
+    kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v, seq_len);
+    if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
+        kv_cache_.dequantize_layer(layer_idx);
+    }
+
+    int total_len = kv_cache_.filled(layer_idx);
+    TensorPtr k_sliced = kv_cache_.get_key_filled(layer_idx);
+    TensorPtr v_sliced = kv_cache_.get_value_filled(layer_idx);
+
+    // Step 7: GQA expand (GPU)
+    TensorPtr k_expanded, v_expanded;
+    if (num_kv_heads < num_heads) {
+        k_expanded = expand_kv_heads(k_sliced, total_len, num_heads, num_kv_heads,
+                                      head_dim, DeviceType::CUDA);
+        v_expanded = expand_kv_heads(v_sliced, total_len, num_heads, num_kv_heads,
+                                      head_dim, DeviceType::CUDA);
+    } else {
+        k_expanded = k_sliced;
+        v_expanded = v_sliced;
+    }
+
+    // Step 8: Flash attention (GPU)
+    auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_expanded, v_expanded,
+                                                         seq_len, total_len, num_heads, head_dim,
+                                                         nullptr, true);
+
+    // Step 9: Sigmoid gate (GPU)
+    forge::cuda::launch_sigmoid_multiply(
+        static_cast<const float*>(gate->data()),
+        static_cast<float*>(attn_out->data()),
+        seq_len * q_dim, stream);
+
+    // Step 10: Output projection (GPU)
+    auto attn_proj = ops::matmul_transB(attn_out, lw.attn_output());
+    auto hidden_after_attn = ops::add(hidden, attn_proj);
+
+    // Step 11: Post-attention norm + FFN (GPU)
+    TensorPtr ffn_input;
+    if (lw.post_attention_norm()) {
+        ffn_input = ops::rms_norm(hidden_after_attn, lw.post_attention_norm(), cfg.rms_norm_eps);
+    } else {
+        ffn_input = hidden_after_attn;
+    }
+    if (lw.w1() && lw.w3() && lw.w2()) {
+        auto gate_ffn = ops::matmul_transB(ffn_input, lw.w1());
+        auto up = ops::matmul_transB(ffn_input, lw.w3());
+        auto ffn_mid = ops::silu_multiply(gate_ffn, up);
+        auto ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
+        return ops::add(hidden_after_attn, ffn_out);
+    }
+    return hidden_after_attn;
+}
+#endif
+
+// ============================================================================
 // Linear Attention Layer (Gated Delta Net)
 // ============================================================================
-TensorPtr Qwen35Engine::forward_linear_attn_layer(const TensorPtr& hidden, int layer_idx,
-                                                  int seq_len, int64_t start_pos, DeviceType dev, int seq_id) {
+TensorPtr Qwen35Engine::forward_linear_attn_layer_cpu(const TensorPtr& hidden, int layer_idx,
+                                                       int seq_len, int64_t start_pos,
+                                                       DeviceType dev, int seq_id) {
     const auto& cfg = model_.config();
     const auto& lw = weights_.layers[layer_idx];
     int hidden_dim = cfg.hidden_dim;

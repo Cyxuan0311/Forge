@@ -7,6 +7,7 @@ namespace forge {
 class Qwen35Engine : public TransformerEngine {
 public:
     explicit Qwen35Engine(Model& model, InferenceContext& ctx);
+    ~Qwen35Engine() override;
 
     std::string name() const override { return "qwen35"; }
 
@@ -21,16 +22,32 @@ private:
     // Forward pass for Linear Attention (Gated Delta Net) layers
     TensorPtr forward_linear_attn_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
                                         int64_t start_pos, DeviceType dev, int seq_id = 0);
-    // Forward pass for Full Attention layers (with gated Q)
+    // Forward pass for Full Attention layers (with gated Q) — dispatcher
     TensorPtr forward_full_attn_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
                                       int64_t start_pos, DeviceType dev, int seq_id = 0);
 
-    // Gated Delta Net autoregressive step (single token)
+    // GPU path for full attention layer
+    TensorPtr forward_full_attn_layer_cuda(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                            int64_t start_pos, int seq_id = 0);
+
+    // CPU path for full attention layer (fallback)
+    TensorPtr forward_full_attn_layer_cpu(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                           int64_t start_pos, DeviceType dev, int seq_id = 0);
+
+    // GPU path for linear attention layer
+    TensorPtr forward_linear_attn_layer_cuda(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                              int64_t start_pos, int seq_id = 0);
+
+    // CPU path for linear attention layer (fallback)
+    TensorPtr forward_linear_attn_layer_cpu(const TensorPtr& hidden, int layer_idx, int seq_len,
+                                             int64_t start_pos, DeviceType dev, int seq_id = 0);
+
+    // Gated Delta Net autoregressive step (single token) — CPU fallback
     void gated_delta_net_ar_cpu(const float* q, const float* k, const float* v, const float* gate,
                                 const float* beta, float* state, float* output, int head_k_dim,
                                 int head_v_dim, int num_k_heads, int num_v_heads);
 
-    // Causal conv1d for linear attention layers
+    // Causal conv1d for linear attention layers — CPU fallback
     void ssm_conv1d_cpu(const float* x_data, const float* weight_data, float* y_data,
                         float* conv_state, int seq_len, int conv_channels, int d_conv);
 
@@ -39,12 +56,19 @@ private:
                           int seq_len, int num_heads, int num_kv_heads, int head_dim, int n_rot,
                           int64_t start_pos, float theta);
 
-    // Persistent states for linear attention layers
+    // Persistent states for linear attention layers (CPU)
     struct RecurrentLayerState {
         std::vector<float> conv_state;  // [d_conv-1, conv_channels]
         std::vector<float> ssm_state;   // [head_v_dim, head_v_dim, num_v_heads]
     };
     std::vector<RecurrentLayerState> recurrent_states_;
+
+    // Persistent states for linear attention layers (GPU)
+    struct DeviceRecurrentState {
+        float* conv_state = nullptr;  // GPU: [(d_conv-1) * conv_channels]
+        float* ssm_state = nullptr;   // GPU: [num_v_heads * head_v_dim * head_v_dim]
+    };
+    std::vector<DeviceRecurrentState> device_states_;
     bool states_initialized_ = false;
 
     // SSM dimensions (parsed from model config and weight shapes)
