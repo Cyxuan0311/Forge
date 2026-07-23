@@ -642,6 +642,133 @@ void launch_gemv_q4_k_q8_1(const float* x, const void* q_weight, float* out,
 }
 
 // ============================================================================
+// Q4_0 GEMV (M=1, decode) - Q8_1 pre-quantization + dp4a
+// ============================================================================
+//
+// Replaces the old FP32-domain smem/splitK kernels with int8 dp4a.
+// Strategy: quantize FP32 x → Q8_1 once, then use dp4a for int8×int8 dot product.
+//
+// Q4_0 block: 2 bytes fp16 scale + 16 bytes qs (4-bit packed, 2 nibbles/byte) = 18 bytes/32 elems
+// Q8_1 block: 4 bytes half2 ds + 32 bytes int8 qs = 36 bytes/32 elems
+//
+// For each Q4_0 block:
+//   qs[j] byte = low_nibble | (high_nibble << 4)
+//   weight[j*2+0] = low_nibble - 8,  weight[j*2+1] = high_nibble - 8
+//   dot = scale * (sum(low_nibble * q8[j]) + sum(high_nibble * q8[j+16]) - 8 * sum(q8))
+//
+// With dp4a:
+//   dot = scale * d8 * (dp4a(packed_low, q8_packed) + dp4a(packed_high, q8_packed+16)
+//                        - 8 * dp4a(0x01010101, all_q8_packed))
+
+__global__ void gemv_q4_0_q8_1_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_weight,
+    float* __restrict__ out, int K, int N)
+{
+    constexpr int Q4_0_BLOCK_SIZE = 18;
+    constexpr int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+
+    if (warp_id >= N) return;
+
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * num_blocks_row * Q4_0_BLOCK_SIZE;
+
+    float sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+
+        const uint8_t* block_ptr = row_ptr + (size_t)bi * Q4_0_BLOCK_SIZE;
+        const block_q8_1_gemv* q8_blk = x_q8 + bi;
+
+        // Read fp16 scale (first 2 bytes of Q4_0 block)
+        uint16_t scale_bits;
+        memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
+        float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
+
+        // Read Q8_1 scale
+        float d8 = __low2float(q8_blk->ds);
+
+        // qs starts at offset 2
+        const uint8_t* qs = block_ptr + 2;
+        const int* q8_int = (const int*)q8_blk->qs;
+
+        // Process 16 bytes of qs = 32 nibbles = 32 elements
+        // Each byte qs[j] has low nibble (element j) and high nibble (element j+16)
+        // We process 4 bytes at a time with dp4a
+        float block_sum = 0.0f;
+        int bsum = 0;  // sum of Q8_1 values for bias correction
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            // Read 4 qs bytes as uint32 (4 bytes = 8 nibbles = 8 low + 8 high elements)
+            uint32_t qs4;
+            memcpy(&qs4, qs + j * 4, 4);
+
+            // Extract low nibbles: (qs4 & 0x0F0F0F0F)
+            int q4_low = qs4 & 0x0F0F0F0F;
+            // Extract high nibbles: (qs4 >> 4) & 0x0F0F0F0F
+            int q4_high = (qs4 >> 4) & 0x0F0F0F0F;
+
+            // Q8_1 values for low nibble elements (positions j*4..j*4+3)
+            int u_low = q8_int[j];
+            // Q8_1 values for high nibble elements (positions j*4+16..j*4+19)
+            int u_high = q8_int[j + 4];
+
+            // dp4a for low nibbles and high nibbles
+            int dot_low  = forge_dp4a(q4_low, u_low, 0);
+            int dot_high = forge_dp4a(q4_high, u_high, 0);
+
+            // Sum of Q8_1 values for bias correction (-8 * sum)
+            bsum += forge_dp4a(0x01010101, u_low, 0);
+            bsum += forge_dp4a(0x01010101, u_high, 0);
+
+            block_sum += (float)(dot_low + dot_high);
+        }
+
+        // Bias correction: weight = nibble - 8, so dot = sum(nibble*q8) - 8*sum(q8)
+        block_sum -= 8.0f * (float)bsum;
+
+        // Apply scales: weight * activation = scale * (nibble-8) * d8 * q8_value
+        sum += scale * d8 * block_sum;
+    }
+
+    // Warp reduce
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) out[warp_id] = sum;
+}
+
+void launch_gemv_q4_0_q8_1(const float* x, const void* q_weight, float* out,
+                             int K, int N, cudaStream_t stream) {
+    // Step 1: Quantize x to Q8_1 format
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+
+    int q8_threads = 256;
+    int q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, K);
+
+    // Step 2: Launch Q4_0 × Q8_1 GEMV kernel
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int grid_blocks = (N + warps_per_block - 1) / warps_per_block;
+    gemv_q4_0_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_weight), out, K, N);
+}
+
+// ============================================================================
 // FFN Up Fused: Q3_K gate + Q4_K up (M=1, decode) - Q8_1 pre-quantization + dp4a
 // ============================================================================
 // Computes: out[i] = SiLU(x @ gate_row_i) * (x @ up_row_i)
@@ -825,6 +952,373 @@ void launch_ffn_up_fused_q3k_q3k(const float* x, const void* q_gate, const void*
     ffn_up_fused_q3k_q3k_kernel<<<grid_blocks, threads, 0, stream>>>(
         x_q8, static_cast<const uint8_t*>(q_gate), static_cast<const uint8_t*>(q_up),
         out, K, intermediate_dim);
+}
+
+// ============================================================================
+// FFN Up Fused Q4_0 (M=1, decode) - Q8_1 pre-quantization + dp4a
+// ============================================================================
+// Computes: out[i] = SiLU(x @ gate_row_i) * (x @ up_row_i)
+// Key optimization: quantize x to Q8_1 only once, shared between gate and up.
+// Uses dp4a for int8×int8 dot product instead of FP32 scalar.
+
+__global__ void ffn_up_fused_q4_0_q8_1_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_w1,
+    const uint8_t* __restrict__ q_w3,
+    float* __restrict__ out, int K, int N)
+{
+    constexpr int Q4_0_BLOCK_SIZE = 18;
+    constexpr int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+
+    if (warp_id >= N) return;
+
+    const uint8_t* w1_row = q_w1 + (size_t)warp_id * num_blocks_row * Q4_0_BLOCK_SIZE;
+    const uint8_t* w3_row = q_w3 + (size_t)warp_id * num_blocks_row * Q4_0_BLOCK_SIZE;
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+
+        const block_q8_1_gemv* q8_blk = x_q8 + bi;
+        float d8 = __low2float(q8_blk->ds);
+        const int* q8_int = (const int*)q8_blk->qs;
+
+        // Process gate weights (w1)
+        {
+            const uint8_t* block_ptr = w1_row + (size_t)bi * Q4_0_BLOCK_SIZE;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
+            float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
+            const uint8_t* qs = block_ptr + 2;
+
+            float block_sum = 0.0f;
+            int bsum = 0;
+
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t qs4;
+                memcpy(&qs4, qs + j * 4, 4);
+                int q4_low = qs4 & 0x0F0F0F0F;
+                int q4_high = (qs4 >> 4) & 0x0F0F0F0F;
+                int u_low = q8_int[j];
+                int u_high = q8_int[j + 4];
+                int dot_low  = forge_dp4a(q4_low, u_low, 0);
+                int dot_high = forge_dp4a(q4_high, u_high, 0);
+                bsum += forge_dp4a(0x01010101, u_low, 0);
+                bsum += forge_dp4a(0x01010101, u_high, 0);
+                block_sum += (float)(dot_low + dot_high);
+            }
+            block_sum -= 8.0f * (float)bsum;
+            gate_sum += scale * d8 * block_sum;
+        }
+
+        // Process up weights (w3)
+        {
+            const uint8_t* block_ptr = w3_row + (size_t)bi * Q4_0_BLOCK_SIZE;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
+            float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
+            const uint8_t* qs = block_ptr + 2;
+
+            float block_sum = 0.0f;
+            int bsum = 0;
+
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t qs4;
+                memcpy(&qs4, qs + j * 4, 4);
+                int q4_low = qs4 & 0x0F0F0F0F;
+                int q4_high = (qs4 >> 4) & 0x0F0F0F0F;
+                int u_low = q8_int[j];
+                int u_high = q8_int[j + 4];
+                int dot_low  = forge_dp4a(q4_low, u_low, 0);
+                int dot_high = forge_dp4a(q4_high, u_high, 0);
+                bsum += forge_dp4a(0x01010101, u_low, 0);
+                bsum += forge_dp4a(0x01010101, u_high, 0);
+                block_sum += (float)(dot_low + dot_high);
+            }
+            block_sum -= 8.0f * (float)bsum;
+            up_sum += scale * d8 * block_sum;
+        }
+    }
+
+    // Warp reduce
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 16);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 8);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 4);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 2);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 1);
+
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 16);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 8);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 4);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 2);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 1);
+
+    if (lane == 0) {
+        float silu_gate = gate_sum / (1.0f + __expf(-gate_sum));
+        out[warp_id] = silu_gate * up_sum;
+    }
+}
+
+void launch_ffn_up_fused_q4_0_q8_1(const float* x, const void* q_w1, const void* q_w3,
+                                     float* out, int K, int intermediate_dim, cudaStream_t stream) {
+    // Step 1: Quantize x to Q8_1 format (shared between gate and up)
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+
+    int q8_threads = 256;
+    int q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, K);
+
+    // Step 2: Launch fused gate+up+SiLU kernel
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int grid_blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
+    ffn_up_fused_q4_0_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3),
+        out, K, intermediate_dim);
+}
+
+// ============================================================================
+// FFN Down Fused Q4_0 (M=1, decode) - Q8_1 pre-quantization + dp4a + residual
+// ============================================================================
+// Computes: out[i] = (ffn_mid @ w2_row_i) + residual[i]
+// Tiled: each warp processes ROWS_PER_WARP output rows to reuse ffn_mid Q8_1.
+
+template <int ROWS_PER_WARP>
+__global__ void ffn_down_fused_q4_0_q8_1_tiled_kernel(
+    const block_q8_1_gemv* __restrict__ ffn_mid_q8,
+    const uint8_t* __restrict__ q_w2,
+    const float* __restrict__ residual,
+    float* __restrict__ out, int K, int N)
+{
+    constexpr int Q4_0_BLOCK_SIZE = 18;
+    constexpr int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+
+    int first_row = global_warp_id * ROWS_PER_WARP;
+    if (first_row >= N) return;
+
+    float sums[ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r)
+        sums[r] = 0.0f;
+
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+
+        // Q8_1 block shared across all output rows
+        const block_q8_1_gemv* q8_blk = ffn_mid_q8 + bi;
+        float d8 = __low2float(q8_blk->ds);
+        const int* q8_int = (const int*)q8_blk->qs;
+
+        // Precompute Q8_1 contributions for this block (shared across output rows)
+        float dp_per_row[ROWS_PER_WARP];  // dot product accumulator per row
+        int bsum_per_row[ROWS_PER_WARP];  // bias sum per row
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            dp_per_row[r] = 0.0f;
+            bsum_per_row[r] = 0;
+        }
+
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            int row = first_row + r;
+            if (row >= N) break;
+
+            const uint8_t* block_ptr = q_w2 + (size_t)row * num_blocks_row * Q4_0_BLOCK_SIZE + (size_t)bi * Q4_0_BLOCK_SIZE;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
+            float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
+            const uint8_t* qs = block_ptr + 2;
+
+            float block_sum = 0.0f;
+            int bsum = 0;
+
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t qs4;
+                memcpy(&qs4, qs + j * 4, 4);
+                int q4_low = qs4 & 0x0F0F0F0F;
+                int q4_high = (qs4 >> 4) & 0x0F0F0F0F;
+                int u_low = q8_int[j];
+                int u_high = q8_int[j + 4];
+                int dot_low  = forge_dp4a(q4_low, u_low, 0);
+                int dot_high = forge_dp4a(q4_high, u_high, 0);
+                bsum += forge_dp4a(0x01010101, u_low, 0);
+                bsum += forge_dp4a(0x01010101, u_high, 0);
+                block_sum += (float)(dot_low + dot_high);
+            }
+            block_sum -= 8.0f * (float)bsum;
+            sums[r] += scale * d8 * block_sum;
+        }
+    }
+
+    // Warp reduce and write results for each row
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        int row = first_row + r;
+        if (row >= N) break;
+
+        float s = sums[r];
+        s += __shfl_down_sync(0xFFFFFFFF, s, 16);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 8);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 4);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 2);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 1);
+
+        if (lane == 0) {
+            out[row] = s + residual[row];
+        }
+    }
+}
+
+void launch_ffn_down_fused_q4_0_q8_1(const float* ffn_mid, const void* q_w2,
+                                       const float* residual, float* out,
+                                       int K, int hidden_dim, cudaStream_t stream) {
+    // Step 1: Quantize ffn_mid to Q8_1 format
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* ffn_mid_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+
+    int q8_threads = 256;
+    int q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(ffn_mid, ffn_mid_q8, K);
+
+    // Step 2: Launch tiled fused down+residual kernel
+    constexpr int ROWS_PER_WARP = 4;
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int num_warps = (hidden_dim + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+    int blocks = (num_warps + warps_per_block - 1) / warps_per_block;
+    ffn_down_fused_q4_0_q8_1_tiled_kernel<ROWS_PER_WARP><<<blocks, threads, 0, stream>>>(
+        ffn_mid_q8, static_cast<const uint8_t*>(q_w2), residual, out, K, hidden_dim);
+}
+
+// ============================================================================
+// Output Proj Q4_0 (M=1, decode, large N) - Q8_1 + dp4a + multi-warp split-K
+// ============================================================================
+// Specialized for lm_head where N (vocab_size) is very large (e.g., 152064).
+// Uses multiple warps per row (Split-K) to keep GPU busy.
+// Each warp handles a subset of K-blocks for one row, atomicAdd to combine.
+// Uses dp4a for int8×int8 dot product instead of FP32 scalar.
+
+__global__ void output_proj_q4_0_q8_1_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_weight,
+    float* __restrict__ out, int K, int N, int warps_per_row)
+{
+    constexpr int Q4_0_BLOCK_SIZE = 18;
+    constexpr int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    int row = global_warp_id / warps_per_row;
+    int sub_warp = global_warp_id % warps_per_row;
+
+    if (row >= N) return;
+
+    const uint8_t* row_ptr = q_weight + (size_t)row * num_blocks_row * Q4_0_BLOCK_SIZE;
+
+    int blocks_per_sub = (num_blocks_row + warps_per_row - 1) / warps_per_row;
+    int start_block = sub_warp * blocks_per_sub;
+    int end_block = min(start_block + blocks_per_sub, num_blocks_row);
+
+    float sum = 0.0f;
+
+    for (int bi = start_block + lane; bi < end_block; bi += 32) {
+        const uint8_t* block_ptr = row_ptr + (size_t)bi * Q4_0_BLOCK_SIZE;
+        const block_q8_1_gemv* q8_blk = x_q8 + bi;
+
+        // Read fp16 scale
+        uint16_t scale_bits;
+        memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
+        float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
+
+        // Read Q8_1 scale
+        float d8 = __low2float(q8_blk->ds);
+
+        const uint8_t* qs = block_ptr + 2;
+        const int* q8_int = (const int*)q8_blk->qs;
+
+        float block_sum = 0.0f;
+        int bsum = 0;
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint32_t qs4;
+            memcpy(&qs4, qs + j * 4, 4);
+            int q4_low = qs4 & 0x0F0F0F0F;
+            int q4_high = (qs4 >> 4) & 0x0F0F0F0F;
+            int u_low = q8_int[j];
+            int u_high = q8_int[j + 4];
+            int dot_low  = forge_dp4a(q4_low, u_low, 0);
+            int dot_high = forge_dp4a(q4_high, u_high, 0);
+            bsum += forge_dp4a(0x01010101, u_low, 0);
+            bsum += forge_dp4a(0x01010101, u_high, 0);
+            block_sum += (float)(dot_low + dot_high);
+        }
+        block_sum -= 8.0f * (float)bsum;
+        sum += scale * d8 * block_sum;
+    }
+
+    // Warp reduce
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        atomicAdd(&out[row], sum);
+    }
+}
+
+void launch_output_proj_q4_0_q8_1(const float* x, const void* q_weight, float* out,
+                                    int K, int N, cudaStream_t stream) {
+    // Step 1: Quantize x to Q8_1 format
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+
+    int q8_threads = 256;
+    int q8_blocks_grid = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks_grid, q8_threads, 0, stream>>>(x, x_q8, K);
+
+    // Step 2: Launch output proj kernel with split-K
+    int num_blocks_row = (K + 31) / 32;
+    int warps_per_row = (num_blocks_row + 31) / 32;
+    if (warps_per_row < 1) warps_per_row = 1;
+    if (warps_per_row > 16) warps_per_row = 16;
+
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int total_warps = N * warps_per_row;
+    int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
+    cudaMemsetAsync(out, 0, N * sizeof(float), stream);
+    output_proj_q4_0_q8_1_kernel<<<blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
 }
 
 }  // namespace cuda

@@ -18,6 +18,10 @@ void launch_gemv(const float* x, const float* W, float* out, int K, int N, cudaS
 void launch_gemv_q4_0_transB(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
 
+// ---- Q4_0 GEMV (Q8_1 + dp4a, replaces smem/splitK for decode) ----
+void launch_gemv_q4_0_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+
 void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
                                   const void* q_weight2, int N2, float* out, int K,
                                   cudaStream_t stream = 0);

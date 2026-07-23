@@ -309,6 +309,71 @@ void launch_dequant_q4_k_matrix(const void* q_data, float* out, int N, int K, cu
                                                                out, N, K);
 }
 
+// ---- Q4_K → FP16 Matrix Dequantization (for cached output_proj) ----
+
+__global__ void dequant_q4_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
+                                                 __half* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int Q4_K_BLOCK_SIZE = 144;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int j = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * blocks_per_row * Q4_K_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q4_K_BLOCK_SIZE;
+
+    uint16_t d_bits, dmin_bits;
+    memcpy(&d_bits, block_ptr, 2);
+    memcpy(&dmin_bits, block_ptr + 2, 2);
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+    float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+
+    const uint8_t* scales = block_ptr + 4;
+    const uint8_t* qs = block_ptr + 16;
+
+    int group = j / 64;
+    int l = j % 64;
+    int is = group * 2;
+
+    uint8_t sc, m_val;
+    if (l < 32) {
+        get_scale_min_k4(is, scales, &sc, &m_val);
+    } else {
+        get_scale_min_k4(is + 1, scales, &sc, &m_val);
+    }
+
+    float d1 = d * static_cast<float>(sc);
+    float m1 = dmin * static_cast<float>(m_val);
+
+    int qs_offset = group * 32;
+    int q_val;
+    if (l < 32) {
+        q_val = qs[qs_offset + l] & 0xF;
+    } else {
+        q_val = (qs[qs_offset + l - 32] >> 4) & 0xF;
+    }
+
+    out[idx] = __float2half(d1 * static_cast<float>(q_val) - m1);
+}
+
+void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                      cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q4_k_matrix_fp16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), static_cast<__half*>(out), N, K);
+}
+
 // ---- Q6_K Matrix Dequantization ----
 
 __global__ void dequant_q6_k_matrix_kernel(const uint8_t* __restrict__ q_data,
@@ -1073,6 +1138,32 @@ void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
     int blocks = (total + threads - 1) / threads;
     dequant_iq4_nl_matrix_kernel<<<blocks, threads, 0, stream>>>(
         static_cast<const uint8_t*>(q_data), out, N, K);
+}
+
+// ---- GPU Repeat Penalty ----
+// Applies repeat penalty in-place on GPU logits.
+// Each thread handles one token_id from history, scattering to logits[tid].
+__global__ void repeat_penalty_kernel(float* __restrict__ logits,
+                                       const int32_t* __restrict__ token_history,
+                                       int n_history, float penalty, int vocab_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_history) {
+        int tid = token_history[idx];
+        if (tid >= 0 && tid < vocab_size) {
+            float val = logits[tid];
+            logits[tid] = (val > 0.0f) ? (val / penalty) : (val * penalty);
+        }
+    }
+}
+
+void launch_repeat_penalty(float* logits, const int32_t* token_history,
+                           int n_history, float penalty, int vocab_size,
+                           cudaStream_t stream) {
+    if (n_history <= 0 || penalty == 1.0f) return;
+    int threads = 256;
+    int blocks = (n_history + threads - 1) / threads;
+    repeat_penalty_kernel<<<blocks, threads, 0, stream>>>(
+        logits, token_history, n_history, penalty, vocab_size);
 }
 
 }  // namespace cuda

@@ -35,7 +35,10 @@ void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M
                                    bool transB, cudaStream_t stream = 0);
 
 void launch_dequant_q4_0_matrix_fp16(const void* q_data, void* out, int N, int K,
-                                     cudaStream_t stream = 0);
+                                      cudaStream_t stream = 0);
+
+void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                      cudaStream_t stream = 0);
 
 }  // namespace cuda
 }  // namespace forge
