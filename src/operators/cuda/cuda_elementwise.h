@@ -17,5 +17,12 @@ void launch_silu_multiply(const float* gate, const float* up, float* out, int n,
 void launch_gelu_multiply(const float* gate, const float* up, float* out, int n,
                           cudaStream_t stream = 0);
 
+void launch_split_q_gate(const float* q_full, float* q, float* gate,
+                         int seq_len, int num_heads, int head_dim,
+                         cudaStream_t stream = 0);
+
+void launch_sigmoid_multiply(const float* gate, float* data, int n,
+                             cudaStream_t stream = 0);
+
 }  // namespace cuda
 }  // namespace forge

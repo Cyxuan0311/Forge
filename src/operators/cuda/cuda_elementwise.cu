@@ -107,5 +107,43 @@ void launch_gelu_tanh_multiply(float* x, const float* y, int n_per, int n_layer,
         x, y, n_per, n_layer, layer_idx, seq_len, n_total);
 }
 
+__global__ void split_q_gate_kernel(const float* q_full, float* q, float* gate,
+                                     int seq_len, int num_heads, int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * num_heads * head_dim;
+    if (idx >= total) return;
+
+    int d = idx % head_dim;
+    int h = (idx / head_dim) % num_heads;
+    int s = idx / (num_heads * head_dim);
+
+    int src_idx = s * num_heads * head_dim * 2 + h * head_dim * 2 + d;
+    q[idx] = q_full[src_idx];
+    gate[idx] = q_full[src_idx + head_dim];
+}
+
+void launch_split_q_gate(const float* q_full, float* q, float* gate,
+                         int seq_len, int num_heads, int head_dim,
+                         cudaStream_t stream) {
+    int n = seq_len * num_heads * head_dim;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    split_q_gate_kernel<<<blocks, threads, 0, stream>>>(q_full, q, gate, seq_len, num_heads, head_dim);
+}
+
+__global__ void sigmoid_multiply_kernel(const float* gate, float* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        data[idx] *= 1.0f / (1.0f + expf(-gate[idx]));
+    }
+}
+
+void launch_sigmoid_multiply(const float* gate, float* data, int n,
+                             cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    sigmoid_multiply_kernel<<<blocks, threads, 0, stream>>>(gate, data, n);
+}
+
 }  // namespace cuda
 }  // namespace forge
