@@ -1082,6 +1082,146 @@ void launch_ffn_up_fused_q4_k_geglu(const float* x, const void* q_w1, const void
         out, K, intermediate_dim);
 }
 
+// ---- Fused FFN Up Q5_K (M=1, decode) ----
+// Shares x_vals across w1 (gate) and w3 (up) — halves x global read.
+
+__global__ void ffn_up_fused_q5_k_kernel(const float* __restrict__ x,
+                                         const uint8_t* __restrict__ q_w1,
+                                         const uint8_t* __restrict__ q_w3,
+                                         float* __restrict__ out, int K, int N) {
+    const int QK_K = 256;
+    const int Q5_K_BLOCK_SIZE = 176;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    if (warp_id >= N) return;
+
+    const uint8_t* w1_row = q_w1 + (size_t)warp_id * blocks_per_row * Q5_K_BLOCK_SIZE;
+    const uint8_t* w3_row = q_w3 + (size_t)warp_id * blocks_per_row * Q5_K_BLOCK_SIZE;
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        float x_vals[8];
+        {
+            int is = 0;
+            for (int j = 0; j < QK_K; j += 64) {
+                int idx0 = bi * QK_K + j + lane;
+                int idx1 = bi * QK_K + j + 32 + lane;
+                x_vals[is * 2 + 0] = (idx0 < K) ? x[idx0] : 0.0f;
+                x_vals[is * 2 + 1] = (idx1 < K) ? x[idx1] : 0.0f;
+                is++;
+            }
+        }
+
+        // Process w1 (gate) block
+        {
+            const uint8_t* block_ptr = w1_row + bi * Q5_K_BLOCK_SIZE;
+            uint16_t d_bits, dmin_bits;
+            memcpy(&d_bits, block_ptr, 2);
+            memcpy(&dmin_bits, block_ptr + 2, 2);
+            float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+            float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+            const uint8_t* scales = block_ptr + 4;
+            const uint8_t* qh = block_ptr + 16;
+            const uint8_t* ql = block_ptr + 48;
+
+            int si = 0;
+            int xi = 0;
+            uint16_t u1 = 1, u2 = 2;
+            for (int j = 0; j < QK_K; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                get_scale_min_k4(si, scales, &sc1, &m1);
+                get_scale_min_k4(si + 1, scales, &sc2, &m2);
+                float d1 = d * sc1;
+                float m1_val = dmin * m1;
+                float d2 = d * sc2;
+                float m2_val = dmin * m2;
+
+                int q_low = (ql[lane] & 0xF) + ((qh[lane] & u1) ? 16 : 0);
+                int q_high = (ql[lane] >> 4) + ((qh[lane] & u2) ? 16 : 0);
+
+                gate_sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+                gate_sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+                ql += 32;
+                si += 2;
+                xi += 1;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+
+        // Process w3 (up) block
+        {
+            const uint8_t* block_ptr = w3_row + bi * Q5_K_BLOCK_SIZE;
+            uint16_t d_bits, dmin_bits;
+            memcpy(&d_bits, block_ptr, 2);
+            memcpy(&dmin_bits, block_ptr + 2, 2);
+            float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+            float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+            const uint8_t* scales = block_ptr + 4;
+            const uint8_t* qh = block_ptr + 16;
+            const uint8_t* ql = block_ptr + 48;
+
+            int si = 0;
+            int xi = 0;
+            uint16_t u1 = 1, u2 = 2;
+            for (int j = 0; j < QK_K; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                get_scale_min_k4(si, scales, &sc1, &m1);
+                get_scale_min_k4(si + 1, scales, &sc2, &m2);
+                float d1 = d * sc1;
+                float m1_val = dmin * m1;
+                float d2 = d * sc2;
+                float m2_val = dmin * m2;
+
+                int q_low = (ql[lane] & 0xF) + ((qh[lane] & u1) ? 16 : 0);
+                int q_high = (ql[lane] >> 4) + ((qh[lane] & u2) ? 16 : 0);
+
+                up_sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+                up_sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+                ql += 32;
+                si += 2;
+                xi += 1;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+    }
+
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 16);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 8);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 4);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 2);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 1);
+
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 16);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 8);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 4);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 2);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 1);
+
+    if (lane == 0) {
+        float silu_gate = gate_sum / (1.0f + __expf(-gate_sum));
+        out[warp_id] = silu_gate * up_sum;
+    }
+}
+
+void launch_ffn_up_fused_q5_k(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
+                               int intermediate_dim, cudaStream_t stream) {
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
+    ffn_up_fused_q5_k_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3),
+        out, K, intermediate_dim);
+}
+
 template <int ROWS_PER_WARP>
 __global__ void ffn_down_fused_q4_0_tiled_kernel(const float* __restrict__ ffn_mid,
                                                  const uint8_t* __restrict__ q_w2,
@@ -1411,10 +1551,8 @@ __global__ void ffn_down_fused_q5_k_tiled_kernel(const float* __restrict__ ffn_m
 
             int si = 0;
             int xi = 0;
+            uint16_t u1 = 1, u2 = 2;
             for (int j = 0; j < QK_K; j += 64) {
-                int bit_pos = j / 16;
-                uint8_t u1 = 1 << bit_pos;
-                uint8_t u2 = 2 << bit_pos;
 
                 uint8_t sc1, m1, sc2, m2;
                 get_scale_min_k4(si, scales, &sc1, &m1);
@@ -1433,6 +1571,8 @@ __global__ void ffn_down_fused_q5_k_tiled_kernel(const float* __restrict__ ffn_m
                 ql += 32;
                 si += 2;
                 xi += 1;
+                u1 <<= 2;
+                u2 <<= 2;
             }
         }
     }
@@ -1716,6 +1856,24 @@ void launch_output_proj_q4_k(const float* x, const void* q_weight, float* out, i
     int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
     cudaMemsetAsync(out, 0, N * sizeof(float), stream);
     output_proj_typed_kernel<DataType::Q4_K><<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
+}
+
+void launch_output_proj_q5_k(const float* x, const void* q_weight, float* out, int K, int N,
+                              cudaStream_t stream) {
+    constexpr int BE = CudaQuantTraits<DataType::Q5_K>::block_elements;
+    int num_blocks_row = (K + BE - 1) / BE;
+
+    int warps_per_row = (num_blocks_row + 31) / 32;
+    if (warps_per_row < 1) warps_per_row = 1;
+    if (warps_per_row > 16) warps_per_row = 16;
+
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int total_warps = N * warps_per_row;
+    int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
+    cudaMemsetAsync(out, 0, N * sizeof(float), stream);
+    output_proj_typed_kernel<DataType::Q5_K><<<blocks, threads, 0, stream>>>(
         x, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
 }
 
@@ -2114,6 +2272,205 @@ void launch_qkv_fused_q4_k(const float* x, const void* q_wq, int N_q,
         static_cast<const uint8_t*>(q_wk), N_k,
         static_cast<const uint8_t*>(q_wv), N_v,
         out_q, out_k, out_v, K);
+}
+
+// ---- Fused QKV Q5_K (M=1, decode) ----
+// Shares x_vals across Q, K, V weight rows — 3x x-read savings.
+
+__global__ void qkv_fused_q5_k_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ q_wq, int N_q,
+    const uint8_t* __restrict__ q_wk, int N_k,
+    const uint8_t* __restrict__ q_wv, int N_v,
+    float* __restrict__ out_q, float* __restrict__ out_k, float* __restrict__ out_v, int K)
+{
+    const int QK_K = 256;
+    const int Q5_K_BLOCK_SIZE = 176;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+    int total_N = N_q + N_k + N_v;
+    if (warp_id >= total_N) return;
+
+    const uint8_t* row_ptr;
+    float* out_ptr;
+    if (warp_id < N_q) {
+        row_ptr = q_wq + (size_t)warp_id * blocks_per_row * Q5_K_BLOCK_SIZE;
+        out_ptr = out_q + warp_id;
+    } else if (warp_id < N_q + N_k) {
+        int row = warp_id - N_q;
+        row_ptr = q_wk + (size_t)row * blocks_per_row * Q5_K_BLOCK_SIZE;
+        out_ptr = out_k + row;
+    } else {
+        int row = warp_id - N_q - N_k;
+        row_ptr = q_wv + (size_t)row * blocks_per_row * Q5_K_BLOCK_SIZE;
+        out_ptr = out_v + row;
+    }
+
+    float sum = 0.0f;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        // Read x block once
+        float x_vals[8];
+        {
+            int is = 0;
+            for (int j = 0; j < QK_K; j += 64) {
+                int idx0 = bi * QK_K + j + lane;
+                int idx1 = bi * QK_K + j + 32 + lane;
+                x_vals[is * 2 + 0] = (idx0 < K) ? x[idx0] : 0.0f;
+                x_vals[is * 2 + 1] = (idx1 < K) ? x[idx1] : 0.0f;
+                is++;
+            }
+        }
+
+        const uint8_t* block_ptr = row_ptr + bi * Q5_K_BLOCK_SIZE;
+        uint16_t d_bits, dmin_bits;
+        memcpy(&d_bits, block_ptr, 2);
+        memcpy(&dmin_bits, block_ptr + 2, 2);
+        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+        const uint8_t* scales = block_ptr + 4;
+        const uint8_t* qh = block_ptr + 16;
+        const uint8_t* ql = block_ptr + 48;
+
+        int si = 0;
+        int xi = 0;
+        uint16_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(si, scales, &sc1, &m1);
+            get_scale_min_k4(si + 1, scales, &sc2, &m2);
+            float d1 = d * sc1;
+            float m1_val = dmin * m1;
+            float d2 = d * sc2;
+            float m2_val = dmin * m2;
+
+            int q_low = (ql[lane] & 0xF) + ((qh[lane] & u1) ? 16 : 0);
+            int q_high = (ql[lane] >> 4) + ((qh[lane] & u2) ? 16 : 0);
+
+            sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+            sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+            ql += 32;
+            si += 2;
+            xi += 1;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+    if (lane == 0) *out_ptr = sum;
+}
+
+void launch_qkv_fused_q5_k(const float* x, const void* q_wq, int N_q,
+                             const void* q_wk, int N_k, const void* q_wv, int N_v,
+                             float* out_q, float* out_k, float* out_v, int K,
+                             cudaStream_t stream) {
+    int total_N = N_q + N_k + N_v;
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (total_N + warps_per_block - 1) / warps_per_block;
+    qkv_fused_q5_k_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_wq), N_q,
+        static_cast<const uint8_t*>(q_wk), N_k,
+        static_cast<const uint8_t*>(q_wv), N_v,
+        out_q, out_k, out_v, K);
+}
+
+// ---- Attn Proj Q5_K Cooperative (M=1, decode) ----
+// Uses cooperative warp: all 32 lanes work on each Q5_K block together,
+// sharing x_vals loaded into registers. 100% lane utilization vs 50% in
+// split-K GEMV when blocks_per_row < 32 (e.g., K=4096 → 16 blocks).
+__global__ void attn_proj_q5_k_cooperative_kernel(
+        const float* __restrict__ x,
+        const uint8_t* __restrict__ q_weight,
+        float* __restrict__ out,
+        int K, int N) {
+    const int QK_K = 256;
+    const int Q5_K_BLOCK_SIZE = 176;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    if (warp_id >= N) return;
+
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * blocks_per_row * Q5_K_BLOCK_SIZE;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        float x_vals[8];
+        {
+            int is = 0;
+            for (int j = 0; j < QK_K; j += 64) {
+                int idx0 = bi * QK_K + j + lane;
+                int idx1 = bi * QK_K + j + 32 + lane;
+                x_vals[is * 2 + 0] = (idx0 < K) ? x[idx0] : 0.0f;
+                x_vals[is * 2 + 1] = (idx1 < K) ? x[idx1] : 0.0f;
+                is++;
+            }
+        }
+
+        const uint8_t* block_ptr = row_ptr + bi * Q5_K_BLOCK_SIZE;
+        uint16_t d_bits, dmin_bits;
+        memcpy(&d_bits, block_ptr, 2);
+        memcpy(&dmin_bits, block_ptr + 2, 2);
+        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+        const uint8_t* scales = block_ptr + 4;
+        const uint8_t* qh = block_ptr + 16;
+        const uint8_t* ql = block_ptr + 48;
+
+        int si = 0;
+        int xi = 0;
+        uint16_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(si, scales, &sc1, &m1);
+            get_scale_min_k4(si + 1, scales, &sc2, &m2);
+            float d1 = d * sc1;
+            float m1_val = dmin * m1;
+            float d2 = d * sc2;
+            float m2_val = dmin * m2;
+
+            int q_low = (ql[lane] & 0xF) + ((qh[lane] & u1) ? 16 : 0);
+            int q_high = (ql[lane] >> 4) + ((qh[lane] & u2) ? 16 : 0);
+
+            sum += x_vals[xi * 2 + 0] * (d1 * q_low - m1_val);
+            sum += x_vals[xi * 2 + 1] * (d2 * q_high - m2_val);
+
+            ql += 32;
+            si += 2;
+            xi += 1;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        out[warp_id] = sum;
+    }
+}
+
+void launch_attn_proj_q5_k_cooperative(const float* x, const void* q_weight, float* out,
+                                        int K, int N, cudaStream_t stream) {
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (N + warps_per_block - 1) / warps_per_block;
+    attn_proj_q5_k_cooperative_kernel<<<blocks, threads, 0, stream>>>(
+        x, static_cast<const uint8_t*>(q_weight), out, K, N);
 }
 
 }  // namespace cuda

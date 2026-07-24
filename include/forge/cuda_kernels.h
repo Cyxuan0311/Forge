@@ -45,6 +45,10 @@ void launch_embedding_q4_k(const void* q_weight, const int32_t* indices, float* 
                            int num_indices, int embed_dim, int vocab_size, bool transposed = false,
                            cudaStream_t stream = 0);
 
+void launch_embedding_q5_k(const void* q_weight, const int32_t* indices, float* out,
+                           int num_indices, int embed_dim, int vocab_size, bool transposed = false,
+                           cudaStream_t stream = 0);
+
 void launch_embedding_q6_k(const void* q_weight, const int32_t* indices, float* out,
                            int num_indices, int embed_dim, int vocab_size, bool transposed = false,
                            cudaStream_t stream = 0);
@@ -109,8 +113,16 @@ void launch_qkv_fused_q4_k(const float* x, const void* q_wq, int N_q,
                              float* out_q, float* out_k, float* out_v, int K,
                              cudaStream_t stream = 0);
 
+void launch_qkv_fused_q5_k(const float* x, const void* q_wq, int N_q,
+                             const void* q_wk, int N_k, const void* q_wv, int N_v,
+                             float* out_q, float* out_k, float* out_v, int K,
+                             cudaStream_t stream = 0);
+
 void launch_ffn_up_fused_q4_0(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
                               int intermediate_dim, cudaStream_t stream = 0);
+
+void launch_ffn_up_fused_q5_k(const float* x, const void* q_w1, const void* q_w3, float* out, int K,
+                               int intermediate_dim, cudaStream_t stream = 0);
 
 void launch_ffn_up_fused_q4_0_q8_1(const float* x, const void* q_w1, const void* q_w3, float* out,
                                      int K, int intermediate_dim, cudaStream_t stream = 0);
@@ -139,6 +151,9 @@ void launch_ffn_up_fused_q3k_q4k(const float* x, const void* q_gate, const void*
 
 void launch_ffn_up_fused_q3k_q3k(const float* x, const void* q_gate, const void* q_up,
                                    float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
+
+void launch_dequant_q5_k_matrix(const void* q_data, float* out, int N, int K,
+                                cudaStream_t stream = 0);
 
 void launch_dequant_q6_k_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
@@ -258,6 +273,9 @@ void launch_output_proj_q4_0_q8_1(const float* x, const void* q_weight, float* o
 void launch_output_proj_q4_k(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
 
+void launch_output_proj_q5_k(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+
 void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
 
@@ -265,6 +283,10 @@ void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, i
 // Uses cooperative warp processing instead of split-K for better lane utilization
 void launch_output_proj_q4_k_cooperative(const float* x, const void* q_weight, float* out,
                                           int K, int N, cudaStream_t stream = 0);
+
+// ---- Attn Proj Q5_K Cooperative (M=1, decode, 100% lane utilization) ----
+void launch_attn_proj_q5_k_cooperative(const float* x, const void* q_weight, float* out,
+                                        int K, int N, cudaStream_t stream = 0);
 
 // Same but with fused logit softcap + suppress tokens (saves one kernel launch)
 void launch_output_proj_q4_k_cooperative_softcap(const float* x, const void* q_weight, float* out,
