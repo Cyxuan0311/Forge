@@ -24,6 +24,7 @@ INST_GEMV(DataType::Q4_1)
 INST_GEMV(DataType::Q4_K)
 INST_GEMV(DataType::Q8_0)
 INST_GEMV(DataType::Q3_K)
+INST_GEMV(DataType::Q5_K)
 INST_GEMV(DataType::Q6_K)
 
 #undef INST_GEMV
@@ -46,7 +47,7 @@ const GemvFn gemv_dispatch[18] = {
     /* Q5_1=9  */ nullptr,
     /* Q2_K=10 */ nullptr,
     /* Q3_K=11 */ launch_gemv_q3_k_smem,                            // special smem+dp4a
-    /* Q5_K=12 */ nullptr,
+    /* Q5_K=12 */ launch_gemv_typed_transB<DataType::Q5_K>,
     /* Q6_K=13 */ launch_gemv_typed_transB<DataType::Q6_K>,
     /* IQ2_S=14*/ nullptr,
     /* BF16=15 */ nullptr,
@@ -67,7 +68,7 @@ const GemvBatchFn gemv_batch_dispatch[18] = {
     /* Q5_1=9  */ nullptr,
     /* Q2_K=10 */ nullptr,
     /* Q3_K=11 */ launch_gemv_typed_transB_batch<DataType::Q3_K>,
-    /* Q5_K=12 */ nullptr,
+    /* Q5_K=12 */ launch_gemv_typed_transB_batch<DataType::Q5_K>,
     /* Q6_K=13 */ launch_gemv_typed_transB_batch<DataType::Q6_K>,
     /* IQ2_S=14*/ nullptr,
     /* BF16=15 */ nullptr,

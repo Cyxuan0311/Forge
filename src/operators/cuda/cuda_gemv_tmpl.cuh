@@ -136,6 +136,57 @@ struct CudaQuantTraits<DataType::Q4_K> {
     }
 };
 
+// ---- Q5_K: 256 elements/block, 176 bytes/block ----
+// Layout: d(f16,2B) + dmin(f16,2B) + scales[12] + qh[32] + ql[128]
+template <>
+struct CudaQuantTraits<DataType::Q5_K> {
+    static constexpr int block_elements = QuantTraits<DataType::Q5_K>::block_elements;  // 256
+    static constexpr int block_size = QuantTraits<DataType::Q5_K>::block_size;           // 176
+
+    static __device__ __forceinline__ float dot_block(
+        const uint8_t* block_ptr, const float* x, int base, int K) {
+        uint16_t d_bits, dmin_bits;
+        memcpy(&d_bits, block_ptr, 2);
+        memcpy(&dmin_bits, block_ptr + 2, 2);
+        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+        const uint8_t* scales = block_ptr + 4;
+        const uint8_t* qh = block_ptr + 16;
+        const uint8_t* ql = block_ptr + 48;
+
+        float sum = 0.0f;
+        uint8_t u1 = 1, u2 = 2;
+        int is = 0;
+        for (int j = 0; j < block_elements; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is, scales, &sc1, &m1);
+            get_scale_min_k4(is + 1, scales, &sc2, &m2);
+            float d1 = d * sc1;
+            float m1_val = dmin * m1;
+            float d2 = d * sc2;
+            float m2_val = dmin * m2;
+
+            for (int l = 0; l < 32; ++l) {
+                int idx1 = base + j + l;
+                if (idx1 < K) {
+                    int q1 = (ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0);
+                    sum += x[idx1] * (d1 * q1 - m1_val);
+                }
+                int idx2 = base + j + 32 + l;
+                if (idx2 < K) {
+                    int q2 = (ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0);
+                    sum += x[idx2] * (d2 * q2 - m2_val);
+                }
+            }
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        return sum;
+    }
+};
+
 // ---- Q6_K: 256 elements/block, 210 bytes/block ----
 // Layout: ql[128] + qh[64] + sc[16+2]
 template <>
