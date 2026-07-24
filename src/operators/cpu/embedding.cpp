@@ -276,6 +276,117 @@ static void dequant_q6_k_rows(const uint8_t* q_data, float* out, const int32_t* 
     }
 }
 
+static void dequant_q2_k_rows(const uint8_t* q_data, float* out, const int32_t* indices,
+                               int num_indices, int vocab_size, int embed_dim) {
+    constexpr int Q2_K_BLOCK_SIZE = 84;
+    int blocks_per_row = (embed_dim + QK_K_EMB - 1) / QK_K_EMB;
+    size_t row_bytes = blocks_per_row * Q2_K_BLOCK_SIZE;
+
+    for (int i = 0; i < num_indices; ++i) {
+        int vocab_idx = indices[i];
+        if (vocab_idx < 0 || vocab_idx >= vocab_size)
+            continue;
+
+        const uint8_t* row_ptr = q_data + vocab_idx * row_bytes;
+        float* out_row = out + i * embed_dim;
+
+        for (int bi = 0; bi < blocks_per_row; ++bi) {
+            const uint8_t* block_ptr = row_ptr + bi * Q2_K_BLOCK_SIZE;
+            const uint8_t* scales = block_ptr;
+            const uint8_t* q = block_ptr + 16;
+            uint16_t d_bits, dmin_bits;
+            memcpy(&d_bits, block_ptr + 80, 2);
+            memcpy(&dmin_bits, block_ptr + 82, 2);
+            float d = fp16_to_fp32_embed(d_bits);
+            float min = fp16_to_fp32_embed(dmin_bits);
+
+            float* y = out_row + bi * QK_K_EMB;
+            int is = 0;
+            for (int n = 0; n < QK_K_EMB; n += 128) {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j) {
+                    uint8_t sc = scales[is++];
+                    float dl = d * (sc & 0xF);
+                    float ml = min * (sc >> 4);
+                    for (int l = 0; l < 16; ++l) {
+                        y[l] = dl * static_cast<float>(static_cast<int8_t>((q[l] >> shift) & 3)) - ml;
+                    }
+                    sc = scales[is++];
+                    dl = d * (sc & 0xF);
+                    ml = min * (sc >> 4);
+                    for (int l = 0; l < 16; ++l) {
+                        y[16 + l] = dl * static_cast<float>(static_cast<int8_t>((q[l + 16] >> shift) & 3)) - ml;
+                    }
+                    shift += 2;
+                    y += 32;
+                }
+                q += 32;
+            }
+        }
+    }
+}
+
+static void dequant_q3_k_rows(const uint8_t* q_data, float* out, const int32_t* indices,
+                               int num_indices, int vocab_size, int embed_dim) {
+    constexpr int Q3_K_BLOCK_SIZE = 110;
+    int blocks_per_row = (embed_dim + QK_K_EMB - 1) / QK_K_EMB;
+    size_t row_bytes = blocks_per_row * Q3_K_BLOCK_SIZE;
+
+    for (int i = 0; i < num_indices; ++i) {
+        int vocab_idx = indices[i];
+        if (vocab_idx < 0 || vocab_idx >= vocab_size)
+            continue;
+
+        const uint8_t* row_ptr = q_data + vocab_idx * row_bytes;
+        float* out_row = out + i * embed_dim;
+
+        for (int bi = 0; bi < blocks_per_row; ++bi) {
+            const uint8_t* block_ptr = row_ptr + bi * Q3_K_BLOCK_SIZE;
+            const uint8_t* hm = block_ptr;
+            const uint8_t* q = block_ptr + 32;
+            const uint8_t* scales_raw = block_ptr + 96;
+            uint16_t d_bits;
+            memcpy(&d_bits, block_ptr + 108, 2);
+            float d_all = fp16_to_fp32_embed(d_bits);
+
+            uint32_t aux[4];
+            const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+            memcpy(aux, scales_raw, 12);
+            uint32_t tmp = aux[2];
+            const uint32_t kmask1 = 0x03030303;
+            const uint32_t kmask2 = 0x0f0f0f0f;
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+            float* y = out_row + bi * QK_K_EMB;
+            int is = 0;
+            uint8_t m = 1;
+            for (int n = 0; n < QK_K_EMB; n += 128) {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j) {
+                    float dl = d_all * static_cast<float>(scales[is++] - 32);
+                    for (int l = 0; l < 16; ++l) {
+                        *y++ = dl * static_cast<float>(
+                            static_cast<int8_t>((q[l] >> shift) & 3) -
+                            ((hm[l] & m) ? 0 : 4));
+                    }
+                    dl = d_all * static_cast<float>(scales[is++] - 32);
+                    for (int l = 0; l < 16; ++l) {
+                        *y++ = dl * static_cast<float>(
+                            static_cast<int8_t>((q[l + 16] >> shift) & 3) -
+                            ((hm[l + 16] & m) ? 0 : 4));
+                    }
+                    shift += 2;
+                    m <<= 1;
+                }
+                q += 32;
+            }
+        }
+    }
+}
+
 using DequantEmbFn = void (*)(const uint8_t*, float*, const int32_t*, int, int, int);
 
 static DequantEmbFn get_dequant_emb_fn(DataType dt) {
@@ -292,6 +403,10 @@ static DequantEmbFn get_dequant_emb_fn(DataType dt) {
         return dequant_q5_k_rows;
     case DataType::Q6_K:
         return dequant_q6_k_rows;
+    case DataType::Q2_K:
+        return dequant_q2_k_rows;
+    case DataType::Q3_K:
+        return dequant_q3_k_rows;
     default:
         return nullptr;
     }
@@ -334,6 +449,14 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                 static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q6_K) {
             cuda::launch_embedding_q6_k(
+                weight->data(), static_cast<const int32_t*>(indices->data()),
+                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+        } else if (weight->dtype() == DataType::Q2_K) {
+            cuda::launch_embedding_q2_k(
+                weight->data(), static_cast<const int32_t*>(indices->data()),
+                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+        } else if (weight->dtype() == DataType::Q3_K) {
+            cuda::launch_embedding_q3_k(
                 weight->data(), static_cast<const int32_t*>(indices->data()),
                 static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
         } else if (is_quantized_type(weight->dtype())) {
@@ -387,7 +510,15 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                     } else if (weight->dtype() == DataType::Q4_1) {
                         fp32_weight = dequantize_q4_1_weight(weight);
                     } else {
-                        std::memset(o_data, 0, num_indices * embed_dim * sizeof(float));
+                        // For quant types without pre-dequant cache, fall through to dequant path.
+                        // The weight data is stored vocab-contiguous, so dequant_by_row works.
+                        auto fallback_fn = get_dequant_emb_fn(weight->dtype());
+                        if (fallback_fn) {
+                            fallback_fn(static_cast<const uint8_t*>(weight->data()), o_data,
+                                        idx_data, num_indices, vocab_size, embed_dim);
+                        } else {
+                            std::memset(o_data, 0, num_indices * embed_dim * sizeof(float));
+                        }
                         return out;
                     }
                 }

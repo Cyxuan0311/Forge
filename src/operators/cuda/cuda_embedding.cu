@@ -433,5 +433,135 @@ void launch_embedding_q6_k(const void* q_weight, const int32_t* indices, float* 
         static_cast<const uint8_t*>(q_weight), indices, out, num_indices, embed_dim, vocab_size);
 }
 
+// ---- Q2_K Embedding ----
+
+__global__ void embedding_q2_k_kernel(const uint8_t* q_weight, const int32_t* indices, float* out,
+                                      int num_indices, int embed_dim, int vocab_size) {
+    const int QK_K = 256;
+    const int Q2_K_BLOCK_SIZE = 84;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int token_idx = idx / embed_dim;
+    int dim_idx = idx % embed_dim;
+
+    if (token_idx >= num_indices)
+        return;
+
+    int vocab_idx = indices[token_idx];
+    if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+        out[idx] = 0.0f;
+        return;
+    }
+
+    int blocks_per_row = (embed_dim + QK_K - 1) / QK_K;
+    int row_offset = vocab_idx * blocks_per_row * Q2_K_BLOCK_SIZE;
+
+    int bi = dim_idx / QK_K;
+    int j_in_block = dim_idx % QK_K;
+
+    const uint8_t* block_ptr = q_weight + row_offset + bi * Q2_K_BLOCK_SIZE;
+    const uint8_t* scales = block_ptr;
+    const uint8_t* q = block_ptr + 16;
+    uint16_t d_bits, dmin_bits;
+    memcpy(&d_bits, block_ptr + 80, 2);
+    memcpy(&dmin_bits, block_ptr + 82, 2);
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+    float min = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+
+    int h = j_in_block / 128;
+    int rem = j_in_block % 128;
+    int sub = rem / 32;
+    int l_sub = rem % 32;
+    int shift = sub * 2;
+
+    int is = h * 8 + sub * 2 + (l_sub / 16);
+    uint8_t sc = scales[is];
+    float dl = d * (sc & 0xF);
+    float ml = min * (sc >> 4);
+
+    int q_offset = h * 32 + l_sub;
+    int q_val = (q[q_offset] >> shift) & 3;
+
+    out[idx] = dl * static_cast<float>(static_cast<int8_t>(q_val)) - ml;
+}
+
+void launch_embedding_q2_k(const void* q_weight, const int32_t* indices, float* out,
+                           int num_indices, int embed_dim, int vocab_size, bool transposed,
+                           cudaStream_t stream) {
+    (void)transposed;
+    int total = num_indices * embed_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    embedding_q2_k_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_weight), indices, out, num_indices, embed_dim, vocab_size);
+}
+
+// ---- Q3_K Embedding ----
+
+__global__ void embedding_q3_k_kernel(const uint8_t* q_weight, const int32_t* indices, float* out,
+                                      int num_indices, int embed_dim, int vocab_size) {
+    const int QK_K = 256;
+    const int Q3_K_BLOCK_SIZE = 110;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int token_idx = idx / embed_dim;
+    int dim_idx = idx % embed_dim;
+
+    if (token_idx >= num_indices)
+        return;
+
+    int vocab_idx = indices[token_idx];
+    if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+        out[idx] = 0.0f;
+        return;
+    }
+
+    int blocks_per_row = (embed_dim + QK_K - 1) / QK_K;
+    int row_offset = vocab_idx * blocks_per_row * Q3_K_BLOCK_SIZE;
+
+    int bi = dim_idx / QK_K;
+    int j_in_block = dim_idx % QK_K;
+
+    const uint8_t* block_ptr = q_weight + row_offset + bi * Q3_K_BLOCK_SIZE;
+    const uint8_t* hm = block_ptr;
+    const uint8_t* q = block_ptr + 32;
+    const uint8_t* scales_raw = block_ptr + 96;
+    uint16_t d_bits;
+    memcpy(&d_bits, block_ptr + 108, 2);
+    float d_all = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+    int h = j_in_block / 128;
+    int rem = j_in_block % 128;
+    int sub = rem / 32;
+    int l_sub = rem % 32;
+    int shift = sub * 2;
+
+    int bit_pos = h * 4 + sub;
+    uint8_t hm_bit = (hm[l_sub] >> bit_pos) & 1;
+
+    int q_offset = h * 32 + l_sub;
+    int q_val = (q[q_offset] >> shift) & 3;
+    int q_adj = q_val - (hm_bit ? 0 : 4);
+
+    int is = h * 8 + sub * 2 + (l_sub / 16);
+
+    int8_t unpacked[16];
+    q3_k_unpack_scales(scales_raw, unpacked);
+    float dl = d_all * static_cast<float>(unpacked[is] - 32);
+
+    out[idx] = dl * static_cast<float>(q_adj);
+}
+
+void launch_embedding_q3_k(const void* q_weight, const int32_t* indices, float* out,
+                           int num_indices, int embed_dim, int vocab_size, bool transposed,
+                           cudaStream_t stream) {
+    (void)transposed;
+    int total = num_indices * embed_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    embedding_q3_k_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_weight), indices, out, num_indices, embed_dim, vocab_size);
+}
+
 }  // namespace cuda
 }  // namespace forge
