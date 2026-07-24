@@ -374,6 +374,74 @@ void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K
         static_cast<const uint8_t*>(q_data), static_cast<__half*>(out), N, K);
 }
 
+// ---- Q5_K Matrix Dequantization ----
+
+__global__ void dequant_q5_k_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                           float* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int Q5_K_BLOCK_SIZE = 176;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int j_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + row * blocks_per_row * Q5_K_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q5_K_BLOCK_SIZE;
+
+    uint16_t d_bits, dmin_bits;
+    memcpy(&d_bits, block_ptr, 2);
+    memcpy(&dmin_bits, block_ptr + 2, 2);
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+    float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+    const uint8_t* scales = block_ptr + 4;
+    const uint8_t* qh = block_ptr + 16;
+    const uint8_t* ql = block_ptr + 48;
+
+    int group = j_in_block / 64;
+    int l_full = j_in_block % 64;
+    int l = l_full % 32;
+    int is = group * 2;
+
+    uint8_t sc, m_val;
+    if (l_full < 32) {
+        get_scale_min_k4(is, scales, &sc, &m_val);
+    } else {
+        get_scale_min_k4(is + 1, scales, &sc, &m_val);
+    }
+
+    float d1 = d * static_cast<float>(sc);
+    float m1 = dmin * static_cast<float>(m_val);
+
+    const uint8_t* ql_group = ql + group * 32;
+    uint8_t u_mask = (group == 0) ? 1 : (group == 1) ? 4 : (group == 2) ? 16 : 64;
+
+    int q_val;
+    if (l_full < 32) {
+        q_val = (ql_group[l] & 0xF) + ((qh[l] & u_mask) ? 16 : 0);
+    } else {
+        uint8_t u_mask2 = (group == 0) ? 2 : (group == 1) ? 8 : (group == 2) ? 32 : 128;
+        q_val = (ql_group[l] >> 4) + ((qh[l] & u_mask2) ? 16 : 0);
+    }
+
+    out[idx] = d1 * static_cast<float>(q_val) - m1;
+}
+
+void launch_dequant_q5_k_matrix(const void* q_data, float* out, int N, int K, cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q5_k_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
+                                                               out, N, K);
+}
+
 // ---- Q6_K Matrix Dequantization ----
 
 __global__ void dequant_q6_k_matrix_kernel(const uint8_t* __restrict__ q_data,
