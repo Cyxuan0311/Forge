@@ -53,6 +53,14 @@ void launch_embedding_q6_k(const void* q_weight, const int32_t* indices, float* 
                            int num_indices, int embed_dim, int vocab_size, bool transposed = false,
                            cudaStream_t stream = 0);
 
+void launch_embedding_q2_k(const void* q_weight, const int32_t* indices, float* out,
+                           int num_indices, int embed_dim, int vocab_size, bool transposed = false,
+                           cudaStream_t stream = 0);
+
+void launch_embedding_q3_k(const void* q_weight, const int32_t* indices, float* out,
+                           int num_indices, int embed_dim, int vocab_size, bool transposed = false,
+                           cudaStream_t stream = 0);
+
 void launch_rope_fp32(const float* q, const float* k, float* q_out, float* k_out, int num_heads,
                       int head_dim, int seq_len, int64_t pos, float theta, cudaStream_t stream = 0);
 
@@ -150,6 +158,9 @@ void launch_ffn_up_fused_q3k_q4k(const float* x, const void* q_gate, const void*
                                    float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
 
 void launch_ffn_up_fused_q3k_q3k(const float* x, const void* q_gate, const void* q_up,
+                                   float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
+
+void launch_ffn_up_fused_q2k_q2k(const float* x, const void* q_gate, const void* q_up,
                                    float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
 
 void launch_dequant_q5_k_matrix(const void* q_data, float* out, int N, int K,

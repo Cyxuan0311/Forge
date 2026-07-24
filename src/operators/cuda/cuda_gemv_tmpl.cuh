@@ -233,6 +233,57 @@ struct CudaQuantTraits<DataType::Q6_K> {
     }
 };
 
+// ---- Q2_K: 256 elements/block, 84 bytes/block ----
+// Layout: scales[16] + qs[64] + d(f16,2B) + dmin(f16,2B)
+// weight = d * d_scale * q2_val - dmin * min_scale
+// scales[i]: lo nibble = d_scale, hi nibble = min_scale
+template <>
+struct CudaQuantTraits<DataType::Q2_K> {
+    static constexpr int block_elements = QuantTraits<DataType::Q2_K>::block_elements;  // 256
+    static constexpr int block_size = QuantTraits<DataType::Q2_K>::block_size;           // 84
+
+    static __device__ __forceinline__ float dot_block(
+        const uint8_t* block_ptr, const float* x, int base, int K) {
+        const uint8_t* scales = block_ptr;
+        const uint8_t* qs = block_ptr + 16;
+        uint16_t d_bits, dmin_bits;
+        memcpy(&d_bits,   block_ptr + 80, 2);
+        memcpy(&dmin_bits, block_ptr + 82, 2);
+        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+
+        float sum = 0.0f;
+        for (int n = 0; n < block_elements; n += 128) {
+            const uint8_t* q = qs + (n == 0 ? 0 : 32);
+            for (int sub = 0; sub < 4; ++sub) {
+                int shift = sub * 2;
+                for (int l = 0; l < 16; ++l) {
+                    int idx = base + n + sub * 32 + l;
+                    if (idx >= K) continue;
+                    int q_val = (q[l] >> shift) & 3;
+                    // is = h*8 + sub*2 + (l/16)
+                    int is = (n / 128) * 8 + sub * 2 + (l / 16);
+                    uint8_t sc_byte = scales[is];
+                    int d_scale = sc_byte & 0xF;
+                    int min_scale = (sc_byte >> 4) & 0xF;
+                    sum += x[idx] * (d * d_scale * q_val - dmin * min_scale);
+                }
+                for (int l = 0; l < 16; ++l) {
+                    int idx = base + n + sub * 32 + 16 + l;
+                    if (idx >= K) continue;
+                    int q_val = (q[l + 16] >> shift) & 3;
+                    int is = (n / 128) * 8 + sub * 2 + 1;
+                    uint8_t sc_byte = scales[is];
+                    int d_scale = sc_byte & 0xF;
+                    int min_scale = (sc_byte >> 4) & 0xF;
+                    sum += x[idx] * (d * d_scale * q_val - dmin * min_scale);
+                }
+            }
+        }
+        return sum;
+    }
+};
+
 // ---- Q3_K: 256 elements/block, 110 bytes/block ----
 // Layout: hmask[32] + qs[64] + scales[12] + d[2]
 template <>

@@ -923,6 +923,11 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
                          lw.w1()->dtype() == DataType::Q3_K && lw.w3()->dtype() == DataType::Q4_K) {
                     ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
                 }
+                // Fused CUDA Q2_K gate+up (shared Q8_1 + dp4a)
+                else if (dev == DeviceType::CUDA && seq_len == 1 &&
+                         lw.w1()->dtype() == DataType::Q2_K && lw.w3()->dtype() == DataType::Q2_K) {
+                    ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
+                }
                 // Fused CPU Q4_0 gate+up
                 else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
                          lw.w1()->dtype() == DataType::Q4_0 && lw.w3()->dtype() == DataType::Q4_0) {
@@ -942,6 +947,11 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
                 else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
                          lw.w1()->dtype() == DataType::Q3_K && lw.w3()->dtype() == DataType::Q3_K) {
                     ffn_mid = ops::matmul_transB_fused_ffn_up_q3_k(x, lw.w1(), lw.w3());
+                }
+                // Fused CPU Q2_K gate+up
+                else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
+                         lw.w1()->dtype() == DataType::Q2_K && lw.w3()->dtype() == DataType::Q2_K) {
+                    ffn_mid = ops::matmul_transB_fused_ffn_up_q2_k(x, lw.w1(), lw.w3());
                 } else {
                     auto gate = ops::matmul_transB(x, lw.w1());
                     auto up = ops::matmul_transB(x, lw.w3());

@@ -30,12 +30,20 @@ void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
 void launch_gemv_q3_k_smem(const float* x, const void* q_weight, float* out,
                             int K, int N, cudaStream_t stream = 0);
 
+// ---- Q2_K special GEMV (Q8_1 + dp4a) ----
+void launch_gemv_q2_k_q8_1(const float* x, const void* q_weight, float* out,
+                             int K, int N, cudaStream_t stream = 0);
+
 // ---- Q4_K special GEMV (Q8_1 + dp4a) ----
 void launch_gemv_q4_k_q8_1(const float* x, const void* q_weight, float* out,
-                             int K, int N, cudaStream_t stream = 0);
+                              int K, int N, cudaStream_t stream = 0);
 
 // ---- FFN Up Fused: Q3_K gate + Q4_K up (shared Q8_1 + dp4a) ----
 void launch_ffn_up_fused_q3k_q4k(const float* x, const void* q_gate, const void* q_up,
+                                   float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
+
+// ---- FFN Up Fused: Q2_K gate + Q2_K up (shared Q8_1 + dp4a) ----
+void launch_ffn_up_fused_q2k_q2k(const float* x, const void* q_gate, const void* q_up,
                                    float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
 
 // ---- Typed GEMV dispatch tables ----
