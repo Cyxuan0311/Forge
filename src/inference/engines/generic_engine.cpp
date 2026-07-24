@@ -375,6 +375,46 @@ GenericEngine::QKVProjResult GenericEngine::qkv_proj_forward(const TensorPtr& x,
         }
 #endif
     }
+    // CUDA Q5_K fused path
+    else if (dev == DeviceType::CUDA && seq_len == 1 && wq->dtype() == DataType::Q5_K &&
+             wk->dtype() == DataType::Q5_K && wv->dtype() == DataType::Q5_K) {
+#ifdef USE_CUDA
+        int K_proj = static_cast<int>(wq->shape()[1]);
+        int N_q = static_cast<int>(wq->shape()[0]);
+        int N_k = static_cast<int>(wk->shape()[0]);
+        int N_v = static_cast<int>(wv->shape()[0]);
+
+        result.q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_q},
+                                            DeviceType::CUDA);
+        result.k = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_k},
+                                            DeviceType::CUDA);
+        result.v = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, N_v},
+                                            DeviceType::CUDA);
+
+        cuda::launch_qkv_fused_q5_k(
+            static_cast<const float*>(x->data()), wq->data(), N_q, wk->data(), N_k, wv->data(),
+            N_v, static_cast<float*>(result.q->data()), static_cast<float*>(result.k->data()),
+            static_cast<float*>(result.v->data()), K_proj);
+
+        if (bq && bq->numel() > 0) {
+            cuda::launch_add_bias(static_cast<const float*>(result.q->data()),
+                                  static_cast<const float*>(bq->data()),
+                                  static_cast<float*>(result.q->data()), N_q);
+        }
+        if (bk && bk->numel() > 0) {
+            cuda::launch_add_bias(static_cast<const float*>(result.k->data()),
+                                  static_cast<const float*>(bk->data()),
+                                  static_cast<float*>(result.k->data()), N_k);
+        }
+        if (bv && bv->numel() > 0) {
+            cuda::launch_add_bias(static_cast<const float*>(result.v->data()),
+                                  static_cast<const float*>(bv->data()),
+                                  static_cast<float*>(result.v->data()), N_v);
+        }
+#else
+        (void)0;
+#endif
+    }
     // CPU Q4_0 fused path
     else if (dev == DeviceType::CPU && seq_len == 1 && wq->dtype() == DataType::Q4_0 &&
              wk->dtype() == DataType::Q4_0 && wv->dtype() == DataType::Q4_0) {
@@ -868,6 +908,11 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
                          lw.w1()->dtype() == DataType::Q3_K && lw.w3()->dtype() == DataType::Q3_K) {
                     ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
                 }
+                // Fused CUDA Q5_K gate+up (shared x read)
+                else if (dev == DeviceType::CUDA && seq_len == 1 &&
+                         lw.w1()->dtype() == DataType::Q5_K && lw.w3()->dtype() == DataType::Q5_K) {
+                    ffn_mid = ops::ffn_up_fused(x, lw.w1(), lw.w3(), cfg.intermediate_dim);
+                }
                 // Fused CUDA Q4_K gate+up (shared Q8_1 quantization of x)
                 else if (dev == DeviceType::CUDA && seq_len == 1 &&
                          lw.w1()->dtype() == DataType::Q4_K && lw.w3()->dtype() == DataType::Q4_K) {
@@ -887,6 +932,11 @@ TensorPtr GenericEngine::ffn_forward(const TensorPtr& x, const TensorPtr& residu
                 else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
                          lw.w1()->dtype() == DataType::Q4_K && lw.w3()->dtype() == DataType::Q4_K) {
                     ffn_mid = ops::matmul_transB_fused_ffn_up_q4_k(x, lw.w1(), lw.w3());
+                }
+                // Fused CPU Q5_K gate+up
+                else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
+                         lw.w1()->dtype() == DataType::Q5_K && lw.w3()->dtype() == DataType::Q5_K) {
+                    ffn_mid = ops::matmul_transB_fused_ffn_up_q5_k(x, lw.w1(), lw.w3());
                 }
                 // Fused CPU Q3_K gate+up
                 else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
@@ -1149,6 +1199,17 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden, int layer_idx, i
         if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q4_0) {
             attn_proj = ops::matmul_transB_fused_attn_proj_residual_q4_0(attn_out, lw.wo(), hidden);
             fused_attn_residual = true;
+        } else if (dev == DeviceType::CUDA && seq_len == 1 && lw.wo()->dtype() == DataType::Q5_K) {
+#ifdef USE_CUDA
+            int K_wo = static_cast<int>(lw.wo()->shape()[1]);
+            int N_wo = static_cast<int>(lw.wo()->shape()[0]);
+            attn_proj = std::make_shared<Tensor>(DataType::FP32,
+                                                 std::vector<int64_t>{1, N_wo},
+                                                 DeviceType::CUDA);
+            cuda::launch_attn_proj_q5_k_cooperative(
+                static_cast<const float*>(attn_out->data()), lw.wo()->data(),
+                static_cast<float*>(attn_proj->data()), K_wo, N_wo);
+#endif
         } else {
             attn_proj = ops::matmul_transB(attn_out, lw.wo());
         }

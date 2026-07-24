@@ -542,6 +542,10 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
                     weights_.output_weight_fp16->data(),
                     static_cast<float*>(logits->data()),
                     1, K, N, true);
+            } else if (dtype == DataType::Q5_K) {
+                cuda::launch_output_proj_q5_k(static_cast<const float*>(cur_hidden->data()),
+                                              output_weight->data(),
+                                              static_cast<float*>(logits->data()), K, N);
             } else if (dtype == DataType::Q6_K) {
                 cuda::launch_output_proj_q6_k(static_cast<const float*>(cur_hidden->data()),
                                               output_weight->data(),
