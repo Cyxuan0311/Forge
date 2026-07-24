@@ -283,6 +283,83 @@ void launch_embedding_q4_k(const void* q_weight, const int32_t* indices, float* 
         static_cast<const uint8_t*>(q_weight), indices, out, num_indices, embed_dim, vocab_size);
 }
 
+// ---- Q5_K Embedding ----
+
+__global__ void embedding_q5_k_kernel(const uint8_t* q_weight, const int32_t* indices, float* out,
+                                      int num_indices, int embed_dim, int vocab_size) {
+    const int QK_K = 256;
+    const int Q5_K_BLOCK_SIZE = 176;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int token_idx = idx / embed_dim;
+    int dim_idx = idx % embed_dim;
+
+    if (token_idx >= num_indices)
+        return;
+
+    int vocab_idx = indices[token_idx];
+    if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+        out[idx] = 0.0f;
+        return;
+    }
+
+    int blocks_per_row = (embed_dim + QK_K - 1) / QK_K;
+    int row_offset = vocab_idx * blocks_per_row * Q5_K_BLOCK_SIZE;
+
+    int bi = dim_idx / QK_K;
+    int j_in_block = dim_idx % QK_K;
+
+    const uint8_t* block_ptr = q_weight + row_offset + bi * Q5_K_BLOCK_SIZE;
+
+    uint16_t d_bits, dmin_bits;
+    memcpy(&d_bits, block_ptr, 2);
+    memcpy(&dmin_bits, block_ptr + 2, 2);
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+    float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+    const uint8_t* scales = block_ptr + 4;
+    const uint8_t* qh = block_ptr + 16;
+    const uint8_t* ql = block_ptr + 48;
+
+    // j_in_block is in [0, 255], 4 groups of 64 elements
+    int group = j_in_block / 64;       // 0..3
+    int l_full = j_in_block % 64;      // 0..63
+    int l = l_full % 32;
+    int is = group * 2;
+
+    uint8_t sc, m_val;
+    if (l_full < 32) {
+        get_scale_min_k4(is, scales, &sc, &m_val);
+    } else {
+        get_scale_min_k4(is + 1, scales, &sc, &m_val);
+    }
+
+    float d1 = d * static_cast<float>(sc);
+    float m1 = dmin * static_cast<float>(m_val);
+
+    const uint8_t* ql_group = ql + group * 32;
+    uint8_t u_mask = (group == 0) ? 1 : (group == 1) ? 4 : (group == 2) ? 16 : 64;
+
+    int q_val;
+    if (l_full < 32) {
+        q_val = (ql_group[l] & 0xF) + ((qh[l] & u_mask) ? 16 : 0);
+    } else {
+        uint8_t u_mask2 = (group == 0) ? 2 : (group == 1) ? 8 : (group == 2) ? 32 : 128;
+        q_val = (ql_group[l] >> 4) + ((qh[l] & u_mask2) ? 16 : 0);
+    }
+
+    out[idx] = d1 * static_cast<float>(q_val) - m1;
+}
+
+void launch_embedding_q5_k(const void* q_weight, const int32_t* indices, float* out,
+                           int num_indices, int embed_dim, int vocab_size, bool transposed,
+                           cudaStream_t stream) {
+    int total = num_indices * embed_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    embedding_q5_k_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_weight), indices, out, num_indices, embed_dim, vocab_size);
+}
+
 // ---- Q6_K Embedding ----
 
 __global__ void embedding_q6_k_kernel(const uint8_t* q_weight, const int32_t* indices, float* out,

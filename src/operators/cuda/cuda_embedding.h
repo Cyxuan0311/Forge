@@ -23,6 +23,10 @@ void launch_embedding_q4_k(const void* q_weight, const int32_t* indices, float* 
                            int num_indices, int embed_dim, int vocab_size, bool transposed = false,
                            cudaStream_t stream = 0);
 
+void launch_embedding_q5_k(const void* q_weight, const int32_t* indices, float* out,
+                           int num_indices, int embed_dim, int vocab_size, bool transposed = false,
+                           cudaStream_t stream = 0);
+
 void launch_embedding_q6_k(const void* q_weight, const int32_t* indices, float* out,
                            int num_indices, int embed_dim, int vocab_size, bool transposed = false,
                            cudaStream_t stream = 0);
