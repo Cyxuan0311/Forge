@@ -20,6 +20,16 @@ struct block_q8_K {
     int16_t bsums[16];
 };
 
+// Q2_K block structure (256 elements, 84 bytes)
+// Layout: scales[16] + qs[64] + d[2] + dmin[2]
+struct block_q2_K {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    uint16_t d;
+    uint16_t dmin;
+};
+static_assert(sizeof(block_q2_K) == 84, "block_q2_K must be 84 bytes");
+
 // Q3_K block structure (256 elements, 110 bytes)
 // Layout: hmask[32] + qs[64] + scales[12] + d[2]
 struct block_q3_K {

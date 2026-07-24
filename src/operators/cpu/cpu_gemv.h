@@ -2376,6 +2376,152 @@ static void gemv_q3_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
     }
 }
 
+// Q3_K Batch-GEMV (transB layout) for M > 1 (prefill).
+// Q3_K weight decoding (scales, hmask, qs) is done once per weight block,
+// then reused for all M input vectors.
+// Uses pre-allocated thread-local accumulators to avoid per-row heap alloc.
+static void gemv_q3_k_transB_batch_avx2(const float* a, const uint8_t* w, float* out,
+                                          int M, int K, int N) {
+    constexpr int QK_K = 256;
+    constexpr int Q3_K_BLOCK_BYTES = 110;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i mone = _mm256_set1_epi8(1);
+    const __m128i m32 = _mm_set1_epi8(32);
+
+    static const uint32_t kmask1 = 0x03030303;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+
+    // Quantize all M input vectors to Q8_K
+    std::vector<block_q8_K> q8_src(M * nb);
+    for (int m = 0; m < M; ++m) {
+        quantize_row_q8_K(a + m * K, q8_src.data() + m * nb, K);
+    }
+
+    // Transpose Q8_K data: q8_t[i * M + m] = q8_src[m * nb + i]
+    // This makes per-block access sequential for all M rows
+    std::vector<block_q8_K> q8_t(nb * M);
+    for (int i = 0; i < nb; ++i) {
+        for (int m = 0; m < M; ++m) {
+            q8_t[i * M + m] = q8_src[m * nb + i];
+        }
+    }
+
+    // Pre-allocate aligned accumulators per OpenMP thread
+    int max_threads = omp_get_max_threads();
+    __m256* acc_storage = static_cast<__m256*>(_mm_malloc(max_threads * M * sizeof(__m256), 32));
+
+#pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        int tid = omp_get_thread_num();
+        __m256* acc = acc_storage + (size_t)tid * M;
+        for (int m = 0; m < M; ++m) acc[m] = _mm256_setzero_ps();
+
+        const uint8_t* q3_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
+
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* sb_ptr = q3_row + (size_t)i * Q3_K_BLOCK_BYTES;
+            const block_q3_K* x = reinterpret_cast<const block_q3_K*>(sb_ptr);
+
+            _mm_prefetch((const char*)((const block_q3_K*)q3_row + i + 1), _MM_HINT_T0);
+
+            // === Q3_K shared decoding (done once for all M) ===
+            const float d_half = fp16_to_float_scalar(x->d);
+
+            uint32_t aux[3];
+            memcpy(aux, x->scales, 12);
+            __m128i scales128 = _mm_set_epi32(
+                    ((aux[1] >> 4) & kmask2) | (((aux[2] >> 6) & kmask1) << 4),
+                    ((aux[0] >> 4) & kmask2) | (((aux[2] >> 4) & kmask1) << 4),
+                    (aux[1] & kmask2) | (((aux[2] >> 2) & kmask1) << 4),
+                    (aux[0] & kmask2) | (((aux[2] >> 0) & kmask1) << 4));
+            scales128 = _mm_sub_epi8(scales128, m32);
+
+            const __m256i hbits = _mm256_loadu_si256((const __m256i*)x->hmask);
+            const uint8_t* q3_base = x->qs;
+
+            for (int m = 0; m < M; ++m) {
+                const block_q8_K* y = q8_t.data() + i * M + m;
+                const float d = y->d * d_half;
+
+                const int8_t* q8d = y->qs;
+                const uint8_t* q3 = q3_base;
+                __m256i sumi = _mm256_setzero_si256();
+                int bit = 0;
+                int is = 0;
+
+                for (int j = 0; j < QK_K / 128; ++j) {
+                    const __m256i q3bits = _mm256_loadu_si256((const __m256i*)q3);
+                    q3 += 32;
+
+                    const __m256i q3l_0 = _mm256_and_si256(q3bits, m3);
+                    const __m256i q3h_0 = _mm256_slli_epi16(
+                        _mm256_srli_epi16(_mm256_andnot_si256(hbits, _mm256_slli_epi16(mone, bit)), bit), 2);
+                    ++bit;
+
+                    const __m256i q3l_1 = _mm256_and_si256(_mm256_srli_epi16(q3bits, 2), m3);
+                    const __m256i q3h_1 = _mm256_slli_epi16(
+                        _mm256_srli_epi16(_mm256_andnot_si256(hbits, _mm256_slli_epi16(mone, bit)), bit), 2);
+                    ++bit;
+
+                    const __m256i q3l_2 = _mm256_and_si256(_mm256_srli_epi16(q3bits, 4), m3);
+                    const __m256i q3h_2 = _mm256_slli_epi16(
+                        _mm256_srli_epi16(_mm256_andnot_si256(hbits, _mm256_slli_epi16(mone, bit)), bit), 2);
+                    ++bit;
+
+                    const __m256i q3l_3 = _mm256_and_si256(_mm256_srli_epi16(q3bits, 6), m3);
+                    const __m256i q3h_3 = _mm256_slli_epi16(
+                        _mm256_srli_epi16(_mm256_andnot_si256(hbits, _mm256_slli_epi16(mone, bit)), bit), 2);
+                    ++bit;
+
+                    const __m256i q8_0 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+                    const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+                    const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+                    const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+
+                    __m256i q8s_0 = _mm256_maddubs_epi16(q3h_0, q8_0);
+                    __m256i q8s_1 = _mm256_maddubs_epi16(q3h_1, q8_1);
+                    __m256i q8s_2 = _mm256_maddubs_epi16(q3h_2, q8_2);
+                    __m256i q8s_3 = _mm256_maddubs_epi16(q3h_3, q8_3);
+
+                    __m256i p16_0 = _mm256_maddubs_epi16(q3l_0, q8_0);
+                    __m256i p16_1 = _mm256_maddubs_epi16(q3l_1, q8_1);
+                    __m256i p16_2 = _mm256_maddubs_epi16(q3l_2, q8_2);
+                    __m256i p16_3 = _mm256_maddubs_epi16(q3l_3, q8_3);
+
+                    p16_0 = _mm256_sub_epi16(p16_0, q8s_0);
+                    p16_1 = _mm256_sub_epi16(p16_1, q8s_1);
+                    p16_2 = _mm256_sub_epi16(p16_2, q8s_2);
+                    p16_3 = _mm256_sub_epi16(p16_3, q8s_3);
+
+                    const __m128i scale_0 = _mm_shuffle_epi8(scales128, get_scale_shuffle(is + 0));
+                    const __m128i scale_1 = _mm_shuffle_epi8(scales128, get_scale_shuffle(is + 1));
+                    const __m128i scale_2 = _mm_shuffle_epi8(scales128, get_scale_shuffle(is + 2));
+                    const __m128i scale_3 = _mm_shuffle_epi8(scales128, get_scale_shuffle(is + 3));
+                    is += 4;
+
+                    p16_0 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_0), p16_0);
+                    p16_1 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_1), p16_1);
+                    p16_2 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_2), p16_2);
+                    p16_3 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_3), p16_3);
+
+                    p16_0 = _mm256_add_epi32(p16_0, p16_1);
+                    p16_2 = _mm256_add_epi32(p16_2, p16_3);
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_2));
+                }
+
+                acc[m] = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc[m]);
+            }
+        }
+
+        for (int m = 0; m < M; ++m) {
+            out[m * N + n] = hsum_avx2(acc[m]);
+        }
+    }
+    _mm_free(acc_storage);
+}
+
 // ---- Q3_K fused FFN Up (SiLU(gate@w1) * (up@w3)) for decode ----
 // Quantizes activation to Q8_K once, then for each output row computes
 // gate and up dot products in parallel, sharing the activation read.
@@ -2834,6 +2980,235 @@ static void gemv_q4_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
     }
 }
 
+#endif  // USE_AVX2
+
+// ---- Q2_K × Q8_K fused dot product (llama.cpp AVX2 impl) ----
+// Q2_K block: 84 bytes, 256 elements, 2-bit quants with d+dmin
+// scales[16]: lo nibble = d_scale, hi nibble = min
+#ifdef USE_AVX2
+
+static inline float dot_q2_K_q8_K_avx2(const uint8_t* q2_row, const block_q8_K* q8, int nb,
+                                        const uint8_t* scales_row) {
+    constexpr int QK_K = 256;
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0xF);
+    (void)scales_row;
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const block_q2_K* x = reinterpret_cast<const block_q2_K*>(q2_row) + i;
+        const block_q8_K* y = q8 + i;
+
+        _mm_prefetch((const char*)((const block_q2_K*)q2_row + i + 1), _MM_HINT_T0);
+        _mm_prefetch((const char*)(q8 + i + 1), _MM_HINT_T0);
+
+        const float d = y->d * fp16_to_float_scalar(x->d);
+        const float dmin = -y->d * fp16_to_float_scalar(x->dmin);
+
+        const uint8_t* q2 = x->qs;
+        const int8_t* q8d = y->qs;
+
+        const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x->scales);
+        const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+        const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+
+        const __m256i mins = _mm256_cvtepi8_epi16(mins8);
+        const __m256i prod = _mm256_madd_epi16(mins, _mm256_loadu_si256((const __m256i*)y->bsums));
+        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&dmin), _mm256_cvtepi32_ps(prod), acc);
+
+        const __m256i all_scales = _mm256_cvtepi8_epi16(scales8);
+        const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+        const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+        const __m256i scales[2] = {_mm256_set_m128i(l_scales, l_scales), _mm256_set_m128i(h_scales, h_scales)};
+
+        __m256i sumi = _mm256_setzero_si256();
+
+        for (int j = 0; j < QK_K/128; ++j) {
+            const __m256i q2bits = _mm256_loadu_si256((const __m256i*)q2); q2 += 32;
+
+            const __m256i q8_0 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+            const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+
+            const __m256i q2_0 = _mm256_and_si256(q2bits, m3);
+            const __m256i q2_1 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 2), m3);
+            const __m256i q2_2 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 4), m3);
+            const __m256i q2_3 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 6), m3);
+
+            __m256i p0 = _mm256_maddubs_epi16(q2_0, q8_0);
+            __m256i p1 = _mm256_maddubs_epi16(q2_1, q8_1);
+            __m256i p2 = _mm256_maddubs_epi16(q2_2, q8_2);
+            __m256i p3 = _mm256_maddubs_epi16(q2_3, q8_3);
+
+            p0 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(0)), p0);
+            p1 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(1)), p1);
+            p2 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(2)), p2);
+            p3 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(3)), p3);
+
+            p0 = _mm256_add_epi32(p0, p1);
+            p2 = _mm256_add_epi32(p2, p3);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p2));
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    return hsum_avx2(acc);
+}
+
+// Q2_K GEMV: quantize input to Q8_K once, then dot per row
+static void gemv_q2_k_transB_avx2(const float* a, const uint8_t* w, float* out, int M, int K,
+                                   int N) {
+    constexpr int QK_K = 256;
+    constexpr int Q2_K_BLOCK_BYTES = 84;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    if (M == 1) {
+        std::vector<block_q8_K> q8_buf(nb);
+        quantize_row_q8_K(a, q8_buf.data(), K);
+
+#pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* q2_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+            out[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
+        }
+    } else {
+        std::vector<block_q8_K> q8_all(M * nb);
+        for (int m = 0; m < M; ++m) {
+            quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
+        }
+
+#pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* q2_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+            for (int m = 0; m < M; ++m) {
+                out[m * N + n] = dot_q2_K_q8_K_avx2(q2_row, q8_all.data() + m * nb, nb, nullptr);
+            }
+        }
+    }
+}
+// Q2_K Batch-GEMV (transB layout) for M > 1 (prefill).
+// Q2_K weight decoding (scales, qs bit extraction) is done once per weight block,
+// then reused for all M input vectors.
+// Q8_K data is transposed to [block_idx * M + row_idx] for sequential access.
+static void gemv_q2_k_transB_batch_avx2(const float* a, const uint8_t* w, float* out,
+                                          int M, int K, int N) {
+    constexpr int QK_K = 256;
+    constexpr int Q2_K_BLOCK_BYTES = 84;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0xF);
+
+    // Quantize all M input vectors to Q8_K
+    // Store as [m][i] layout
+    std::vector<block_q8_K> q8_src(M * nb);
+    for (int m = 0; m < M; ++m) {
+        quantize_row_q8_K(a + m * K, q8_src.data() + m * nb, K);
+    }
+
+    // Transpose Q8_K data: q8_t[i * M + m] = q8_src[m * nb + i]
+    // This makes per-block access sequential for all M rows
+    std::vector<block_q8_K> q8_t(nb * M);
+    for (int i = 0; i < nb; ++i) {
+        for (int m = 0; m < M; ++m) {
+            q8_t[i * M + m] = q8_src[m * nb + i];
+        }
+    }
+
+    // Pre-allocate aligned accumulators per OpenMP thread
+    int max_threads = omp_get_max_threads();
+    __m256* acc_storage = static_cast<__m256*>(_mm_malloc(max_threads * M * sizeof(__m256), 32));
+
+#pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        int tid = omp_get_thread_num();
+        __m256* acc = acc_storage + (size_t)tid * M;
+        for (int m = 0; m < M; ++m) acc[m] = _mm256_setzero_ps();
+
+        const uint8_t* q2_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+
+        for (int i = 0; i < nb; ++i) {
+            const block_q2_K* x = reinterpret_cast<const block_q2_K*>(q2_row) + i;
+
+            _mm_prefetch((const char*)((const block_q2_K*)q2_row + i + 1), _MM_HINT_T0);
+
+            // === Q2_K shared decoding (done once for all M) ===
+            const float d_half = fp16_to_float_scalar(x->d);
+            const float dmin_half = fp16_to_float_scalar(x->dmin);
+
+            const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x->scales);
+            const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+            const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+
+            const __m256i mins = _mm256_cvtepi8_epi16(mins8);
+            const __m256i all_scales = _mm256_cvtepi8_epi16(scales8);
+            const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+            const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+            const __m256i scales[2] = {
+                _mm256_set_m128i(l_scales, l_scales),
+                _mm256_set_m128i(h_scales, h_scales)
+            };
+
+            const uint8_t* q2_base = x->qs;
+
+            // === Per-M: load Q8_K (now sequential) and compute dot product ===
+            for (int m = 0; m < M; ++m) {
+                const block_q8_K* y = q8_t.data() + i * M + m;
+
+                const float d = y->d * d_half;
+                const float dmin = -y->d * dmin_half;
+
+                // Min contribution: mins * bsums
+                const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y->bsums);
+                const __m256i prod = _mm256_madd_epi16(mins, q8sums);
+                acc[m] = _mm256_fmadd_ps(_mm256_broadcast_ss(&dmin), _mm256_cvtepi32_ps(prod), acc[m]);
+
+                // Dot product: Q2_K qs (shared) × Q8_K qs (per-m)
+                const int8_t* q8d = y->qs;
+                __m256i sumi = _mm256_setzero_si256();
+                const uint8_t* q2 = q2_base;
+
+                for (int j = 0; j < QK_K/128; ++j) {
+                    const __m256i q2bits = _mm256_loadu_si256((const __m256i*)q2); q2 += 32;
+
+                    const __m256i q8_0 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+                    const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+                    const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+                    const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+
+                    const __m256i q2_0 = _mm256_and_si256(q2bits, m3);
+                    const __m256i q2_1 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 2), m3);
+                    const __m256i q2_2 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 4), m3);
+                    const __m256i q2_3 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 6), m3);
+
+                    __m256i p0 = _mm256_maddubs_epi16(q2_0, q8_0);
+                    __m256i p1 = _mm256_maddubs_epi16(q2_1, q8_1);
+                    __m256i p2 = _mm256_maddubs_epi16(q2_2, q8_2);
+                    __m256i p3 = _mm256_maddubs_epi16(q2_3, q8_3);
+
+                    p0 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(0)), p0);
+                    p1 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(1)), p1);
+                    p2 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(2)), p2);
+                    p3 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q3k(3)), p3);
+
+                    p0 = _mm256_add_epi32(p0, p1);
+                    p2 = _mm256_add_epi32(p2, p3);
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p2));
+                }
+
+                acc[m] = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc[m]);
+            }
+        }
+
+        for (int m = 0; m < M; ++m) {
+            out[m * N + n] = hsum_avx2(acc[m]);
+        }
+    }
+    _mm_free(acc_storage);
+}
 #endif  // USE_AVX2
 
 // ---- Q4_K × Q8_K fused dot product ----
