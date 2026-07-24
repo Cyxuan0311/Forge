@@ -51,6 +51,12 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
 TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPtr& w_gate,
                                           const TensorPtr& w_up);
 
+// Q5_K fused FFN gate+up: reads input once, quantizes to Q8_K one time,
+// then computes gate and up dot products in parallel, producing SiLU(gate)*up.
+// Both weight tensors must be Q5_K with the same K and N.
+TensorPtr matmul_transB_fused_ffn_up_q5_k(const TensorPtr& input, const TensorPtr& w_gate,
+                                          const TensorPtr& w_up);
+
 // Q3_K fused FFN gate+up: reads input once, quantizes to Q8_K one time,
 // then computes gate and up dot products in parallel, producing SiLU(gate)*up.
 // Both weight tensors must be Q3_K with the same K and N.

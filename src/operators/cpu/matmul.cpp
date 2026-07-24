@@ -1213,6 +1213,12 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 cuda::launch_dequant_q4_k_matrix(b->data(), b_fp32, N, K);
                 cuda::launch_cublas_sgemm(static_cast<const float*>(a->data()), b_fp32,
                                           static_cast<float*>(out->data()), M, K, N, true);
+            } else if (b->dtype() == DataType::Q5_K) {
+                size_t fp32_bytes = (size_t)N * K * sizeof(float);
+                float* b_fp32 = static_cast<float*>(get_scratch().ensure(fp32_bytes));
+                cuda::launch_dequant_q5_k_matrix(b->data(), b_fp32, N, K);
+                cuda::launch_cublas_sgemm(static_cast<const float*>(a->data()), b_fp32,
+                                          static_cast<float*>(out->data()), M, K, N, true);
             } else if (b->dtype() == DataType::Q6_K) {
                 size_t fp32_bytes = (size_t)N * K * sizeof(float);
                 float* b_fp32 = static_cast<float*>(get_scratch().ensure(fp32_bytes));
@@ -1552,6 +1558,16 @@ TensorPtr ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const Tensor
                 cuda::launch_ffn_up_fused_q4_k_batch(
                     static_cast<const float*>(input->data()), w1->data(), w3->data(),
                     static_cast<float*>(out->data()), M, K, intermediate_dim);
+            }
+        } else if (w1->dtype() == DataType::Q5_K && w3->dtype() == DataType::Q5_K) {
+            if (M == 1) {
+                cuda::launch_ffn_up_fused_q5_k(
+                    static_cast<const float*>(input->data()), w1->data(), w3->data(),
+                    static_cast<float*>(out->data()), K, intermediate_dim);
+            } else {
+                auto gate = ops::matmul_transB(input, w1);
+                auto up = ops::matmul_transB(input, w3);
+                out = ops::silu_multiply(gate, up);
             }
         } else if (w1->dtype() == DataType::Q3_K && w3->dtype() == DataType::Q3_K) {
             if (M == 1) {
@@ -2300,6 +2316,28 @@ static void gemv_q5_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
         }
     }
 }
+
+static void gemv_q5_k_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
+                                         const uint8_t* w_up, float* out, int K, int N) {
+    constexpr int QK_K = 256;
+    constexpr int Q5_K_BLOCK_BYTES = 176;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    std::vector<cpu::block_q8_K> q8_buf(nb);
+    cpu::quantize_row_q8_K(a, q8_buf.data(), K);
+
+    auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
+
+#    pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* gate_row = w_gate + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+        const uint8_t* up_row = w_up + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+
+        float gate_val = silu(dot_q5_K_q8_K_row_avx2(gate_row, q8_buf.data(), nb));
+        float up_val = dot_q5_K_q8_K_row_avx2(up_row, q8_buf.data(), nb);
+        out[n] = gate_val * up_val;
+    }
+}
 #endif
 
 TensorPtr matmul_transB_fused_ffn_down_residual_q6_k(const TensorPtr& input,
@@ -2399,6 +2437,41 @@ TensorPtr matmul_transB_fused_ffn_up_q4_0(const TensorPtr& input, const TensorPt
 
     for (int m = 0; m < M; ++m) {
         cpu::gemv_q4_0_fused_ffn_up_avx2(
+            a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+            static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+    }
+#else
+    auto gate = ops::matmul_transB(input, w_gate);
+    auto up = ops::matmul_transB(input, w_up);
+    out = ops::silu_multiply(gate, up);
+#endif
+
+    return out;
+}
+
+TensorPtr matmul_transB_fused_ffn_up_q5_k(const TensorPtr& input, const TensorPtr& w_gate,
+                                         const TensorPtr& w_up) {
+    if (input->ndim() != 2 || w_gate->ndim() != 2 || w_up->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_q5_k expects 2D tensors");
+    if (w_gate->dtype() != DataType::Q5_K || w_up->dtype() != DataType::Q5_K)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_q5_k requires Q5_K weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_q5_k is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N = static_cast<int>(w_gate->shape()[0]);
+
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q5_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+
+    for (int m = 0; m < M; ++m) {
+        gemv_q5_k_fused_ffn_up_avx2(
             a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
             static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
     }
