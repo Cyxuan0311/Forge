@@ -190,9 +190,6 @@ __global__ void moe_expert_gemv_kernel(
     const float* x_token = x + token * K;
 
     // Each warp handles one output row with split-K
-    int global_warp_id = (blockIdx.x * gridDim.y + blockIdx.y) *
-                         (blockDim.x * blockDim.y / 32) +
-                         (threadIdx.y * blockDim.x + threadIdx.x) / 32;
     // Simplify: use 1D thread indexing
     int tid = threadIdx.x;
     int lane = tid % 32;
