@@ -231,6 +231,7 @@ TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos, i
             PERF_SCOPE("forward/logit_softcap");
             int vocab_size = logits->shape().back();
 
+#ifdef USE_CUDA
             if (logits->device() == DeviceType::CUDA) {
                 // GPU path: softcap (optional) + suppress in one kernel
                 float cap = has_softcap ? cfg.f_final_logit_softcapping : 1.0f;
@@ -254,7 +255,9 @@ TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos, i
                 cuda::launch_logit_softcap(
                     static_cast<float*>(logits->data()),
                     cap, has_softcap, d_suppress, n_suppress, vocab_size);
-            } else {
+            } else
+#endif
+            {
                 // CPU path: softcap is now fused into the sampler for efficiency
                 // (softcap + max/argmax done in one traversal). Only handle suppress tokens here.
                 logits = ensure_cpu(logits);
@@ -306,6 +309,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
         PERF_SCOPE("layer/q_norm");
         int rows = seq_len * num_heads;
         int cols = head_dim;
+#ifdef USE_CUDA
         if (q->device() == DeviceType::CUDA && lw.attn_q_norm()->device() == DeviceType::CUDA) {
             auto q_out = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
             cuda::launch_rms_norm(
@@ -314,7 +318,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                 static_cast<float*>(q_out->data()),
                 rows, cols, cfg.rms_norm_eps);
             q = q_out;
-        } else {
+        } else
+#endif
+        {
             q = ensure_cpu(q);
             auto qn_w = ensure_cpu(lw.attn_q_norm());
             float* q_data = static_cast<float*>(q->data());
@@ -349,6 +355,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
             PERF_SCOPE("layer/k_norm");
             int rows = seq_len * num_kv_heads;
             int cols = head_dim;
+#ifdef USE_CUDA
             if (k->device() == DeviceType::CUDA && lw.attn_k_norm()->device() == DeviceType::CUDA) {
                 auto k_out = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CUDA);
                 cuda::launch_rms_norm(
@@ -357,7 +364,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                     static_cast<float*>(k_out->data()),
                     rows, cols, cfg.rms_norm_eps);
                 k = k_out;
-            } else {
+            } else
+#endif
+            {
                 k = ensure_cpu(k);
                 auto kn_w = ensure_cpu(lw.attn_k_norm());
                 float* k_data = static_cast<float*>(k->data());
@@ -379,6 +388,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
             PERF_SCOPE("layer/v_norm");
             int rows = seq_len * num_kv_heads;
             int cols = head_dim;
+#ifdef USE_CUDA
             if (v->device() == DeviceType::CUDA) {
                 auto v_out = std::make_shared<Tensor>(DataType::FP32, v->shape(), DeviceType::CUDA);
                 cuda::launch_rms_norm_unweighted(
@@ -386,7 +396,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                     static_cast<float*>(v_out->data()),
                     rows, cols, cfg.rms_norm_eps);
                 v = v_out;
-            } else {
+            } else
+#endif
+            {
                 float* v_data = static_cast<float*>(v->data());
                 for (int s = 0; s < seq_len; ++s) {
                     for (int h = 0; h < num_kv_heads; ++h) {
@@ -423,6 +435,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
             }
         }
 
+#ifdef USE_CUDA
         if (q->device() == DeviceType::CUDA && k->device() == DeviceType::CUDA) {
             // GPU RoPE path
             PERF_SCOPE("layer/rope");
@@ -436,7 +449,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                 num_heads, num_kv_heads, head_dim,
                 seq_len, start_pos, theta,
                 d_freq_factors);
-        } else {
+        } else
+#endif
+        {
             // CPU RoPE path
             PERF_SCOPE("layer/rope");
             q = ensure_cpu(q);
@@ -512,6 +527,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
             }
         }
 
+#ifdef USE_CUDA
         if (q->device() == DeviceType::CUDA) {
             PERF_SCOPE("layer/rope_q_only");
             q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
@@ -521,7 +537,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                 num_heads, head_dim,
                 seq_len, start_pos, theta,
                 d_freq_factors_q);
-        } else {
+        } else
+#endif
+        {
             PERF_SCOPE("layer/rope_q_only");
             q = ensure_cpu(q);
             const float* q_data = static_cast<const float*>(q->data());
@@ -669,6 +687,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                 auto normed_for_router = ops::rms_norm(attn_residual, ones, cfg.rms_norm_eps);
                 float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(cfg.hidden_dim));
 
+#ifdef USE_CUDA
                 if (use_gpu) {
                     // GPU path: fused scaling kernel
                     auto scaled = std::make_shared<Tensor>(DataType::FP32, normed_for_router->shape(), DeviceType::CUDA);
@@ -678,7 +697,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                         static_cast<float*>(scaled->data()),
                         cfg.hidden_dim, inv_sqrt, cfg.rms_norm_eps, seq_len);
                     router_input = scaled;
-                } else {
+                } else
+#endif
+                {
                     // CPU path
                     normed_for_router = ensure_cpu(normed_for_router);
                     float* nr_data = static_cast<float*>(normed_for_router->data());
@@ -1073,6 +1094,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
         // Input gate projection
         auto gated = ops::matmul_transB(output, lw.per_layer_inp_gate());
 
+#ifdef USE_CUDA
         if (gated->device() == DeviceType::CUDA &&
             per_layer_input_cache_->device() == DeviceType::CUDA) {
             // GPU path: fused GELU(tanh) + element-wise multiply
@@ -1080,7 +1102,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
                 static_cast<float*>(gated->data()),
                 static_cast<const float*>(per_layer_input_cache_->data()),
                 n_per, n_layer, layer_idx, seq_len);
-        } else {
+        } else
+#endif
+        {
             // CPU path
             gated = ensure_cpu(gated);
             float* gated_data = static_cast<float*>(gated->data());
@@ -1114,10 +1138,13 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
     if (lw.layer_out_scale()) {
         auto scale_cpu = ensure_cpu(lw.layer_out_scale());
         float s = static_cast<const float*>(scale_cpu->data())[0];
+#ifdef USE_CUDA
         if (output->device() == DeviceType::CUDA) {
             cuda::launch_scale(static_cast<float*>(output->data()), s,
                                static_cast<int>(output->numel()));
-        } else {
+        } else
+#endif
+        {
             output = ensure_cpu(output);
             float* out_data = static_cast<float*>(output->data());
             int n = static_cast<int>(output->numel());

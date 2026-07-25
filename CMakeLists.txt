@@ -61,9 +61,14 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_JOBS 0)
 set(PYBIND11_LTO_CXX_FLAGS "")
 
 # ---- Optional CUDA support ----
+# CUDA is unsupported on Apple platforms (macOS deprecated CUDA in 10.14,
+# and nvcc cannot compile for arm64). Intel Macs can technically use CUDA
+# with outdated drivers, but we disable it for simplicity.
 option(FORGE_USE_CUDA "Enable CUDA GPU acceleration" ON)
 
-if(FORGE_USE_CUDA)
+if(APPLE)
+  message(STATUS "CUDA disabled on Apple platforms - building CPU-only")
+elseif(FORGE_USE_CUDA)
   find_package(CUDAToolkit QUIET)
   if(CUDAToolkit_FOUND)
     enable_language(CUDA)
