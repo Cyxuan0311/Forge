@@ -85,3 +85,8 @@ _deps/
 
 # some unused files
 plan.md
+模型接入与量化类型体系的重构方案.md
+内存、并行.md
+算子.md
+python与cli.md
+chat-template.md
