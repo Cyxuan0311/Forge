@@ -59,11 +59,15 @@ int Sampler::sample(const TensorPtr& logits, int64_t pos) {
 }
 
 void Sampler::ensure_token_history_buffer(int n) {
+#ifdef USE_CUDA
     if (n > d_token_history_capacity_) {
         if (d_token_history_) cudaFree(d_token_history_);
         cudaMalloc(&d_token_history_, n * sizeof(int32_t));
         d_token_history_capacity_ = n;
     }
+#else
+    (void)n;
+#endif
 }
 
 int Sampler::sample_greedy(const TensorPtr& logits) {
