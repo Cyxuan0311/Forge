@@ -60,4 +60,9 @@ struct OpKernelAutoRegister {
     static ::forge::OpKernelAutoRegister _op_kernel_reg_##op##_##dev(::forge::OpType::op, \
                                                                      ::forge::DeviceType::dev, fn)
 
+// Explicit registration of built-in op kernels.
+// Required because op_kernels.cpp lives in a static library where
+// static-initialization-based auto-registration can be dropped by the linker.
+void register_builtin_op_kernels();
+
 }  // namespace forge

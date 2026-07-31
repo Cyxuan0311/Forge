@@ -215,4 +215,16 @@ static bool register_all_kernels() {
 static bool _kernels_registered = register_all_kernels();
 
 }  // anonymous namespace
+
+// ---- 显式注册入口 ----
+// op_kernels.cpp 在静态库 forge_core 中, 其匿名命名空间内的 _kernels_registered
+// 静态初始化可能被链接器丢弃(与 graph builder 的 force-link 问题同源)。
+// 提供外部可见的注册函数, 由 execution_plan 在创建时显式调用, 确保 kernel 一定被注册。
+void register_builtin_op_kernels() {
+    static bool done = false;
+    if (done) return;
+    register_all_kernels();
+    done = true;
+}
+
 }  // namespace forge

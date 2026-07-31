@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "inference/inference_memory.h"
 #include "kv_cache.h"
 #include "quant_policy.h"
 #include "speculative.h"
@@ -49,8 +50,13 @@ public:
     int generate(int start_token, int max_tokens, std::function<int(float*, int)> sampler_fn);
 
     const Model& model() const { return model_; }
-    const KVCache& kv_cache() const { return *kv_cache_; }
-    KVCache& kv_cache() { return *kv_cache_; }
+
+    // InferenceContext 是推理期 memory 的唯一所有者。engine 只持有引用。
+    InferenceMemory& memory() { return *memory_; }
+    const InferenceMemory& memory() const { return *memory_; }
+
+    const KVCache& kv_cache() const { return *memory_->kv(); }
+    KVCache& kv_cache() { return *memory_->kv(); }
 
     const ContextParams& params() const { return params_; }
     ContextParams& params_mut() { return params_; }
@@ -77,10 +83,9 @@ public:
 private:
     const Model& model_;
     ContextParams params_;
-    std::unique_ptr<KVCache> kv_cache_;
+    std::unique_ptr<InferenceMemory> memory_;
     std::unique_ptr<InferenceEngine> engine_;
     int current_pos_ = 0;
-    bool kv_cache_initialized_ = false;
 };
 
 }  // namespace forge
