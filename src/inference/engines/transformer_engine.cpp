@@ -31,16 +31,24 @@
 namespace forge {
 
 TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
-    : model_(model), ctx_(ctx), workspace_pool_(model.device()) {}
+    : model_(model),
+      ctx_(ctx),
+      plan_(build_execution_plan(model.config().arch_type, model.config())),
+      memory_(ctx.memory()),
+      kv_cache_(*ctx.memory().kv()),
+      workspace_pool_(model.device()) {
+    LOG_INFO("Execution plan: " + plan_.plan_id());
+    graph_runtime_.set_builder(plan_.graph_builder);
+}
 
 void TransformerEngine::reset() {
     kv_cache_.reset();
-    kv_cache_initialized_ = false;
-    graph_cache_.invalidate();
+    set_kv_cache_initialized(false);
+    graph_runtime_.invalidate();
 }
 
 void TransformerEngine::set_gpu_layers(int gpu_layers) {
-    graph_cache_.invalidate();
+    graph_runtime_.invalidate();
     gpu_layers_ = gpu_layers;
     const auto& cfg = model_.config();
     int num_layers = cfg.num_layers;
@@ -68,7 +76,7 @@ void TransformerEngine::set_gpu_layers(int gpu_layers) {
     weights_.move_output_weights(last_dev);
 
     // Update KV cache per-layer devices (if already initialized)
-    if (kv_cache_initialized_) {
+    if (kv_cache_initialized()) {
         kv_cache_.set_layer_devices(layer_devices_);
     }
 
@@ -96,9 +104,8 @@ TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceType
     return transferred;
 }
 
-TensorPtr TransformerEngine::forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id) {
+TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
     const auto& cfg = model_.config();
-    int seq_len = static_cast<int>(input_ids->numel());
 
     // Decode path: use fewer threads (memory-bandwidth bound)
 #ifdef _OPENMP
@@ -108,7 +115,7 @@ TensorPtr TransformerEngine::forward(const TensorPtr& input_ids, int64_t start_p
     init_kv_cache(cfg);
 
     DeviceType first_dev = layer_device(0);
-    auto ids_on_dev = transfer_hidden(input_ids, first_dev);
+    auto ids_on_dev = transfer_hidden(req.input_ids, first_dev);
 
     auto token_emb = model_.weights().get("token_embedding");
     if (!token_emb) {
@@ -128,7 +135,7 @@ TensorPtr TransformerEngine::forward(const TensorPtr& input_ids, int64_t start_p
         return nullptr;
     }
 
-    return forward_layers(hidden, seq_len, start_pos, seq_id);
+    return forward_layers(hidden, req);
 }
 
 TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
@@ -222,8 +229,9 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                 {
                     std::string perf_name = "forward_batch/layer_" + std::to_string(layer);
                     PERF_SCOPE(perf_name.c_str());
-                    seq_hidden = forward_layer(seq_hidden, layer, seq_len, item.start_pos,
-                                               layer_dev, item.seq_id);
+                    auto seq_req = ForwardRequest::from_hidden(seq_len, item.start_pos, item.seq_id);
+                    seq_hidden =
+                        forward_layer(seq_hidden, make_layer_context(layer, seq_req, layer_dev));
                 }
 
                 if (!seq_hidden) {
@@ -364,11 +372,11 @@ TensorPtr TransformerEngine::forward_from_hidden(const TensorPtr& hidden, int64_
 
     init_kv_cache(cfg);
 
-    return forward_layers(hidden, seq_len, start_pos, /*seq_id=*/0);
+    return forward_layers(hidden, ForwardRequest::from_hidden(seq_len, start_pos, /*seq_id=*/0));
 }
 
 void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
-    if (kv_cache_initialized_)
+    if (kv_cache_initialized())
         return;
 
     int kv_max_seq = cfg.max_seq_len;
@@ -437,30 +445,32 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         kv_cache_.set_layer_devices(layer_devices_);
     }
 
-    kv_cache_initialized_ = true;
+    set_kv_cache_initialized(true);
     LOG_INFO("KV cache initialized successfully, actual size: " +
              std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
 }
 
-TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len,
-                                            int64_t start_pos, int seq_id) {
-    // Try graph-based execution if a graph builder is available
-    if (use_graph_ && graph_builder_) {
-        return forward_layers_graph(hidden, seq_len, start_pos, seq_id);
-    }
+LayerExecutionContext TransformerEngine::make_layer_context(int layer_idx,
+                                                            const ForwardRequest& req,
+                                                            DeviceType dev) const {
+    return LayerExecutionContext{model_.config(), weights_.layers[layer_idx], req, layer_idx, dev};
+}
 
-    // Fallback: try to create a graph builder from registry
-    if (use_graph_ && !graph_builder_) {
-        const auto& cfg = model_.config();
-        auto builder = GraphBuilderRegistry::instance().create(cfg.arch_type);
-        if (builder) {
-            graph_builder_ = std::move(builder);
-            LOG_INFO("Using graph-based execution for arch: " + cfg.arch_type);
-            return forward_layers_graph(hidden, seq_len, start_pos, seq_id);
-        } else {
-            LOG_WARN("No graph builder for arch: " + cfg.arch_type +
+TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const ForwardRequest& req) {
+    const int seq_len = req.n_tokens;
+    const int64_t start_pos = req.start_pos;
+
+    // Graph 执行。builder 由 ExecutionPlan 在构造时决定, 执行期不再按架构名查表。
+    // 不支持 graph 的架构直接退回 imperative, 不使用 placeholder builder。
+    if (use_graph_) {
+        if (!graph_runtime_.has_builder()) {
+            LOG_WARN("Graph execution not supported by plan " + plan_.plan_id() +
                      ", falling back to imperative mode");
             use_graph_ = false;
+        } else {
+            auto key = GraphKey::from_request(req, plan_.plan_id(), gpu_layers_, hidden->device());
+            return graph_runtime_.run(hidden, req, key, model_.config(), weights_, kv_cache_,
+                                      layer_devices_, model_.device());
         }
     }
 
@@ -475,7 +485,7 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
         {
             std::string perf_name = "forward/layer_" + std::to_string(layer);
             PERF_SCOPE(perf_name.c_str());
-            cur_hidden = forward_layer(cur_hidden, layer, seq_len, start_pos, layer_dev, seq_id);
+            cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
         }
         if (!cur_hidden) {
             fprintf(stderr, "[FATAL] Layer %d returned NULL!\n", layer);
@@ -565,67 +575,6 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, int seq_len
              std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos) + ")");
 
     return logits;
-}
-
-TensorPtr TransformerEngine::forward_layers_graph(const TensorPtr& hidden, int seq_len,
-                                                  int64_t start_pos, int seq_id) {
-    const auto& cfg = model_.config();
-    auto t0 = std::chrono::steady_clock::now();
-
-    // Check if cached graph can be reused
-    if (graph_cache_.can_reuse(seq_len, gpu_layers_, cfg.arch_type)) {
-        graph_cache_.graph->set_input(0, hidden);
-        auto result = graph_cache_.graph->execute();
-        auto t1 = std::chrono::steady_clock::now();
-        double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        LOG_INFO("Forward (graph, reused) total: " + std::to_string((int)total_ms) +
-                 "ms (seq_len=" + std::to_string(seq_len) + ")");
-        return result;
-    }
-
-    // Cache miss: build a new graph
-    auto graph = std::make_unique<ComputeGraph>();
-
-    // Add hidden state as graph input
-    int hidden_idx = graph->add_input(hidden);
-
-    // Build layer graphs
-    int cur_idx = hidden_idx;
-    for (int layer = 0; layer < cfg.num_layers; ++layer) {
-        DeviceType layer_dev = layer_device(layer);
-        const auto& lw = weights_.layers[layer];
-        cur_idx = graph_builder_->build_layer_graph(*graph, cur_idx, lw, cfg, layer, seq_len,
-                                                    start_pos, layer_dev, kv_cache_);
-    }
-
-    // Build output head graph
-    int output_idx = graph_builder_->build_output_graph(*graph, cur_idx, weights_, cfg);
-
-    // Schedule: assign nodes to optimal devices
-    {
-        BackendScheduler scheduler;
-        SchedulingPlan plan = scheduler.schedule(*graph);
-        if (plan.valid) {
-            graph->apply_schedule(plan);
-        }
-    }
-
-    // Update cache
-    graph_cache_.graph = std::move(graph);
-    graph_cache_.cached_seq_len = seq_len;
-    graph_cache_.cached_gpu_layers = gpu_layers_;
-    graph_cache_.cached_arch = cfg.arch_type;
-    graph_cache_.valid = true;
-
-    auto result = graph_cache_.graph->execute();
-
-    auto t1 = std::chrono::steady_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    LOG_INFO("Forward (graph, built) total: " + std::to_string((int)total_ms) +
-             "ms (seq_len=" + std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos) +
-             ", nodes=" + std::to_string(graph_cache_.graph->num_nodes()) + ")");
-
-    return result;
 }
 
 void TransformerEngine::apply_rope_standard(const float* q_data, const float* k_data, float* q_out,

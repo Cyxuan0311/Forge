@@ -1,5 +1,7 @@
 #pragma once
 
+#include "forge/inference/layers/gemma4_attention.h"
+#include "forge/inference/layers/gemma4_embedding.h"
 #include "transformer_engine.h"
 
 namespace forge {
@@ -10,7 +12,7 @@ public:
 
     std::string name() const override { return "Gemma4Engine"; }
 
-    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) override;
+    TensorPtr forward_request(const ForwardRequest& req) override;
 
     // Gemma4 has custom embedding scaling + per-layer projection;
     // override forward_batch to use per-sequence forward() instead of
@@ -18,19 +20,16 @@ public:
     TensorPtr forward_batch(const InferenceBatch& batch) override;
 
 protected:
-    TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len, int64_t start_pos,
-                            DeviceType dev, int seq_id = 0) override;
+    TensorPtr forward_layer(const TensorPtr& hidden, const LayerExecutionContext& lctx) override;
     bool init_weights() override;
     void init_kv_cache(const ModelConfig& cfg) override;
 
 private:
-    // Per-layer embedding projection cache
-    TensorPtr per_layer_proj_cache_;  // [n_embd_per_layer, n_layer, n_tokens]
-    TensorPtr per_layer_input_cache_; // [n_embd_per_layer, n_layer, n_tokens]
+    // final logit softcapping + suppress tokens。
+    void apply_logit_postprocess(TensorPtr& logits, const ModelConfig& cfg);
 
-    // Proportional RoPE frequency factors for full-attention layers
-    TensorPtr rope_freqs_;            // [head_dim/2] per-dimension frequency scale
-    TensorPtr rope_freqs_cpu_;        // CPU copy for RoPE computation when rope_freqs_ is on CUDA
+    Gemma4Embedding embedding_;
+    Gemma4Attention attention_;
 
     // GPU-side cache for suppress tokens (used by logit softcap kernel)
     TensorPtr suppress_tokens_gpu_;   // [num_suppress] int32 on CUDA

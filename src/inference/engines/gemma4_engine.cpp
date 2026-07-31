@@ -2,10 +2,12 @@
 
 #include <cmath>
 #include <cstring>
-#include <algorithm>
 #include <stdexcept>
 
 #include "forge/cuda_kernels.h"
+#include "forge/inference/forward_request.h"
+#include "forge/inference/layers/gemma4_moe.h"
+#include "forge/inference/tensor_device_utils.h"
 #include "forge/inference_batch.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
@@ -13,25 +15,8 @@
 
 namespace forge {
 
-// Helper: ensure tensor data is accessible on CPU for scalar operations.
-// If the tensor is on CUDA, copies to CPU and returns the CPU version.
-static TensorPtr ensure_cpu(const TensorPtr& t) {
-    if (!t || t->device() == DeviceType::CPU) return t;
-    auto cpu = std::make_shared<Tensor>(t->dtype(), t->shape(), DeviceType::CPU);
-    cpu->copy_from(*t);
-    return cpu;
-}
-
-// Helper: transfer a tensor back to the original device after CPU operations.
-static TensorPtr restore_device(const TensorPtr& t, DeviceType target) {
-    if (!t || t->device() == target) return t;
-    auto on_dev = std::make_shared<Tensor>(t->dtype(), t->shape(), target);
-    on_dev->copy_from(*t);
-    return on_dev;
-}
-
 Gemma4Engine::Gemma4Engine(Model& model, InferenceContext& ctx)
-    : TransformerEngine(model, ctx) {
+    : TransformerEngine(model, ctx), attention_(kv_cache_) {
     if (!init_weights()) {
         throw std::runtime_error("Gemma4Engine: failed to initialize weights");
     }
@@ -41,37 +26,36 @@ bool Gemma4Engine::init_weights() {
     if (!weights_.init(model_.weights(), model_.config())) {
         return false;
     }
-    // Load proportional RoPE frequency factors for full-attention layers
+    // Load proportional RoPE frequency factors for full-attention layers.
     // The GGUF stores rope_freqs per full-attention layer (e.g., blk.4.rope_freqs.weight),
     // NOT as a global tensor. Layer 0 is SWA and has no rope_freqs, so we must search
     // for the first full-attention layer that has it.
-    rope_freqs_ = model_.weights().get("rope_freqs");
-    if (!rope_freqs_) {
+    TensorPtr rope_freqs = model_.weights().get("rope_freqs");
+    if (!rope_freqs) {
         const auto& cfg = model_.config();
         for (int i = 0; i < cfg.num_layers; ++i) {
             bool is_swa = (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1);
             if (!is_swa) {
-                // This is a full-attention layer — check if it has rope_freqs
-                rope_freqs_ = weights_.layers[i].get("rope_freqs");
-                if (rope_freqs_) break;
+                rope_freqs = weights_.layers[i].get("rope_freqs");
+                if (rope_freqs) break;
             }
         }
     }
-    if (rope_freqs_) {
-        // Dequantize if needed
-        if (is_quantized_type(rope_freqs_->dtype())) {
-            rope_freqs_ = ops::dequantize_weight(rope_freqs_);
+    if (rope_freqs) {
+        if (is_quantized_type(rope_freqs->dtype())) {
+            rope_freqs = ops::dequantize_weight(rope_freqs);
         }
-        LOG_INFO("rope_freqs loaded: shape=" + std::to_string(rope_freqs_->shape()[0]));
+        LOG_INFO("rope_freqs loaded: shape=" + std::to_string(rope_freqs->shape()[0]));
     } else {
         LOG_WARN("rope_freqs NOT found in weights for Gemma4");
     }
+    attention_.set_rope_freqs(rope_freqs);
 
     return true;
 }
 
 void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
-    if (kv_cache_initialized_)
+    if (kv_cache_initialized())
         return;
 
     int kv_max_seq = cfg.max_seq_len;
@@ -120,927 +104,108 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
     if (!layer_devices_.empty()) {
         kv_cache_.set_layer_devices(layer_devices_);
     }
-    kv_cache_initialized_ = true;
+    set_kv_cache_initialized(true);
 
     LOG_INFO("KV cache initialized successfully, actual size: " +
              std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
 }
 
-TensorPtr Gemma4Engine::forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id) {
+TensorPtr Gemma4Engine::forward_request(const ForwardRequest& req) {
     const auto& cfg = model_.config();
-    int seq_len = static_cast<int>(input_ids->numel());
 
     init_kv_cache(cfg);
 
     DeviceType first_dev = layer_device(0);
-    auto ids_on_dev = transfer_hidden(input_ids, first_dev);
-
+    auto ids_on_dev = transfer_hidden(req.input_ids, first_dev);
     auto token_emb = model_.weights().get("token_embedding");
-    TensorPtr hidden;
-    {
-        PERF_SCOPE("forward/embedding");
-        hidden = ops::embedding(token_emb, ids_on_dev, weights_.token_embedding_fp32);
-    }
 
-    // Gemma embedding scaling: hidden *= sqrt(n_embd)
-    {
-        PERF_SCOPE("forward/emb_scale");
-        float scale = std::sqrt(static_cast<float>(cfg.hidden_dim));
-        hidden = ensure_cpu(hidden);
-        int n = static_cast<int>(hidden->numel());
-        float* data = static_cast<float*>(hidden->data());
-        for (int i = 0; i < n; ++i) {
-            data[i] *= scale;
-        }
-        hidden = restore_device(hidden, first_dev);
-    }
+    auto hidden = embedding_.embed(ids_on_dev, token_emb, weights_, cfg, first_dev, req.n_tokens);
 
-    // Gemma4 per-layer embedding projection
-    if (cfg.n_embd_per_layer > 0 && weights_.per_layer_model_proj) {
-        PERF_SCOPE("forward/per_layer_proj");
-        auto proj = ops::matmul_transB(hidden, weights_.per_layer_model_proj);
-
-        // Scale projection (need CPU access for scalar loop)
-        proj = ensure_cpu(proj);
-        float proj_scale = 1.0f / std::sqrt(static_cast<float>(cfg.hidden_dim));
-        float* proj_data = static_cast<float*>(proj->data());
-        int proj_n = static_cast<int>(proj->numel());
-        for (int i = 0; i < proj_n; ++i) {
-            proj_data[i] *= proj_scale;
-        }
-
-        // Apply per-layer proj norm
-        if (weights_.per_layer_proj_norm) {
-            int n_layer = cfg.num_layers;
-            int n_per = cfg.n_embd_per_layer;
-            auto norm_w = ensure_cpu(weights_.per_layer_proj_norm);
-            for (int s = 0; s < seq_len; ++s) {
-                for (int l = 0; l < n_layer; ++l) {
-                    float* chunk = proj_data + s * n_layer * n_per + l * n_per;
-                    float ss = 0.0f;
-                    for (int d = 0; d < n_per; ++d) ss += chunk[d] * chunk[d];
-                    float inv_rms = 1.0f / (std::sqrt(ss / n_per + cfg.rms_norm_eps));
-                    const float* nw = static_cast<const float*>(norm_w->data());
-                    for (int d = 0; d < n_per; ++d) chunk[d] = chunk[d] * inv_rms * nw[d];
-                }
-            }
-        }
-
-        per_layer_proj_cache_ = proj;
-    }
-
-    // Compute per-layer token embeddings if present
-    if (cfg.n_embd_per_layer > 0 && weights_.per_layer_tok_embd) {
-        PERF_SCOPE("forward/per_layer_embd");
-        int n_layer = cfg.num_layers;
-        int n_per = cfg.n_embd_per_layer;
-        float embd_scale = std::sqrt(static_cast<float>(n_per));
-
-        // Use ops::embedding for efficient row-wise dequantization of Q6_K
-        auto ple = ops::embedding(weights_.per_layer_tok_embd, ids_on_dev, nullptr);
-
-        // Scale by sqrt(n_embd_per_layer) (need CPU access for scalar loop)
-        ple = ensure_cpu(ple);
-        float* ple_data = static_cast<float*>(ple->data());
-        int64_t total = ple->numel();
-        for (int64_t j = 0; j < total; ++j) {
-            ple_data[j] *= embd_scale;
-        }
-
-        // Add per-layer projection cache
-        if (per_layer_proj_cache_) {
-            auto proj_cpu = ensure_cpu(per_layer_proj_cache_);
-            float* proj_data = static_cast<float*>(proj_cpu->data());
-            float input_scale = 1.0f / std::sqrt(2.0f);
-            for (int64_t j = 0; j < total; ++j) {
-                ple_data[j] = (ple_data[j] + proj_data[j]) * input_scale;
-            }
-        }
-
-        per_layer_input_cache_ = ple;
-    }
-
-    auto logits = forward_layers(hidden, seq_len, start_pos, seq_id);
-
-    // Gemma4 final logit softcapping + suppress tokens
-    if (logits) {
-        bool has_softcap = (cfg.f_final_logit_softcapping > 0.0f);
-        bool has_suppress = !cfg.suppress_tokens.empty();
-
-        if (has_softcap || has_suppress) {
-            PERF_SCOPE("forward/logit_softcap");
-            int vocab_size = logits->shape().back();
-
-#ifdef USE_CUDA
-            if (logits->device() == DeviceType::CUDA) {
-                // GPU path: softcap (optional) + suppress in one kernel
-                float cap = has_softcap ? cfg.f_final_logit_softcapping : 1.0f;
-                const int* d_suppress = nullptr;
-                int n_suppress = 0;
-                if (has_suppress) {
-                    // Lazy init: cache suppress tokens on GPU (first call only)
-                    if (!suppress_tokens_gpu_) {
-                        int n_sup = static_cast<int>(cfg.suppress_tokens.size());
-                        auto cpu_tokens = std::make_shared<Tensor>(DataType::INT32,
-                            std::vector<int64_t>{n_sup}, DeviceType::CPU);
-                        int* cpu_data = static_cast<int*>(cpu_tokens->data());
-                        for (int i = 0; i < n_sup; ++i) cpu_data[i] = cfg.suppress_tokens[i];
-                        suppress_tokens_gpu_ = std::make_shared<Tensor>(DataType::INT32,
-                            std::vector<int64_t>{n_sup}, DeviceType::CUDA);
-                        suppress_tokens_gpu_->copy_from(*cpu_tokens);
-                    }
-                    n_suppress = static_cast<int>(cfg.suppress_tokens.size());
-                    d_suppress = static_cast<const int*>(suppress_tokens_gpu_->data());
-                }
-                cuda::launch_logit_softcap(
-                    static_cast<float*>(logits->data()),
-                    cap, has_softcap, d_suppress, n_suppress, vocab_size);
-            } else
-#endif
-            {
-                // CPU path: softcap is now fused into the sampler for efficiency
-                // (softcap + max/argmax done in one traversal). Only handle suppress tokens here.
-                logits = ensure_cpu(logits);
-                float* data = static_cast<float*>(logits->data());
-                int n = static_cast<int>(logits->numel());
-                if (has_suppress) {
-                    int num_rows = logits->numel() / vocab_size;
-                    for (int tok_id : cfg.suppress_tokens) {
-                        if (tok_id >= 0 && tok_id < vocab_size) {
-                            for (int r = 0; r < num_rows; ++r) {
-                                data[r * vocab_size + tok_id] = -INFINITY;
-                            }
-                        }
-                    }
-                }
-                logits = restore_device(logits, logits->device());
-            }
-        }
-    }
-
+    auto logits = forward_layers(hidden, req);
+    apply_logit_postprocess(logits, cfg);
     return logits;
 }
 
-TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                      int64_t start_pos, DeviceType dev, int seq_id) {
-    const auto& cfg = model_.config();
-    const auto& lw = weights_.layers[layer_idx];
+void Gemma4Engine::apply_logit_postprocess(TensorPtr& logits, const ModelConfig& cfg) {
+    if (!logits) return;
 
-    // Per-layer head dimensions: SWA layers use different head_dim than full-attention
-    bool is_swa_layer = (layer_idx < (int)cfg.swa_layers.size() && cfg.swa_layers[layer_idx] == 1);
-    bool has_kv = (layer_idx < cfg.n_layer_kv_from_start);
+    bool has_softcap = (cfg.f_final_logit_softcapping > 0.0f);
+    bool has_suppress = !cfg.suppress_tokens.empty();
+    if (!has_softcap && !has_suppress) return;
 
-    int head_dim = is_swa_layer ? cfg.head_dim_swa : cfg.head_dim;
-    int num_heads = is_swa_layer ? cfg.num_heads_swa : cfg.num_heads;
-    int num_kv_heads = is_swa_layer ? cfg.num_kv_heads_swa : cfg.num_kv_heads;
+    PERF_SCOPE("forward/logit_softcap");
+    int vocab_size = logits->shape().back();
 
-    // ---- Pre-attention RMSNorm ----
+#ifdef USE_CUDA
+    if (logits->device() == DeviceType::CUDA) {
+        // GPU path: softcap (optional) + suppress in one kernel
+        float cap = has_softcap ? cfg.f_final_logit_softcapping : 1.0f;
+        const int* d_suppress = nullptr;
+        int n_suppress = 0;
+        if (has_suppress) {
+            // Lazy init: cache suppress tokens on GPU (first call only)
+            if (!suppress_tokens_gpu_) {
+                int n_sup = static_cast<int>(cfg.suppress_tokens.size());
+                auto cpu_tokens = std::make_shared<Tensor>(
+                    DataType::INT32, std::vector<int64_t>{n_sup}, DeviceType::CPU);
+                int* cpu_data = static_cast<int*>(cpu_tokens->data());
+                for (int i = 0; i < n_sup; ++i) cpu_data[i] = cfg.suppress_tokens[i];
+                suppress_tokens_gpu_ = std::make_shared<Tensor>(
+                    DataType::INT32, std::vector<int64_t>{n_sup}, DeviceType::CUDA);
+                suppress_tokens_gpu_->copy_from(*cpu_tokens);
+            }
+            n_suppress = static_cast<int>(cfg.suppress_tokens.size());
+            d_suppress = static_cast<const int*>(suppress_tokens_gpu_->data());
+        }
+        cuda::launch_logit_softcap(static_cast<float*>(logits->data()), cap, has_softcap, d_suppress,
+                                   n_suppress, vocab_size);
+        return;
+    }
+#endif
+    // CPU path: softcap is fused into the sampler (softcap + max/argmax in one
+    // traversal), so only suppress tokens are handled here.
+    if (!has_suppress) return;
+    logits = ensure_cpu(logits);
+    float* data = static_cast<float*>(logits->data());
+    int num_rows = static_cast<int>(logits->numel()) / vocab_size;
+    for (int tok_id : cfg.suppress_tokens) {
+        if (tok_id >= 0 && tok_id < vocab_size) {
+            for (int r = 0; r < num_rows; ++r) {
+                data[r * vocab_size + tok_id] = -INFINITY;
+            }
+        }
+    }
+}
+
+TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden,
+                                      const LayerExecutionContext& lctx) {
+    const auto& cfg = lctx.config;
+    const auto& lw = lctx.weights;
+
+    // ---- Attention ----
     TensorPtr normed;
     {
         PERF_SCOPE("layer/attn_norm");
         normed = ops::rms_norm(hidden, lw.attn_norm(), cfg.rms_norm_eps);
     }
 
-    // ---- Q Projection ----
-    TensorPtr q = ops::matmul_transB(normed, lw.wq());
+    auto attn_out = attention_.attend(normed, lctx);
 
-    // ---- Q-Norm (per-head RMSNorm) ----
-    if (lw.attn_q_norm()) {
-        PERF_SCOPE("layer/q_norm");
-        int rows = seq_len * num_heads;
-        int cols = head_dim;
-#ifdef USE_CUDA
-        if (q->device() == DeviceType::CUDA && lw.attn_q_norm()->device() == DeviceType::CUDA) {
-            auto q_out = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
-            cuda::launch_rms_norm(
-                static_cast<const float*>(q->data()),
-                static_cast<const float*>(lw.attn_q_norm()->data()),
-                static_cast<float*>(q_out->data()),
-                rows, cols, cfg.rms_norm_eps);
-            q = q_out;
-        } else
-#endif
-        {
-            q = ensure_cpu(q);
-            auto qn_w = ensure_cpu(lw.attn_q_norm());
-            float* q_data = static_cast<float*>(q->data());
-            const float* qn_w_data = static_cast<const float*>(qn_w->data());
-            for (int s = 0; s < seq_len; ++s) {
-                for (int h = 0; h < num_heads; ++h) {
-                    float* head = q_data + s * num_heads * head_dim + h * head_dim;
-                    float ss = 0.0f;
-                    for (int d = 0; d < head_dim; ++d) ss += head[d] * head[d];
-                    float inv_rms = 1.0f / (std::sqrt(ss / head_dim + cfg.rms_norm_eps));
-                    for (int d = 0; d < head_dim; ++d) head[d] = head[d] * inv_rms * qn_w_data[d];
-                }
-            }
-        }
-    }
-
-    // ---- RoPE (NeoX style) ----
-    auto q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
-    TensorPtr k_rope, v;
-
-    if (has_kv) {
-        // ---- K, V Projection ----
-        TensorPtr k = ops::matmul_transB(normed, lw.wk());
-        if (lw.wv()) {
-            v = ops::matmul_transB(normed, lw.wv());
-        } else {
-            v = k;
-        }
-
-        // ---- K-Norm (per-head RMSNorm) ----
-        if (lw.attn_k_norm()) {
-            PERF_SCOPE("layer/k_norm");
-            int rows = seq_len * num_kv_heads;
-            int cols = head_dim;
-#ifdef USE_CUDA
-            if (k->device() == DeviceType::CUDA && lw.attn_k_norm()->device() == DeviceType::CUDA) {
-                auto k_out = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CUDA);
-                cuda::launch_rms_norm(
-                    static_cast<const float*>(k->data()),
-                    static_cast<const float*>(lw.attn_k_norm()->data()),
-                    static_cast<float*>(k_out->data()),
-                    rows, cols, cfg.rms_norm_eps);
-                k = k_out;
-            } else
-#endif
-            {
-                k = ensure_cpu(k);
-                auto kn_w = ensure_cpu(lw.attn_k_norm());
-                float* k_data = static_cast<float*>(k->data());
-                const float* kn_w_data = static_cast<const float*>(kn_w->data());
-                for (int s = 0; s < seq_len; ++s) {
-                    for (int h = 0; h < num_kv_heads; ++h) {
-                        float* head = k_data + s * num_kv_heads * head_dim + h * head_dim;
-                        float ss = 0.0f;
-                        for (int d = 0; d < head_dim; ++d) ss += head[d] * head[d];
-                        float inv_rms = 1.0f / (std::sqrt(ss / head_dim + cfg.rms_norm_eps));
-                        for (int d = 0; d < head_dim; ++d) head[d] = head[d] * inv_rms * kn_w_data[d];
-                    }
-                }
-            }
-        }
-
-        // ---- V-Norm (RMSNorm without learned weight, matching llama.cpp ggml_rms_norm) ----
-        {
-            PERF_SCOPE("layer/v_norm");
-            int rows = seq_len * num_kv_heads;
-            int cols = head_dim;
-#ifdef USE_CUDA
-            if (v->device() == DeviceType::CUDA) {
-                auto v_out = std::make_shared<Tensor>(DataType::FP32, v->shape(), DeviceType::CUDA);
-                cuda::launch_rms_norm_unweighted(
-                    static_cast<const float*>(v->data()),
-                    static_cast<float*>(v_out->data()),
-                    rows, cols, cfg.rms_norm_eps);
-                v = v_out;
-            } else
-#endif
-            {
-                float* v_data = static_cast<float*>(v->data());
-                for (int s = 0; s < seq_len; ++s) {
-                    for (int h = 0; h < num_kv_heads; ++h) {
-                        float* head = v_data + s * num_kv_heads * head_dim + h * head_dim;
-                        float ss = 0.0f;
-                        for (int d = 0; d < head_dim; ++d) ss += head[d] * head[d];
-                        float inv_rms = 1.0f / (std::sqrt(ss / head_dim + cfg.rms_norm_eps));
-                        for (int d = 0; d < head_dim; ++d) head[d] *= inv_rms;
-                    }
-                }
-            }
-        }
-
-        // Apply RoPE to Q and K
-        float theta = is_swa_layer ? cfg.rope_theta_swa : cfg.rope_theta;
-        const float* d_freq_factors = nullptr;
-        TensorPtr rope_freqs_gpu_temp;  // temp GPU copy for RoPE kernel
-        if (!is_swa_layer && rope_freqs_) {
-            if (q->device() == DeviceType::CUDA) {
-                // For GPU RoPE path, need freq_factors on GPU
-                if (rope_freqs_->device() == DeviceType::CUDA) {
-                    d_freq_factors = static_cast<const float*>(rope_freqs_->data());
-                } else {
-                    // Copy CPU rope_freqs to GPU temporarily
-                    rope_freqs_gpu_temp = std::make_shared<Tensor>(DataType::FP32,
-                        rope_freqs_->shape(), DeviceType::CUDA);
-                    rope_freqs_gpu_temp->copy_from(*rope_freqs_);
-                    d_freq_factors = static_cast<const float*>(rope_freqs_gpu_temp->data());
-                }
-            } else {
-                auto cpu_rf = ensure_cpu(rope_freqs_);
-                rope_freqs_cpu_ = cpu_rf;
-                d_freq_factors = static_cast<const float*>(rope_freqs_cpu_->data());
-            }
-        }
-
-#ifdef USE_CUDA
-        if (q->device() == DeviceType::CUDA && k->device() == DeviceType::CUDA) {
-            // GPU RoPE path
-            PERF_SCOPE("layer/rope");
-            q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
-            k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CUDA);
-            cuda::launch_rope_gemma4_gqa(
-                static_cast<const float*>(q->data()),
-                static_cast<const float*>(k->data()),
-                static_cast<float*>(q_rope->data()),
-                static_cast<float*>(k_rope->data()),
-                num_heads, num_kv_heads, head_dim,
-                seq_len, start_pos, theta,
-                d_freq_factors);
-        } else
-#endif
-        {
-            // CPU RoPE path
-            PERF_SCOPE("layer/rope");
-            q = ensure_cpu(q);
-            k = ensure_cpu(k);
-            k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
-            const float* q_data = static_cast<const float*>(q->data());
-            const float* k_data = static_cast<const float*>(k->data());
-            float* qo = static_cast<float*>(q_rope->data());
-            float* ko = static_cast<float*>(k_rope->data());
-
-            int half_dim = head_dim / 2;
-            int q_stride = num_heads * head_dim;
-            int k_stride = num_kv_heads * head_dim;
-            float q_scale = std::sqrt(static_cast<float>(head_dim));
-
-            for (int s = 0; s < seq_len; ++s) {
-                int64_t pos = start_pos + s;
-                for (int h = 0; h < num_heads; ++h) {
-                    for (int d = 0; d < half_dim; ++d) {
-                        float base_freq = 1.0f / std::pow(theta, 2.0f * d / head_dim);
-                        float freq = d_freq_factors ? base_freq / d_freq_factors[d] : base_freq;
-                        float angle = pos * freq;
-                        float cos_a = std::cos(angle);
-                        float sin_a = std::sin(angle);
-
-                        int q_idx0 = s * q_stride + h * head_dim + d;
-                        int q_idx1 = q_idx0 + half_dim;
-
-                        float q0 = q_data[q_idx0];
-                        float q1 = q_data[q_idx1];
-                        qo[q_idx0] = (q0 * cos_a - q1 * sin_a) * q_scale;
-                        qo[q_idx1] = (q0 * sin_a + q1 * cos_a) * q_scale;
-
-                        if (h < num_kv_heads) {
-                            int k_idx0 = s * k_stride + h * head_dim + d;
-                            int k_idx1 = k_idx0 + half_dim;
-
-                            float k0 = k_data[k_idx0];
-                            float k1 = k_data[k_idx1];
-                            ko[k_idx0] = k0 * cos_a - k1 * sin_a;
-                            ko[k_idx1] = k0 * sin_a + k1 * cos_a;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ---- KV Cache update (on CPU, then copy to cache device) ----
-        {
-            PERF_SCOPE("layer/kv_cache_update");
-            kv_cache_.update(layer_idx, seq_id, start_pos, k_rope, v, seq_len);
-        }
-    } else {
-        // Non-KV layer: reuse KV cache from the last two KV layers
-        // Apply RoPE to Q only (with sqrt(d) pre-scaling for QK-Norm attention)
-        float theta = is_swa_layer ? cfg.rope_theta_swa : cfg.rope_theta;
-        const float* d_freq_factors_q = nullptr;
-        TensorPtr rope_freqs_gpu_temp_q;  // temp GPU copy for RoPE kernel
-        if (!is_swa_layer && rope_freqs_) {
-            if (q->device() == DeviceType::CUDA) {
-                if (rope_freqs_->device() == DeviceType::CUDA) {
-                    d_freq_factors_q = static_cast<const float*>(rope_freqs_->data());
-                } else {
-                    rope_freqs_gpu_temp_q = std::make_shared<Tensor>(DataType::FP32,
-                        rope_freqs_->shape(), DeviceType::CUDA);
-                    rope_freqs_gpu_temp_q->copy_from(*rope_freqs_);
-                    d_freq_factors_q = static_cast<const float*>(rope_freqs_gpu_temp_q->data());
-                }
-            } else {
-                auto cpu_rf = ensure_cpu(rope_freqs_);
-                rope_freqs_cpu_ = cpu_rf;
-                d_freq_factors_q = static_cast<const float*>(rope_freqs_cpu_->data());
-            }
-        }
-
-#ifdef USE_CUDA
-        if (q->device() == DeviceType::CUDA) {
-            PERF_SCOPE("layer/rope_q_only");
-            q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
-            cuda::launch_rope_gemma4_q_only(
-                static_cast<const float*>(q->data()),
-                static_cast<float*>(q_rope->data()),
-                num_heads, head_dim,
-                seq_len, start_pos, theta,
-                d_freq_factors_q);
-        } else
-#endif
-        {
-            PERF_SCOPE("layer/rope_q_only");
-            q = ensure_cpu(q);
-            const float* q_data = static_cast<const float*>(q->data());
-            float* qo = static_cast<float*>(q_rope->data());
-
-            int half_dim = head_dim / 2;
-            int q_stride = num_heads * head_dim;
-            float q_scale = std::sqrt(static_cast<float>(head_dim));
-
-            for (int s = 0; s < seq_len; ++s) {
-                int64_t pos = start_pos + s;
-                for (int h = 0; h < num_heads; ++h) {
-                    for (int d = 0; d < half_dim; ++d) {
-                        float base_freq = 1.0f / std::pow(theta, 2.0f * d / head_dim);
-                        float freq = d_freq_factors_q ? base_freq / d_freq_factors_q[d] : base_freq;
-                        float angle = pos * freq;
-                        float cos_a = std::cos(angle);
-                        float sin_a = std::sin(angle);
-
-                        int q_idx0 = s * q_stride + h * head_dim + d;
-                        int q_idx1 = q_idx0 + half_dim;
-
-                        float q0 = q_data[q_idx0];
-                        float q1 = q_data[q_idx1];
-                        qo[q_idx0] = (q0 * cos_a - q1 * sin_a) * q_scale;
-                        qo[q_idx1] = (q0 * sin_a + q1 * cos_a) * q_scale;
-                    }
-                }
-            }
-        }
-    }
-
-    // Transfer Q, K, V back to the layer device for attention computation (only needed for CPU path)
-    if (q_rope->device() != dev) q_rope = restore_device(q_rope, dev);
-    if (v && v->device() != dev) v = restore_device(v, dev);
-    if (k_rope && k_rope->device() != dev) k_rope = restore_device(k_rope, dev);
-
-    // ---- Attention ----
-    TensorPtr attn_out;
-    {
-        PERF_SCOPE("layer/attention");
-        int total_len = 0;
-        TensorPtr k_sliced, v_sliced;
-        int attn_num_kv_heads = num_kv_heads;
-        int attn_head_dim = head_dim;
-
-        if (has_kv) {
-            total_len = kv_cache_.filled(layer_idx);
-            k_sliced = kv_cache_.get_key_filled(layer_idx);
-            v_sliced = kv_cache_.get_value_filled(layer_idx);
-        } else {
-            // Non-KV layers reuse KV from the last two KV layers:
-            // - SWA layers reuse from n_layer_kv_from_start - 2 (SWA layer, head_dim_swa)
-            // - Full-attention layers reuse from n_layer_kv_from_start - 1 (full layer, head_dim)
-            // This matches the llama.cpp reference implementation.
-            int reuse_layer = is_swa_layer
-                ? (cfg.n_layer_kv_from_start - 2)
-                : (cfg.n_layer_kv_from_start - 1);
-            total_len = kv_cache_.filled(reuse_layer);
-            k_sliced = kv_cache_.get_key_filled(reuse_layer);
-            v_sliced = kv_cache_.get_value_filled(reuse_layer);
-            // Use the reused KV layer's dimensions for attention
-            bool reuse_is_swa = (reuse_layer < (int)cfg.swa_layers.size() && cfg.swa_layers[reuse_layer] == 1);
-            attn_num_kv_heads = reuse_is_swa ? cfg.num_kv_heads_swa : cfg.num_kv_heads;
-            attn_head_dim = reuse_is_swa ? cfg.head_dim_swa : cfg.head_dim;
-        }
-
-        // ---- SWA sliding window handled by ring buffer ----
-        // When ring buffer is active (set via kv_cache_.set_ring_buffer()),
-        // get_key_filled() and filled() automatically return only the last
-        // window_size positions. No manual slice needed.
-
-        if (dev == DeviceType::CUDA && k_sliced && k_sliced->device() == DeviceType::CPU) {
-            auto k_cuda = std::make_shared<Tensor>(DataType::FP32, k_sliced->shape(), DeviceType::CUDA);
-            k_cuda->copy_from(*k_sliced);
-            k_sliced = k_cuda;
-            auto v_cuda = std::make_shared<Tensor>(DataType::FP32, v_sliced->shape(), DeviceType::CUDA);
-            v_cuda->copy_from(*v_sliced);
-            v_sliced = v_cuda;
-        }
-
-        if (attn_num_kv_heads < num_heads) {
-            attn_out = ops::scaled_dot_product_attention_2d_gqa(q_rope, k_sliced, v_sliced, seq_len,
-                                                                total_len, num_heads, attn_num_kv_heads,
-                                                                attn_head_dim, nullptr, true);
-        } else {
-            attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_sliced, v_sliced, seq_len,
-                                                            total_len, num_heads, attn_head_dim, nullptr, true);
-        }
-    }
-
-    // ---- Attention output projection ----
     {
         PERF_SCOPE("layer/attn_proj");
         attn_out = ops::matmul_transB(attn_out, lw.wo());
     }
-
-    // ---- Post-attention norm ----
     if (lw.attn_post_norm()) {
         PERF_SCOPE("layer/attn_post_norm");
         attn_out = ops::rms_norm(attn_out, lw.attn_post_norm(), cfg.rms_norm_eps);
     }
 
-    // ---- First residual add ----
     auto attn_residual = ops::add(hidden, attn_out);
 
     // ---- FFN ----
     TensorPtr ffn_out;
-    bool is_moe = (lw.ffn_gate_inp() != nullptr);
-
-    if (is_moe) {
-        // Gemma4 MoE: shared expert + routed experts
-        PERF_SCOPE("layer/moe");
-
-        // Shared expert (standard FFN with GeGLU)
-        TensorPtr shared_out;
-        {
-            auto cur_mlp = ops::rms_norm(attn_residual, lw.ffn_norm(), cfg.rms_norm_eps);
-            auto gate = ops::matmul_transB(cur_mlp, lw.w1());
-            auto up = ops::matmul_transB(cur_mlp, lw.w3());
-            auto gated = ops::gelu_multiply(gate, up);
-            shared_out = ops::matmul_transB(gated, lw.w2());
-        }
-        if (lw.ffn_post_norm_1()) {
-            shared_out = ops::rms_norm(shared_out, lw.ffn_post_norm_1(), cfg.rms_norm_eps);
-        }
-
-        // Routed experts
-        TensorPtr expert_out;
-        {
-            auto cur_moe = ops::rms_norm(attn_residual, lw.ffn_pre_norm_2(), cfg.rms_norm_eps);
-
-            // Router: compute expert logits
-            TensorPtr router_input = attn_residual;
-            if (lw.ffn_gate_inp_s()) {
-                // Custom scaling: rms_norm then multiply by scale * inv_sqrt
-                bool use_gpu = (attn_residual->device() == DeviceType::CUDA &&
-                                lw.ffn_gate_inp_s()->device() == DeviceType::CUDA);
-                auto ones = std::make_shared<Tensor>(DataType::FP32,
-                    std::vector<int64_t>{1, cfg.hidden_dim},
-                    use_gpu ? DeviceType::CUDA : DeviceType::CPU);
-                float* ones_data = static_cast<float*>(ones->data());
-                std::fill_n(ones_data, cfg.hidden_dim, 1.0f);
-
-                auto normed_for_router = ops::rms_norm(attn_residual, ones, cfg.rms_norm_eps);
-                float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(cfg.hidden_dim));
-
-#ifdef USE_CUDA
-                if (use_gpu) {
-                    // GPU path: fused scaling kernel
-                    auto scaled = std::make_shared<Tensor>(DataType::FP32, normed_for_router->shape(), DeviceType::CUDA);
-                    cuda::launch_moe_router_scale(
-                        static_cast<const float*>(normed_for_router->data()),
-                        static_cast<const float*>(lw.ffn_gate_inp_s()->data()),
-                        static_cast<float*>(scaled->data()),
-                        cfg.hidden_dim, inv_sqrt, cfg.rms_norm_eps, seq_len);
-                    router_input = scaled;
-                } else
-#endif
-                {
-                    // CPU path
-                    normed_for_router = ensure_cpu(normed_for_router);
-                    float* nr_data = static_cast<float*>(normed_for_router->data());
-                    int nr_n = static_cast<int>(normed_for_router->numel());
-                    for (int i = 0; i < nr_n; ++i) nr_data[i] *= inv_sqrt;
-                    auto s_cpu = ensure_cpu(lw.ffn_gate_inp_s());
-                    const float* s_data = static_cast<const float*>(s_cpu->data());
-                    for (int s = 0; s < seq_len; ++s) {
-                        float* row = nr_data + s * cfg.hidden_dim;
-                        for (int d = 0; d < cfg.hidden_dim; ++d) {
-                            row[d] *= s_data[d];
-                        }
-                    }
-                    router_input = normed_for_router;
-                }
-            }
-            auto router_logits = ops::matmul_transB(router_input, lw.ffn_gate_inp());
-
-            // Top-K expert selection
-            int n_expert = cfg.n_expert;
-            int n_expert_used = cfg.n_expert_used > 0 ? cfg.n_expert_used : 1;
-            int n_tokens = seq_len;
-
-            expert_out = std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{seq_len, cfg.hidden_dim}, dev);
-            float* expert_out_data = static_cast<float*>(expert_out->data());
-            std::fill_n(expert_out_data, seq_len * cfg.hidden_dim, 0.0f);
-
-            if (router_logits->device() == DeviceType::CUDA && dev == DeviceType::CUDA) {
-                // Full GPU MoE path — no CPU round-trips
-#ifdef USE_CUDA
-                auto indices_tensor = std::make_shared<Tensor>(DataType::INT32,
-                    std::vector<int64_t>{seq_len * n_expert_used}, DeviceType::CUDA);
-                auto weights_tensor = std::make_shared<Tensor>(DataType::FP32,
-                    std::vector<int64_t>{seq_len * n_expert_used}, DeviceType::CUDA);
-                auto softmax_buf = std::make_shared<Tensor>(DataType::FP32,
-                    std::vector<int64_t>{seq_len * n_expert}, DeviceType::CUDA);
-
-                cuda::launch_moe_router(
-                    static_cast<const float*>(router_logits->data()),
-                    static_cast<int*>(indices_tensor->data()),
-                    static_cast<float*>(weights_tensor->data()),
-                    static_cast<float*>(softmax_buf->data()),
-                    n_expert, n_expert_used, seq_len);
-
-                const int* d_indices = static_cast<const int*>(indices_tensor->data());
-                const float* d_weights = static_cast<const float*>(weights_tensor->data());
-                auto w_dtype = lw.ffn_gate_up_exps()
-                    ? lw.ffn_gate_up_exps()->dtype()
-                    : (lw.ffn_gate_exps() ? lw.ffn_gate_exps()->dtype() : DataType::FP32);
-
-                if (lw.ffn_gate_up_exps() && is_quantized_type(w_dtype)) {
-                    // Fused gate_up path: GEMV → GeGLU split → down GEMV
-                    int K_gate = cfg.hidden_dim;
-                    int N_gate = static_cast<int>(lw.ffn_gate_up_exps()->shape()[1]);
-                    int n_ff = N_gate / 2;
-
-                    // gate_up projection
-                    auto gate_up_out = std::make_shared<Tensor>(DataType::FP32,
-                        std::vector<int64_t>{seq_len, N_gate}, DeviceType::CUDA);
-                    cudaMemset(static_cast<float*>(gate_up_out->data()), 0,
-                               seq_len * N_gate * sizeof(float));
-
-                    auto dispatch_gemv = [&](DataType dt) {
-                        if (dt == DataType::Q4_0)
-                            cuda::launch_moe_expert_gemv<DataType::Q4_0>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_gate_up_exps()->data(),
-                                static_cast<float*>(gate_up_out->data()),
-                                d_indices, d_weights,
-                                K_gate, N_gate, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q4_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q4_K>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_gate_up_exps()->data(),
-                                static_cast<float*>(gate_up_out->data()),
-                                d_indices, d_weights,
-                                K_gate, N_gate, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q6_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q6_K>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_gate_up_exps()->data(),
-                                static_cast<float*>(gate_up_out->data()),
-                                d_indices, d_weights,
-                                K_gate, N_gate, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q8_0)
-                            cuda::launch_moe_expert_gemv<DataType::Q8_0>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_gate_up_exps()->data(),
-                                static_cast<float*>(gate_up_out->data()),
-                                d_indices, d_weights,
-                                K_gate, N_gate, n_expert, n_expert_used, seq_len);
-                    };
-                    dispatch_gemv(w_dtype);
-
-                    // GeGLU split: gelu(gate) * up
-                    auto gated = std::make_shared<Tensor>(DataType::FP32,
-                        std::vector<int64_t>{seq_len, n_ff}, DeviceType::CUDA);
-                    cuda::launch_gelu_tanh_multiply_split(
-                        static_cast<const float*>(gate_up_out->data()),
-                        static_cast<float*>(gated->data()),
-                        n_ff, seq_len);
-
-                    // down projection
-                    int K_down = n_ff;
-                    int N_down = cfg.hidden_dim;
-                    auto w_down_dtype = lw.ffn_down_exps()->dtype();
-                    auto dispatch_down = [&](DataType dt) {
-                        if (dt == DataType::Q4_0)
-                            cuda::launch_moe_expert_gemv<DataType::Q4_0>(
-                                static_cast<const float*>(gated->data()),
-                                lw.ffn_down_exps()->data(),
-                                static_cast<float*>(expert_out->data()),
-                                d_indices, d_weights,
-                                K_down, N_down, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q4_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q4_K>(
-                                static_cast<const float*>(gated->data()),
-                                lw.ffn_down_exps()->data(),
-                                static_cast<float*>(expert_out->data()),
-                                d_indices, d_weights,
-                                K_down, N_down, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q6_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q6_K>(
-                                static_cast<const float*>(gated->data()),
-                                lw.ffn_down_exps()->data(),
-                                static_cast<float*>(expert_out->data()),
-                                d_indices, d_weights,
-                                K_down, N_down, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q8_0)
-                            cuda::launch_moe_expert_gemv<DataType::Q8_0>(
-                                static_cast<const float*>(gated->data()),
-                                lw.ffn_down_exps()->data(),
-                                static_cast<float*>(expert_out->data()),
-                                d_indices, d_weights,
-                                K_down, N_down, n_expert, n_expert_used, seq_len);
-                    };
-                    dispatch_down(w_down_dtype);
-
-                } else if (lw.ffn_gate_exps() && lw.ffn_up_exps()) {
-                    // Separate gate + up path
-                    int K_gu = cfg.hidden_dim;
-                    int N_gate = static_cast<int>(lw.ffn_gate_exps()->shape()[1]);
-                    int N_up = static_cast<int>(lw.ffn_up_exps()->shape()[1]);
-                    int N_down = cfg.hidden_dim;
-                    auto gate_dtype = lw.ffn_gate_exps()->dtype();
-
-                    // gate projection
-                    auto gate_out = std::make_shared<Tensor>(DataType::FP32,
-                        std::vector<int64_t>{seq_len, N_gate}, DeviceType::CUDA);
-                    cudaMemset(static_cast<float*>(gate_out->data()), 0,
-                               seq_len * N_gate * sizeof(float));
-
-                    auto dispatch_gate = [&](DataType dt) {
-                        if (dt == DataType::Q4_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q4_K>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_gate_exps()->data(),
-                                static_cast<float*>(gate_out->data()),
-                                d_indices, d_weights,
-                                K_gu, N_gate, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q6_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q6_K>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_gate_exps()->data(),
-                                static_cast<float*>(gate_out->data()),
-                                d_indices, d_weights,
-                                K_gu, N_gate, n_expert, n_expert_used, seq_len);
-                    };
-                    dispatch_gate(gate_dtype);
-
-                    // up projection
-                    auto up_out = std::make_shared<Tensor>(DataType::FP32,
-                        std::vector<int64_t>{seq_len, N_up}, DeviceType::CUDA);
-                    cudaMemset(static_cast<float*>(up_out->data()), 0,
-                               seq_len * N_up * sizeof(float));
-
-                    auto up_dtype = lw.ffn_up_exps()->dtype();
-                    auto dispatch_up = [&](DataType dt) {
-                        if (dt == DataType::Q4_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q4_K>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_up_exps()->data(),
-                                static_cast<float*>(up_out->data()),
-                                d_indices, d_weights,
-                                K_gu, N_up, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q6_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q6_K>(
-                                static_cast<const float*>(cur_moe->data()),
-                                lw.ffn_up_exps()->data(),
-                                static_cast<float*>(up_out->data()),
-                                d_indices, d_weights,
-                                K_gu, N_up, n_expert, n_expert_used, seq_len);
-                    };
-                    dispatch_up(up_dtype);
-
-                    // GELU multiply
-                    auto gated = std::make_shared<Tensor>(DataType::FP32,
-                        std::vector<int64_t>{seq_len, N_gate}, DeviceType::CUDA);
-                    cuda::launch_gelu_multiply(
-                        static_cast<const float*>(gate_out->data()),
-                        static_cast<const float*>(up_out->data()),
-                        static_cast<float*>(gated->data()),
-                        seq_len * N_gate);
-
-                    // down projection
-                    auto down_dtype = lw.ffn_down_exps()->dtype();
-                    auto dispatch_down = [&](DataType dt) {
-                        if (dt == DataType::Q4_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q4_K>(
-                                static_cast<const float*>(gated->data()),
-                                lw.ffn_down_exps()->data(),
-                                static_cast<float*>(expert_out->data()),
-                                d_indices, d_weights,
-                                N_gate, N_down, n_expert, n_expert_used, seq_len);
-                        else if (dt == DataType::Q6_K)
-                            cuda::launch_moe_expert_gemv<DataType::Q6_K>(
-                                static_cast<const float*>(gated->data()),
-                                lw.ffn_down_exps()->data(),
-                                static_cast<float*>(expert_out->data()),
-                                d_indices, d_weights,
-                                N_gate, N_down, n_expert, n_expert_used, seq_len);
-                    };
-                    dispatch_down(down_dtype);
-                }
-#endif
-            } else {
-                // CPU router path
-                auto router_logits_cpu = ensure_cpu(router_logits);
-                auto cur_moe_cpu = ensure_cpu(cur_moe);
-                const float* logits_data = static_cast<const float*>(router_logits_cpu->data());
-
-                for (int s = 0; s < n_tokens; ++s) {
-                    // Softmax over experts
-                    std::vector<float> probs(n_expert);
-                    float max_logit = -std::numeric_limits<float>::infinity();
-                    for (int e = 0; e < n_expert; ++e) {
-                        probs[e] = logits_data[s * n_expert + e];
-                        if (probs[e] > max_logit) max_logit = probs[e];
-                    }
-                    float sum_exp = 0.0f;
-                    for (int e = 0; e < n_expert; ++e) {
-                        probs[e] = std::exp(probs[e] - max_logit);
-                        sum_exp += probs[e];
-                    }
-                    for (int e = 0; e < n_expert; ++e) {
-                        probs[e] /= sum_exp;
-                    }
-
-                    // Top-K selection
-                    std::vector<int> indices(n_expert);
-                    std::iota(indices.begin(), indices.end(), 0);
-                    std::partial_sort(indices.begin(), indices.begin() + n_expert_used, indices.end(),
-                        [&](int a, int b) { return probs[a] > probs[b]; });
-
-                    // Renormalize top-K probs
-                    float topk_sum = 0.0f;
-                    for (int k = 0; k < n_expert_used; ++k) {
-                        topk_sum += probs[indices[k]];
-                    }
-
-                    expert_out = ensure_cpu(expert_out);
-                    float* expert_out_data = static_cast<float*>(expert_out->data());
-
-                    for (int k = 0; k < n_expert_used; ++k) {
-                        int expert_idx = indices[k];
-                        float weight = probs[expert_idx] / topk_sum;
-
-                        TensorPtr token_hidden = std::make_shared<Tensor>(DataType::FP32,
-                            std::vector<int64_t>{1, cfg.hidden_dim}, DeviceType::CPU);
-                        const float* moe_in = static_cast<const float*>(cur_moe_cpu->data()) + s * cfg.hidden_dim;
-                        std::memcpy(token_hidden->data(), moe_in, cfg.hidden_dim * sizeof(float));
-
-                        TensorPtr expert_result;
-
-                        // Zero-copy expert extraction: slice the 3D weight along the
-                        // expert dimension then view as 2D. This avoids dequantizing
-                        // the entire 3D tensor (which wastes 99%+ of compute when
-                        // n_expert_used << n_expert). The quantized GEMV kernels
-                        // handle the sliced weight directly.
-                        auto extract_expert_2d = [&](const TensorPtr& w3d) -> TensorPtr {
-                            if (!w3d) return nullptr;
-                            auto& shp = w3d->shape();
-                            if (shp.size() < 2) return w3d;
-                            if (shp.size() == 3 && expert_idx < shp[2]) {
-                                auto expert_slice = w3d->slice(2, expert_idx, expert_idx + 1);
-                                return std::make_shared<Tensor>(expert_slice.view({shp[0], shp[1]}));
-                            }
-                            return w3d;
-                        };
-
-                        if (lw.ffn_gate_up_exps()) {
-                            auto gate_up_w = extract_expert_2d(lw.ffn_gate_up_exps());
-                            auto down_w = extract_expert_2d(lw.ffn_down_exps());
-                            if (gate_up_w && down_w) {
-                                auto gate_up = ops::matmul_transB(token_hidden, gate_up_w);
-                                int half_out = static_cast<int>(gate_up->shape()[1]) / 2;
-                                auto gate_t = std::make_shared<Tensor>(DataType::FP32,
-                                    std::vector<int64_t>{1, half_out}, DeviceType::CPU);
-                                auto up_t = std::make_shared<Tensor>(DataType::FP32,
-                                    std::vector<int64_t>{1, half_out}, DeviceType::CPU);
-                                auto gate_up_cpu = ensure_cpu(gate_up);
-                                const float* gu_data = static_cast<const float*>(gate_up_cpu->data());
-                                std::memcpy(gate_t->data(), gu_data, half_out * sizeof(float));
-                                std::memcpy(up_t->data(), gu_data + half_out, half_out * sizeof(float));
-                                auto gated = ops::gelu_multiply(gate_t, up_t);
-                                expert_result = ops::matmul_transB(gated, down_w);
-                            }
-                        } else if (lw.ffn_gate_exps() && lw.ffn_up_exps()) {
-                            auto gate_w = extract_expert_2d(lw.ffn_gate_exps());
-                            auto up_w = extract_expert_2d(lw.ffn_up_exps());
-                            auto down_w = extract_expert_2d(lw.ffn_down_exps());
-                            if (gate_w && up_w && down_w) {
-                                auto gate_t = ops::matmul_transB(token_hidden, gate_w);
-                                auto up_t = ops::matmul_transB(token_hidden, up_w);
-                                auto gated = ops::gelu_multiply(gate_t, up_t);
-                                expert_result = ops::matmul_transB(gated, down_w);
-                            }
-                        }
-
-                        if (expert_result) {
-                            auto er_cpu = ensure_cpu(expert_result);
-                            const float* er_data = static_cast<const float*>(er_cpu->data());
-                            float* out_row = expert_out_data + s * cfg.hidden_dim;
-                            for (int d = 0; d < cfg.hidden_dim; ++d) {
-                                out_row[d] += weight * er_data[d];
-                            }
-                        }
-                    }
-                }
-                expert_out = restore_device(expert_out, dev);
-            }
-        }
-        if (lw.ffn_post_norm_2()) {
-            expert_out = ops::rms_norm(expert_out, lw.ffn_post_norm_2(), cfg.rms_norm_eps);
-        }
-        // Transfer expert_out back to device for the add operation
-        expert_out = restore_device(expert_out, dev);
-
-        // Combine shared + routed experts
-        ffn_out = ops::add(shared_out, expert_out);
+    if (lw.ffn_gate_inp()) {
+        ffn_out = Gemma4Moe::apply(attn_residual, lctx);
     } else {
         // Standard GeGLU FFN
         PERF_SCOPE("layer/ffn");
@@ -1048,23 +213,21 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
 
 #ifdef USE_CUDA
         // Fused gate+up+GeGLU kernel for Q4_K weights on GPU
+        const int seq_len = lctx.seq_len();
         auto w1_tensor = lw.w1();
         auto w3_tensor = lw.w3();
-        if (seq_len == 1 && dev == DeviceType::CUDA &&
-            w1_tensor && w3_tensor &&
+        if (seq_len == 1 && lctx.device == DeviceType::CUDA && w1_tensor && w3_tensor &&
             w1_tensor->device() == DeviceType::CUDA && w3_tensor->device() == DeviceType::CUDA &&
             w1_tensor->dtype() == DataType::Q4_K && w3_tensor->dtype() == DataType::Q4_K) {
             // matmul_transB convention: b shape is [N, K] = [intermediate_dim, hidden_dim]
             int K = cfg.hidden_dim;
             int N = static_cast<int>(w1_tensor->shape()[0]);
             auto gated = std::make_shared<Tensor>(DataType::FP32,
-                std::vector<int64_t>{seq_len, N}, DeviceType::CUDA);
-            cuda::launch_ffn_up_fused_q4_k_geglu(
-                static_cast<const float*>(ffn_normed->data()),
-                w1_tensor->data(),
-                w3_tensor->data(),
-                static_cast<float*>(gated->data()),
-                K, N);
+                                                  std::vector<int64_t>{seq_len, N},
+                                                  DeviceType::CUDA);
+            cuda::launch_ffn_up_fused_q4_k_geglu(static_cast<const float*>(ffn_normed->data()),
+                                                 w1_tensor->data(), w3_tensor->data(),
+                                                 static_cast<float*>(gated->data()), K, N);
             ffn_out = ops::matmul_transB(gated, lw.w2());
         } else
 #endif
@@ -1076,63 +239,15 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden, int layer_idx, in
         }
     }
 
-    // ---- Post-FFN norm ----
     if (lw.post_ffn_norm()) {
         PERF_SCOPE("layer/post_ffn_norm");
         ffn_out = ops::rms_norm(ffn_out, lw.post_ffn_norm(), cfg.rms_norm_eps);
     }
 
-    // ---- Second residual add ----
     auto output = ops::add(attn_residual, ffn_out);
 
     // ---- Per-layer embeddings ----
-    if (lw.per_layer_inp_gate() && lw.per_layer_proj() && per_layer_input_cache_) {
-        PERF_SCOPE("layer/per_layer_embd");
-        int n_per = cfg.n_embd_per_layer;
-        int n_layer = cfg.num_layers;
-
-        // Input gate projection
-        auto gated = ops::matmul_transB(output, lw.per_layer_inp_gate());
-
-#ifdef USE_CUDA
-        if (gated->device() == DeviceType::CUDA &&
-            per_layer_input_cache_->device() == DeviceType::CUDA) {
-            // GPU path: fused GELU(tanh) + element-wise multiply
-            cuda::launch_gelu_tanh_multiply(
-                static_cast<float*>(gated->data()),
-                static_cast<const float*>(per_layer_input_cache_->data()),
-                n_per, n_layer, layer_idx, seq_len);
-        } else
-#endif
-        {
-            // CPU path
-            gated = ensure_cpu(gated);
-            float* gated_data = static_cast<float*>(gated->data());
-            for (int i = 0; i < static_cast<int>(gated->numel()); ++i) {
-                float x = gated_data[i];
-                gated_data[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-            }
-            auto ple_cpu = ensure_cpu(per_layer_input_cache_);
-            const float* ple_data = static_cast<const float*>(ple_cpu->data());
-            for (int s = 0; s < seq_len; ++s) {
-                const float* layer_embd = ple_data + s * n_per * n_layer + layer_idx * n_per;
-                float* gated_row = gated_data + s * n_per;
-                for (int d = 0; d < n_per; ++d) {
-                    gated_row[d] *= layer_embd[d];
-                }
-            }
-            gated = restore_device(gated, dev);
-        }
-
-        // Project back to hidden dim
-        auto pe_out = ops::matmul_transB(gated, lw.per_layer_proj());
-        if (lw.per_layer_post_norm()) {
-            pe_out = ops::rms_norm(pe_out, lw.per_layer_post_norm(), cfg.rms_norm_eps);
-        }
-
-        // Residual add
-        output = ops::add(output, pe_out);
-    }
+    output = embedding_.apply_per_layer(output, lctx);
 
     // ---- Layer output scale ----
     if (lw.layer_out_scale()) {
@@ -1180,15 +295,11 @@ TensorPtr Gemma4Engine::forward_batch(const InferenceBatch& batch) {
                                                    std::vector<int64_t>{seq_len}, DeviceType::CPU);
         std::memcpy(input_ids->data(), item.tokens.data(), seq_len * sizeof(int32_t));
 
-        auto logits = forward(input_ids, item.start_pos, item.seq_id);
+        auto logits = forward_request(ForwardRequest::from_ids(input_ids, item.start_pos, item.seq_id));
         if (!logits)
             continue;
 
-        TensorPtr logits_cpu = logits;
-        if (logits->device() == DeviceType::CUDA) {
-            logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(), DeviceType::CPU);
-            logits_cpu->copy_from(*logits);
-        }
+        TensorPtr logits_cpu = ensure_cpu(logits);
 
         vocab_size = static_cast<int>(logits_cpu->shape().back());
         int seq_len_out = static_cast<int>(logits_cpu->shape()[0]);

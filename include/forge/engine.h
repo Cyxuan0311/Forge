@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "inference/forward_request.h"
 #include "inference_batch.h"
 #include "model.h"
 #include "tensor.h"
@@ -17,57 +18,14 @@ class Model;
 class InferenceContext;
 class KVCache;
 
-// Describes what an engine can handle, used for compatibility checking
-// when falling back from an unregistered architecture to a known engine.
-struct EngineCapability {
-    NormType supported_norm = NormType::RMSNorm;
-    bool supports_norm_bias = false;
-    ActivationType supported_activation = ActivationType::SiLU_GELU;
-    bool supports_qkv_bias = false;
-    bool supports_parallel_residual = false;
-    bool supports_qk_norm = false;
-    bool supports_embedding_scale = false;
-    bool supports_post_attention_norm = false;
-    bool supports_post_ffn_norm = false;
-    bool supports_mrope = false;
-    bool supports_neox_rope = false;
-
-    // Returns empty string if compatible, otherwise describes the incompatibility
-    std::string check_compatibility(const ArchCapability& cap) const {
-        std::string reasons;
-        if (cap.norm_type == NormType::LayerNorm && supported_norm != NormType::LayerNorm)
-            reasons += "requires LayerNorm but engine only supports RMSNorm; ";
-        if (cap.has_norm_bias && !supports_norm_bias)
-            reasons += "requires norm bias but engine doesn't support it; ";
-        if (cap.ffn_activation != supported_activation &&
-            cap.ffn_activation != ActivationType::SiLU_GELU)
-            reasons += "requires different activation type; ";
-        if (cap.has_qkv_bias && !supports_qkv_bias)
-            reasons += "requires QKV bias but engine doesn't support it; ";
-        if (cap.use_parallel_residual && !supports_parallel_residual)
-            reasons += "requires parallel residual but engine doesn't support it; ";
-        if (cap.use_qk_norm && !supports_qk_norm)
-            reasons += "requires QK-norm but engine doesn't support it; ";
-        if (cap.embedding_scale && !supports_embedding_scale)
-            reasons += "requires embedding scaling but engine doesn't support it; ";
-        if (cap.has_post_attention_norm && !supports_post_attention_norm)
-            reasons += "requires post-attention norm but engine doesn't support it; ";
-        if (cap.has_post_ffn_norm && !supports_post_ffn_norm)
-            reasons += "requires post-FFN norm but engine doesn't support it; ";
-        if (cap.use_mrope && !supports_mrope)
-            reasons += "requires MRoPE but engine doesn't support it; ";
-        if (cap.use_neox_rope && !supports_neox_rope)
-            reasons += "requires NeoX RoPE but engine doesn't support it; ";
-        return reasons;
-    }
-};
-
 class InferenceEngine {
 public:
     virtual ~InferenceEngine() = default;
 
-    // Single-sequence forward (backward compatible, seq_id defaults to 0)
-    virtual TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) = 0;
+    // Request-based forward. This is the primary entry point: all runtime
+    // semantics (start_pos, seq_id, token count, prefill/decode) travel together
+    // in one object instead of as separate positional arguments.
+    virtual TensorPtr forward_request(const ForwardRequest& req) = 0;
 
     // Multi-sequence batch forward.
     // Default implementation: fall back to sequential forward() calls.
@@ -84,9 +42,16 @@ public:
     virtual void set_gpu_layers(int layers) { (void)layers; }
     virtual int gpu_layers() const { return -1; }
 
-    // Access the engine's KV cache (returns nullptr if not available)
+    // Access the engine's KV cache (returns nullptr if not available).
+    // The cache itself is owned by InferenceContext; this is a forwarding
+    // accessor kept for scheduler / generator / bindings compatibility.
     virtual KVCache* kv_cache() { return nullptr; }
     virtual const KVCache* kv_cache() const { return nullptr; }
+
+    // Allocate the engine's runtime memory (KV cache and, later, recurrent
+    // state) if it has not been allocated yet. InferenceContext calls this so
+    // that callers can query cache stats before the first forward.
+    virtual void init_memory() {}
 };
 
 using EngineCreator = std::function<std::unique_ptr<InferenceEngine>(Model&, InferenceContext&)>;

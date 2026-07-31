@@ -1,4 +1,5 @@
 #include "forge/engine.h"
+#include "forge/inference/execution_plan.h"
 #include "forge/inference_batch.h"
 #include "forge/logger.h"
 #include "forge/model.h"
@@ -8,180 +9,48 @@
 
 namespace forge {
 
-// Static table of engine capabilities for compatibility checking.
-// Keyed by engine registration name. GenericEngine handles all architectures
-// through strategy sub-functions, so its entries are comprehensive.
-static const std::unordered_map<std::string, EngineCapability>& engine_capabilities() {
-    static const std::unordered_map<std::string, EngineCapability> caps = {
-        // GenericEngine (registered under many architecture names)
-        {"llama", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-            .supports_qk_norm = true,
-            .supports_embedding_scale = true,
-            .supports_post_attention_norm = true,
-            .supports_post_ffn_norm = true,
-            .supports_mrope = true,
-            .supports_neox_rope = true,
-        }},
-        {"mistral", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-            .supports_neox_rope = true,
-        }},
-        {"qwen", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-        }},
-        {"qwen2", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-        }},
-        {"qwen3vl", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-            .supports_qk_norm = true,
-            .supports_mrope = true,
-        }},
-        {"yi", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-            .supports_neox_rope = true,
-        }},
-        {"deepseek", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-        }},
-        // Gemma family (GeGLU + embedding scale)
-        {"gemma", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::GeGLU,
-            .supports_embedding_scale = true,
-            .supports_neox_rope = true,
-        }},
-        {"gemma2", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::GeGLU,
-            .supports_embedding_scale = true,
-            .supports_post_attention_norm = true,
-            .supports_post_ffn_norm = true,
-            .supports_neox_rope = true,
-        }},
-        {"gemma4", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::GeGLU,
-            .supports_qk_norm = true,
-            .supports_embedding_scale = true,
-            .supports_neox_rope = true,
-        }},
-        // Falcon (LayerNorm + bias + parallel residual)
-        {"falcon", EngineCapability{
-            .supported_norm = NormType::LayerNorm,
-            .supports_norm_bias = true,
-            .supported_activation = ActivationType::GELU,
-            .supports_qkv_bias = true,
-            .supports_parallel_residual = true,
-        }},
-        // Specialized engines
-        {"deepseek_v2", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-            .supports_neox_rope = true,
-        }},
-        {"deepseek_v3", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-            .supports_neox_rope = true,
-        }},
-        {"qwen35", EngineCapability{
-            .supported_norm = NormType::RMSNorm,
-            .supported_activation = ActivationType::SiLU_GELU,
-            .supports_mrope = true,
-        }},
-    };
-    return caps;
-}
-
-// Helper: check fallback compatibility and throw if incompatible
-static void check_fallback_compatibility(const std::string& engine_name,
-                                          const std::string& arch,
-                                          const ArchCapability& cap) {
-    auto& caps = engine_capabilities();
-    auto cap_it = caps.find(engine_name);
-    if (cap_it == caps.end())
-        return;  // No capability info registered, skip check
-    auto reasons = cap_it->second.check_compatibility(cap);
-    if (!reasons.empty()) {
-        throw std::runtime_error(
-            "Engine '" + engine_name + "' cannot handle architecture '" + arch +
-            "': " + reasons +
-            "Please register a dedicated engine for this architecture.");
-    }
-}
-
 // ============================================================================
-// Startup compatibility validation
+// Startup plan validation
 // ============================================================================
-// Runs once (via std::call_once) on first EngineRegistry::create() call.
-// Verifies that all registered architectures have compatible engine backends.
+// Runs once (via std::call_once) before the first engine is created.
+// Every registered architecture must produce a valid ExecutionPlan whose engine
+// kind resolves to a registered engine creator.
+//
+// This replaces the previous hand-maintained EngineCapability string table:
+// that table was a second source of truth next to the ArchCapability
+// registrations and could silently drift from them. The ExecutionPlan is now
+// the only place where "which engine can run this architecture" is decided.
 
-static void ensure_arch_compatibility() {
+static void ensure_plans_valid() {
     auto& cap_reg = ArchCapabilityRegistry::instance();
     auto& eng_reg = EngineRegistry::instance();
-    auto& caps = engine_capabilities();
 
     std::string errors;
 
     for (const auto& [arch, cap] : cap_reg.all()) {
-        // Check 1: if the architecture has a dedicated engine, verify that the
-        // engine's declared capability covers the architecture's requirements.
-        if (eng_reg.has(arch)) {
-            auto cap_it = caps.find(arch);
-            if (cap_it != caps.end()) {
-                auto reasons = cap_it->second.check_compatibility(cap);
-                if (!reasons.empty()) {
-                    errors += "  - Architecture '" + arch +
-                              "' has a dedicated engine but EngineCapability mismatch: " +
-                              reasons + "\n";
-                }
+        (void)cap;
+        try {
+            auto plan = build_execution_plan_from_capability(arch);
+            const char* engine_name = engine_name_for(plan.engine_kind);
+            if (!eng_reg.has(arch) && !eng_reg.has(engine_name)) {
+                errors += "  - Architecture '" + arch + "' resolves to engine '" +
+                          std::string(engine_name) + "' but that engine is not registered\n";
+                continue;
             }
-        }
-
-        // Check 2: if the architecture has NO dedicated engine, verify the
-        // fallback engine can handle it.
-        if (!eng_reg.has(arch)) {
-            // Determine fallback engine (same logic as in create())
-            std::string fallback;
-            if (cap.use_ssm)       fallback = "qwen35";
-            else if (cap.use_mla)  fallback = "deepseek_v2";
-            else if (cap.use_gqa)  fallback = "llama";
-
-            if (!fallback.empty()) {
-                auto cap_it = caps.find(fallback);
-                if (cap_it != caps.end()) {
-                    auto reasons = cap_it->second.check_compatibility(cap);
-                    if (!reasons.empty()) {
-                        errors += "  - Architecture '" + arch +
-                                  "' will fallback to engine '" + fallback +
-                                  "' but: " + reasons + "\n";
-                    }
-                } else {
-                    errors += "  - Architecture '" + arch +
-                              "' will fallback to engine '" + fallback +
-                              "' but no EngineCapability declared for that engine\n";
-                }
-            }
+            LOG_DEBUG("Execution plan: " + plan.plan_id());
+        } catch (const std::exception& e) {
+            errors += "  - Architecture '" + arch + "': " + e.what() + "\n";
         }
     }
 
     if (!errors.empty()) {
-        LOG_ERROR("COMPATIBILITY ERRORS AT STARTUP:");
+        LOG_ERROR("EXECUTION PLAN ERRORS AT STARTUP:");
         throw std::runtime_error(
             "COMPATIBILITY ERROR at startup:\n" + errors +
-            "Please register a dedicated engine or update EngineCapability for the affected architectures.");
+            "Please fix the architecture registration or register a dedicated engine.");
     }
 
-    LOG_INFO("Architecture compatibility check passed");
+    LOG_INFO("Architecture execution plan check passed");
 }
 
 EngineRegistry& EngineRegistry::instance() {
@@ -194,48 +63,30 @@ void EngineRegistry::register_engine(const std::string& arch, EngineCreator crea
 }
 
 std::unique_ptr<InferenceEngine> EngineRegistry::create(const std::string& arch, Model& model,
-                                                        InferenceContext& ctx) {
-    // Lazy one-time compatibility check before first engine creation
-    static std::once_flag compat_flag;
-    std::call_once(compat_flag, ensure_arch_compatibility);
+                                                       InferenceContext& ctx) {
+    static std::once_flag plan_flag;
+    std::call_once(plan_flag, ensure_plans_valid);
 
-    // Try exact match first
+    // An explicit registration for this architecture always wins.
     auto it = creators_.find(arch);
     if (it != creators_.end())
         return it->second(model, ctx);
 
-    // Fallback: use architecture capability to auto-select engine
-    auto& cap_registry = ArchCapabilityRegistry::instance();
-    if (cap_registry.has(arch)) {
-        auto cap = cap_registry.get(arch);
-        // SSM → Qwen35Engine
-        if (cap.use_ssm) {
-            auto ssm_it = creators_.find("qwen35");
-            if (ssm_it != creators_.end()) {
-                check_fallback_compatibility("qwen35", arch, cap);
-                return ssm_it->second(model, ctx);
-            }
-        }
-        // MLA → DeepSeekEngine
-        if (cap.use_mla) {
-            auto mla_it = creators_.find("deepseek_v2");
-            if (mla_it != creators_.end()) {
-                check_fallback_compatibility("deepseek_v2", arch, cap);
-                return mla_it->second(model, ctx);
-            }
-        }
-        // GQA (default) → GenericEngine (registered as "llama")
-        if (cap.use_gqa) {
-            auto gqa_it = creators_.find("llama");
-            if (gqa_it != creators_.end()) {
-                check_fallback_compatibility("llama", arch, cap);
-                return gqa_it->second(model, ctx);
-            }
-        }
-    }
+    // Otherwise the ExecutionPlan decides which engine can execute this model.
+    // The plan is built from the real ModelConfig, so a model whose metadata
+    // contradicts its architecture declaration fails here rather than at
+    // forward time. Selection no longer falls back on a single bool.
+    if (!ArchCapabilityRegistry::instance().has(arch))
+        return nullptr;
 
-    // No matching engine found — return nullptr (caller will raise error)
-    return nullptr;
+    auto plan = build_execution_plan(arch, model.config());
+    auto engine_it = creators_.find(engine_name_for(plan.engine_kind));
+    if (engine_it == creators_.end())
+        return nullptr;
+
+    LOG_INFO("Architecture '" + arch + "' executed by engine '" +
+             std::string(engine_name_for(plan.engine_kind)) + "', plan: " + plan.plan_id());
+    return engine_it->second(model, ctx);
 }
 
 std::vector<std::string> EngineRegistry::registered_archs() const {
@@ -255,20 +106,20 @@ EngineAutoRegister::EngineAutoRegister(const std::string& arch, EngineCreator cr
     EngineRegistry::instance().register_engine(arch, std::move(creator));
 }
 
-// Default forward_batch implementation: sequential fallback to forward()
+// Default forward_batch implementation: sequential fallback to forward_request()
 // Returns [n_seq, vocab_size] with each sequence's last-token logits on CPU.
 TensorPtr InferenceEngine::forward_batch(const InferenceBatch& batch) {
     if (batch.empty())
         return nullptr;
 
-    // Call forward() for each sequence individually
+    // Call forward_request() for each sequence individually
     std::vector<TensorPtr> all_logits;
     for (const auto& item : batch.items) {
         int seq_len = static_cast<int>(item.tokens.size());
         auto input_ids =
             std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{seq_len}, DeviceType::CPU);
         std::memcpy(input_ids->data(), item.tokens.data(), seq_len * sizeof(int32_t));
-        all_logits.push_back(forward(input_ids, item.start_pos, item.seq_id));
+        all_logits.push_back(forward_request(ForwardRequest::from_ids(input_ids, item.start_pos, item.seq_id)));
     }
 
     int n_seq = static_cast<int>(all_logits.size());

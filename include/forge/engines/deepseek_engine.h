@@ -1,9 +1,11 @@
 #pragma once
 
 #include "forge/engines/transformer_engine.h"
+#include "forge/inference/layers/deepseek_layer_executor.h"
 
 namespace forge {
 
+// DeepSeekEngine: 只做编排。MLA / GQA 的层内实现位于 DeepSeekLayerExecutor。
 class DeepSeekEngine : public TransformerEngine {
 public:
     explicit DeepSeekEngine(Model& model, InferenceContext& ctx);
@@ -11,15 +13,11 @@ public:
     std::string name() const override { return "deepseek"; }
 
 protected:
-    TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len, int64_t start_pos,
-                            DeviceType dev, int seq_id = 0) override;
+    TensorPtr forward_layer(const TensorPtr& hidden, const LayerExecutionContext& lctx) override;
     bool init_weights() override;
 
 private:
-    TensorPtr forward_layer_gqa(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                int64_t start_pos, DeviceType dev, int seq_id = 0);
-    TensorPtr forward_layer_mla(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                int64_t start_pos, DeviceType dev, int seq_id = 0);
+    DeepSeekLayerExecutor layer_executor_;
 };
 
 }  // namespace forge

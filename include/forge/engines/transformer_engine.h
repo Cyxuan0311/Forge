@@ -2,35 +2,20 @@
 
 #include "forge/context.h"
 #include "forge/engine.h"
-#include "forge/engines/layer_graph_builder.h"
+#include "forge/inference/execution_plan.h"
+#include "forge/inference/graph/graph_runtime.h"
+#include "forge/inference/layer_execution_context.h"
 #include "forge/kv_cache.h"
 #include "forge/memory_pool.h"
 #include "forge/model.h"
 
 namespace forge {
 
-struct GraphCache {
-    std::unique_ptr<ComputeGraph> graph;
-    int cached_seq_len = -1;
-    int cached_gpu_layers = -1;
-    std::string cached_arch;
-    bool valid = false;
-
-    bool can_reuse(int seq_len, int gpu_layers, const std::string& arch) const {
-        return valid && graph
-               && seq_len == cached_seq_len
-               && gpu_layers == cached_gpu_layers
-               && arch == cached_arch;
-    }
-
-    void invalidate() { valid = false; }
-};
-
 class TransformerEngine : public InferenceEngine {
 public:
     explicit TransformerEngine(Model& model, InferenceContext& ctx);
 
-    TensorPtr forward(const TensorPtr& input_ids, int64_t start_pos, int seq_id = 0) override;
+    TensorPtr forward_request(const ForwardRequest& req) override;
     TensorPtr forward_batch(const InferenceBatch& batch) override;
     TensorPtr forward_from_hidden(const TensorPtr& hidden, int64_t start_pos) override;
     void reset() override;
@@ -44,6 +29,10 @@ public:
     KVCache& kv_cache_ref() { return kv_cache_; }
     const KVCache& kv_cache_ref() const { return kv_cache_; }
 
+    // InferenceContext 通过此入口在首次 forward 之前完成 KV cache 分配,
+    // 使 CLI/bindings 可以在推理前读取 cache 统计信息。
+    void init_memory() override { init_kv_cache(model_.config()); }
+
     // Access to unified model weights
     const ModelWeights& weights() const { return weights_; }
     ModelWeights& weights() { return weights_; }
@@ -52,15 +41,30 @@ public:
     void set_use_graph(bool use_graph) { use_graph_ = use_graph; }
     bool use_graph() const { return use_graph_; }
 
+    // 本 engine 的执行计划。在构造时生成一次, 执行期只读。
+    const ExecutionPlan& plan() const { return plan_; }
+
 protected:
-    virtual TensorPtr forward_layer(const TensorPtr& hidden, int layer_idx, int seq_len,
-                                    int64_t start_pos, DeviceType dev, int seq_id = 0) = 0;
+    // 单层前向。所有运行时状态由 LayerExecutionContext 携带, 不再使用位置参数。
+    virtual TensorPtr forward_layer(const TensorPtr& hidden,
+                                    const LayerExecutionContext& lctx) = 0;
     virtual bool init_weights() = 0;
 
     virtual void init_kv_cache(const ModelConfig& cfg);
-    TensorPtr forward_layers(const TensorPtr& hidden, int seq_len, int64_t start_pos, int seq_id = 0);
-    TensorPtr forward_layers_graph(const TensorPtr& hidden, int seq_len, int64_t start_pos,
-                                   int seq_id = 0);
+
+    // KV cache 是否已分配。状态存放在 context 持有的 InferenceMemory 上,
+    // engine 不再自己维护一份, 避免两个所有者各自 init。
+    bool kv_cache_initialized() const { return memory_.initialized(); }
+    void set_kv_cache_initialized(bool v) { memory_.set_initialized(v); }
+
+    // 按层构造 LayerExecutionContext。集中处理权重查找和 per-layer device 分配,
+    // 避免每个 engine 各自实现一套。
+    LayerExecutionContext make_layer_context(int layer_idx, const ForwardRequest& req,
+                                             DeviceType dev) const;
+
+    // Request-based layer driving. The ForwardRequest carries n_tokens, start_pos
+    // and seq_id, so no layer can silently drop or reorder them.
+    TensorPtr forward_layers(const TensorPtr& hidden, const ForwardRequest& req);
 
     DeviceType layer_device(int layer_idx) const;
     const std::vector<DeviceType>& layer_devices() const { return layer_devices_; }
@@ -75,16 +79,18 @@ protected:
 
     Model& model_;
     InferenceContext& ctx_;
+    ExecutionPlan plan_;
+    // Memory 由 InferenceContext 持有, engine 只引用。
+    InferenceMemory& memory_;
+    KVCache& kv_cache_;
     ModelWeights weights_;
-    KVCache kv_cache_;
-    bool kv_cache_initialized_ = false;
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
     MemoryPool workspace_pool_;
     int gpu_layers_ = -1;
     std::vector<DeviceType> layer_devices_;  // per-layer device assignment
     bool use_graph_ = false;
-    std::unique_ptr<LayerGraphBuilder> graph_builder_;
-    GraphCache graph_cache_;
+    // graph 的构建/缓存/执行全部由 GraphRuntime 负责, builder 来自 ExecutionPlan。
+    GraphRuntime graph_runtime_;
 };
 
 }  // namespace forge
