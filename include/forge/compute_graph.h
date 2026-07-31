@@ -67,6 +67,11 @@ public:
 
     int num_nodes() const { return static_cast<int>(nodes_.size()); }
     const GraphNode& node(int idx) const { return nodes_[idx]; }
+
+    // 回填已构建节点的 op_params。用于 start_pos 这类"同一拓扑、每次调用不同"的量:
+    // 它们不能在构建时被永久固化, 否则缓存图复用会读到过期位置。
+    void patch_node_param_i64(int node_idx, int int32_offset, int64_t value);
+
     TensorPtr get_output(int node_idx) const;
 
     void set_workspace_backend(std::shared_ptr<Backend> backend);

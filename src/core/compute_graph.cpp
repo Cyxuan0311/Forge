@@ -53,6 +53,12 @@ int ComputeGraph::add_node(const std::string& name, const std::string& op_type_s
     return node_idx;
 }
 
+void ComputeGraph::patch_node_param_i64(int node_idx, int int32_offset, int64_t value) {
+    if (node_idx < 0 || node_idx >= static_cast<int>(nodes_.size()))
+        return;
+    std::memcpy(nodes_[node_idx].op_params + int32_offset, &value, sizeof(int64_t));
+}
+
 TensorPtr ComputeGraph::ensure_device(const TensorPtr& tensor, DeviceType target_dev) {
     if (!tensor || tensor->device() == target_dev)
         return tensor;
