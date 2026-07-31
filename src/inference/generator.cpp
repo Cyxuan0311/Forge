@@ -6,6 +6,7 @@
 
 #include "forge/engine.h"
 #include "forge/engines/llama_engine.h"
+#include "forge/inference/forward_request.h"
 #include "forge/inference_batch.h"
 #include "forge/kv_cache.h"
 #include "forge/logger.h"
@@ -90,7 +91,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             input_ids->to_device(DeviceType::CUDA);
         }
 
-        auto logits = engine->forward(input_ids, 0);
+        auto logits = engine->forward_request(ForwardRequest::from_ids(input_ids, 0));
 
         auto last_logits = std::make_shared<Tensor>(logits->slice(0, prompt_len - 1, prompt_len));
 
@@ -257,7 +258,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         TensorPtr logits;
         {
             PERF_SCOPE("decode/forward");
-            logits = engine->forward(input_ids, pos);
+            logits = engine->forward_request(ForwardRequest::from_ids(input_ids, pos));
         }
 
         {

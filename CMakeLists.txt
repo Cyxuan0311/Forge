@@ -222,15 +222,30 @@ target_link_libraries(forge_vision PUBLIC forge_core forge_ops forge_model
 add_library(
   forge_infer STATIC
   src/inference/perf_profiler.cpp
+  src/inference/execution_plan.cpp
   src/inference/engines/transformer_engine.cpp
   src/inference/engines/deepseek_engine.cpp
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/gemma4_engine.cpp
   src/inference/engines/generic_engine.cpp
-  src/inference/engines/layer_graph_builder.cpp
-  src/inference/engines/llama_graph_builder.cpp
-  src/inference/engines/deepseek_graph_builder.cpp
-  src/inference/engines/qwen35_graph_builder.cpp
+  src/inference/layers/norm_executor.cpp
+  src/inference/layers/rope_executor.cpp
+  src/inference/layers/attention_executor.cpp
+  src/inference/layers/ffn_executor.cpp
+  src/inference/layers/mla_executor.cpp
+  src/inference/layers/deepseek_layer_executor.cpp
+  src/inference/layers/gemma4_embedding.cpp
+  src/inference/layers/gemma4_attention.cpp
+  src/inference/layers/gemma4_moe.cpp
+  src/inference/layers/qwen35_recurrent_memory.cpp
+  src/inference/layers/qwen35_rope.cpp
+  src/inference/layers/qwen35_full_attention.cpp
+  src/inference/layers/qwen35_linear_attention.cpp
+  src/inference/graph/graph_key.cpp
+  src/inference/graph/layer_graph_builder.cpp
+  src/inference/graph/llama_graph_builder.cpp
+  src/inference/graph/deepseek_graph_builder.cpp
+  src/inference/graph/graph_runtime.cpp
   src/inference/context.cpp
   src/inference/sampler.cpp
   src/inference/generator.cpp

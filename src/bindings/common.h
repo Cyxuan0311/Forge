@@ -15,6 +15,7 @@
 #include "forge/engines/transformer_engine.h"
 #include "forge/generator.h"
 #include "forge/gguf_model.h"
+#include "forge/inference/forward_request.h"
 #include "forge/logger.h"
 #include "forge/model.h"
 #include "forge/model_loader.h"
@@ -165,7 +166,7 @@ public:
         if (!engine)
             throw std::runtime_error("No inference engine available");
 
-        auto logits = engine->forward(ids_tensor, start_pos);
+        auto logits = engine->forward_request(ForwardRequest::from_ids(ids_tensor, start_pos));
         return tensor_to_numpy(logits);
     }
 
@@ -192,7 +193,7 @@ public:
         if (!engine)
             throw std::runtime_error("No inference engine available");
 
-        auto logits = engine->forward(ids_tensor, start_pos);
+        auto logits = engine->forward_request(ForwardRequest::from_ids(ids_tensor, start_pos));
 
         SamplerConfig sampler_cfg;
         sampler_cfg.temperature = temperature;

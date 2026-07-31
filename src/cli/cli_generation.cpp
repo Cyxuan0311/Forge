@@ -10,6 +10,7 @@
 #include "forge/context.h"
 #include "forge/engine.h"
 #include "forge/generator.h"
+#include "forge/inference/forward_request.h"
 #include "forge/sampler.h"
 #include "forge/tensor.h"
 #include "forge/tokenizer.h"
@@ -60,7 +61,7 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
         input_ids->to_device(DeviceType::CUDA);
     }
 
-    auto logits = engine->forward(input_ids, 0);
+    auto logits = engine->forward_request(ForwardRequest::from_ids(input_ids, 0));
 
     auto t_prefill_end = std::chrono::high_resolution_clock::now();
     stats.prompt_eval_ms =
@@ -112,7 +113,7 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
             *static_cast<int32_t*>(next_input->data()) = last_token;
         }
 
-        logits = engine->forward(next_input, pos);
+        logits = engine->forward_request(ForwardRequest::from_ids(next_input, pos));
         token_id = sampler.sample(logits, pos);
         pos += 1;
         stats.num_generated_tokens++;

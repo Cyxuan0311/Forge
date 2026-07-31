@@ -29,6 +29,7 @@
 #include "forge/arch_registry.h"
 #include "forge/context.h"
 #include "forge/engine.h"
+#include "forge/inference/forward_request.h"
 #include "forge/kv_cache.h"
 #include "forge/logger.h"
 #include "forge/model.h"
@@ -273,7 +274,7 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
         auto t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < 3; ++i) {
             ctx.reset_kv_cache();
-            ctx.engine()->forward(input_ids, 0);
+            ctx.engine()->forward_request(ForwardRequest::from_ids(input_ids, 0));
         }
 #ifdef USE_CUDA
         if (ctx.device() == DeviceType::CUDA)
@@ -294,7 +295,7 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
         if (ctx.device() == DeviceType::CUDA) {
             input_ids->to_device(DeviceType::CUDA);
         }
-        ctx.engine()->forward(input_ids, 0);
+        ctx.engine()->forward_request(ForwardRequest::from_ids(input_ids, 0));
     }
 
     int num_decode_steps = 128;
@@ -306,7 +307,7 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
         if (ctx.device() == DeviceType::CUDA) {
             input_ids->to_device(DeviceType::CUDA);
         }
-        ctx.engine()->forward(input_ids, i + 1);
+        ctx.engine()->forward_request(ForwardRequest::from_ids(input_ids, i + 1));
     }
 #ifdef USE_CUDA
     if (ctx.device() == DeviceType::CUDA)
