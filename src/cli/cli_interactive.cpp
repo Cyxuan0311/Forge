@@ -138,6 +138,10 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
                 kv_dtype = KVCacheDType::Q4_0;
             tfm_eng->set_kv_cache_dtype(kv_dtype);
             tfm_eng->set_gpu_layers(args.n_gpu_layers);
+            if (args.cuda_graph) {
+                tfm_eng->set_use_graph(true);
+                tfm_eng->set_cuda_graph_enabled(true);
+            }
         }
 
         ctx->set_engine(std::move(engine));

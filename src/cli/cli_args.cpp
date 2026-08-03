@@ -28,6 +28,7 @@ static void print_usage(const char* prog) {
            "  -t,  --threads N           CPU threads (default: auto)\n"
            "  -b,  --batch-size N        Prompt processing batch size (default: 512)\n"
            "       --kv-cache-dtype TYPE KV cache dtype: fp32, q4_0 (default: fp32)\n"
+           "       --cuda-graph          Enable CUDA Graph for decode (default: off)\n"
            "\n"
            "Sampling:\n"
            "       --temp FLOAT          Sampling temperature (default: 0.7, 0=greedy)\n"
@@ -188,6 +189,8 @@ CliArgs parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             args.system_prompt = argv[i];
+        } else if (arg == "--cuda-graph") {
+            args.cuda_graph = true;
         } else if (arg == "--info") {
             args.info_only = true;
         } else if (arg == "--bench") {

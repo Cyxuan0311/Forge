@@ -33,6 +33,7 @@ struct CliArgs {
     int batch_size = 512;
     int n_predict = -1;
     std::string kv_cache_dtype = "fp32";
+    bool cuda_graph = false;  // Phase 10: CUDA Graph for decode
 
     // Sampling control
     float temperature = 0.7f;

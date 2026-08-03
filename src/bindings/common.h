@@ -7,6 +7,7 @@
 #include <pybind11/stl.h>
 
 #include "../core/platform.h"
+#include "../core/memory_counters.h"
 #include "forge/arch_registry.h"
 #include "forge/backend.h"
 #include "forge/compute_graph.h"
@@ -142,6 +143,22 @@ public:
             return false;
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
         return tfm_eng ? tfm_eng->use_graph() : false;
+    }
+    void set_cuda_graph_enabled(bool v) {
+        auto* engine = ctx_.engine();
+        if (!engine)
+            throw std::runtime_error("No inference engine available");
+        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
+        if (tfm_eng) {
+            tfm_eng->set_cuda_graph_enabled(v);
+        }
+    }
+    bool cuda_graph_enabled() const {
+        auto* engine = const_cast<InferenceContext&>(ctx_).engine();
+        if (!engine)
+            return false;
+        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
+        return tfm_eng ? tfm_eng->cuda_graph_enabled() : false;
     }
     DeviceType device() const { return ctx_.device(); }
 

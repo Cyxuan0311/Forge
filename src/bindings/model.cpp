@@ -152,6 +152,8 @@ void register_model(py::module_& m) {
         .def("gpu_layers", &PyInferenceContext::gpu_layers)
         .def("set_use_graph", &PyInferenceContext::set_use_graph, py::arg("use_graph"))
         .def("use_graph", &PyInferenceContext::use_graph)
+        .def("set_cuda_graph_enabled", &PyInferenceContext::set_cuda_graph_enabled, py::arg("v"))
+        .def("cuda_graph_enabled", &PyInferenceContext::cuda_graph_enabled)
         .def("memory_stats", &PyInferenceContext::memory_stats)
         .def_property("n_batch",
             [](PyInferenceContext& self) { return self.get().params().n_batch; },

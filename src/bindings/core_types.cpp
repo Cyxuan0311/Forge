@@ -17,7 +17,10 @@ void register_core_types(py::module_& m) {
         .value("Q3_K", DataType::Q3_K)
         .value("Q5_K", DataType::Q5_K)
         .value("Q6_K", DataType::Q6_K)
-        .value("IQ2_S", DataType::IQ2_S);
+        .value("IQ2_S", DataType::IQ2_S)
+        .value("IQ2_XXS", DataType::IQ2_XXS)
+        .value("IQ4_NL", DataType::IQ4_NL)
+        .value("BF16", DataType::BF16);
 
     py::enum_<DeviceType>(m, "DeviceType")
         .value("CPU", DeviceType::CPU)
@@ -90,6 +93,9 @@ void register_core_types(py::module_& m) {
         .def("device", &Tensor::device)
         .def("numel", &Tensor::numel)
         .def("nbytes", &Tensor::nbytes)
+        .def(
+            "strides",
+            [](const Tensor& t) -> std::vector<int64_t> { return t.strides(); })
         .def("zero_", &Tensor::zero_)
         .def(
             "copy_from", [](Tensor& self, const Tensor& other) { self.copy_from(other); },
@@ -101,7 +107,69 @@ void register_core_types(py::module_& m) {
                 return &t;
             },
             py::return_value_policy::reference_internal)
+        .def(
+            "view",
+            [](const Tensor& t, const std::vector<int64_t>& new_shape) {
+                return std::make_shared<Tensor>(t.view(new_shape));
+            },
+            py::arg("new_shape"))
+        .def(
+            "slice",
+            [](const Tensor& t, int64_t dim, int64_t start, int64_t end) {
+                return std::make_shared<Tensor>(t.slice(dim, start, end));
+            },
+            py::arg("dim"), py::arg("start"), py::arg("end"))
+        .def("byte_offset", &Tensor::byte_offset, "Byte offset of data() relative to storage base")
+        .def("allocation_bytes", &Tensor::allocation_bytes,
+             "Bytes needed for allocation (planner uses this)")
+        .def_static(
+            "from_buffer",
+            [](uintptr_t ptr, DataType dtype, const std::vector<int64_t>& shape, DeviceType device,
+               bool own) {
+                return std::make_shared<Tensor>(
+                    Tensor::from_buffer(reinterpret_cast<void*>(ptr), dtype, shape, device, own));
+            },
+            py::arg("ptr"), py::arg("dtype"), py::arg("shape"),
+            py::arg("device") = DeviceType::CPU, py::arg("own") = false)
         .def("numpy", [](TensorPtr& t) { return tensor_to_numpy(t); });
+
+    // ---- dtype helper functions (quant_traits.h) ----
+    m.def("dtype_size", &dtype_size, py::arg("dt"), "Element size in bytes (0 for quantized types)");
+    m.def("dtype_name", &dtype_name, py::arg("dt"), "Human-readable dtype name");
+    m.def("dtype_block_size", &dtype_block_size, py::arg("dt"),
+          "Bytes per quantization block (0 for non-quantized)");
+    m.def("dtype_block_elements", &dtype_block_elements, py::arg("dt"),
+          "Elements per quantization block (1 for non-quantized)");
+    m.def("is_quantized_type", &is_quantized_type, py::arg("dt"),
+          "Whether this DataType is a quantized format");
+    m.def("compute_quantized_bytes", &compute_quantized_bytes, py::arg("numel"), py::arg("dt"),
+          "Compute bytes needed for numel elements of quantized type");
+    m.def(
+        "get_dequant_row_fn",
+        [](DataType dt) -> uintptr_t {
+            return reinterpret_cast<uintptr_t>(get_dequant_row_fn(dt));
+        },
+        py::arg("dt"), "Get dequant_row function pointer (0 if N/A)");
+
+    // ---- Memory counters (Phase 0 baseline) ----
+    m.def("get_memory_counters", []() -> py::dict {
+        auto snap = MemoryCounters::instance().snapshot();
+        py::dict d;
+        d["cpu_malloc"] = snap.cpu_malloc;
+        d["cpu_free"] = snap.cpu_free;
+        d["cuda_malloc"] = snap.cuda_malloc;
+        d["cuda_free"] = snap.cuda_free;
+        d["h2d_copies"] = snap.h2d_copies;
+        d["d2h_copies"] = snap.d2h_copies;
+        d["d2d_copies"] = snap.d2d_copies;
+        d["h2d_bytes"] = snap.h2d_bytes;
+        d["d2h_bytes"] = snap.d2h_bytes;
+        d["d2d_bytes"] = snap.d2d_bytes;
+        return d;
+    }, "Get current memory allocation/copy counters");
+    m.def("reset_memory_counters", []() {
+        MemoryCounters::instance().reset();
+    }, "Reset all memory counters to zero");
 
     // ---- ModelConfig ----
     py::class_<ModelConfig>(m, "ModelConfig")
