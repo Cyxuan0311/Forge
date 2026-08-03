@@ -29,6 +29,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)")
   else()
     message(STATUS "AVX2 not supported - using scalar CPU kernels")
   endif()
+
+  # AVX-512 VNNI: compile-time flag (runtime detection still needed)
+  check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vnni -mavx512vl -mf16c" COMPILER_SUPPORTS_AVX512_VNNI)
+  if(COMPILER_SUPPORTS_AVX512_VNNI)
+    message(STATUS "AVX-512 VNNI supported - enabling AVX-512 GEMM kernels")
+    add_compile_definitions(USE_AVX512_VNNI)
+  else()
+    message(STATUS "AVX-512 VNNI not supported - AVX-512 GEMM kernels disabled")
+  endif()
 else()
   message(
     STATUS
@@ -52,6 +61,14 @@ if(USE_OPENBLAS)
   endif()
 else()
   message(STATUS "OpenBLAS disabled - using hand-tuned CPU kernels")
+endif()
+
+option(FORGE_PROFILING "Enable PerfProfiler instrumentation" OFF)
+if(FORGE_PROFILING)
+  message(STATUS "PerfProfiler enabled - FORGE_PROFILING=ON")
+  add_compile_definitions(FORGE_PROFILING=1)
+else()
+  message(STATUS "PerfProfiler disabled - FORGE_PROFILING=OFF (zero-cost)")
 endif()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -142,6 +159,7 @@ if(CUDAToolkit_FOUND)
   target_sources(
     forge_ops
     PRIVATE src/operators/cuda/cuda_rms_norm.cu
+            src/operators/cuda/matmul_cuda.cpp
             src/operators/cuda/cuda_activation.cu
             src/operators/cuda/cuda_elementwise.cu
             src/operators/cuda/cuda_rope.cu
@@ -156,7 +174,8 @@ if(CUDAToolkit_FOUND)
             src/operators/cuda/cuda_logit_softcap.cu
             src/operators/cuda/cuda_moe.cu
             src/operators/cuda/cuda_sampler.cu
-            src/operators/cuda/cuda_ssm.cu)
+            src/operators/cuda/cuda_ssm.cu
+            src/operators/cuda/cuda_mmq.cu)
   target_compile_definitions(forge_ops PUBLIC USE_CUDA)
 endif()
 
@@ -230,6 +249,7 @@ add_library(
   src/inference/engines/generic_engine.cpp
   src/inference/layers/norm_executor.cpp
   src/inference/layers/rope_executor.cpp
+  src/inference/layers/attention_selector.cpp
   src/inference/layers/attention_executor.cpp
   src/inference/layers/ffn_executor.cpp
   src/inference/layers/mla_executor.cpp
@@ -245,7 +265,9 @@ add_library(
   src/inference/graph/layer_graph_builder.cpp
   src/inference/graph/llama_graph_builder.cpp
   src/inference/graph/deepseek_graph_builder.cpp
+  src/inference/graph/qwen35_graph_builder.cpp
   src/inference/graph/graph_runtime.cpp
+  src/inference/graph/graph_cuda_runner.cpp
   src/inference/context.cpp
   src/inference/sampler.cpp
   src/inference/generator.cpp

@@ -90,3 +90,6 @@ plan.md
 算子.md
 python与cli.md
 chat-template.md
+gemm_microkernel_plan.md
+operator_develop.md
+文档.md

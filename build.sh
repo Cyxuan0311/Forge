@@ -120,6 +120,16 @@ esac
 echo -e "  → OpenBLAS: ${GREEN}$USE_OPENBLAS${NC}"
 echo
 
+# --- PerfProfiler ---
+echo -e "${CYAN}PerfProfiler:${NC}"
+FORGE_PROFILING=$(ask_option "Enable PerfProfiler instrumentation? (y/n)" "n")
+case $FORGE_PROFILING in
+    y|Y|yes) FORGE_PROFILING="ON" ;;
+    *) FORGE_PROFILING="OFF" ;;
+esac
+echo -e "  → PerfProfiler: ${GREEN}$FORGE_PROFILING${NC}"
+echo
+
 # --- Parallel Jobs ---
 NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 echo -e "${CYAN}Build Parallelism:${NC}"
@@ -143,6 +153,7 @@ if [ "$USE_CUDA" = "ON" ]; then
     echo -e "  CUDA Arch:      ${GREEN}$CUDA_ARCH${NC}"
 fi
 echo -e "  OpenBLAS:       ${GREEN}$USE_OPENBLAS${NC}"
+echo -e "  PerfProfiler:   ${GREEN}$FORGE_PROFILING${NC}"
 echo -e "  Parallel Jobs:  ${GREEN}$JOBS${NC}"
 echo -e "  Build Dir:      ${GREEN}$BUILD_DIR${NC}"
 echo -e "${CYAN}========================================${NC}"
@@ -176,6 +187,8 @@ fi
 if [ "$USE_OPENBLAS" = "ON" ]; then
     CMAKE_ARGS+=(-DUSE_OPENBLAS=ON)
 fi
+
+CMAKE_ARGS+=(-DFORGE_PROFILING="$FORGE_PROFILING")
 
 cmake "${CMAKE_ARGS[@]}"
 
