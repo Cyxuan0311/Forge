@@ -1,13 +1,20 @@
 #include <cmath>
 #include <cstdio>
 
+#include "cuda_attn_common.cuh"
 #include "cuda_flash_attn.h"
 
 namespace forge {
 namespace cuda {
 
 // =========================================================================
-// Prefill kernels (q_len > 1)
+// Prefill kernel (q_len > 1) — SINGLE-PASS online softmax
+//
+// Each thread iterates over its assigned KV positions, maintaining
+// local max/sum/acc incrementally. After the loop:
+//   - Warp-level reduce (max → sum → acc[d])
+//   - Cross-warp reduce via shared memory with LSE merge
+//   QK computed only ONCE, NO atomicAdd.
 // =========================================================================
 
 template <int HEAD_DIM, int BLOCK_SIZE>
@@ -16,139 +23,89 @@ __global__ void flash_attn_kernel(const float* Q, const float* K, const float* V
                                   const float* mask, bool causal) {
     int h = blockIdx.y;
     int qi = blockIdx.x;
-
-    if (h >= num_heads || qi >= q_len)
-        return;
+    if (h >= num_heads || qi >= q_len) return;
 
     int q_pos = kv_len - q_len + qi;
-
     const float* q_row = Q + qi * num_heads * HEAD_DIM + h * HEAD_DIM;
     float* o_row = O + qi * num_heads * HEAD_DIM + h * HEAD_DIM;
 
-    __shared__ float s_sum;
-    __shared__ float s_acc[HEAD_DIM];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
 
-    float thread_max = -1e30f;
+    float local_max = -1e30f;
+    float local_sum = 0.0f;
+    float local_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
 
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
+    for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
         float m = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
         if (m < -1e20f) continue;
         if (!mask && causal && j > q_pos) continue;
+
         float dot = 0.0f;
         const float* k_row = K + j * num_heads * HEAD_DIM + h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            dot += q_row[d] * k_row[d];
-        }
-        dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
-        dot += m;
-        thread_max = fmaxf(thread_max, dot);
-    }
-
-    __shared__ float s_block_max[BLOCK_SIZE];
-    s_block_max[threadIdx.x] = thread_max;
-    __syncthreads();
-
-    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            s_block_max[threadIdx.x] =
-                fmaxf(s_block_max[threadIdx.x], s_block_max[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    float max_val = s_block_max[0];
-
-    float thread_sum = 0.0f;
-    float thread_acc[HEAD_DIM];
-    for (int d = 0; d < HEAD_DIM; ++d)
-        thread_acc[d] = 0.0f;
-
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        float m = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
-        if (m < -1e20f) continue;
-        if (!mask && causal && j > q_pos) continue;
-        float dot = 0.0f;
-        const float* k_row = K + j * num_heads * HEAD_DIM + h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            dot += q_row[d] * k_row[d];
-        }
-        dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+        for (int d = 0; d < HEAD_DIM; ++d) dot += q_row[d] * k_row[d];
+        dot *= scale;
         dot += m;
 
-        float weight = expf(dot - max_val);
-        thread_sum += weight;
+        float new_max = fmaxf(local_max, dot);
+        float correction = expf(local_max - new_max);
+        float weight = expf(dot - new_max);
+        local_sum = local_sum * correction + weight;
 
         const float* v_row = V + j * num_heads * HEAD_DIM + h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            thread_acc[d] += weight * v_row[d];
-        }
-    }
-
-    if (threadIdx.x == 0) {
-        s_sum = 0.0f;
+#pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d)
-            s_acc[d] = 0.0f;
+            local_acc[d] = local_acc[d] * correction + weight * v_row[d];
+        local_max = new_max;
     }
+
+    float w_max = warp_reduce_max(local_max);
+    float rescale = expf(local_max - w_max);
+    float w_sum = warp_reduce_sum(local_sum * rescale);
+    float w_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = local_acc[d] * rescale;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = warp_reduce_sum(w_acc[d]);
+
+    __shared__ float s_warp_max[NUM_WARPS];
+    __shared__ float s_warp_sum[NUM_WARPS];
+    __shared__ float s_warp_acc[NUM_WARPS * HEAD_DIM];
+    if (lane == 0) { s_warp_max[warp_id] = w_max; s_warp_sum[warp_id] = w_sum; }
+    for (int d = lane; d < HEAD_DIM; d += 32) s_warp_acc[warp_id * HEAD_DIM + d] = w_acc[d];
     __syncthreads();
 
-    atomicAdd(&s_sum, thread_sum);
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        atomicAdd(&s_acc[d], thread_acc[d]);
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        float inv_sum = 1.0f / (s_sum + 1e-30f);
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            o_row[d] = s_acc[d] * inv_sum;
-        }
-    }
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
+        s_warp_max, s_warp_sum, s_warp_acc, o_row, 0, lane);
 }
 
 void launch_flash_attention(const float* Q, const float* K, const float* V, float* O, int q_len,
                             int kv_len, int num_heads, int head_dim,
-                            const float* mask, bool causal,
-                            cudaStream_t stream) {
+                            const float* mask, bool causal, cudaStream_t stream) {
     dim3 grid(q_len, num_heads);
     int threads = 128;
-
-#define LAUNCH_FLASH_ATTN(HD)  \
-    flash_attn_kernel<HD, 128> \
-        <<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, mask, causal)
-
+#define LAUNCH(HD) flash_attn_kernel<HD, 128><<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, mask, causal)
     switch (head_dim) {
-    case 16:
-        LAUNCH_FLASH_ATTN(16);
-        break;
-    case 32:
-        LAUNCH_FLASH_ATTN(32);
-        break;
-    case 64:
-        LAUNCH_FLASH_ATTN(64);
-        break;
-    case 72:
-        LAUNCH_FLASH_ATTN(72);
-        break;
-    case 96:
-        LAUNCH_FLASH_ATTN(96);
-        break;
-    case 128:
-        LAUNCH_FLASH_ATTN(128);
-        break;
-    case 256:
-        LAUNCH_FLASH_ATTN(256);
-        break;
-    case 512:
-        LAUNCH_FLASH_ATTN(512);
-        break;
-    default:
-        fprintf(stderr, "[ERROR] flash_attn_kernel: unsupported head_dim=%d\n", head_dim);
-        break;
+    case 16:  LAUNCH(16);  break;
+    case 32:  LAUNCH(32);  break;
+    case 64:  LAUNCH(64);  break;
+    case 72:  LAUNCH(72);  break;
+    case 96:  LAUNCH(96);  break;
+    case 128: LAUNCH(128); break;
+    case 256: LAUNCH(256); break;
+    case 512: LAUNCH(512); break;
+    default:  fprintf(stderr, "[ERROR] flash_attn: unsupported head_dim=%d\n", head_dim); break;
     }
-#undef LAUNCH_FLASH_ATTN
+#undef LAUNCH
 }
 
 // =========================================================================
-// GQA Prefill kernel
+// GQA Prefill kernel — SINGLE-PASS online softmax (same structure, GQA mapping)
 // =========================================================================
 
 template <int HEAD_DIM, int BLOCK_SIZE>
@@ -157,9 +114,7 @@ __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const floa
                                       const float* mask, bool causal) {
     int h = blockIdx.y;
     int qi = blockIdx.x;
-
-    if (h >= num_heads || qi >= q_len)
-        return;
+    if (h >= num_heads || qi >= q_len) return;
 
     int q_pos = kv_len - q_len + qi;
     int kv_groups = num_heads / num_kv_heads;
@@ -168,83 +123,59 @@ __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const floa
     const float* q_row = Q + qi * num_heads * HEAD_DIM + h * HEAD_DIM;
     float* o_row = O + qi * num_heads * HEAD_DIM + h * HEAD_DIM;
 
-    __shared__ float s_sum;
-    __shared__ float s_acc[HEAD_DIM];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
 
-    float thread_max = -1e30f;
+    float local_max = -1e30f;
+    float local_sum = 0.0f;
+    float local_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
 
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
+    for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
         float m_val = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
         if (m_val < -1e20f) continue;
         if (!mask && causal && j > q_pos) continue;
+
         float dot = 0.0f;
         const float* k_row = K + j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            dot += q_row[d] * k_row[d];
-        }
-        dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
-        dot += m_val;
-        thread_max = fmaxf(thread_max, dot);
-    }
-
-    __shared__ float s_block_max[BLOCK_SIZE];
-    s_block_max[threadIdx.x] = thread_max;
-    __syncthreads();
-
-    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            s_block_max[threadIdx.x] =
-                fmaxf(s_block_max[threadIdx.x], s_block_max[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    float max_val = s_block_max[0];
-
-    float thread_sum = 0.0f;
-    float thread_acc[HEAD_DIM];
-    for (int d = 0; d < HEAD_DIM; ++d)
-        thread_acc[d] = 0.0f;
-
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        float m_val = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
-        if (m_val < -1e20f) continue;
-        if (!mask && causal && j > q_pos) continue;
-        float dot = 0.0f;
-        const float* k_row = K + j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            dot += q_row[d] * k_row[d];
-        }
-        dot *= 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+        for (int d = 0; d < HEAD_DIM; ++d) dot += q_row[d] * k_row[d];
+        dot *= scale;
         dot += m_val;
 
-        float weight = expf(dot - max_val);
-        thread_sum += weight;
+        float new_max = fmaxf(local_max, dot);
+        float correction = expf(local_max - new_max);
+        float weight = expf(dot - new_max);
+        local_sum = local_sum * correction + weight;
 
         const float* v_row = V + j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            thread_acc[d] += weight * v_row[d];
-        }
-    }
-
-    if (threadIdx.x == 0) {
-        s_sum = 0.0f;
+#pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d)
-            s_acc[d] = 0.0f;
+            local_acc[d] = local_acc[d] * correction + weight * v_row[d];
+        local_max = new_max;
     }
+
+    float w_max = warp_reduce_max(local_max);
+    float rescale = expf(local_max - w_max);
+    float w_sum = warp_reduce_sum(local_sum * rescale);
+    float w_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = local_acc[d] * rescale;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = warp_reduce_sum(w_acc[d]);
+
+    __shared__ float s_warp_max[NUM_WARPS];
+    __shared__ float s_warp_sum[NUM_WARPS];
+    __shared__ float s_warp_acc[NUM_WARPS * HEAD_DIM];
+    if (lane == 0) { s_warp_max[warp_id] = w_max; s_warp_sum[warp_id] = w_sum; }
+    for (int d = lane; d < HEAD_DIM; d += 32) s_warp_acc[warp_id * HEAD_DIM + d] = w_acc[d];
     __syncthreads();
 
-    atomicAdd(&s_sum, thread_sum);
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        atomicAdd(&s_acc[d], thread_acc[d]);
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        float inv_sum = 1.0f / (s_sum + 1e-30f);
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            o_row[d] = s_acc[d] * inv_sum;
-        }
-    }
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
+        s_warp_max, s_warp_sum, s_warp_acc, o_row, 0, lane);
 }
 
 void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, float* O, int q_len,
@@ -252,46 +183,25 @@ void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, 
                                 const float* mask, bool causal, cudaStream_t stream) {
     dim3 grid(q_len, num_heads);
     int threads = 128;
-
-#define LAUNCH_FLASH_ATTN_GQA(HD)  \
-    flash_attn_gqa_kernel<HD, 128> \
-        <<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, mask, causal)
-
+#define LAUNCH(HD) flash_attn_gqa_kernel<HD, 128><<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, mask, causal)
     switch (head_dim) {
-    case 16:
-        LAUNCH_FLASH_ATTN_GQA(16);
-        break;
-    case 32:
-        LAUNCH_FLASH_ATTN_GQA(32);
-        break;
-    case 64:
-        LAUNCH_FLASH_ATTN_GQA(64);
-        break;
-    case 72:
-        LAUNCH_FLASH_ATTN_GQA(72);
-        break;
-    case 96:
-        LAUNCH_FLASH_ATTN_GQA(96);
-        break;
-    case 128:
-        LAUNCH_FLASH_ATTN_GQA(128);
-        break;
-    case 256:
-        LAUNCH_FLASH_ATTN_GQA(256);
-        break;
-    case 512:
-        LAUNCH_FLASH_ATTN_GQA(512);
-        break;
-    default:
-        fprintf(stderr, "[ERROR] flash_attn_gqa_kernel: unsupported head_dim=%d\n", head_dim);
-        break;
+    case 16:  LAUNCH(16);  break;
+    case 32:  LAUNCH(32);  break;
+    case 64:  LAUNCH(64);  break;
+    case 72:  LAUNCH(72);  break;
+    case 96:  LAUNCH(96);  break;
+    case 128: LAUNCH(128); break;
+    case 256: LAUNCH(256); break;
+    case 512: LAUNCH(512); break;
+    default:  fprintf(stderr, "[ERROR] flash_attn_gqa: unsupported head_dim=%d\n", head_dim); break;
     }
-#undef LAUNCH_FLASH_ATTN_GQA
+#undef LAUNCH
 }
 
 // =========================================================================
-// GQA Decode kernel (small head_dim: 64, 96, 128)
-// Uses per-thread register arrays + warp-level reduction
+// GQA Decode kernel (HEAD_DIM <= 128)
+// Per-thread register arrays + warp-level reduction
+// SINGLE-PASS online softmax with float4 vectorized QK/V access
 // =========================================================================
 
 template <int HEAD_DIM, int NUM_WARPS>
@@ -301,39 +211,30 @@ __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
                                              int kv_len, int num_heads, int num_kv_heads,
                                              const float* __restrict__ mask_row) {
     int h = blockIdx.x;
-    if (h >= num_heads)
-        return;
+    if (h >= num_heads) return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
-
     int lane = threadIdx.x & 31;
     int warp_id = threadIdx.x >> 5;
     int tid = threadIdx.x;
     int block_size = blockDim.x;
 
     __shared__ float s_q[HEAD_DIM];
-    for (int d = tid; d < HEAD_DIM; d += block_size) {
-        s_q[d] = Q[h * HEAD_DIM + d];
-    }
+    for (int d = tid; d < HEAD_DIM; d += block_size) s_q[d] = Q[h * HEAD_DIM + d];
     __syncthreads();
 
     const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
-    constexpr int VEC_SIZE = 4;
-    constexpr int VEC_COUNT = HEAD_DIM / VEC_SIZE;
+    constexpr int VEC_COUNT = HEAD_DIM / 4;
 
     float local_max = -1e30f;
     float local_sum = 0.0f;
     float local_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d)
-        local_acc[d] = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
 
     for (int j = tid; j < kv_len; j += block_size) {
-        // Check mask BEFORE computing dot product
-        if (mask_row != nullptr && mask_row[j] < -1e20f) {
-            continue;
-        }
+        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
 
         const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
         const float* v_row = V + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
@@ -341,8 +242,8 @@ __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
         float dot = 0.0f;
 #pragma unroll
         for (int vi = 0; vi < VEC_COUNT; ++vi) {
-            float4 kv = *reinterpret_cast<const float4*>(k_row + vi * VEC_SIZE);
-            float4 qv = *reinterpret_cast<const float4*>(s_q + vi * VEC_SIZE);
+            float4 kv = *reinterpret_cast<const float4*>(k_row + vi * 4);
+            float4 qv = *reinterpret_cast<const float4*>(s_q + vi * 4);
             dot += kv.x * qv.x + kv.y * qv.y + kv.z * qv.z + kv.w * qv.w;
         }
         dot *= scale;
@@ -351,114 +252,48 @@ __global__ void flash_attn_gqa_decode_kernel(const float* __restrict__ Q,
         float new_max = fmaxf(local_max, dot);
         float correction = expf(local_max - new_max);
         float weight = expf(dot - new_max);
-
         local_sum = local_sum * correction + weight;
 
 #pragma unroll
         for (int vi = 0; vi < VEC_COUNT; ++vi) {
-            float4 vf = *reinterpret_cast<const float4*>(v_row + vi * VEC_SIZE);
-            local_acc[vi * VEC_SIZE + 0] =
-                local_acc[vi * VEC_SIZE + 0] * correction + weight * vf.x;
-            local_acc[vi * VEC_SIZE + 1] =
-                local_acc[vi * VEC_SIZE + 1] * correction + weight * vf.y;
-            local_acc[vi * VEC_SIZE + 2] =
-                local_acc[vi * VEC_SIZE + 2] * correction + weight * vf.z;
-            local_acc[vi * VEC_SIZE + 3] =
-                local_acc[vi * VEC_SIZE + 3] * correction + weight * vf.w;
+            float4 vf = *reinterpret_cast<const float4*>(v_row + vi * 4);
+            local_acc[vi * 4 + 0] = local_acc[vi * 4 + 0] * correction + weight * vf.x;
+            local_acc[vi * 4 + 1] = local_acc[vi * 4 + 1] * correction + weight * vf.y;
+            local_acc[vi * 4 + 2] = local_acc[vi * 4 + 2] * correction + weight * vf.z;
+            local_acc[vi * 4 + 3] = local_acc[vi * 4 + 3] * correction + weight * vf.w;
         }
         local_max = new_max;
     }
 
-    float warp_max = local_max;
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        warp_max = fmaxf(warp_max, __shfl_down_sync(0xFFFFFFFF, warp_max, offset));
-    }
-    warp_max = __shfl_sync(0xFFFFFFFF, warp_max, 0);
-
-    float rescale = expf(local_max - warp_max);
-    float warp_sum = local_sum * rescale;
-    float warp_acc[HEAD_DIM];
+    float w_max = warp_reduce_max(local_max);
+    float rescale = expf(local_max - w_max);
+    float w_sum = warp_reduce_sum(local_sum * rescale);
+    float w_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        warp_acc[d] = local_acc[d] * rescale;
-    }
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        warp_sum += __shfl_down_sync(0xFFFFFFFF, warp_sum, offset);
-    }
-    warp_sum = __shfl_sync(0xFFFFFFFF, warp_sum, 0);
-
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = local_acc[d] * rescale;
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        float val = warp_acc[d];
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-        }
-        warp_acc[d] = __shfl_sync(0xFFFFFFFF, val, 0);
-    }
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = warp_reduce_sum(w_acc[d]);
 
     __shared__ float s_warp_max[NUM_WARPS];
     __shared__ float s_warp_sum[NUM_WARPS];
     __shared__ float s_warp_acc[NUM_WARPS * HEAD_DIM];
-
-    if (lane == 0) {
-        s_warp_max[warp_id] = warp_max;
-        s_warp_sum[warp_id] = warp_sum;
-    }
-    for (int d = lane; d < HEAD_DIM; d += 32) {
-        s_warp_acc[warp_id * HEAD_DIM + d] = warp_acc[d];
-    }
+    if (lane == 0) { s_warp_max[warp_id] = w_max; s_warp_sum[warp_id] = w_sum; }
+    for (int d = lane; d < HEAD_DIM; d += 32) s_warp_acc[warp_id * HEAD_DIM + d] = w_acc[d];
     __syncthreads();
 
-    if (warp_id == 0) {
-        float global_max = -1e30f;
-        for (int w = 0; w < NUM_WARPS; ++w) {
-            global_max = fmaxf(global_max, s_warp_max[w]);
-        }
-
-        float global_sum = 0.0f;
-        float global_acc[HEAD_DIM];
-#pragma unroll
-        for (int d = 0; d < HEAD_DIM; ++d)
-            global_acc[d] = 0.0f;
-
-        for (int w = 0; w < NUM_WARPS; ++w) {
-            float corr = expf(s_warp_max[w] - global_max);
-            global_sum += s_warp_sum[w] * corr;
-#pragma unroll
-            for (int d = 0; d < HEAD_DIM; ++d) {
-                global_acc[d] += s_warp_acc[w * HEAD_DIM + d] * corr;
-            }
-        }
-
-        float inv_sum = 1.0f / (global_sum + 1e-30f);
-        for (int d = lane; d < HEAD_DIM; d += 32) {
-            O[h * HEAD_DIM + d] = global_acc[d] * inv_sum;
-        }
-    }
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
+        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
-// GQA Decode kernel for LARGE head_dim (256, 512)
-// Uses two-pass tiled approach with shared memory accumulators
-// to avoid per-thread register array overflow.
+// GQA Decode kernel for LARGE head_dim (256, 512) — SINGLE-PASS online softmax
 //
-// Design:
-//   - Each block handles one head
-//   - Q is loaded into shared memory s_q[HEAD_DIM]
-//   - Pass 1: each thread iterates over assigned KV rows, computes local max
-//     (online softmax per thread)
-//   - Cross-thread max reduction via shared memory
-//   - Pass 2: each thread recomputes Q·K for its KV rows using global max,
-//     accumulates weighted V into s_acc[HEAD_DIM] via atomicAdd
-//   - Final: thread 0 normalizes s_acc and writes output
-//
-// Shared memory usage: s_q[HEAD_DIM] + s_acc[HEAD_DIM] + s_max[BLOCK_SIZE]
-//   For HEAD_DIM=512: 512*4*3 + 512*4 = ~10 KB (well within 48KB limit)
+// Use 4 warps (128 threads) so each thread can keep local_acc[HEAD_DIM]
+// in registers. NO QK recomputation, NO atomicAdd.
 // =========================================================================
 
-template <int HEAD_DIM, int BLOCK_SIZE>
-__global__ void flash_attn_gqa_decode_large_kernel(
+template <int HEAD_DIM, int NUM_WARPS>
+__global__ void flash_attn_gqa_decode_large_online_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K,
     const float* __restrict__ V,
@@ -467,99 +302,68 @@ __global__ void flash_attn_gqa_decode_large_kernel(
     const float* __restrict__ mask_row) {
 
     int h = blockIdx.x;
-    if (h >= num_heads)
-        return;
+    if (h >= num_heads) return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
+    int lane = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
     int tid = threadIdx.x;
+    int block_size = blockDim.x;
 
-    // Shared memory: Q vector, accumulator, and per-thread max values
     __shared__ float s_q[HEAD_DIM];
-    __shared__ float s_acc[HEAD_DIM];
-    __shared__ float s_max[BLOCK_SIZE];
-    __shared__ float s_sum;
-
-    // Load Q into shared memory
-    for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) {
-        s_q[d] = Q[h * HEAD_DIM + d];
-    }
+    for (int d = tid; d < HEAD_DIM; d += block_size) s_q[d] = Q[h * HEAD_DIM + d];
     __syncthreads();
 
     const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
 
-    // ---- Pass 1: compute per-thread local max with online softmax ----
     float local_max = -1e30f;
-
-    for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
-        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
-
-        const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
-
-        float dot = 0.0f;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            dot += s_q[d] * k_row[d];
-        }
-        dot *= scale;
-        if (mask_row != nullptr) dot += mask_row[j];
-        local_max = fmaxf(local_max, dot);
-    }
-
-    // Reduce max across all threads
-    s_max[tid] = local_max;
-    __syncthreads();
-
-    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
-        }
-        __syncthreads();
-    }
-    float global_max = s_max[0];
-
-    // ---- Pass 2: compute weighted sum using global max ----
-    // Initialize shared accumulator
-    for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) {
-        s_acc[d] = 0.0f;
-    }
-    if (tid == 0) {
-        s_sum = 0.0f;
-    }
-    __syncthreads();
-
     float local_sum = 0.0f;
+    float local_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
 
-    for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
+    for (int j = tid; j < kv_len; j += block_size) {
         if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
 
         const float* k_row = K + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
         const float* v_row = V + (size_t)j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
 
         float dot = 0.0f;
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            dot += s_q[d] * k_row[d];
-        }
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d) dot += s_q[d] * k_row[d];
         dot *= scale;
         if (mask_row != nullptr) dot += mask_row[j];
 
-        float weight = expf(dot - global_max);
-        local_sum += weight;
+        float new_max = fmaxf(local_max, dot);
+        float correction = expf(local_max - new_max);
+        float weight = expf(dot - new_max);
+        local_sum = local_sum * correction + weight;
 
-        // Accumulate weighted V into shared memory
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            atomicAdd(&s_acc[d], weight * v_row[d]);
-        }
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d)
+            local_acc[d] = local_acc[d] * correction + weight * v_row[d];
+        local_max = new_max;
     }
 
-    // Reduce sum across threads
-    atomicAdd(&s_sum, local_sum);
+    float w_max = warp_reduce_max(local_max);
+    float rescale = expf(local_max - w_max);
+    float w_sum = warp_reduce_sum(local_sum * rescale);
+    float w_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = local_acc[d] * rescale;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = warp_reduce_sum(w_acc[d]);
+
+    __shared__ float s_warp_max[NUM_WARPS];
+    __shared__ float s_warp_sum[NUM_WARPS];
+    __shared__ float s_warp_acc[NUM_WARPS * HEAD_DIM];
+    if (lane == 0) { s_warp_max[warp_id] = w_max; s_warp_sum[warp_id] = w_sum; }
+    for (int d = lane; d < HEAD_DIM; d += 32) s_warp_acc[warp_id * HEAD_DIM + d] = w_acc[d];
     __syncthreads();
 
-    // Normalize and write output
-    float inv_sum = 1.0f / (s_sum + 1e-30f);
-    for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) {
-        O[h * HEAD_DIM + d] = s_acc[d] * inv_sum;
-    }
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
+        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
@@ -568,40 +372,29 @@ __global__ void flash_attn_gqa_decode_large_kernel(
 
 void launch_flash_attention_gqa_decode(const float* Q, const float* K, const float* V, float* O,
                                        int kv_len, int num_heads, int num_kv_heads, int head_dim,
-                                       const float* mask_row,
-                                       cudaStream_t stream) {
+                                       const float* mask_row, cudaStream_t stream) {
     int blocks = num_heads;
 
-#define LAUNCH_DECODE(HD, NW)            \
-    flash_attn_gqa_decode_kernel<HD, NW> \
+#define LAUNCH_SMALL(HD, NW)              \
+    flash_attn_gqa_decode_kernel<HD, NW>  \
         <<<blocks, 128, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads, mask_row)
 
-#define LAUNCH_DECODE_LARGE(HD)                    \
-    flash_attn_gqa_decode_large_kernel<HD, 256>    \
-        <<<blocks, 256, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads, mask_row)
+#define LAUNCH_LARGE(HD, NW)                           \
+    flash_attn_gqa_decode_large_online_kernel<HD, NW>  \
+        <<<blocks, (NW)*32, 0, stream>>>(Q, K, V, O, kv_len, num_heads, num_kv_heads, mask_row)
 
     switch (head_dim) {
-    case 64:
-        LAUNCH_DECODE(64, 4);
-        break;
-    case 96:
-        LAUNCH_DECODE(96, 4);
-        break;
-    case 128:
-        LAUNCH_DECODE(128, 4);
-        break;
-    case 256:
-        LAUNCH_DECODE_LARGE(256);
-        break;
-    case 512:
-        LAUNCH_DECODE_LARGE(512);
-        break;
-    default:
-        fprintf(stderr, "[ERROR] flash_attn_gqa_decode: unsupported head_dim=%d\n", head_dim);
-        break;
+    case 16:  LAUNCH_SMALL(16, 4);   break;
+    case 32:  LAUNCH_SMALL(32, 4);   break;
+    case 64:  LAUNCH_SMALL(64, 4);   break;
+    case 96:  LAUNCH_SMALL(96, 4);   break;
+    case 128: LAUNCH_SMALL(128, 4);  break;
+    case 256: LAUNCH_LARGE(256, 4);  break;
+    case 512: LAUNCH_LARGE(512, 4);  break;
+    default:  fprintf(stderr, "[ERROR] flash_attn_gqa_decode: unsupported head_dim=%d\n", head_dim); break;
     }
-#undef LAUNCH_DECODE
-#undef LAUNCH_DECODE_LARGE
+#undef LAUNCH_SMALL
+#undef LAUNCH_LARGE
 }
 
 }  // namespace cuda
