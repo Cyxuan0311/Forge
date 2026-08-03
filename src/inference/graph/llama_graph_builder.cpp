@@ -141,11 +141,48 @@ int LlamaGraphBuilder::build_layer(const GraphBuildContext& bctx) {
                        {ref(q_rope_idx), ref(k_cache_idx), ref(v_cache_idx)}, fa_params, dev);
 
     int wo_idx = graph.add_input(lw.wo());
-    int proj_idx =
-        graph.add_node("out_proj", OpType::MUL_MAT_TRANSB, {ref(attn_idx), wo_idx}, nullptr, dev);
 
-    int after_attn_idx =
-        graph.add_node("residual_add", OpType::ADD, {hidden_idx, ref(proj_idx)}, nullptr, dev);
+    // Fused attn output projection + residual for CPU decode
+    bool use_attn_proj_fused =
+        (dev == DeviceType::CPU && seq_len == 1 &&
+         (lw.wo()->dtype() == DataType::Q4_0 || lw.wo()->dtype() == DataType::Q4_K ||
+          lw.wo()->dtype() == DataType::Q5_K || lw.wo()->dtype() == DataType::Q6_K ||
+          lw.wo()->dtype() == DataType::Q2_K || lw.wo()->dtype() == DataType::Q3_K));
+
+    int after_attn_idx;
+    if (use_attn_proj_fused) {
+        after_attn_idx = graph.add_node(
+            "attn_proj_fused", "attn_proj_fused", {ref(attn_idx), hidden_idx},
+            [&lw](const std::vector<TensorPtr>& inputs) -> TensorPtr {
+                auto wo_dtype = lw.wo()->dtype();
+                if (wo_dtype == DataType::Q4_0) {
+                    return ops::matmul_transB_fused_attn_proj_residual_q4_0(inputs[0], lw.wo(),
+                                                                             inputs[1]);
+                } else if (wo_dtype == DataType::Q4_K) {
+                    return ops::matmul_transB_fused_attn_proj_residual_q4_k(inputs[0], lw.wo(),
+                                                                             inputs[1]);
+                } else if (wo_dtype == DataType::Q5_K) {
+                    return ops::matmul_transB_fused_attn_proj_residual_q5_k(inputs[0], lw.wo(),
+                                                                             inputs[1]);
+                } else if (wo_dtype == DataType::Q6_K) {
+                    return ops::matmul_transB_fused_attn_proj_residual_q6_k(inputs[0], lw.wo(),
+                                                                             inputs[1]);
+                } else if (wo_dtype == DataType::Q2_K) {
+                    return ops::matmul_transB_fused_attn_proj_residual_q2_k(inputs[0], lw.wo(),
+                                                                             inputs[1]);
+                } else if (wo_dtype == DataType::Q3_K) {
+                    return ops::matmul_transB_fused_attn_proj_residual_q3_k(inputs[0], lw.wo(),
+                                                                             inputs[1]);
+                }
+                return ops::add(inputs[1], ops::matmul_transB(inputs[0], lw.wo()));
+            },
+            dev);
+    } else {
+        int proj_idx = graph.add_node("out_proj", OpType::MUL_MAT_TRANSB,
+                                      {ref(attn_idx), wo_idx}, nullptr, dev);
+        after_attn_idx =
+            graph.add_node("residual_add", OpType::ADD, {hidden_idx, ref(proj_idx)}, nullptr, dev);
+    }
 
     // === FFN ===
 
@@ -184,7 +221,12 @@ int LlamaGraphBuilder::build_layer(const GraphBuildContext& bctx) {
     bool use_ffn_down_fused =
         (dev == DeviceType::CUDA &&
          (lw.w2()->dtype() == DataType::Q4_0 || lw.w2()->dtype() == DataType::Q4_K ||
-          lw.w2()->dtype() == DataType::Q5_K || lw.w2()->dtype() == DataType::Q6_K));
+          lw.w2()->dtype() == DataType::Q5_K || lw.w2()->dtype() == DataType::Q6_K)) ||
+        (dev == DeviceType::CPU && seq_len == 1 &&
+         (lw.w2()->dtype() == DataType::Q4_0 || lw.w2()->dtype() == DataType::Q4_1 ||
+          lw.w2()->dtype() == DataType::Q4_K || lw.w2()->dtype() == DataType::Q5_K ||
+          lw.w2()->dtype() == DataType::Q6_K || lw.w2()->dtype() == DataType::Q2_K ||
+          lw.w2()->dtype() == DataType::Q3_K));
     if (!use_ffn_down_fused) {
         int w2_idx = graph.add_input(lw.w2());
         int down_idx = graph.add_node("down_proj", OpType::MUL_MAT_TRANSB,
@@ -193,34 +235,60 @@ int LlamaGraphBuilder::build_layer(const GraphBuildContext& bctx) {
                               {ref(after_attn_idx), ref(down_idx)}, nullptr, dev);
     }
 
+    if (dev == DeviceType::CUDA) {
+        return graph.add_node(
+            "ffn_down_fused", "ffn_down_fused", {ref(ffn_mid_idx), ref(after_attn_idx)},
+            [&lw](const std::vector<TensorPtr>& inputs) -> TensorPtr {
+                int K_down = static_cast<int>(lw.w2()->shape()[1]);
+                int N_down = static_cast<int>(lw.w2()->shape()[0]);
+                auto ffn_out = std::make_shared<Tensor>(DataType::FP32,
+                                                        std::vector<int64_t>{1, N_down},
+                                                        DeviceType::CUDA);
+#ifdef USE_CUDA
+                auto w2_dtype = lw.w2()->dtype();
+                const float* mid = static_cast<const float*>(inputs[0]->data());
+                const float* residual = static_cast<const float*>(inputs[1]->data());
+                float* out = static_cast<float*>(ffn_out->data());
+                if (w2_dtype == DataType::Q4_0) {
+                    cuda::launch_ffn_down_fused_q4_0_q8_1(mid, lw.w2()->data(), residual, out, K_down,
+                                                          N_down);
+                } else if (w2_dtype == DataType::Q4_K) {
+                    cuda::launch_ffn_down_fused_q4_k_q8_1(mid, lw.w2()->data(), residual, out, K_down,
+                                                          N_down);
+                } else if (w2_dtype == DataType::Q5_K) {
+                    cuda::launch_ffn_down_fused_q5_k(mid, lw.w2()->data(), residual, out, K_down,
+                                                     N_down);
+                } else if (w2_dtype == DataType::Q6_K) {
+                    cuda::launch_ffn_down_fused_q6_k(mid, lw.w2()->data(), residual, out, K_down,
+                                                     N_down);
+                }
+#endif
+                return ffn_out;
+            },
+            dev);
+    }
+
+    // CPU fused FFN down + residual
     return graph.add_node(
         "ffn_down_fused", "ffn_down_fused", {ref(ffn_mid_idx), ref(after_attn_idx)},
         [&lw](const std::vector<TensorPtr>& inputs) -> TensorPtr {
-            int K_down = static_cast<int>(lw.w2()->shape()[1]);
-            int N_down = static_cast<int>(lw.w2()->shape()[0]);
-            auto ffn_out = std::make_shared<Tensor>(DataType::FP32,
-                                                    std::vector<int64_t>{1, N_down},
-                                                    DeviceType::CUDA);
-#ifdef USE_CUDA
             auto w2_dtype = lw.w2()->dtype();
-            const float* mid = static_cast<const float*>(inputs[0]->data());
-            const float* residual = static_cast<const float*>(inputs[1]->data());
-            float* out = static_cast<float*>(ffn_out->data());
             if (w2_dtype == DataType::Q4_0) {
-                cuda::launch_ffn_down_fused_q4_0_q8_1(mid, lw.w2()->data(), residual, out, K_down,
-                                                      N_down);
+                return ops::matmul_transB_fused_ffn_down_residual_q4_0(inputs[0], lw.w2(), inputs[1]);
+            } else if (w2_dtype == DataType::Q4_1) {
+                return ops::matmul_transB_fused_ffn_down_residual_q4_1(inputs[0], lw.w2(), inputs[1]);
             } else if (w2_dtype == DataType::Q4_K) {
-                cuda::launch_ffn_down_fused_q4_k_q8_1(mid, lw.w2()->data(), residual, out, K_down,
-                                                      N_down);
+                return ops::matmul_transB_fused_ffn_down_residual_q4_k(inputs[0], lw.w2(), inputs[1]);
             } else if (w2_dtype == DataType::Q5_K) {
-                cuda::launch_ffn_down_fused_q5_k(mid, lw.w2()->data(), residual, out, K_down,
-                                                 N_down);
+                return ops::matmul_transB_fused_ffn_down_residual_q5_k(inputs[0], lw.w2(), inputs[1]);
             } else if (w2_dtype == DataType::Q6_K) {
-                cuda::launch_ffn_down_fused_q6_k(mid, lw.w2()->data(), residual, out, K_down,
-                                                 N_down);
+                return ops::matmul_transB_fused_ffn_down_residual_q6_k(inputs[0], lw.w2(), inputs[1]);
+            } else if (w2_dtype == DataType::Q2_K) {
+                return ops::matmul_transB_fused_ffn_down_residual_q2_k(inputs[0], lw.w2(), inputs[1]);
+            } else if (w2_dtype == DataType::Q3_K) {
+                return ops::matmul_transB_fused_ffn_down_residual_q3_k(inputs[0], lw.w2(), inputs[1]);
             }
-#endif
-            return ffn_out;
+            return ops::add(inputs[1], ops::matmul_transB(inputs[0], lw.w2()));
         },
         dev);
 }

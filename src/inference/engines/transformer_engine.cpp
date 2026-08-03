@@ -227,8 +227,8 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
 
                 // Forward through this layer for this sequence
                 {
-                    std::string perf_name = "forward_batch/layer_" + std::to_string(layer);
-                    PERF_SCOPE(perf_name.c_str());
+                    PERF_SCOPE_FMT("forward_batch/layer_%d", layer);
+                    SET_PERF_CONTEXT(item.seq_id, "layer", layer, layer_dev == DeviceType::CUDA ? "cuda" : "cpu", seq_len);
                     auto seq_req = ForwardRequest::from_hidden(seq_len, item.start_pos, item.seq_id);
                     seq_hidden =
                         forward_layer(seq_hidden, make_layer_context(layer, seq_req, layer_dev));
@@ -483,8 +483,8 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
         DeviceType layer_dev = layer_device(layer);
         cur_hidden = transfer_hidden(cur_hidden, layer_dev);
         {
-            std::string perf_name = "forward/layer_" + std::to_string(layer);
-            PERF_SCOPE(perf_name.c_str());
+            PERF_SCOPE_FMT("forward/layer_%d", layer);
+            SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev == DeviceType::CUDA ? "cuda" : "cpu", req.n_tokens);
             cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
         }
         if (!cur_hidden) {
@@ -571,8 +571,10 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
 
     auto t1 = std::chrono::steady_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+#if defined(FORGE_PROFILING) && FORGE_PROFILING == 1
     LOG_INFO("Forward total: " + std::to_string((int)total_ms) + "ms (seq_len=" +
              std::to_string(seq_len) + ", start_pos=" + std::to_string(start_pos) + ")");
+#endif
 
     return logits;
 }

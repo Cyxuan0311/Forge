@@ -20,6 +20,8 @@
 
 namespace forge {
 
+class Qwen35RecurrentMemory;
+
 struct GraphBuildContext {
     ComputeGraph& graph;
     const ModelConfig& config;
@@ -37,6 +39,10 @@ struct GraphBuildContext {
     int layer_idx = 0;
     int seq_len = 0;
     DeviceType device = DeviceType::CPU;
+
+    // Qwen3.5 循环状态 (Gated Delta Net 的 conv_state / ssm_state)。
+    // 非 Qwen3.5 架构时为 nullptr, builder 无需关心。
+    Qwen35RecurrentMemory* recurrent_memory = nullptr;
 
     void record_start_pos_slot(int node_idx, int int32_offset) const {
         if (start_pos_slots) {

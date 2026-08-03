@@ -16,6 +16,7 @@ Qwen35Engine::Qwen35Engine(Model& model, InferenceContext& ctx)
         throw std::runtime_error("Qwen35Engine: failed to initialize weights");
     }
     recurrent_memory_.init(model_.config(), weights_);
+    graph_runtime_.set_recurrent_memory(&recurrent_memory_);
 }
 
 bool Qwen35Engine::init_weights() {

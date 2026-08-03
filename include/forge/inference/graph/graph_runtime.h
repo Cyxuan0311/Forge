@@ -19,7 +19,13 @@
 #include "forge/kv_cache.h"
 #include "forge/model.h"
 
+#ifdef USE_CUDA
+#    include "forge/cuda_graph_runner.h"
+#endif
+
 namespace forge {
+
+class Qwen35RecurrentMemory;
 
 class GraphRuntime {
 public:
@@ -32,10 +38,16 @@ public:
     bool has_builder() const { return builder_ != nullptr; }
     const LayerGraphBuilder* builder() const { return builder_.get(); }
 
+    // Qwen3.5 循环状态 (Gated Delta Net)。非 Qwen3.5 架构时为 nullptr。
+    void set_recurrent_memory(Qwen35RecurrentMemory* mem) { recurrent_memory_ = mem; }
+
     void invalidate() {
         graph_.reset();
         cached_key_ = GraphKey{};
         start_pos_slots_.clear();
+#ifdef USE_CUDA
+        if (cuda_graph_runner_) cuda_graph_runner_->invalidate();
+#endif
     }
 
     // 执行一次前向。图不可复用时先重建。返回 logits。
@@ -44,6 +56,10 @@ public:
                   const std::vector<DeviceType>& layer_devices, DeviceType default_device);
 
     int num_nodes() const { return graph_ ? graph_->num_nodes() : 0; }
+
+    // CUDA Graph control (Phase 10). Default off; enable for decode path.
+    void set_cuda_graph_enabled(bool v);
+    bool cuda_graph_enabled() const;
 
 private:
     void build(const TensorPtr& hidden, const ModelConfig& cfg, ModelWeights& weights,
@@ -59,6 +75,12 @@ private:
     GraphKey cached_key_;
     GraphRuntimeStatePtr runtime_state_;
     std::vector<StartPosSlot> start_pos_slots_;
+    Qwen35RecurrentMemory* recurrent_memory_ = nullptr;
+
+    // Phase 10: CUDA Graph runner (lazy-created when enabled)
+#ifdef USE_CUDA
+    std::unique_ptr<CudaGraphRunner> cuda_graph_runner_;
+#endif
 };
 
 }  // namespace forge

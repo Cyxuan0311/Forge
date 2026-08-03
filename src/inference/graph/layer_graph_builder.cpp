@@ -2,6 +2,7 @@
 
 #include "forge/inference/graph/deepseek_graph_builder.h"
 #include "forge/inference/graph/llama_graph_builder.h"
+#include "forge/inference/graph/qwen35_graph_builder.h"
 
 namespace forge {
 
@@ -19,9 +20,11 @@ std::shared_ptr<LayerGraphBuilder> create_graph_builder(const std::string& arch)
         return std::make_shared<DeepSeekGraphBuilder>();
     }
 
-    // Qwen3.5 的循环状态尚未建模为 graph 节点, 因此不支持 graph 执行。
-    // ExecutionPlan 会据此把 supports_graph 置为 false, 走 imperative 路径,
-    // 而不是注册一个返回 -1 的 placeholder builder 再在执行期回退。
+    // Qwen3.5 (SSM hybrid: FullAttention + LinearAttention with Gated Delta Net)。
+    if (arch == "qwen35") {
+        return std::make_shared<Qwen35GraphBuilder>();
+    }
+
     return nullptr;
 }
 

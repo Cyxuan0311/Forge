@@ -196,3 +196,47 @@ class TestGraphModeTinyLlama:
             prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
         )
         assert result["num_generated_tokens"] >= 1
+
+
+# ---- Phase 10: CUDA Graph tests ----
+
+CUDA_AVAILABLE = False
+try:
+    import ctypes
+    cuda_rt = ctypes.CDLL("libcudart.so")
+    device_count = ctypes.c_int(0)
+    result = cuda_rt.cudaGetDeviceCount(ctypes.byref(device_count))
+    if result == 0 and device_count.value > 0:
+        CUDA_AVAILABLE = True
+except Exception:
+    CUDA_AVAILABLE = False
+
+skip_no_cuda = pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA device not available")
+
+
+@skip_no_cuda
+class TestCudaGraph:
+    """Test CUDA Graph capture and replay (Phase 10)."""
+
+    def test_cuda_graph_api(self, model_path, model_config):
+        """Test set_cuda_graph_enabled / cuda_graph_enabled API."""
+        cfg = {k: v for k, v in model_config.items() if k != "device"}
+        model = forge.Model()
+        model.load(model_path, device="cuda", **cfg)
+        ctx = model.create_context(gpu_layers=-1)
+        # Default off
+        assert ctx.cuda_graph_enabled() is False
+        # Can enable
+        ctx.set_cuda_graph_enabled(True)
+        assert ctx.cuda_graph_enabled() is True
+        # Can disable
+        ctx.set_cuda_graph_enabled(False)
+        assert ctx.cuda_graph_enabled() is False
+
+    def test_cuda_graph_disabled_by_default(self, model_path, model_config):
+        """CUDA Graph should be disabled by default."""
+        cfg = {k: v for k, v in model_config.items() if k != "device"}
+        model = forge.Model()
+        model.load(model_path, device="cuda", **cfg)
+        ctx = model.create_context(gpu_layers=-1)
+        assert ctx.cuda_graph_enabled() is False

@@ -41,6 +41,11 @@ public:
     void set_use_graph(bool use_graph) { use_graph_ = use_graph; }
     bool use_graph() const { return use_graph_; }
 
+    // CUDA Graph for decode (Phase 10). Default off.
+    // Requires graph mode (use_graph_=true) and CUDA device.
+    void set_cuda_graph_enabled(bool v) { graph_runtime_.set_cuda_graph_enabled(v); }
+    bool cuda_graph_enabled() const { return graph_runtime_.cuda_graph_enabled(); }
+
     // 本 engine 的执行计划。在构造时生成一次, 执行期只读。
     const ExecutionPlan& plan() const { return plan_; }
 

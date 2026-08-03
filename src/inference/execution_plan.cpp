@@ -165,11 +165,8 @@ ExecutionPlan build_execution_plan(const std::string& arch, const ModelConfig& c
 
     // ---- graph 支持 ----
     // 直接持有 builder 实例, 执行期不再按架构名重新查表。
-    // Qwen3.5 的 state graph 未完成, create_graph_builder 返回 nullptr。
     register_builtin_op_kernels();
-    if (plan.engine_kind != EngineKind::Qwen35Hybrid) {
-        plan.graph_builder = create_graph_builder(arch);
-    }
+    plan.graph_builder = create_graph_builder(arch);
     plan.supports_graph = plan.graph_builder != nullptr;
 
     // ---- 一致性校验: 计划矛盾必须在创建阶段暴露 ----
