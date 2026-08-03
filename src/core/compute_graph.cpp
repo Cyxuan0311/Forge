@@ -83,18 +83,20 @@ bool ComputeGraph::allocate_graph() {
     if (graph_allocated_)
         return true;
 
+    auto* backend = workspace_backend();
+    if (!backend) {
+        backend = BackendManager::instance().get_backend(DeviceType::CPU).get();
+    }
+
     planner_ = std::make_unique<MemoryPlanner>();
+    // Phase 2: pass backend to planner for backend-specific allocation size
+    planner_->set_backend(backend);
     planner_->plan(*this, release_intermediates_);
 
     size_t total_size = planner_->total_buffer_size();
     if (total_size == 0) {
         graph_allocated_ = true;
         return true;
-    }
-
-    auto* backend = workspace_backend();
-    if (!backend) {
-        backend = BackendManager::instance().get_backend(DeviceType::CPU).get();
     }
 
     graph_buffer_ = std::make_unique<GraphBuffer>(
@@ -177,37 +179,60 @@ TensorPtr ComputeGraph::execute() {
         if (node.compute_fn) {
             node.output = node.compute_fn(node.resolved_inputs);
         } else if (node.op_type != OpType::NONE) {
-            node.output = OpDispatch::instance().execute(node.op_type, node.device,
-                                                         node.resolved_inputs, node.op_params);
-        }
+            // Phase 3: prefer dst injection when a dst kernel is registered
+            bool has_dst = OpDispatch::instance().has_dst_kernel(node.op_type, node.device);
+            const PlannedAllocation* alloc =
+                (has_dst && graph_buffer_ && graph_buffer_->valid() && planner_)
+                    ? planner_->get_allocation(i)
+                    : nullptr;
 
-        // Copy to pre-allocated buffer and free temp memory
-        if (node.output && graph_buffer_ && graph_buffer_->valid() && planner_) {
-            const PlannedAllocation* alloc = planner_->get_allocation(i);
-            if (alloc && alloc->size > 0 && alloc->offset + alloc->size <= graph_buffer_->size()) {
-                void* planned_ptr = static_cast<char*>(graph_buffer_->data()) + alloc->offset;
-                size_t copy_size = std::min(node.output->nbytes(), alloc->size);
+            if (has_dst && alloc && alloc->size > 0 &&
+                alloc->offset + alloc->size <= graph_buffer_->size()) {
+                // Construct dst view into pre-allocated graph buffer — no allocation, no memcpy
+                void* planned_ptr =
+                    static_cast<char*>(graph_buffer_->data()) + alloc->offset;
+                DeviceType buf_dev = graph_buffer_->device();
+                auto dst = std::make_shared<Tensor>(Tensor::from_buffer(
+                    planned_ptr, DataType::FP32, node.resolved_inputs[0]->shape(), buf_dev, false));
+                OpDispatch::instance().execute_dst(node.op_type, node.device, node.resolved_inputs,
+                                                   dst, node.op_params);
+                node.output = dst;
+            } else {
+                // Legacy path: execute (allocates internally), then copy to graph buffer
+                node.output = OpDispatch::instance().execute(node.op_type, node.device,
+                                                             node.resolved_inputs, node.op_params);
 
-                if (copy_size > 0 && planned_ptr != node.output->data()) {
-                    if (node.output->device() == DeviceType::CPU) {
-                        std::memcpy(planned_ptr, node.output->data(), copy_size);
-                    }
+                // Copy to pre-allocated buffer and free temp memory
+                if (node.output && graph_buffer_ && graph_buffer_->valid() && planner_) {
+                    const PlannedAllocation* legacy_alloc = planner_->get_allocation(i);
+                    if (legacy_alloc && legacy_alloc->size > 0 &&
+                        legacy_alloc->offset + legacy_alloc->size <= graph_buffer_->size()) {
+                        void* planned_ptr =
+                            static_cast<char*>(graph_buffer_->data()) + legacy_alloc->offset;
+                        size_t copy_size = std::min(node.output->nbytes(), legacy_alloc->size);
+
+                        if (copy_size > 0 && planned_ptr != node.output->data()) {
+                            if (node.output->device() == DeviceType::CPU) {
+                                std::memcpy(planned_ptr, node.output->data(), copy_size);
+                            }
 #ifdef USE_CUDA
-                    else if (node.output->device() == DeviceType::CUDA) {
-                        cudaMemcpyAsync(planned_ptr, node.output->data(), copy_size,
-                                        cudaMemcpyDeviceToDevice);
-                    }
+                            else if (node.output->device() == DeviceType::CUDA) {
+                                cudaMemcpyAsync(planned_ptr, node.output->data(), copy_size,
+                                                cudaMemcpyDeviceToDevice);
+                            }
 #endif
-                    void* old_data = node.output->replace_data(planned_ptr, copy_size);
-                    if (old_data) {
-                        if (node.output->device() == DeviceType::CPU) {
-                            std::free(old_data);
-                        }
+                            void* old_data = node.output->replace_data(planned_ptr, copy_size);
+                            if (old_data) {
+                                if (node.output->device() == DeviceType::CPU) {
+                                    std::free(old_data);
+                                }
 #ifdef USE_CUDA
-                        else {
-                            cudaFree(old_data);
-                        }
+                                else {
+                                    cudaFree(old_data);
+                                }
 #endif
+                            }
+                        }
                     }
                 }
             }

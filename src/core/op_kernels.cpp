@@ -5,43 +5,187 @@
 #include "forge/op_dispatch.h"
 #include "forge/operators.h"
 
+#ifdef USE_AVX2
+#    include <immintrin.h>
+#endif
+
+#ifdef _OPENMP
+#    include <omp.h>
+#endif
+
 namespace forge {
 namespace {
 
-// ---- ADD ----
-TensorPtr add_kernel(const std::vector<TensorPtr>& inputs, const int32_t*) {
-    return ops::add(inputs[0], inputs[1]);
+// ---- Phase 3: dst-injection kernels ----
+// These kernels write directly into dst->data(), eliminating graph-mode memcpy.
+
+// ---- ADD (dst injection) ----
+void add_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*) {
+    auto a = inputs[0];
+    auto b = inputs[1];
+    int n = static_cast<int>(a->numel());
+    if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        cuda::launch_add_bias(static_cast<const float*>(a->data()),
+                              static_cast<const float*>(b->data()),
+                              static_cast<float*>(dst->data()), n);
+#endif
+    } else {
+        const float* a_data = static_cast<const float*>(a->data());
+        const float* b_data = static_cast<const float*>(b->data());
+        float* o_data = static_cast<float*>(dst->data());
+#ifdef USE_AVX2
+        int i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 av = _mm256_loadu_ps(a_data + i);
+            __m256 bv = _mm256_loadu_ps(b_data + i);
+            _mm256_storeu_ps(o_data + i, _mm256_add_ps(av, bv));
+        }
+        for (; i < n; ++i)
+            o_data[i] = a_data[i] + b_data[i];
+#else
+        for (int i = 0; i < n; ++i)
+            o_data[i] = a_data[i] + b_data[i];
+#endif
+    }
 }
 
-// ---- MUL ----
-TensorPtr mul_kernel(const std::vector<TensorPtr>& inputs, const int32_t*) {
-    return ops::multiply(inputs[0], inputs[1]);
+// ---- MUL (dst injection) ----
+void mul_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*) {
+    auto a = inputs[0];
+    auto b = inputs[1];
+    int n = static_cast<int>(a->numel());
+    if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        cuda::launch_multiply(static_cast<const float*>(a->data()),
+                              static_cast<const float*>(b->data()),
+                              static_cast<float*>(dst->data()), n);
+#endif
+    } else {
+        const float* a_data = static_cast<const float*>(a->data());
+        const float* b_data = static_cast<const float*>(b->data());
+        float* o_data = static_cast<float*>(dst->data());
+#ifdef USE_AVX2
+        int i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 av = _mm256_loadu_ps(a_data + i);
+            __m256 bv = _mm256_loadu_ps(b_data + i);
+            _mm256_storeu_ps(o_data + i, _mm256_mul_ps(av, bv));
+        }
+        for (; i < n; ++i)
+            o_data[i] = a_data[i] * b_data[i];
+#else
+        for (int i = 0; i < n; ++i)
+            o_data[i] = a_data[i] * b_data[i];
+#endif
+    }
 }
 
-// ---- SILU ----
-TensorPtr silu_kernel(const std::vector<TensorPtr>& inputs, const int32_t*) {
-    return ops::silu(inputs[0]);
+// ---- SILU (dst injection) ----
+void silu_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*) {
+    auto x = inputs[0];
+    int n = static_cast<int>(x->numel());
+    if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        cuda::launch_silu(static_cast<const float*>(x->data()),
+                          static_cast<float*>(dst->data()), n);
+#endif
+    } else {
+        const float* x_data = static_cast<const float*>(x->data());
+        float* o_data = static_cast<float*>(dst->data());
+        for (int i = 0; i < n; ++i) {
+            float v = x_data[i];
+            o_data[i] = v / (1.0f + std::exp(-v));
+        }
+    }
 }
 
-// ---- RMS_NORM ----
+// ---- RMS_NORM (dst injection) ----
 // inputs[0] = x, inputs[1] = weight
 // params[0..1] = float eps
-TensorPtr rms_norm_kernel(const std::vector<TensorPtr>& inputs, const int32_t* params) {
+void rms_norm_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst,
+                         const int32_t* params) {
+    auto x = inputs[0];
+    auto weight = (inputs.size() > 1) ? inputs[1] : nullptr;
     float eps = 1e-6f;
     if (params) {
         std::memcpy(&eps, params, sizeof(float));
     }
-    return ops::rms_norm(inputs[0], inputs[1], eps);
+
+    int rows = static_cast<int>(x->shape()[0]);
+    int cols = static_cast<int>(x->shape()[1]);
+
+    if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        if (weight) {
+            cuda::launch_rms_norm(static_cast<const float*>(x->data()),
+                                  static_cast<const float*>(weight->data()),
+                                  static_cast<float*>(dst->data()), rows, cols, eps);
+        } else {
+            std::vector<float> ones(cols, 1.0f);
+            cuda::launch_rms_norm(static_cast<const float*>(x->data()), ones.data(),
+                                  static_cast<float*>(dst->data()), rows, cols, eps);
+        }
+#endif
+    } else {
+        const float* x_data = static_cast<const float*>(x->data());
+        const float* w_data = weight ? static_cast<const float*>(weight->data()) : nullptr;
+        float* o_data = static_cast<float*>(dst->data());
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 1)
+#endif
+        for (int r = 0; r < rows; ++r) {
+            const float* x_row = x_data + r * cols;
+            float* o_row = o_data + r * cols;
+#ifdef USE_AVX2
+            __m256 sum_sq_v = _mm256_setzero_ps();
+            int c = 0;
+            for (; c + 8 <= cols; c += 8) {
+                __m256 xv = _mm256_loadu_ps(x_row + c);
+                sum_sq_v = _mm256_fmadd_ps(xv, xv, sum_sq_v);
+            }
+            __m128 hi128 = _mm256_extractf128_ps(sum_sq_v, 1);
+            __m128 lo128 = _mm256_castps256_ps128(sum_sq_v);
+            __m128 sum128 = _mm_add_ps(lo128, hi128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            float sum_sq = _mm_cvtss_f32(sum128);
+            for (; c < cols; ++c) {
+                float v = x_row[c];
+                sum_sq += v * v;
+            }
+            float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
+            __m256 rms_v = _mm256_set1_ps(rms);
+            c = 0;
+            if (w_data) {
+                for (; c + 8 <= cols; c += 8) {
+                    __m256 xv = _mm256_loadu_ps(x_row + c);
+                    __m256 wv = _mm256_loadu_ps(w_data + c);
+                    _mm256_storeu_ps(o_row + c, _mm256_mul_ps(_mm256_mul_ps(xv, rms_v), wv));
+                }
+            } else {
+                for (; c + 8 <= cols; c += 8) {
+                    __m256 xv = _mm256_loadu_ps(x_row + c);
+                    _mm256_storeu_ps(o_row + c, _mm256_mul_ps(xv, rms_v));
+                }
+            }
+            for (; c < cols; ++c) {
+                o_row[c] = x_row[c] * rms * (w_data ? w_data[c] : 1.0f);
+            }
+#else
+            float sum_sq = 0.0f;
+            for (int c = 0; c < cols; ++c)
+                sum_sq += x_row[c] * x_row[c];
+            float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
+            for (int c = 0; c < cols; ++c)
+                o_row[c] = x_row[c] * rms * (w_data ? w_data[c] : 1.0f);
+#endif
+        }
+    }
 }
 
-// ---- MUL_MAT_TRANSB ----
-// inputs[0] = a, inputs[1] = b, inputs[2] = bias (optional)
-TensorPtr mul_mat_transb_kernel(const std::vector<TensorPtr>& inputs, const int32_t*) {
-    TensorPtr bias = (inputs.size() > 2) ? inputs[2] : nullptr;
-    return ops::matmul_transB(inputs[0], inputs[1], bias);
-}
-
-// ---- ROPE ----
+// ---- ROPE (dst injection) ----
 // inputs[0] = tensor (either Q or K)
 // params layout:
 //   [0] = is_q (0 = K, 1 = Q)
@@ -52,13 +196,13 @@ TensorPtr mul_mat_transb_kernel(const std::vector<TensorPtr>& inputs, const int3
 //   [6..7] = float rope_theta
 //   [8] = use_neox (0/1)
 //   [9] = device_type (0=CPU, 1=CUDA)
-TensorPtr rope_kernel(const std::vector<TensorPtr>& inputs, const int32_t* params) {
+void rope_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t* params) {
     auto x = inputs[0];
     if (!params)
-        return nullptr;
+        return;
 
     int is_q = params[0];
-    int num_h = params[1];  // num_heads (Q) or num_kv_heads (K)
+    int num_h = params[1];
     int head_dim = params[2];
     int seq_len = params[3];
     int64_t start_pos;
@@ -67,26 +211,23 @@ TensorPtr rope_kernel(const std::vector<TensorPtr>& inputs, const int32_t* param
     std::memcpy(&rope_theta, params + 6, sizeof(float));
     DeviceType dev = (params[9] == 1) ? DeviceType::CUDA : DeviceType::CPU;
 
-    auto out = std::make_shared<Tensor>(DataType::FP32, x->shape(), dev);
-
     if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
         if (is_q) {
-            cuda::launch_rope_gqa(static_cast<const float*>(x->data()), nullptr,
-                                  static_cast<float*>(out->data()), nullptr, num_h, 0, head_dim,
+            cuda::launch_rope_gqa(static_cast<const float*>(x->data()), nullptr, nullptr,
+                                  static_cast<float*>(dst->data()), num_h, 0, head_dim,
                                   seq_len, start_pos, rope_theta);
         } else {
             cuda::launch_rope_gqa(nullptr, static_cast<const float*>(x->data()), nullptr,
-                                  static_cast<float*>(out->data()), 0, num_h, head_dim, seq_len,
+                                  static_cast<float*>(dst->data()), 0, num_h, head_dim, seq_len,
                                   start_pos, rope_theta);
         }
 #endif
     } else {
-        // CPU rope (adapted from rope only helpers)
         int half_dim = head_dim / 2;
         int stride = num_h * head_dim;
         const float* x_data = static_cast<const float*>(x->data());
-        float* o_data = static_cast<float*>(out->data());
+        float* o_data = static_cast<float*>(dst->data());
         for (int s = 0; s < seq_len; ++s) {
             for (int h = 0; h < num_h; ++h) {
                 for (int d = 0; d < half_dim; ++d) {
@@ -102,17 +243,17 @@ TensorPtr rope_kernel(const std::vector<TensorPtr>& inputs, const int32_t* param
             }
         }
     }
-    return out;
 }
 
-// ---- FLASH_ATTN_GQA ----
-// inputs[0] = q, inputs[1] = k, inputs[2] = v
-// params:
-//   [0] = num_heads
-//   [1] = num_kv_heads
-//   [2] = head_dim
-//   [3] = causal (0/1)
-//   [4] = device_type (0=CPU, 1=CUDA)
+// ---- Legacy kernels (for ops not yet migrated to dst injection) ----
+
+// ---- MUL_MAT_TRANSB (legacy) ----
+TensorPtr mul_mat_transb_kernel(const std::vector<TensorPtr>& inputs, const int32_t*) {
+    TensorPtr bias = (inputs.size() > 2) ? inputs[2] : nullptr;
+    return ops::matmul_transB(inputs[0], inputs[1], bias);
+}
+
+// ---- FLASH_ATTN_GQA (legacy) ----
 TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int32_t* params) {
     auto q = inputs[0];
     auto k = inputs[1];
@@ -153,7 +294,6 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
         return ops::scaled_dot_product_attention_2d(q, k, v, seq_len_q, total_len, num_heads,
                                                     head_dim, nullptr, causal);
     } else {
-        // CPU path: GQA expand if needed
         TensorPtr k_expanded, v_expanded;
         if (num_kv_heads < num_heads) {
             int kv_groups = num_heads / num_kv_heads;
@@ -189,23 +329,26 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
 static bool register_all_kernels() {
     auto& d = OpDispatch::instance();
 
-    d.register_kernel(OpType::ADD, DeviceType::CPU, add_kernel);
-    d.register_kernel(OpType::ADD, DeviceType::CUDA, add_kernel);
+    // ---- Phase 3: dst-injection kernels ----
+    // ADD/MUL/SILU/RMS_NORM/ROPE migrated to dst injection
+    d.register_kernel_dst(OpType::ADD, DeviceType::CPU, add_kernel_dst);
+    d.register_kernel_dst(OpType::ADD, DeviceType::CUDA, add_kernel_dst);
 
-    d.register_kernel(OpType::MUL, DeviceType::CPU, mul_kernel);
-    d.register_kernel(OpType::MUL, DeviceType::CUDA, mul_kernel);
+    d.register_kernel_dst(OpType::MUL, DeviceType::CPU, mul_kernel_dst);
+    d.register_kernel_dst(OpType::MUL, DeviceType::CUDA, mul_kernel_dst);
 
-    d.register_kernel(OpType::SILU, DeviceType::CPU, silu_kernel);
-    d.register_kernel(OpType::SILU, DeviceType::CUDA, silu_kernel);
+    d.register_kernel_dst(OpType::SILU, DeviceType::CPU, silu_kernel_dst);
+    d.register_kernel_dst(OpType::SILU, DeviceType::CUDA, silu_kernel_dst);
 
-    d.register_kernel(OpType::RMS_NORM, DeviceType::CPU, rms_norm_kernel);
-    d.register_kernel(OpType::RMS_NORM, DeviceType::CUDA, rms_norm_kernel);
+    d.register_kernel_dst(OpType::RMS_NORM, DeviceType::CPU, rms_norm_kernel_dst);
+    d.register_kernel_dst(OpType::RMS_NORM, DeviceType::CUDA, rms_norm_kernel_dst);
 
+    d.register_kernel_dst(OpType::ROPE, DeviceType::CPU, rope_kernel_dst);
+    d.register_kernel_dst(OpType::ROPE, DeviceType::CUDA, rope_kernel_dst);
+
+    // ---- Legacy kernels (ops not yet migrated) ----
     d.register_kernel(OpType::MUL_MAT_TRANSB, DeviceType::CPU, mul_mat_transb_kernel);
     d.register_kernel(OpType::MUL_MAT_TRANSB, DeviceType::CUDA, mul_mat_transb_kernel);
-
-    d.register_kernel(OpType::ROPE, DeviceType::CPU, rope_kernel);
-    d.register_kernel(OpType::ROPE, DeviceType::CUDA, rope_kernel);
 
     d.register_kernel(OpType::FLASH_ATTN_GQA, DeviceType::CPU, flash_attn_gqa_kernel);
     d.register_kernel(OpType::FLASH_ATTN_GQA, DeviceType::CUDA, flash_attn_gqa_kernel);
@@ -217,9 +360,6 @@ static bool _kernels_registered = register_all_kernels();
 }  // anonymous namespace
 
 // ---- 显式注册入口 ----
-// op_kernels.cpp 在静态库 forge_core 中, 其匿名命名空间内的 _kernels_registered
-// 静态初始化可能被链接器丢弃(与 graph builder 的 force-link 问题同源)。
-// 提供外部可见的注册函数, 由 execution_plan 在创建时显式调用, 确保 kernel 一定被注册。
 void register_builtin_op_kernels() {
     static bool done = false;
     if (done) return;
