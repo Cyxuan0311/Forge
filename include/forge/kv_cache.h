@@ -35,18 +35,87 @@ struct KVCellMeta {
     bool no_seqs() const { return seq_id_mask == 0; }
 };
 
-struct KVCacheLayer {
-    TensorPtr key_cache;
-    TensorPtr value_cache;
-    std::vector<uint8_t> q_key_cache;
-    std::vector<uint8_t> q_value_cache;
-    // CUDA-side quantized KV cache buffers
-    void* d_q_key_cache = nullptr;
-    void* d_q_value_cache = nullptr;
-    size_t d_q_cache_bytes = 0;
-    int filled = 0;              // retained for backward compat and PagedKVCache migration
+// =========================================================================
+// KVCacheStorage — unified per-layer storage bound to a device.
+//
+// Replaces the old dual-track (host std::vector<uint8_t> + bare CUDA void*)
+// and the FP32 shadow cache for quantized modes.
+//
+// For FP32 mode: holds a TensorPtr (FP32, device-bound).
+// For quantized modes (F16/Q8_0/Q4_0/Q4_K):
+//   - CPU layers: h_data vector
+//   - CUDA layers: d_data + d_bytes (RAII-managed)
+// =========================================================================
 
-    // Cell metadata track — size max_seq_len, parallel to key_cache/value_cache
+struct KVCacheStorage {
+    KVCacheDType dtype = KVCacheDType::FP32;
+    DeviceType device = DeviceType::CPU;
+
+    // --- FP32 path: TensorPtr (used when dtype == FP32) ---
+    TensorPtr tensor;   // FP32 Tensor, device-bound
+
+    // --- Quantized path: raw buffers ---
+    std::vector<uint8_t> h_data;     // CPU-side quantized buffer
+    void* d_data = nullptr;          // CUDA-side quantized buffer
+    size_t d_bytes = 0;              // allocated size of d_data
+
+    // --- Common ---
+    int max_rows = 0;                // max_seq_len
+    size_t row_bytes = 0;            // bytes per row (block_nbytes for quantized, kv_dim*4 for FP32)
+
+    KVCacheStorage() = default;
+    ~KVCacheStorage();
+
+    // Non-copyable, movable
+    KVCacheStorage(const KVCacheStorage&) = delete;
+    KVCacheStorage& operator=(const KVCacheStorage&) = delete;
+    KVCacheStorage(KVCacheStorage&& o) noexcept;
+    KVCacheStorage& operator=(KVCacheStorage&& o) noexcept;
+
+    // Allocate storage for given dimensions.
+    // For FP32: creates a Tensor(max_rows, row_bytes/4) on `device`.
+    // For quantized: allocates h_data (CPU) or d_data (CUDA).
+    void alloc(KVCacheDType dt, DeviceType dev, int max_rows, size_t row_bytes);
+
+    // Zero-fill all allocated storage
+    void zero_fill();
+
+    // Total allocated bytes
+    size_t capacity_bytes() const;
+
+    // ---- Data access ----
+
+    // FP32 data pointer (only valid when dtype == FP32)
+    float* fp32_data();
+    const float* fp32_data() const;
+
+    // Quantized host data pointer (only valid when device == CPU && dtype != FP32)
+    uint8_t* q_data();
+    const uint8_t* q_data() const;
+
+    // Quantized device data pointer (only valid when device == CUDA && dtype != FP32)
+    void* d_q_data();
+    const void* d_q_data() const;
+
+    // Row pointer (host) — for CPU quantized mode
+    uint8_t* q_row(int row);
+    const uint8_t* q_row(int row) const;
+
+    // FP32 row pointer — for FP32 mode
+    float* fp32_row(int row);
+    const float* fp32_row(int row) const;
+};
+
+// =========================================================================
+// KVCacheLayer — per-layer KV storage + metadata
+// =========================================================================
+
+struct KVCacheLayer {
+    KVCacheStorage key_store;
+    KVCacheStorage value_store;
+    int filled = 0;
+
+    // Cell metadata — size max_seq_len, parallel to KV rows
     std::vector<KVCellMeta> cells;
 };
 
@@ -75,6 +144,9 @@ public:
 
     // Per-layer device query
     DeviceType layer_device(int layer) const;
+
+    // Set the CUDA stream for all KV cache operations (default: stream 0)
+    void set_cuda_stream(void* stream);
 
     void reset();
 
@@ -118,6 +190,9 @@ public:
 
     // --- Accessors ---
 
+    // Returns FP32 key/value tensor for the layer.
+    // For FP32 mode: returns the storage tensor directly.
+    // For quantized mode: triggers dequantization into a temporary FP32 buffer.
     TensorPtr get_key(int layer) const;
     TensorPtr get_value(int layer) const;
 
@@ -135,13 +210,11 @@ public:
     int max_seq_len() const { return max_seq_len_; }
     int num_layers() const { return static_cast<int>(layers_.size()); }
     const std::vector<KVCacheLayer>& layers() const { return layers_; }
+
     // Access quantized CUDA cache pointers for fused attention kernels
-    void* d_q_key_cache(int layer) const {
-        return (layer >= 0 && layer < (int)layers_.size()) ? layers_[layer].d_q_key_cache : nullptr;
-    }
-    void* d_q_value_cache(int layer) const {
-        return (layer >= 0 && layer < (int)layers_.size()) ? layers_[layer].d_q_value_cache : nullptr;
-    }
+    void* d_q_key_cache(int layer) const;
+    void* d_q_value_cache(int layer) const;
+
     DeviceType device() const { return device_; }
     KVCacheDType kv_dtype() const { return kv_dtype_; }
     KVCacheDType type_k() const { return kv_config_.type_k; }
@@ -159,7 +232,13 @@ public:
     static size_t q4_0_block_nbytes(int n);
     static size_t block_nbytes(KVCacheDType dtype, int n);
 
+    // Dequantize a layer's KV data into FP32 (on-demand, for non-fused attention paths).
+    // Returns the FP32 key/value tensor pair. Results are cached per-layer.
     void dequantize_layer(int layer);
+
+    // Get the quantized row size for key/value at a given layer
+    size_t key_row_bytes(int layer) const;
+    size_t value_row_bytes(int layer) const;
 
 private:
     int update_fp32(int layer, int64_t start_pos,
@@ -169,8 +248,10 @@ private:
     int update_quantized_cuda(int layer, int64_t start_pos,
                               const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
     void dequantize_layer_cuda(int layer);
-    void alloc_cuda_q_cache(int layer, size_t bytes);
     void init_cells(int layer);  // allocate cells vector for a layer
+
+    // Get the CUDA stream (returns nullptr for default stream)
+    void* cuda_stream() const;
 
     std::vector<KVCacheLayer> layers_;
     int num_kv_heads_ = 0;
@@ -190,6 +271,9 @@ private:
     // Per-layer ring cursors: next slot to write (wraps at window_size_).
     // Only meaningful for SWA layers; non-SWA layers use normal linear filling.
     std::vector<int> ring_cursor_;
+
+    // CUDA stream for KV cache operations (default: nullptr = default stream)
+    void* cuda_stream_ = nullptr;
 };
 
 }  // namespace forge

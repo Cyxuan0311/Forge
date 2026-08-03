@@ -24,21 +24,17 @@ static inline uint16_t fp32_to_fp16(float f) {
     uint16_t h;
 
     if (exp == 0xFF) {
-        // Inf or NaN
         h = (sign << 15) | 0x7C00 | (mant ? 1 : 0);
     } else if (exp >= 143) {
-        // Overflow → Inf
         h = (sign << 15) | 0x7C00;
     } else if (exp >= 113) {
-        // Normal
         h = (sign << 15) | ((exp - 112) << 10) | (mant >> 13);
     } else if (exp >= 103) {
-        // Subnormal
         uint32_t sub_exp = 126 - exp;
         uint32_t sub_mant = (mant | 0x800000) >> (sub_exp + 13);
         h = (sign << 15) | sub_mant;
     } else {
-        h = (sign << 15);  // underflow → 0
+        h = (sign << 15);
     }
     return h;
 }
@@ -53,7 +49,6 @@ static inline float fp16_to_fp32(uint16_t h) {
         if (mant == 0) {
             x = sign << 31;
         } else {
-            // Subnormal: normalize
             int e = -1;
             while (!(mant & 0x400)) {
                 mant <<= 1;
@@ -225,8 +220,6 @@ static void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
 }
 
 static void quantize_q4_k_cpu(const float* data, uint8_t* q_data, int n) {
-    // Simplified Q4_K quantization: use uniform scale per block (no sub-block min)
-    // Block layout: d[2] + dmin[2] + scales[12] + qs[128] = 144 bytes
     constexpr int BLOCK = 256;
     int num_blocks = (n + BLOCK - 1) / BLOCK;
 
@@ -249,12 +242,8 @@ static void quantize_q4_k_cpu(const float* data, uint8_t* q_data, int n) {
         std::memcpy(block, &d_fp16, 2);
         std::memcpy(block + 2, &dmin_fp16, 2);
 
-        // Set all 6-bit scales to 1 (sc=1, m=0 for each of 8 sub-blocks)
-        // scales[12] encodes 8 (sc, m) pairs via get_scale_min_k4
-        // sc=1, m=0 → 6-bit encoding: (m << 4) | sc = 0x01
         std::memset(block + 4, 0x01, 12);
 
-        // Quantize 256 elements into 128 packed bytes (4-bit each)
         uint8_t* qs = block + 16;
         for (int i = 0; i < 128; ++i) {
             int idx0 = start + i;
@@ -311,12 +300,36 @@ static void dequantize_q4_k_cpu(const uint8_t* q_data, float* out, int n, int ro
 }
 
 // =========================================================================
+// Per-type CPU quantize/dequantize dispatch
+// =========================================================================
+
+static void quantize_cpu(KVCacheDType dtype, const float* data, uint8_t* q_data, int n) {
+    switch (dtype) {
+    case KVCacheDType::F16:  quantize_f16_cpu(data, q_data, n); break;
+    case KVCacheDType::Q8_0: quantize_q8_0_cpu(data, q_data, n); break;
+    case KVCacheDType::Q4_0: quantize_q4_0_cpu(data, q_data, n); break;
+    case KVCacheDType::Q4_K: quantize_q4_k_cpu(data, q_data, n); break;
+    default: break;
+    }
+}
+
+static void dequantize_cpu(KVCacheDType dtype, const uint8_t* q_data, float* out, int n, int row) {
+    switch (dtype) {
+    case KVCacheDType::F16:  dequantize_f16_cpu(q_data, out, n); break;
+    case KVCacheDType::Q8_0: dequantize_q8_0_cpu(q_data, out, n); break;
+    case KVCacheDType::Q4_0: dequantize_q4_0_cpu(q_data, out, n); break;
+    case KVCacheDType::Q4_K: dequantize_q4_k_cpu(q_data, out, n, row); break;
+    default: break;
+    }
+}
+
+// =========================================================================
 // Block size calculation
 // =========================================================================
 
 size_t KVCache::q4_0_block_nbytes(int n) {
     int num_blocks = (n + 31) / 32;
-    return num_blocks * 18;  // standard: fp16 d (2B) + 16B qs
+    return num_blocks * 18;
 }
 
 size_t KVCache::block_nbytes(KVCacheDType dtype, int n) {
@@ -327,13 +340,13 @@ size_t KVCache::block_nbytes(KVCacheDType dtype, int n) {
         return n * sizeof(uint16_t);
     case KVCacheDType::Q8_0: {
         int num_blocks = (n + 31) / 32;
-        return num_blocks * 34;  // fp16 d (2B) + int8 qs[32] (32B)
+        return num_blocks * 34;
     }
     case KVCacheDType::Q4_0:
         return q4_0_block_nbytes(n);
     case KVCacheDType::Q4_K: {
         int num_blocks = (n + 255) / 256;
-        return num_blocks * 144;  // d(2) + dmin(2) + scales(12) + qs(128)
+        return num_blocks * 144;
     }
     default:
         return n * sizeof(float);
@@ -341,21 +354,148 @@ size_t KVCache::block_nbytes(KVCacheDType dtype, int n) {
 }
 
 // =========================================================================
-// Destructor
+// KVCacheStorage implementation
 // =========================================================================
 
-KVCache::~KVCache() {
+KVCacheStorage::~KVCacheStorage() {
 #ifdef USE_CUDA
-    for (auto& layer : layers_) {
-        if (layer.d_q_key_cache)
-            cudaFree(layer.d_q_key_cache);
-        if (layer.d_q_value_cache)
-            cudaFree(layer.d_q_value_cache);
-        layer.d_q_key_cache = nullptr;
-        layer.d_q_value_cache = nullptr;
+    if (d_data) {
+        cudaFree(d_data);
+        d_data = nullptr;
     }
 #endif
 }
+
+KVCacheStorage::KVCacheStorage(KVCacheStorage&& o) noexcept
+    : dtype(o.dtype), device(o.device), tensor(std::move(o.tensor)),
+      h_data(std::move(o.h_data)), d_data(o.d_data), d_bytes(o.d_bytes),
+      max_rows(o.max_rows), row_bytes(o.row_bytes) {
+    o.d_data = nullptr;
+    o.d_bytes = 0;
+}
+
+KVCacheStorage& KVCacheStorage::operator=(KVCacheStorage&& o) noexcept {
+    if (this != &o) {
+#ifdef USE_CUDA
+        if (d_data)
+            cudaFree(d_data);
+#endif
+        dtype = o.dtype;
+        device = o.device;
+        tensor = std::move(o.tensor);
+        h_data = std::move(o.h_data);
+        d_data = o.d_data;
+        d_bytes = o.d_bytes;
+        max_rows = o.max_rows;
+        row_bytes = o.row_bytes;
+        o.d_data = nullptr;
+        o.d_bytes = 0;
+    }
+    return *this;
+}
+
+void KVCacheStorage::alloc(KVCacheDType dt, DeviceType dev, int rows, size_t rbytes) {
+    dtype = dt;
+    device = dev;
+    max_rows = rows;
+    row_bytes = rbytes;
+
+    size_t total = static_cast<size_t>(max_rows) * row_bytes;
+
+    if (dtype == KVCacheDType::FP32) {
+        // FP32: allocate as Tensor
+        int dim = static_cast<int>(row_bytes / sizeof(float));
+        auto shape = std::vector<int64_t>{max_rows, dim};
+        tensor = std::make_shared<Tensor>(DataType::FP32, shape, device);
+        tensor->zero_();
+    } else {
+        // Quantized: allocate h_data or d_data depending on device
+        if (device == DeviceType::CPU) {
+            h_data.resize(total, 0);
+        } else {
+#ifdef USE_CUDA
+            if (d_data)
+                cudaFree(d_data);
+            d_bytes = total;
+            cudaMalloc(&d_data, total);
+            cudaMemset(d_data, 0, total);
+#endif
+        }
+    }
+}
+
+void KVCacheStorage::zero_fill() {
+    if (dtype == KVCacheDType::FP32) {
+        if (tensor)
+            tensor->zero_();
+    } else {
+        if (device == DeviceType::CPU) {
+            std::fill(h_data.begin(), h_data.end(), 0);
+        } else {
+#ifdef USE_CUDA
+            if (d_data && d_bytes > 0)
+                cudaMemset(d_data, 0, d_bytes);
+#endif
+        }
+    }
+}
+
+size_t KVCacheStorage::capacity_bytes() const {
+    if (dtype == KVCacheDType::FP32) {
+        return tensor ? tensor->nbytes() : 0;
+    }
+    if (device == DeviceType::CPU) {
+        return h_data.size();
+    }
+    return d_bytes;
+}
+
+float* KVCacheStorage::fp32_data() {
+    return (dtype == KVCacheDType::FP32 && tensor) ? static_cast<float*>(tensor->data()) : nullptr;
+}
+
+const float* KVCacheStorage::fp32_data() const {
+    return (dtype == KVCacheDType::FP32 && tensor) ? static_cast<const float*>(tensor->data())
+                                                    : nullptr;
+}
+
+uint8_t* KVCacheStorage::q_data() {
+    return (device == DeviceType::CPU && dtype != KVCacheDType::FP32) ? h_data.data() : nullptr;
+}
+
+const uint8_t* KVCacheStorage::q_data() const {
+    return (device == DeviceType::CPU && dtype != KVCacheDType::FP32) ? h_data.data() : nullptr;
+}
+
+void* KVCacheStorage::d_q_data() {
+    return (device == DeviceType::CUDA && dtype != KVCacheDType::FP32) ? d_data : nullptr;
+}
+
+const void* KVCacheStorage::d_q_data() const {
+    return (device == DeviceType::CUDA && dtype != KVCacheDType::FP32) ? d_data : nullptr;
+}
+
+uint8_t* KVCacheStorage::q_row(int row) {
+    return h_data.data() + static_cast<size_t>(row) * row_bytes;
+}
+
+const uint8_t* KVCacheStorage::q_row(int row) const {
+    return h_data.data() + static_cast<size_t>(row) * row_bytes;
+}
+
+float* KVCacheStorage::fp32_row(int row) {
+    return fp32_data() + static_cast<size_t>(row) * (row_bytes / sizeof(float));
+}
+
+const float* KVCacheStorage::fp32_row(int row) const {
+    return fp32_data() + static_cast<size_t>(row) * (row_bytes / sizeof(float));
+}
+
+// =========================================================================
+// KVCache destructor
+// =========================================================================
+
+KVCache::~KVCache() = default;
 
 // =========================================================================
 // Initialization
@@ -397,7 +537,6 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
     max_seq_len_ = max_seq_len;
     device_ = device;
     kv_config_ = kv_config;
-    // Legacy: kv_dtype_ = max(type_k, type_v) for backward compat
     kv_dtype_ = static_cast<KVCacheDType>(
         std::max(static_cast<int>(kv_config.type_k), static_cast<int>(kv_config.type_v)));
 
@@ -406,24 +545,14 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
     int kv_dim = num_kv_heads * head_dim;
 
     for (int i = 0; i < num_layers; ++i) {
-        // FP32 shadow cache (always allocated — used as dequant target and for attention)
-        auto k_shape = std::vector<int64_t>{max_seq_len, kv_dim};
-        auto v_shape = std::vector<int64_t>{max_seq_len, kv_dim};
-        layers_[i].key_cache = std::make_shared<Tensor>(DataType::FP32, k_shape, device);
-        layers_[i].value_cache = std::make_shared<Tensor>(DataType::FP32, v_shape, device);
-        layers_[i].key_cache->zero_();
-        layers_[i].value_cache->zero_();
-        layers_[i].filled = 0;
+        DeviceType layer_dev = layer_device(i);
 
-        // Allocate quantized caches if needed
-        if (kv_config.type_k != KVCacheDType::FP32) {
-            size_t q_size = max_seq_len * block_nbytes(kv_config.type_k, kv_dim);
-            layers_[i].q_key_cache.resize(q_size, 0);
-        }
-        if (kv_config.type_v != KVCacheDType::FP32) {
-            size_t q_size = max_seq_len * block_nbytes(kv_config.type_v, kv_dim);
-            layers_[i].q_value_cache.resize(q_size, 0);
-        }
+        // Allocate key storage in native dtype — no FP32 shadow for quantized modes
+        size_t k_row_bytes = block_nbytes(kv_config.type_k, kv_dim);
+        size_t v_row_bytes = block_nbytes(kv_config.type_v, kv_dim);
+        layers_[i].key_store.alloc(kv_config.type_k, layer_dev, max_seq_len, k_row_bytes);
+        layers_[i].value_store.alloc(kv_config.type_v, layer_dev, max_seq_len, v_row_bytes);
+        layers_[i].filled = 0;
 
         init_cells(i);
     }
@@ -455,12 +584,11 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
 
     for (int i = 0; i < num_layers; ++i) {
         int dim = (i < (int)kv_dims.size()) ? kv_dims[i] : kv_dims.back();
+        DeviceType layer_dev = layer_device(i);
         if (dim > 0) {
-            auto shape = std::vector<int64_t>{max_seq_len, dim};
-            layers_[i].key_cache = std::make_shared<Tensor>(DataType::FP32, shape, device);
-            layers_[i].value_cache = std::make_shared<Tensor>(DataType::FP32, shape, device);
-            layers_[i].key_cache->zero_();
-            layers_[i].value_cache->zero_();
+            size_t row_bytes = dim * sizeof(float);
+            layers_[i].key_store.alloc(KVCacheDType::FP32, layer_dev, max_seq_len, row_bytes);
+            layers_[i].value_store.alloc(KVCacheDType::FP32, layer_dev, max_seq_len, row_bytes);
         }
         layers_[i].filled = 0;
         init_cells(i);
@@ -482,8 +610,9 @@ void KVCache::reset() {
             cell.pos = -1;
             cell.seq_id_mask = 0;
         }
+        layer.key_store.zero_fill();
+        layer.value_store.zero_fill();
     }
-    // Reset ring cursors
     for (auto& c : ring_cursor_)
         c = 0;
 }
@@ -491,7 +620,6 @@ void KVCache::reset() {
 void KVCache::rollback(int64_t to_pos) {
     for (auto& layer : layers_) {
         if (layer.filled > to_pos) {
-            // 清除 to_pos 之后位置的 cell 元数据
             for (int64_t p = to_pos; p < layer.filled; ++p) {
                 if (p >= 0 && p < static_cast<int64_t>(layer.cells.size())) {
                     layer.cells[p].pos = -1;
@@ -501,7 +629,6 @@ void KVCache::rollback(int64_t to_pos) {
             layer.filled = static_cast<int>(to_pos);
         }
     }
-    // Ring buffer: 不调整 cursor（speculative decoding 通常在非 ring buffer 模式下使用）
 }
 
 // =========================================================================
@@ -516,13 +643,11 @@ void KVCache::set_ring_buffer(int window_size, int layer) {
         return;
     }
     window_size_ = window_size;
-    // Ensure per-layer arrays are sized
     if (use_ring_buffer_.size() != layers_.size()) {
         use_ring_buffer_.assign(layers_.size(), false);
         ring_cursor_.assign(layers_.size(), 0);
     }
     if (layer < 0) {
-        // Enable for all layers
         use_ring_buffer_.assign(layers_.size(), true);
     } else if (layer < static_cast<int>(layers_.size())) {
         use_ring_buffer_[layer] = true;
@@ -545,31 +670,51 @@ bool KVCache::use_ring_buffer(int layer) const {
 
 void KVCache::set_layer_devices(const std::vector<DeviceType>& layer_devices) {
     if (layer_devices.empty()) {
-        // All layers stay on the fallback device (device_)
         layer_devices_.clear();
         return;
     }
     layer_devices_ = layer_devices;
-    // Resize to match layers_ if needed
     if (static_cast<int>(layer_devices_.size()) < static_cast<int>(layers_.size())) {
         layer_devices_.resize(layers_.size(), device_);
     }
 
-    // Move each layer's KV tensors to its target device
+    // Re-allocate each layer's KV storage on its target device
     for (int i = 0; i < static_cast<int>(layers_.size()); ++i) {
         DeviceType target = layer_devices_[i];
         auto& kv = layers_[i];
-        if (kv.key_cache && kv.key_cache->device() != target) {
-            auto new_key = std::make_shared<Tensor>(kv.key_cache->dtype(), kv.key_cache->shape(),
-                                                    target);
-            new_key->copy_from(*kv.key_cache);
-            kv.key_cache = new_key;
+
+        // For FP32 mode: move tensors via copy
+        if (kv.key_store.dtype == KVCacheDType::FP32 && kv.key_store.tensor &&
+            kv.key_store.tensor->device() != target) {
+            auto new_key = std::make_shared<Tensor>(kv.key_store.tensor->dtype(),
+                                                    kv.key_store.tensor->shape(), target);
+            new_key->copy_from(*kv.key_store.tensor);
+            kv.key_store.tensor = new_key;
+            kv.key_store.device = target;
         }
-        if (kv.value_cache && kv.value_cache->device() != target) {
-            auto new_val = std::make_shared<Tensor>(kv.value_cache->dtype(), kv.value_cache->shape(),
-                                                    target);
-            new_val->copy_from(*kv.value_cache);
-            kv.value_cache = new_val;
+        if (kv.value_store.dtype == KVCacheDType::FP32 && kv.value_store.tensor &&
+            kv.value_store.tensor->device() != target) {
+            auto new_val = std::make_shared<Tensor>(kv.value_store.tensor->dtype(),
+                                                    kv.value_store.tensor->shape(), target);
+            new_val->copy_from(*kv.value_store.tensor);
+            kv.value_store.tensor = new_val;
+            kv.value_store.device = target;
+        }
+
+        // For quantized mode: if the device changed, we need to re-allocate
+        // (copy from host to device or vice versa)
+        if (kv.key_store.dtype != KVCacheDType::FP32 && kv.key_store.device != target) {
+            size_t k_row_bytes = kv.key_store.row_bytes;
+            size_t v_row_bytes = kv.value_store.row_bytes;
+            int rows = kv.key_store.max_rows;
+
+            // Save existing data temporarily (only host data can be saved)
+            // For simplicity, re-allocate and zero-fill; the caller should
+            // call set_layer_devices before any KV updates
+            kv.key_store = KVCacheStorage();
+            kv.value_store = KVCacheStorage();
+            kv.key_store.alloc(kv_config_.type_k, target, rows, k_row_bytes);
+            kv.value_store.alloc(kv_config_.type_v, target, rows, v_row_bytes);
         }
     }
 
@@ -583,6 +728,18 @@ DeviceType KVCache::layer_device(int layer) const {
     if (layer_devices_.empty() || layer < 0 || layer >= static_cast<int>(layer_devices_.size()))
         return device_;
     return layer_devices_[layer];
+}
+
+// =========================================================================
+// CUDA stream management
+// =========================================================================
+
+void KVCache::set_cuda_stream(void* stream) {
+    cuda_stream_ = stream;
+}
+
+void* KVCache::cuda_stream() const {
+    return cuda_stream_;
 }
 
 // =========================================================================
@@ -614,12 +771,6 @@ int KVCache::update(int layer, int seq_id, int64_t pos,
         return -1;
     }
 
-    // In ring buffer mode, compute the write position from the ring cursor.
-    // Prefill (seq_len > 1): write at ring_cursor_[layer] = 0 initially,
-    //   filling [0, seq_len). After prefill, cursor = seq_len.
-    // Decode (seq_len == 1): write at cursor, cursor = (cursor + 1) % window_size.
-    //   Once cursor wraps, we overwrite old entries (ring eviction).
-    // Only applies to layers with ring buffer enabled.
     bool layer_uses_ring = use_ring_buffer(layer);
     int64_t write_pos = pos;
     if (layer_uses_ring) {
@@ -645,23 +796,19 @@ int KVCache::update(int layer, int seq_id, int64_t pos,
     auto& kv = layers_[layer];
     for (int s = 0; s < seq_len; ++s) {
         int slot = static_cast<int>(write_pos + s);
-        kv.cells[slot].pos = pos + s;  // actual sequence position (for RoPE)
+        kv.cells[slot].pos = pos + s;
         kv.cells[slot].add_seq(seq_id);
     }
 
-    // Advance filled counter (tracks total tokens ever written)
     int new_end = static_cast<int>(write_pos + seq_len);
     if (new_end > kv.filled) {
         kv.filled = new_end;
     }
 
-    // Advance ring cursor (only for ring-buffer layers)
     if (layer_uses_ring) {
         ring_cursor_[layer] = (ring_cursor_[layer] + seq_len) % window_size_;
     }
 
-    // Return effective KV length for attention:
-    // ring buffer: min(total_written, window_size); normal: filled
     if (layer_uses_ring) {
         return std::min(kv.filled, window_size_);
     }
@@ -677,25 +824,30 @@ int KVCache::update_fp32(int layer, int64_t start_pos,
     auto& kv = layers_[layer];
     int kv_dim = this->kv_dim(layer);
     int filled = static_cast<int>(start_pos);
+    DeviceType layer_dev = kv.key_store.device;
 
-    if (this->layer_device(layer) == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        float* k_dst = static_cast<float*>(kv.key_cache->data()) + filled * kv_dim;
-        float* v_dst = static_cast<float*>(kv.value_cache->data()) + filled * kv_dim;
+    cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream());
+#endif
+
+    if (layer_dev == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        float* k_dst = kv.key_store.fp32_row(filled);
+        float* v_dst = kv.value_store.fp32_row(filled);
         const float* k_src = static_cast<const float*>(new_key->data());
         const float* v_src = static_cast<const float*>(new_value->data());
         size_t copy_bytes = seq_len * kv_dim * sizeof(float);
         if (new_key->device() == DeviceType::CUDA) {
-            cudaMemcpyAsync(k_dst, k_src, copy_bytes, cudaMemcpyDeviceToDevice);
-            cudaMemcpyAsync(v_dst, v_src, copy_bytes, cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(k_dst, k_src, copy_bytes, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(v_dst, v_src, copy_bytes, cudaMemcpyDeviceToDevice, stream);
         } else {
-            cudaMemcpyAsync(k_dst, k_src, copy_bytes, cudaMemcpyHostToDevice);
-            cudaMemcpyAsync(v_dst, v_src, copy_bytes, cudaMemcpyHostToDevice);
+            cudaMemcpyAsync(k_dst, k_src, copy_bytes, cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(v_dst, v_src, copy_bytes, cudaMemcpyHostToDevice, stream);
         }
 #endif
     } else {
-        float* k_dst = static_cast<float*>(kv.key_cache->data()) + filled * kv_dim;
-        float* v_dst = static_cast<float*>(kv.value_cache->data()) + filled * kv_dim;
+        float* k_dst = kv.key_store.fp32_row(filled);
+        float* v_dst = kv.value_store.fp32_row(filled);
 
         if (new_key->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
@@ -719,42 +871,16 @@ int KVCache::update_fp32(int layer, int64_t start_pos,
 }
 
 // =========================================================================
-// Per-type CPU quantize dispatch
-// =========================================================================
-
-static void quantize_cpu(KVCacheDType dtype, const float* data, uint8_t* q_data, int n) {
-    switch (dtype) {
-    case KVCacheDType::F16:  quantize_f16_cpu(data, q_data, n); break;
-    case KVCacheDType::Q8_0: quantize_q8_0_cpu(data, q_data, n); break;
-    case KVCacheDType::Q4_0: quantize_q4_0_cpu(data, q_data, n); break;
-    case KVCacheDType::Q4_K: quantize_q4_k_cpu(data, q_data, n); break;
-    default: break;
-    }
-}
-
-static void dequantize_cpu(KVCacheDType dtype, const uint8_t* q_data, float* out, int n, int row) {
-    switch (dtype) {
-    case KVCacheDType::F16:  dequantize_f16_cpu(q_data, out, n); break;
-    case KVCacheDType::Q8_0: dequantize_q8_0_cpu(q_data, out, n); break;
-    case KVCacheDType::Q4_0: dequantize_q4_0_cpu(q_data, out, n); break;
-    case KVCacheDType::Q4_K: dequantize_q4_k_cpu(q_data, out, n, row); break;
-    default: break;
-    }
-}
-
-// =========================================================================
 // Quantized update (dispatches per type_k / type_v)
 // =========================================================================
 
 int KVCache::update_quantized(int layer, int64_t start_pos,
                               const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
-    // Use CUDA path if this layer's device is CUDA
     DeviceType layer_dev = this->layer_device(layer);
     if (layer_dev == DeviceType::CUDA) {
         int result = update_quantized_cuda(layer, start_pos, new_key, new_value, seq_len);
         if (result >= 0)
             return result;
-        // Fall through to CPU path if CUDA path fails
     }
 
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
@@ -766,8 +892,6 @@ int KVCache::update_quantized(int layer, int64_t start_pos,
         return -1;
 
     int kv_dim = num_kv_heads_ * head_dim_;
-    size_t k_row_size = block_nbytes(kv_config_.type_k, kv_dim);
-    size_t v_row_size = block_nbytes(kv_config_.type_v, kv_dim);
 
     std::vector<float> h_key(seq_len * kv_dim), h_value(seq_len * kv_dim);
 
@@ -785,11 +909,11 @@ int KVCache::update_quantized(int layer, int64_t start_pos,
 
     for (int s = 0; s < seq_len; ++s) {
         if (kv_config_.type_k != KVCacheDType::FP32) {
-            uint8_t* qk_dst = kv.q_key_cache.data() + (filled + s) * k_row_size;
+            uint8_t* qk_dst = kv.key_store.q_row(filled + s);
             quantize_cpu(kv_config_.type_k, h_key.data() + s * kv_dim, qk_dst, kv_dim);
         }
         if (kv_config_.type_v != KVCacheDType::FP32) {
-            uint8_t* qv_dst = kv.q_value_cache.data() + (filled + s) * v_row_size;
+            uint8_t* qv_dst = kv.value_store.q_row(filled + s);
             quantize_cpu(kv_config_.type_v, h_value.data() + s * kv_dim, qv_dst, kv_dim);
         }
     }
@@ -798,7 +922,7 @@ int KVCache::update_quantized(int layer, int64_t start_pos,
 }
 
 // =========================================================================
-// Dequantize layer (dispatches per type_k / type_v)
+// Dequantize layer (on-demand, for non-fused attention paths)
 // =========================================================================
 
 void KVCache::dequantize_layer(int layer) {
@@ -811,7 +935,7 @@ void KVCache::dequantize_layer(int layer) {
         return;
 
     // Use CUDA path if this layer's device is CUDA and CUDA quantized cache exists
-    if (this->layer_device(layer) == DeviceType::CUDA && layers_[layer].d_q_key_cache) {
+    if (this->layer_device(layer) == DeviceType::CUDA && layers_[layer].key_store.d_q_data()) {
         dequantize_layer_cuda(layer);
         return;
     }
@@ -819,38 +943,58 @@ void KVCache::dequantize_layer(int layer) {
     auto& kv = layers_[layer];
     int filled = kv.filled;
     int kv_dim = num_kv_heads_ * head_dim_;
-    size_t k_row_size = block_nbytes(kv_config_.type_k, kv_dim);
-    size_t v_row_size = block_nbytes(kv_config_.type_v, kv_dim);
+
+    // Dequantize into the FP32 shadow tensor (which is the key_store/value_store tensor
+    // in the old model). But now we don't have a permanent FP32 shadow — so we create
+    // a temporary FP32 result. The caller (attention_executor) will use get_key_filled()
+    // which handles this.
+    //
+    // For CPU quantized: dequantize into a temporary buffer, then write back to
+    // the key_store/value_store FP32 tensor. But since we no longer have a permanent
+    // FP32 tensor for quantized modes, we need a different approach.
+    //
+    // For backward compatibility: dequantize_layer() still needs to produce FP32 data
+    // that get_key_filled() can return. We temporarily allocate FP32 tensors for this.
+    // This is only called for non-fused paths (rare in production with quantized KV).
 
     if (need_k && filled > 0) {
+        // Allocate a temporary FP32 tensor if not already present
+        if (!kv.key_store.tensor) {
+            auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+            kv.key_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, kv.key_store.device);
+        }
         std::vector<float> h_out(filled * kv_dim);
         for (int s = 0; s < filled; ++s) {
-            const uint8_t* qk_src = kv.q_key_cache.data() + s * k_row_size;
+            const uint8_t* qk_src = kv.key_store.q_row(s);
             dequantize_cpu(kv_config_.type_k, qk_src, h_out.data() + s * kv_dim, kv_dim, s);
         }
-        if (device_ == DeviceType::CUDA) {
+        if (kv.key_store.device == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cudaMemcpy(kv.key_cache->data(), h_out.data(), filled * kv_dim * sizeof(float),
+            cudaMemcpy(kv.key_store.tensor->data(), h_out.data(), filled * kv_dim * sizeof(float),
                        cudaMemcpyHostToDevice);
 #endif
         } else {
-            std::memcpy(kv.key_cache->data(), h_out.data(), filled * kv_dim * sizeof(float));
+            std::memcpy(kv.key_store.tensor->data(), h_out.data(), filled * kv_dim * sizeof(float));
         }
     }
 
     if (need_v && filled > 0) {
+        if (!kv.value_store.tensor) {
+            auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+            kv.value_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, kv.value_store.device);
+        }
         std::vector<float> h_out(filled * kv_dim);
         for (int s = 0; s < filled; ++s) {
-            const uint8_t* qv_src = kv.q_value_cache.data() + s * v_row_size;
+            const uint8_t* qv_src = kv.value_store.q_row(s);
             dequantize_cpu(kv_config_.type_v, qv_src, h_out.data() + s * kv_dim, kv_dim, s);
         }
-        if (device_ == DeviceType::CUDA) {
+        if (kv.value_store.device == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cudaMemcpy(kv.value_cache->data(), h_out.data(), filled * kv_dim * sizeof(float),
+            cudaMemcpy(kv.value_store.tensor->data(), h_out.data(), filled * kv_dim * sizeof(float),
                        cudaMemcpyHostToDevice);
 #endif
         } else {
-            std::memcpy(kv.value_cache->data(), h_out.data(), filled * kv_dim * sizeof(float));
+            std::memcpy(kv.value_store.tensor->data(), h_out.data(), filled * kv_dim * sizeof(float));
         }
     }
 }
@@ -862,64 +1006,87 @@ void KVCache::dequantize_layer(int layer) {
 TensorPtr KVCache::get_key(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return nullptr;
-    return layers_[layer].key_cache;
+    const auto& store = layers_[layer].key_store;
+
+    // FP32 mode: return the tensor directly
+    if (store.dtype == KVCacheDType::FP32 && store.tensor)
+        return store.tensor;
+
+    // Quantized mode: return the dequantized FP32 tensor if available
+    // (populated by dequantize_layer)
+    if (store.tensor)
+        return store.tensor;
+
+    return nullptr;
 }
 
 TensorPtr KVCache::get_value(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return nullptr;
-    return layers_[layer].value_cache;
+    const auto& store = layers_[layer].value_store;
+
+    if (store.dtype == KVCacheDType::FP32 && store.tensor)
+        return store.tensor;
+
+    if (store.tensor)
+        return store.tensor;
+
+    return nullptr;
 }
 
 TensorPtr KVCache::get_key_filled(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return nullptr;
     const auto& kv = layers_[layer];
-    if (!kv.key_cache)
+    const auto& store = kv.key_store;
+
+    // Need FP32 tensor for attention (either native FP32 or dequantized)
+    if (!store.tensor)
         return nullptr;
+
     int f = kv.filled;
 
     if (use_ring_buffer(layer) && f > window_size_) {
-        // Ring buffer has wrapped: need to reorder the two segments
-        // [cursor, window_size) + [0, cursor) → contiguous [0, window_size)
         int cursor = ring_cursor_[layer];
         int kvd = this->kv_dim(layer);
         auto out = std::make_shared<Tensor>(DataType::FP32,
-                                            std::vector<int64_t>{window_size_, kvd}, device_);
+                                            std::vector<int64_t>{window_size_, kvd},
+                                            store.device);
         float* dst = static_cast<float*>(out->data());
-        const float* src = static_cast<const float*>(kv.key_cache->data());
-        // Segment 1: [cursor, window_size) — older entries
+        const float* src = static_cast<const float*>(store.tensor->data());
         int seg1_len = window_size_ - cursor;
         if (seg1_len > 0)
             std::memcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float));
-        // Segment 2: [0, cursor) — newer entries
         if (cursor > 0)
             std::memcpy(dst + seg1_len * kvd, src, cursor * kvd * sizeof(float));
         return out;
     }
 
-    // Normal mode or ring buffer not yet wrapped
     int eff = use_ring_buffer(layer) ? std::min(f, window_size_) : f;
     if (eff == max_seq_len_)
-        return kv.key_cache;
-    return std::make_shared<Tensor>(kv.key_cache->slice(0, 0, eff));
+        return store.tensor;
+    return std::make_shared<Tensor>(store.tensor->slice(0, 0, eff));
 }
 
 TensorPtr KVCache::get_value_filled(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return nullptr;
     const auto& kv = layers_[layer];
-    if (!kv.value_cache)
+    const auto& store = kv.value_store;
+
+    if (!store.tensor)
         return nullptr;
+
     int f = kv.filled;
 
     if (use_ring_buffer(layer) && f > window_size_) {
         int cursor = ring_cursor_[layer];
         int kvd = this->kv_dim(layer);
         auto out = std::make_shared<Tensor>(DataType::FP32,
-                                            std::vector<int64_t>{window_size_, kvd}, device_);
+                                            std::vector<int64_t>{window_size_, kvd},
+                                            store.device);
         float* dst = static_cast<float*>(out->data());
-        const float* src = static_cast<const float*>(kv.value_cache->data());
+        const float* src = static_cast<const float*>(store.tensor->data());
         int seg1_len = window_size_ - cursor;
         if (seg1_len > 0)
             std::memcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float));
@@ -930,8 +1097,8 @@ TensorPtr KVCache::get_value_filled(int layer) const {
 
     int eff = use_ring_buffer(layer) ? std::min(f, window_size_) : f;
     if (eff == max_seq_len_)
-        return kv.value_cache;
-    return std::make_shared<Tensor>(kv.value_cache->slice(0, 0, eff));
+        return store.tensor;
+    return std::make_shared<Tensor>(store.tensor->slice(0, 0, eff));
 }
 
 int KVCache::filled(int layer) const {
@@ -961,24 +1128,33 @@ size_t KVCache::nbytes() const {
     return per_layer * layers_.size();
 }
 
-// =========================================================================
-// CUDA quantized helpers
-// =========================================================================
-
-void KVCache::alloc_cuda_q_cache(int layer, size_t bytes) {
-#ifdef USE_CUDA
-    auto& kv = layers_[layer];
-    if (kv.d_q_cache_bytes >= bytes)
-        return;
-    if (kv.d_q_key_cache)
-        cudaFree(kv.d_q_key_cache);
-    if (kv.d_q_value_cache)
-        cudaFree(kv.d_q_value_cache);
-    cudaMalloc(&kv.d_q_key_cache, bytes);
-    cudaMalloc(&kv.d_q_value_cache, bytes);
-    kv.d_q_cache_bytes = bytes;
-#endif
+void* KVCache::d_q_key_cache(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return nullptr;
+    return const_cast<void*>(layers_[layer].key_store.d_q_data());
 }
+
+void* KVCache::d_q_value_cache(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return nullptr;
+    return const_cast<void*>(layers_[layer].value_store.d_q_data());
+}
+
+size_t KVCache::key_row_bytes(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return 0;
+    return layers_[layer].key_store.row_bytes;
+}
+
+size_t KVCache::value_row_bytes(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(layers_.size()))
+        return 0;
+    return layers_[layer].value_store.row_bytes;
+}
+
+// =========================================================================
+// CUDA quantized update
+// =========================================================================
 
 int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
                                    const TensorPtr& new_key, const TensorPtr& new_value,
@@ -993,17 +1169,37 @@ int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
         return -1;
 
     int kv_dim = num_kv_heads_ * head_dim_;
-    size_t k_row_size = block_nbytes(kv_config_.type_k, kv_dim);
-    size_t v_row_size = block_nbytes(kv_config_.type_v, kv_dim);
-    size_t total_k_bytes = max_seq_len_ * k_row_size;
-    size_t total_v_bytes = max_seq_len_ * v_row_size;
+    size_t k_row_size = kv.key_store.row_bytes;
+    size_t v_row_size = kv.value_store.row_bytes;
 
-    alloc_cuda_q_cache(layer, std::max(total_k_bytes, total_v_bytes));
+    // Ensure CUDA quantized buffers exist and are large enough
+    size_t total_k_bytes = static_cast<size_t>(max_seq_len_) * k_row_size;
+    size_t total_v_bytes = static_cast<size_t>(max_seq_len_) * v_row_size;
+
+    if (!kv.key_store.d_q_data() || kv.key_store.d_bytes < total_k_bytes) {
+        // Need to allocate/reallocate
+        if (kv.key_store.d_data)
+            cudaFree(kv.key_store.d_data);
+        kv.key_store.d_bytes = total_k_bytes;
+        cudaMalloc(&kv.key_store.d_data, total_k_bytes);
+        cudaMemset(kv.key_store.d_data, 0, total_k_bytes);
+        kv.key_store.device = DeviceType::CUDA;
+    }
+    if (!kv.value_store.d_q_data() || kv.value_store.d_bytes < total_v_bytes) {
+        if (kv.value_store.d_data)
+            cudaFree(kv.value_store.d_data);
+        kv.value_store.d_bytes = total_v_bytes;
+        cudaMalloc(&kv.value_store.d_data, total_v_bytes);
+        cudaMemset(kv.value_store.d_data, 0, total_v_bytes);
+        kv.value_store.device = DeviceType::CUDA;
+    }
+
+    cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream());
 
     const float* k_src = static_cast<const float*>(new_key->data());
     const float* v_src = static_cast<const float*>(new_value->data());
 
-    std::vector<float> h_key, h_value;  // CPU staging buffers (only used if input is on CPU)
+    std::vector<float> h_key, h_value;
     const float* d_k = k_src;
     const float* d_v = v_src;
     float* d_temp = nullptr;
@@ -1014,16 +1210,17 @@ int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
         std::memcpy(h_key.data(), k_src, seq_len * kv_dim * sizeof(float));
         std::memcpy(h_value.data(), v_src, seq_len * kv_dim * sizeof(float));
         cudaMalloc(&d_temp, seq_len * kv_dim * sizeof(float) * 2);
-        cudaMemcpy(d_temp, h_key.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_temp + seq_len * kv_dim, h_value.data(), seq_len * kv_dim * sizeof(float),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(d_temp, h_key.data(), seq_len * kv_dim * sizeof(float),
+                        cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_temp + seq_len * kv_dim, h_value.data(), seq_len * kv_dim * sizeof(float),
+                        cudaMemcpyHostToDevice, stream);
         d_k = d_temp;
         d_v = d_temp + seq_len * kv_dim;
     }
 
     // Quantize K
     if (kv_config_.type_k != KVCacheDType::FP32) {
-        uint8_t* q_dst = static_cast<uint8_t*>(kv.d_q_key_cache) + filled * k_row_size;
+        uint8_t* q_dst = static_cast<uint8_t*>(kv.key_store.d_data) + filled * k_row_size;
         switch (kv_config_.type_k) {
         case KVCacheDType::F16:
             cuda::launch_quantize_f16_matrix(d_k, q_dst, seq_len, kv_dim);
@@ -1044,7 +1241,7 @@ int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
 
     // Quantize V
     if (kv_config_.type_v != KVCacheDType::FP32) {
-        uint8_t* q_dst = static_cast<uint8_t*>(kv.d_q_value_cache) + filled * v_row_size;
+        uint8_t* q_dst = static_cast<uint8_t*>(kv.value_store.d_data) + filled * v_row_size;
         switch (kv_config_.type_v) {
         case KVCacheDType::F16:
             cuda::launch_quantize_f16_matrix(d_v, q_dst, seq_len, kv_dim);
@@ -1080,26 +1277,37 @@ void KVCache::dequantize_layer_cuda(int layer) {
     int filled = kv.filled;
     int kv_dim = num_kv_heads_ * head_dim_;
 
-    if (!kv.d_q_key_cache || filled == 0)
+    if (!kv.key_store.d_q_data() || filled == 0)
         return;
 
-    float* k_out = static_cast<float*>(kv.key_cache->data());
-    float* v_out = static_cast<float*>(kv.value_cache->data());
+    // Ensure FP32 tensors exist for output
+    if (!kv.key_store.tensor) {
+        auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+        kv.key_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, DeviceType::CUDA);
+    }
+    if (!kv.value_store.tensor) {
+        auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+        kv.value_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, DeviceType::CUDA);
+    }
+
+    float* k_out = static_cast<float*>(kv.key_store.tensor->data());
+    float* v_out = static_cast<float*>(kv.value_store.tensor->data());
 
     // Dequantize K
     if (kv_config_.type_k != KVCacheDType::FP32) {
+        const void* q_src = kv.key_store.d_q_data();
         switch (kv_config_.type_k) {
         case KVCacheDType::F16:
-            cuda::launch_dequant_f16_matrix(kv.d_q_key_cache, k_out, filled, kv_dim);
+            cuda::launch_dequant_f16_matrix(q_src, k_out, filled, kv_dim);
             break;
         case KVCacheDType::Q8_0:
-            cuda::launch_dequant_q8_0_matrix(kv.d_q_key_cache, k_out, filled, kv_dim);
+            cuda::launch_dequant_q8_0_matrix(q_src, k_out, filled, kv_dim);
             break;
         case KVCacheDType::Q4_0:
-            cuda::launch_dequant_q4_0_matrix(kv.d_q_key_cache, k_out, filled, kv_dim);
+            cuda::launch_dequant_q4_0_matrix(q_src, k_out, filled, kv_dim);
             break;
         case KVCacheDType::Q4_K:
-            cuda::launch_dequant_q4_k_matrix(kv.d_q_key_cache, k_out, filled, kv_dim);
+            cuda::launch_dequant_q4_k_matrix(q_src, k_out, filled, kv_dim);
             break;
         default:
             break;
@@ -1108,18 +1316,19 @@ void KVCache::dequantize_layer_cuda(int layer) {
 
     // Dequantize V
     if (kv_config_.type_v != KVCacheDType::FP32) {
+        const void* q_src = kv.value_store.d_q_data();
         switch (kv_config_.type_v) {
         case KVCacheDType::F16:
-            cuda::launch_dequant_f16_matrix(kv.d_q_value_cache, v_out, filled, kv_dim);
+            cuda::launch_dequant_f16_matrix(q_src, v_out, filled, kv_dim);
             break;
         case KVCacheDType::Q8_0:
-            cuda::launch_dequant_q8_0_matrix(kv.d_q_value_cache, v_out, filled, kv_dim);
+            cuda::launch_dequant_q8_0_matrix(q_src, v_out, filled, kv_dim);
             break;
         case KVCacheDType::Q4_0:
-            cuda::launch_dequant_q4_0_matrix(kv.d_q_value_cache, v_out, filled, kv_dim);
+            cuda::launch_dequant_q4_0_matrix(q_src, v_out, filled, kv_dim);
             break;
         case KVCacheDType::Q4_K:
-            cuda::launch_dequant_q4_k_matrix(kv.d_q_value_cache, v_out, filled, kv_dim);
+            cuda::launch_dequant_q4_k_matrix(q_src, v_out, filled, kv_dim);
             break;
         default:
             break;
@@ -1129,7 +1338,7 @@ void KVCache::dequantize_layer_cuda(int layer) {
 }
 
 // =========================================================================
-// Sequence operations (unchanged from original)
+// Sequence operations
 // =========================================================================
 
 void KVCache::seq_rm(int seq_id, int64_t p0, int64_t p1) {
