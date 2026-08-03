@@ -40,7 +40,8 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     if (output_weight && output_weight->device() == DeviceType::CPU) {
         bool has_fused_kernel =
             (output_weight->dtype() == DataType::Q4_0 || output_weight->dtype() == DataType::Q8_0 ||
-             output_weight->dtype() == DataType::Q4_1 || output_weight->dtype() == DataType::Q4_K);
+             output_weight->dtype() == DataType::Q4_1 || output_weight->dtype() == DataType::Q4_K ||
+             output_weight->dtype() == DataType::Q6_K);
         if (has_fused_kernel) {
             LOG_INFO("Output_weight is " +
                      std::to_string(static_cast<int>(output_weight->dtype())) + " (" +

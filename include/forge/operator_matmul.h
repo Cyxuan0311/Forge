@@ -46,6 +46,36 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
                                                        const TensorPtr& weight,
                                                        const TensorPtr& residual);
 
+// Q4_K fused attention output projection + residual.
+// Weight must be Q4_K.
+TensorPtr matmul_transB_fused_attn_proj_residual_q4_k(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual);
+
+// Q5_K fused attention output projection + residual.
+// Weight must be Q5_K.
+TensorPtr matmul_transB_fused_attn_proj_residual_q5_k(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual);
+
+// Q6_K fused attention output projection + residual.
+// Weight must be Q6_K.
+TensorPtr matmul_transB_fused_attn_proj_residual_q6_k(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual);
+
+// Q2_K fused attention output projection + residual.
+// Weight must be Q2_K.
+TensorPtr matmul_transB_fused_attn_proj_residual_q2_k(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual);
+
+// Q3_K fused attention output projection + residual.
+// Weight must be Q3_K.
+TensorPtr matmul_transB_fused_attn_proj_residual_q3_k(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual);
+
 // Q4_K fused FFN gate+up: reads input once, produces SiLU(gate)*up directly.
 // Both weight tensors must be Q4_K with the same K and N.
 TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPtr& w_gate,
@@ -83,6 +113,18 @@ TensorPtr matmul_transB_fused_qkv_q3_k(const TensorPtr& input, const TensorPtr& 
 TensorPtr matmul_transB_fused_qkv_q3_k_q4_k(const TensorPtr& input, const TensorPtr& wq,
                                               const TensorPtr& wk, const TensorPtr& wv);
 
+// Q5_K fused QKV projection: reads input once, shares Q8_K quantization
+// across Q, K, V projections. Returns concatenated [1, N_q+N_k+N_v].
+// All three weight tensors must be Q5_K.
+TensorPtr matmul_transB_fused_qkv_q5_k(const TensorPtr& input, const TensorPtr& wq,
+                                       const TensorPtr& wk, const TensorPtr& wv);
+
+// Q2_K fused QKV projection: reads input once, shares Q8_K quantization
+// across Q, K, V projections. Returns concatenated [1, N_q+N_k+N_v].
+// All three weight tensors must be Q2_K.
+TensorPtr matmul_transB_fused_qkv_q2_k(const TensorPtr& input, const TensorPtr& wq,
+                                       const TensorPtr& wk, const TensorPtr& wv);
+
 // Q4_K fused FFN down-projection + residual: computes input @ weight + residual.
 // Weight tensor must be Q4_K.
 TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
@@ -94,14 +136,36 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
 TensorPtr matmul_transB_fused_ffn_down_residual_q6_k(const TensorPtr& input,
                                                      const TensorPtr& weight,
                                                      const TensorPtr& residual);
+
+// Q5_K fused FFN down-projection + residual: computes input @ weight + residual.
+// Weight tensor must be Q5_K.
+TensorPtr matmul_transB_fused_ffn_down_residual_q5_k(const TensorPtr& input,
+                                                     const TensorPtr& weight,
+                                                     const TensorPtr& residual);
+
+// Q2_K fused FFN down-projection + residual: computes input @ weight + residual.
+// Weight tensor must be Q2_K.
+TensorPtr matmul_transB_fused_ffn_down_residual_q2_k(const TensorPtr& input,
+                                                     const TensorPtr& weight,
+                                                     const TensorPtr& residual);
+
+// Q3_K fused FFN down-projection + residual: computes input @ weight + residual.
+// Weight tensor must be Q3_K.
+TensorPtr matmul_transB_fused_ffn_down_residual_q3_k(const TensorPtr& input,
+                                                     const TensorPtr& weight,
+                                                     const TensorPtr& residual);
 TensorPtr dequantize_q4_0_weight(const TensorPtr& q_weight);
 TensorPtr dequantize_q4_1_weight(const TensorPtr& q_weight);
 
 // Dequantize any quantized weight to FP32 (returns original if already FP32)
 TensorPtr dequantize_weight(const TensorPtr& weight);
 
-// Quantize an FP32 [N, K] weight tensor to Q8_0 format
+// Quantize FP32 weight to Q8_0 / Q4_0 format
 TensorPtr quantize_q8_0_weight(const TensorPtr& fp32_weight);
+TensorPtr quantize_q4_0_weight(const TensorPtr& fp32_weight);
+
+// Re-quantize Q8_0 weight to Q4_0 (dequantize → requantize)
+TensorPtr requantize_q8_0_to_q4_0(const TensorPtr& q8_weight);
 
 }  // namespace ops
 }  // namespace forge

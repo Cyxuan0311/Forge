@@ -223,6 +223,21 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
         if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q4_0) {
             attn_proj = ops::matmul_transB_fused_attn_proj_residual_q4_0(attn_out, lw.wo(), hidden);
             fused_attn_residual = true;
+        } else if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q4_K) {
+            attn_proj = ops::matmul_transB_fused_attn_proj_residual_q4_k(attn_out, lw.wo(), hidden);
+            fused_attn_residual = true;
+        } else if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q5_K) {
+            attn_proj = ops::matmul_transB_fused_attn_proj_residual_q5_k(attn_out, lw.wo(), hidden);
+            fused_attn_residual = true;
+        } else if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q6_K) {
+            attn_proj = ops::matmul_transB_fused_attn_proj_residual_q6_k(attn_out, lw.wo(), hidden);
+            fused_attn_residual = true;
+        } else if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q2_K) {
+            attn_proj = ops::matmul_transB_fused_attn_proj_residual_q2_k(attn_out, lw.wo(), hidden);
+            fused_attn_residual = true;
+        } else if (dev == DeviceType::CPU && seq_len == 1 && lw.wo()->dtype() == DataType::Q3_K) {
+            attn_proj = ops::matmul_transB_fused_attn_proj_residual_q3_k(attn_out, lw.wo(), hidden);
+            fused_attn_residual = true;
         } else if (dev == DeviceType::CUDA && seq_len == 1 && lw.wo()->dtype() == DataType::Q5_K) {
 #ifdef USE_CUDA
             int K_wo = static_cast<int>(lw.wo()->shape()[1]);

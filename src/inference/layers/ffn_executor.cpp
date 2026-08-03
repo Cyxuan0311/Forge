@@ -18,7 +18,9 @@ bool FfnExecutor::residual_fused(const ModelConfig& cfg, const LayerWeights& lw,
     }
     if (dev == DeviceType::CPU && seq_len == 1) {
         return w2_dtype == DataType::Q4_0 || w2_dtype == DataType::Q4_1 ||
-               w2_dtype == DataType::Q4_K || w2_dtype == DataType::Q6_K;
+               w2_dtype == DataType::Q4_K || w2_dtype == DataType::Q5_K ||
+               w2_dtype == DataType::Q6_K || w2_dtype == DataType::Q2_K ||
+               w2_dtype == DataType::Q3_K;
     }
     return false;
 }
@@ -142,6 +144,18 @@ TensorPtr FfnExecutor::apply(const TensorPtr& x, const TensorPtr& residual, cons
                 } else if (dev == DeviceType::CPU && seq_len == 1 &&
                            lw.w2()->dtype() == DataType::Q4_K) {
                     ffn_out = ops::matmul_transB_fused_ffn_down_residual_q4_k(ffn_mid, lw.w2(),
+                                                                              residual);
+                } else if (dev == DeviceType::CPU && seq_len == 1 &&
+                           lw.w2()->dtype() == DataType::Q5_K) {
+                    ffn_out = ops::matmul_transB_fused_ffn_down_residual_q5_k(ffn_mid, lw.w2(),
+                                                                              residual);
+                } else if (dev == DeviceType::CPU && seq_len == 1 &&
+                           lw.w2()->dtype() == DataType::Q2_K) {
+                    ffn_out = ops::matmul_transB_fused_ffn_down_residual_q2_k(ffn_mid, lw.w2(),
+                                                                              residual);
+                } else if (dev == DeviceType::CPU && seq_len == 1 &&
+                           lw.w2()->dtype() == DataType::Q3_K) {
+                    ffn_out = ops::matmul_transB_fused_ffn_down_residual_q3_k(ffn_mid, lw.w2(),
                                                                               residual);
                 } else {
                     ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
