@@ -41,6 +41,17 @@ inline bool operator&(BackendCapability a, BackendCapability b) {
     return (static_cast<uint32_t>(a) & static_cast<uint32_t>(b)) != 0;
 }
 
+// Full capability description of a backend, used by OpDispatch::supports() to decide
+// whether an op can run on this backend (aligns with ggml_backend_supports_op).
+struct BackendCapabilities {
+    DeviceType device = DeviceType::CPU;
+    BackendCapability flags = BackendCapability::FP32;
+    size_t alignment = 1;        // required byte alignment of tensor data
+    int compute_capability = 0;  // GPU compute capability (major * 10 + minor), 0 for CPU
+
+    bool has(BackendCapability c) const { return (flags & c); }
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -51,6 +62,11 @@ public:
     // Memory management
     virtual void* allocate(size_t size) = 0;
     virtual void deallocate(void* ptr, size_t size) = 0;
+
+    // Backend-specific allocation size (for planner, aligns with ggml_backend_buft_get_alloc_size).
+    // Returns the actual number of bytes the backend needs to allocate for a tensor of given
+    // logical size. Default implementation returns the logical size.
+    virtual size_t get_alloc_size(size_t logical_size) const { return logical_size; }
 
     // Memory pool (optional, for backends that support it)
     virtual void* pool_allocate(size_t size) { return allocate(size); }
@@ -76,6 +92,16 @@ public:
     // Capability query
     virtual BackendCapability capabilities() const { return BackendCapability::FP32; }
     bool supports(BackendCapability cap) const { return (capabilities() & cap); }
+
+    // Full capability description (device, flags, alignment, compute capability)
+    virtual BackendCapabilities full_capabilities() const {
+        BackendCapabilities caps;
+        caps.device = device_type();
+        caps.flags = capabilities();
+        caps.alignment = 1;
+        caps.compute_capability = 0;
+        return caps;
+    }
 
     // Device info
     virtual size_t device_memory_total() const { return 0; }

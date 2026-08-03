@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "forge/logger.h"
+#include "memory_counters.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -33,6 +34,8 @@ public:
     std::string name() const override { return "cpu"; }
 
     void* allocate(size_t size) override {
+        auto& ctr = MemoryCounters::instance();
+        ctr.cpu_malloc_count.fetch_add(1, std::memory_order_relaxed);
         void* ptr = std::malloc(size);
         if (!ptr && size > 0) {
             LOG_ERROR("CPU malloc failed for " + std::to_string(size) + " bytes");
@@ -41,8 +44,11 @@ public:
     }
 
     void deallocate(void* ptr, size_t) override {
-        if (ptr)
+        if (ptr) {
+            auto& ctr = MemoryCounters::instance();
+            ctr.cpu_free_count.fetch_add(1, std::memory_order_relaxed);
             std::free(ptr);
+        }
     }
 
     void copy(void* dst, const void* src, size_t size, CopyKind) override {
@@ -85,6 +91,8 @@ public:
     std::string name() const override { return "cuda:" + std::to_string(device_id_); }
 
     void* allocate(size_t size) override {
+        auto& ctr = MemoryCounters::instance();
+        ctr.cuda_malloc_count.fetch_add(1, std::memory_order_relaxed);
         void* ptr = nullptr;
         cudaSetDevice(device_id_);
         cudaError_t err = cudaMalloc(&ptr, size);
@@ -97,9 +105,17 @@ public:
 
     void deallocate(void* ptr, size_t) override {
         if (ptr) {
+            auto& ctr = MemoryCounters::instance();
+            ctr.cuda_free_count.fetch_add(1, std::memory_order_relaxed);
             cudaSetDevice(device_id_);
             cudaFree(ptr);
         }
+    }
+
+    // CUDA requires 256-byte alignment for optimal memory access
+    size_t get_alloc_size(size_t logical_size) const override {
+        constexpr size_t alignment = 256;
+        return (logical_size + alignment - 1) & ~(alignment - 1);
     }
 
     void copy(void* dst, const void* src, size_t size, CopyKind kind) override {
@@ -165,6 +181,18 @@ public:
     BackendCapability capabilities() const override {
         return BackendCapability::FP32 | BackendCapability::FP16 | BackendCapability::INT8 |
                BackendCapability::Quantized | BackendCapability::StreamAsync;
+    }
+
+    BackendCapabilities full_capabilities() const override {
+        BackendCapabilities caps;
+        caps.device = DeviceType::CUDA;
+        caps.flags = capabilities();
+        caps.alignment = 256;  // CUDA requires 256-byte alignment for optimal access
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, device_id_) == cudaSuccess) {
+            caps.compute_capability = prop.major * 10 + prop.minor;
+        }
+        return caps;
     }
 
     size_t device_memory_total() const override {
