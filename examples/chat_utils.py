@@ -105,6 +105,7 @@ def print_cpp_profiler_summary():
     try:
         summary = forge.profiler_summary()
         if not summary:
+            print("\n  [Profiler] No C++ operator data. Build with -DFORGE_PROFILING=ON to enable.")
             return
         print("\n" + "=" * 90)
         print("  C++ Operator-Level Performance Profile (from PerfProfiler)")

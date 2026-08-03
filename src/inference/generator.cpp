@@ -83,6 +83,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     int token_id;
     {
         PERF_SCOPE("generator/prefill");
+        SET_PERF_CONTEXT(0, "prefill", -1, dev == DeviceType::CUDA ? "cuda" : "cpu", prompt_len);
         auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{prompt_len},
                                                   DeviceType::CPU);
         std::memcpy(input_ids->data(), prompt_tokens.data(), prompt_len * sizeof(int32_t));
@@ -258,6 +259,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         TensorPtr logits;
         {
             PERF_SCOPE("decode/forward");
+            SET_PERF_CONTEXT(0, "decode", -1, dev == DeviceType::CUDA ? "cuda" : "cpu", 1);
             logits = engine->forward_request(ForwardRequest::from_ids(input_ids, pos));
         }
 

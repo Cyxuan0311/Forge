@@ -72,6 +72,7 @@ void Sampler::ensure_token_history_buffer(int n) {
 
 int Sampler::sample_greedy(const TensorPtr& logits) {
     int vocab_size = static_cast<int>(logits->numel());
+    SET_PERF_CONTEXT(-1, "sampler", -1, logits->device() == DeviceType::CUDA ? "cuda" : "cpu", 1);
 
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
