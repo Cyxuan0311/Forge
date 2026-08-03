@@ -40,6 +40,27 @@ struct block_q3_K {
 };
 static_assert(sizeof(block_q3_K) == 110, "block_q3_K must be 110 bytes");
 
+// Q4_K block structure (256 elements, 144 bytes)
+// Layout: d[2](fp16) + dmin[2](fp16) + scales[12] + qs[128]
+struct block_q4_K {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
+
+// Q5_K block structure (256 elements, 176 bytes)
+// Layout: d[2](fp16) + dmin[2](fp16) + scales[12] + qh[32] + ql[128]
+struct block_q5_K {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];
+    uint8_t ql[128];
+};
+static_assert(sizeof(block_q5_K) == 176, "block_q5_K must be 176 bytes");
+
 // Q6_K block structure (256 elements, 210 bytes)
 struct block_q6_K {
     uint8_t ql[128];
@@ -141,6 +162,25 @@ static inline __m256i get_scale_shuffle_q3k(int i) {
         10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
         12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
         14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15};
+    return _mm256_loadu_si256((const __m256i*)k_shuffle + i);
+}
+
+// Helper: generate 256-bit shuffle mask for Q4_K / Q5_K scale broadcast
+// Each 16-bit scale is duplicated across 16 bytes of the 256-bit vector
+static inline __m256i get_scale_shuffle_k4(int i) {
+    static const uint8_t k_shuffle[256] = {
+        0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,
+        0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,
+        2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  4,  5,
+        4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,
+        4,  5,  4,  5,  4,  5,  4,  5,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,
+        6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  8,  9,  8,  9,
+        8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,
+        8,  9,  8,  9,  8,  9,  10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+        10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 12, 13, 12, 13, 12, 13,
+        12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+        12, 13, 12, 13, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15};
     return _mm256_loadu_si256((const __m256i*)k_shuffle + i);
 }
 #endif  // USE_AVX2

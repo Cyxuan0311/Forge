@@ -2,8 +2,10 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include "forge/cuda_kernels.h"
+#include "forge/logger.h"
 #include "forge/op_dispatch.h"
 #include "forge/operator_activation.h"
 #include "forge/operator_elementwise.h"
@@ -222,6 +224,16 @@ TensorPtr gelu_multiply(const TensorPtr& gate, const TensorPtr& up) {
 }
 
 TensorPtr softmax(const TensorPtr& x, float temperature) {
+    // Phase 4 hard rule: no cross-device fallback. There is no CUDA softmax kernel, so a
+    // CUDA-resident input is a capability failure instead of silent D2H/H2D staging.
+    if (x->device() != DeviceType::CPU) {
+        std::string msg =
+            "softmax capability failure: input lives on a non-CPU device but there is no "
+            "CUDA softmax kernel (cross-device fallback to CPU is disabled)";
+        LOG_ERROR(msg);
+        throw std::runtime_error(msg);
+    }
+
     auto out = std::make_shared<Tensor>(DataType::FP32, x->shape(), x->device());
 
     if (x->ndim() != 2)
@@ -231,17 +243,6 @@ TensorPtr softmax(const TensorPtr& x, float temperature) {
 
     const float* x_data = static_cast<const float*>(x->data());
     float* o_data = static_cast<float*>(out->data());
-
-    std::vector<float> host_data;
-    if (x->device() == DeviceType::CUDA) {
-#ifdef USE_CUDA
-        host_data.resize(x->numel());
-        cudaMemcpy(host_data.data(), x_data, x->numel() * sizeof(float), cudaMemcpyDeviceToHost);
-        x_data = host_data.data();
-        std::vector<float> host_out(x->numel());
-        o_data = host_out.data();
-#endif
-    }
 
     for (int r = 0; r < rows; ++r) {
         float max_val = -1e30f;
@@ -256,13 +257,6 @@ TensorPtr softmax(const TensorPtr& x, float temperature) {
         for (int c = 0; c < cols; ++c) {
             o_data[r * cols + c] /= sum;
         }
-    }
-
-    if (x->device() == DeviceType::CUDA) {
-#ifdef USE_CUDA
-        cudaMemcpy(static_cast<float*>(out->data()), o_data, x->numel() * sizeof(float),
-                   cudaMemcpyHostToDevice);
-#endif
     }
 
     return out;

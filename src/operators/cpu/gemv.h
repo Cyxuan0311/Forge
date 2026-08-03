@@ -775,31 +775,6 @@ static void gemv_q4_1_transB_avx2(const float* a, const uint8_t* w, float* out, 
 
 #ifdef USE_AVX2
 
-struct block_q4_K {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t scales[12];
-    uint8_t qs[128];
-};
-static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
-
-static inline __m256i get_scale_shuffle_k4(int i) {
-    static const uint8_t k_shuffle[256] = {
-        0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  0,  1,
-        0,  1,  0,  1,  0,  1,  0,  1,  0,  1,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,
-        2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  2,  3,  4,  5,
-        4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,  4,  5,
-        4,  5,  4,  5,  4,  5,  4,  5,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,
-        6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  6,  7,  8,  9,  8,  9,
-        8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,  8,  9,
-        8,  9,  8,  9,  8,  9,  10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
-        10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 12, 13, 12, 13, 12, 13,
-        12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
-        12, 13, 12, 13, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
-        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15};
-    return _mm256_loadu_si256((const __m256i*)k_shuffle + i);
-}
-
 // Dot product of one Q4_K weight row with one Q8_K activation block row.
 // Returns the sum for (nb) Q4_K super-blocks.
 static inline float dot_q4_K_q8_K_avx2(const uint8_t* q4_row, const block_q8_K* q8, int nb) {
