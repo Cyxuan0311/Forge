@@ -111,6 +111,26 @@ using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, c
 extern const GemvFn gemv_dispatch[18];
 extern const GemvBatchFn gemv_batch_dispatch[18];
 
+// ---- Phase 6: MMQ (Matrix-Matrix Quantized) ----
+// For large M (>32), replaces dequantize-to-FP32 + cuBLAS with dp4a.
+// Pre-quantizes FP32 activations to Q8_1_mmq, then tiled dp4a dot products.
+using MmqFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
+
+extern const MmqFn mmq_dispatch[18];
+
+void launch_mmq_q3_k(const float* x, const void* q_weight, float* out,
+                      int M, int K, int N, cudaStream_t stream = 0);
+void launch_mmq_q4_k(const float* x, const void* q_weight, float* out,
+                      int M, int K, int N, cudaStream_t stream = 0);
+void launch_mmq_q5_k(const float* x, const void* q_weight, float* out,
+                      int M, int K, int N, cudaStream_t stream = 0);
+void launch_mmq_q4_0(const float* x, const void* q_weight, float* out,
+                      int M, int K, int N, cudaStream_t stream = 0);
+void launch_mmq_q6_k(const float* x, const void* q_weight, float* out,
+                      int M, int K, int N, cudaStream_t stream = 0);
+void launch_mmq_q2_k(const float* x, const void* q_weight, float* out,
+                      int M, int K, int N, cudaStream_t stream = 0);
+
 // ---- Fused kernels ----
 void launch_qkv_fused_q4_0(const float* x, const void* q_wq, int N_q, const void* q_wk, int N_k,
                            const void* q_wv, int N_v, float* out_q, float* out_k, float* out_v,
@@ -168,6 +188,21 @@ void launch_dequant_q5_k_matrix(const void* q_data, float* out, int N, int K,
 
 void launch_dequant_q6_k_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
+
+void launch_dequant_q2_k_matrix(const void* q_data, float* out, int N, int K,
+                                cudaStream_t stream = 0);
+
+void launch_dequant_q3_k_matrix(const void* q_data, float* out, int N, int K,
+                                cudaStream_t stream = 0);
+
+void launch_dequant_q5_0_matrix(const void* q_data, float* out, int N, int K,
+                                cudaStream_t stream = 0);
+
+void launch_dequant_q5_1_matrix(const void* q_data, float* out, int N, int K,
+                                cudaStream_t stream = 0);
+
+void launch_dequant_iq2_s_matrix(const void* q_data, float* out, int N, int K,
+                                 cudaStream_t stream = 0);
 
 void launch_flash_attention(const float* Q, const float* K, const float* V, float* O, int q_len,
                             int kv_len, int num_heads, int head_dim,

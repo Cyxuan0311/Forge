@@ -2,6 +2,12 @@
 #include "forge/cuda_kernels.h"
 
 namespace forge {
+
+// Defined in src/operators/cpu/matmul.cpp (non-static, in namespace forge::ops).
+namespace ops {
+extern const uint64_t iq2s_grid[1024];
+}  // namespace ops
+
 namespace cuda {
 
 // ---- Q4_0 Vector Dequantization ----
@@ -505,7 +511,229 @@ void launch_dequant_q6_k_matrix(const void* q_data, float* out, int N, int K, cu
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     dequant_q6_k_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
-                                                               out, N, K);
+                                                              out, N, K);
+}
+
+// ---- Q2_K Matrix Dequantization ----
+// Block layout: scales[16] + qs[64] + d(f16,2B) + dmin(f16,2B) = 84 bytes
+
+__global__ void dequant_q2_k_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                          float* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int Q2_K_BLOCK_SIZE = 84;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int j_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * blocks_per_row * Q2_K_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q2_K_BLOCK_SIZE;
+    const uint8_t* scales = block_ptr;
+    const uint8_t* q = block_ptr + 16;
+
+    uint16_t d_bits, dmin_bits;
+    memcpy(&d_bits, block_ptr + 80, 2);
+    memcpy(&dmin_bits, block_ptr + 82, 2);
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+    float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+
+    int h = j_in_block / 128;
+    int rem = j_in_block % 128;
+    int sub = rem / 32;
+    int l_sub = rem % 32;
+    int shift = sub * 2;
+
+    int is = h * 8 + sub * 2 + (l_sub / 16);
+    uint8_t sc = scales[is];
+    float dl = d * static_cast<float>(sc & 0xF);
+    float ml = dmin * static_cast<float>(sc >> 4);
+
+    int q_offset = h * 32 + l_sub;
+    int q_val = (q[q_offset] >> shift) & 3;
+
+    out[idx] = dl * static_cast<float>(q_val) - ml;
+}
+
+void launch_dequant_q2_k_matrix(const void* q_data, float* out, int N, int K, cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q2_k_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
+                                                              out, N, K);
+}
+
+// ---- Q3_K Matrix Dequantization ----
+// Block layout: hmask[32] + qs[64] + scales[12] + d(f16,2B) = 110 bytes
+
+__global__ void dequant_q3_k_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                          float* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int Q3_K_BLOCK_SIZE = 110;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int j_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * blocks_per_row * Q3_K_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q3_K_BLOCK_SIZE;
+    const uint8_t* hm = block_ptr;
+    const uint8_t* q = block_ptr + 32;
+    const uint8_t* scales_raw = block_ptr + 96;
+
+    uint16_t d_bits;
+    memcpy(&d_bits, block_ptr + 108, 2);
+    float d_all = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+    int h = j_in_block / 128;
+    int rem = j_in_block % 128;
+    int sub = rem / 32;
+    int l_sub = rem % 32;
+    int shift = sub * 2;
+
+    int bit_pos = h * 4 + sub;
+    uint8_t hm_bit = (hm[l_sub] >> bit_pos) & 1;
+
+    int q_offset = h * 32 + l_sub;
+    int q_val = (q[q_offset] >> shift) & 3;
+    int q_adj = q_val - (hm_bit ? 0 : 4);
+
+    int is = h * 8 + sub * 2 + (l_sub / 16);
+
+    int8_t unpacked[16];
+    q3_k_unpack_scales(scales_raw, unpacked);
+    float dl = d_all * static_cast<float>(unpacked[is] - 32);
+
+    out[idx] = dl * static_cast<float>(q_adj);
+}
+
+void launch_dequant_q3_k_matrix(const void* q_data, float* out, int N, int K, cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q3_k_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
+                                                              out, N, K);
+}
+
+// ---- Q5_0 Matrix Dequantization ----
+// Block layout: d[2](fp16) + qh[4](uint32) + qs[16](nibble) = 22 bytes / 32 elements
+
+__global__ void dequant_q5_0_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                           float* __restrict__ out, int N, int K) {
+    const int Q5_0_BLOCK_SIZE = 22;
+    const int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / BLOCK_ELEMS;
+    int j = col % BLOCK_ELEMS;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * num_blocks_row * Q5_0_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q5_0_BLOCK_SIZE;
+
+    uint16_t d_bits;
+    memcpy(&d_bits, block_ptr, sizeof(uint16_t));
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+    uint32_t qh;
+    memcpy(&qh, block_ptr + 2, 4);
+    const uint8_t* qs = block_ptr + 6;
+
+    int q_val;
+    if (j < 16) {
+        uint8_t xh = ((qh >> j) << 4) & 0x10;
+        q_val = ((qs[j] & 0x0F) | xh) - 16;
+    } else {
+        uint8_t xh = (qh >> (j - 16 + 12)) & 0x10;
+        q_val = ((qs[j - 16] >> 4) | xh) - 16;
+    }
+
+    out[idx] = static_cast<float>(q_val) * d;
+}
+
+void launch_dequant_q5_0_matrix(const void* q_data, float* out, int N, int K,
+                                cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q5_0_matrix_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), out, N, K);
+}
+
+// ---- Q5_1 Matrix Dequantization ----
+// Block layout: d[2](fp16) + m[2](fp16) + qh[4](uint32) + qs[16](nibble) = 24 bytes / 32 elements
+
+__global__ void dequant_q5_1_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                           float* __restrict__ out, int N, int K) {
+    const int Q5_1_BLOCK_SIZE = 24;
+    const int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / BLOCK_ELEMS;
+    int j = col % BLOCK_ELEMS;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * num_blocks_row * Q5_1_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q5_1_BLOCK_SIZE;
+
+    uint16_t d_bits, m_bits;
+    memcpy(&d_bits, block_ptr, sizeof(uint16_t));
+    memcpy(&m_bits, block_ptr + 2, sizeof(uint16_t));
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+    float m = __half2float(reinterpret_cast<const __half&>(m_bits));
+
+    uint32_t qh;
+    memcpy(&qh, block_ptr + 4, 4);
+    const uint8_t* qs = block_ptr + 8;
+
+    int q_val;
+    if (j < 16) {
+        uint8_t xh = ((qh >> j) << 4) & 0x10;
+        q_val = (qs[j] & 0x0F) | xh;
+    } else {
+        uint8_t xh = (qh >> (j - 16 + 12)) & 0x10;
+        q_val = (qs[j - 16] >> 4) | xh;
+    }
+
+    out[idx] = static_cast<float>(q_val) * d + m;
+}
+
+void launch_dequant_q5_1_matrix(const void* q_data, float* out, int N, int K,
+                                cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q5_1_matrix_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), out, N, K);
 }
 
 // ---- Q4_0 Quantization ----
@@ -1144,6 +1372,84 @@ void launch_dequant_iq2_xxs_matrix(const void* q_data, float* out, int N, int K,
     int threads = 256;
     int64_t blocks = (total + threads - 1) / threads;
     dequant_iq2_xxs_matrix_kernel<<<(int)blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), out, N, K);
+}
+
+// =========================================================================
+// IQ2_S CUDA Dequantization
+// block_iq2_s: d[2](fp16) + qs[64] + qh[8] + scales[8] = 82B per 256 elements
+// qs[0..31] = quantized values, qs[32..63] = sign bits
+// =========================================================================
+
+// iq2s_grid is declared at the top of namespace forge (extern).
+
+__constant__ uint64_t c_iq2s_grid[1024];
+// c_kmask_iq2xs is already declared and uploaded by ensure_iq2_xxs_tables().
+
+static bool iq2_s_tables_uploaded = false;
+
+static void ensure_iq2_s_tables() {
+    if (iq2_s_tables_uploaded) return;
+    ensure_iq2_xxs_tables();  // uploads c_kmask_iq2xs
+    cudaMemcpyToSymbol(c_iq2s_grid, forge::ops::iq2s_grid, sizeof(uint64_t) * 1024);
+    iq2_s_tables_uploaded = true;
+}
+
+__global__ void dequant_iq2_s_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                            float* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int IQ2_S_BLOCK_SIZE = 82;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int col_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (int64_t)row * blocks_per_row * IQ2_S_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * IQ2_S_BLOCK_SIZE;
+
+    float d = __half2float(
+        reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
+    const uint8_t* qs = block_ptr + 2;       // [0..31]=values, [32..63]=signs
+    const uint8_t* qh = block_ptr + 2 + 64;  // high bits [0..7]
+    const uint8_t* sc = block_ptr + 2 + 72;  // scales [0..7]
+
+    int ib32 = col_in_block / 32;
+    int l = (col_in_block % 32) / 8;
+    int j = col_in_block % 8;
+
+    // Scale: low nibble for l/2==0, high nibble for l/2==1
+    float db;
+    if (l / 2 == 0) {
+        db = d * (0.5f + (sc[ib32] & 0xF)) * 0.25f;
+    } else {
+        db = d * (0.5f + (sc[ib32] >> 4)) * 0.25f;
+    }
+
+    const uint8_t* qs_sub = qs + ib32 * 4;      // 4 bytes of values for this ib32
+    const uint8_t* signs = qs + 32 + ib32 * 4;  // 4 bytes of signs for this ib32
+
+    int grid_idx = qs_sub[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+    const uint8_t* grid = reinterpret_cast<const uint8_t*>(&c_iq2s_grid[grid_idx]);
+
+    out[idx] = db * static_cast<float>(grid[j]) *
+               (signs[l] & c_kmask_iq2xs[j] ? -1.f : 1.f);
+}
+
+void launch_dequant_iq2_s_matrix(const void* q_data, float* out, int N, int K,
+                                 cudaStream_t stream) {
+    ensure_iq2_s_tables();
+    int64_t total = (int64_t)N * K;
+    int threads = 256;
+    int64_t blocks = (total + threads - 1) / threads;
+    dequant_iq2_s_matrix_kernel<<<(int)blocks, threads, 0, stream>>>(
         static_cast<const uint8_t*>(q_data), out, N, K);
 }
 

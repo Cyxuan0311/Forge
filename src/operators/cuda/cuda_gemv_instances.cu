@@ -23,6 +23,7 @@ INST_GEMV(DataType::Q4_0)
 INST_GEMV(DataType::Q4_1)
 INST_GEMV(DataType::Q4_K)
 INST_GEMV(DataType::Q8_0)
+INST_GEMV(DataType::Q2_K)
 INST_GEMV(DataType::Q3_K)
 INST_GEMV(DataType::Q5_K)
 INST_GEMV(DataType::Q6_K)
@@ -38,42 +39,42 @@ const GemvFn gemv_dispatch[18] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_gemv_q4_0_q8_1,                          // Q8_1+dp4a
-    /* Q4_1=3  */ launch_gemv_typed_transB<DataType::Q4_1>,
+    /* Q4_1=3  */ launch_gemv_q4_1_q8_1,                            // Q8_1+dp4a (Phase 5)
     /* Q4_K=4  */ launch_gemv_q4_k_q8_1,                            // special Q8_1+dp4a
     /* INT8=5  */ nullptr,
     /* INT32=6 */ nullptr,
-    /* Q8_0=7  */ launch_gemv_typed_transB<DataType::Q8_0>,
-    /* Q5_0=8  */ nullptr,
-    /* Q5_1=9  */ nullptr,
+    /* Q8_0=7  */ launch_gemv_q8_0_q8_1,                            // Q8_1+dp4a (Phase 5)
+    /* Q5_0=8  */ launch_gemv_q5_0_q8_1,                             // Q8_1+dp4a (Phase 5)
+    /* Q5_1=9  */ launch_gemv_q5_1_q8_1,                             // Q8_1+dp4a (Phase 5)
     /* Q2_K=10 */ launch_gemv_q2_k_q8_1,                             // special Q8_1+dp4a
     /* Q3_K=11 */ launch_gemv_q3_k_smem,                            // special smem+dp4a
-    /* Q5_K=12 */ launch_gemv_typed_transB<DataType::Q5_K>,
-    /* Q6_K=13 */ launch_gemv_typed_transB<DataType::Q6_K>,
-    /* IQ2_S=14*/ nullptr,
-    /* BF16=15 */ nullptr,
-    /* IQ2_XXS=16 */ nullptr,
-    /* IQ4_NL=17  */ nullptr,
+    /* Q5_K=12 */ launch_gemv_q5_k_q8_1,                             // Q8_1+dp4a (Phase 5)
+    /* Q6_K=13 */ launch_gemv_q6_k_q8_1,                             // Q8_1+dp4a (Phase 5)
+    /* IQ2_S=14  */ launch_gemv_iq2_s_q8_1,                          // Q8_1+dp4a (Phase 5)
+    /* BF16=15  */ nullptr,
+    /* IQ2_XXS=16 */ launch_gemv_iq2_xxs_q8_1,                      // Q8_1+dp4a (Phase 5)
+    /* IQ4_NL=17  */ launch_gemv_iq4_nl_q8_1,                      // Q8_1+dp4a (Phase 5)
 };
 
 const GemvBatchFn gemv_batch_dispatch[18] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
-    /* Q4_0=2  */ launch_gemv_typed_transB_batch<DataType::Q4_0>,
-    /* Q4_1=3  */ launch_gemv_typed_transB_batch<DataType::Q4_1>,
-    /* Q4_K=4  */ launch_gemv_typed_transB_batch<DataType::Q4_K>,
+    /* Q4_0=2  */ launch_gemv_q4_0_q8_1_batch,                          // Q8_1+dp4a (Phase 5)
+    /* Q4_1=3  */ launch_gemv_q4_1_q8_1_batch,                        // Q8_1+dp4a (Phase 5)
+    /* Q4_K=4  */ launch_gemv_q4_k_q8_1_batch,                          // Q8_1+dp4a (Phase 5)
     /* INT8=5  */ nullptr,
     /* INT32=6 */ nullptr,
-    /* Q8_0=7  */ launch_gemv_typed_transB_batch<DataType::Q8_0>,
-    /* Q5_0=8  */ nullptr,
-    /* Q5_1=9  */ nullptr,
-    /* Q2_K=10 */ nullptr,
-    /* Q3_K=11 */ launch_gemv_typed_transB_batch<DataType::Q3_K>,
-    /* Q5_K=12 */ launch_gemv_typed_transB_batch<DataType::Q5_K>,
-    /* Q6_K=13 */ launch_gemv_typed_transB_batch<DataType::Q6_K>,
-    /* IQ2_S=14*/ nullptr,
-    /* BF16=15 */ nullptr,
-    /* IQ2_XXS=16 */ nullptr,
-    /* IQ4_NL=17  */ nullptr,
+    /* Q8_0=7  */ launch_gemv_q8_0_q8_1_batch,                        // Q8_1+dp4a (Phase 5)
+    /* Q5_0=8  */ launch_gemv_q5_0_q8_1_batch,                         // Q8_1+dp4a (Phase 5)
+    /* Q5_1=9  */ launch_gemv_q5_1_q8_1_batch,                         // Q8_1+dp4a (Phase 5)
+    /* Q2_K=10 */ launch_gemv_q2_k_q8_1_batch,                           // Q8_1+dp4a (Phase 5)
+    /* Q3_K=11 */ launch_gemv_q3_k_q8_1_batch,                           // Q8_1+dp4a (Phase 5)
+    /* Q5_K=12 */ launch_gemv_q5_k_q8_1_batch,                           // Q8_1+dp4a (Phase 5)
+    /* Q6_K=13 */ launch_gemv_q6_k_q8_1_batch,                           // Q8_1+dp4a (Phase 5)
+    /* IQ2_S=14  */ launch_gemv_iq2_s_q8_1_batch,                        // Q8_1+dp4a (Phase 5)
+    /* BF16=15  */ nullptr,
+    /* IQ2_XXS=16 */ launch_gemv_iq2_xxs_q8_1_batch,                    // Q8_1+dp4a (Phase 5)
+    /* IQ4_NL=17  */ launch_gemv_iq4_nl_q8_1_batch,                    // Q8_1+dp4a (Phase 5)
 };
 
 }  // namespace cuda

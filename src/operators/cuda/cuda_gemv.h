@@ -22,6 +22,76 @@ void launch_gemv_q4_0_transB(const float* x, const void* q_weight, float* out, i
 void launch_gemv_q4_0_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
 
+// ---- Q4_0 batched GEMV (Q8_1 + dp4a, for M>1 prefill/small batch) ----
+void launch_gemv_q4_0_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q2_K batched GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q2_k_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q3_K batched GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q3_k_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q4_K batched GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q4_k_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q5_0 GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q5_0_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+void launch_gemv_q5_0_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q5_1 GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q5_1_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+void launch_gemv_q5_1_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- IQ4_NL GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_iq4_nl_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                               cudaStream_t stream = 0);
+void launch_gemv_iq4_nl_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                     int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- IQ2_XXS GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_iq2_xxs_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                                cudaStream_t stream = 0);
+void launch_gemv_iq2_xxs_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                      int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- IQ2_S GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_iq2_s_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                              cudaStream_t stream = 0);
+void launch_gemv_iq2_s_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                    int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q4_1 GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q4_1_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+void launch_gemv_q4_1_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q8_0 GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q8_0_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+void launch_gemv_q8_0_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q5_K GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q5_k_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+void launch_gemv_q5_k_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- Q6_K GEMV (Q8_1 + dp4a, Phase 5) ----
+void launch_gemv_q6_k_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+void launch_gemv_q6_k_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
 void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
                                   const void* q_weight2, int N2, float* out, int K,
                                   cudaStream_t stream = 0);
