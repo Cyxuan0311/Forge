@@ -40,6 +40,7 @@ struct CliArgs {
     int top_k = 40;
     float top_p = 0.9f;
     float repeat_penalty = 1.1f;
+    int repeat_last_n = 64;
     uint64_t seed = 0;
     bool no_sample = false;
 
@@ -99,12 +100,12 @@ struct GenerationStats {
 GenerationStats generate_streaming(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
                                    const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                    float temperature, int top_k, float top_p, float repeat_penalty,
-                                   bool do_sample, uint64_t seed, int eos_token_id);
+                                   int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id);
 
 GenerationStats generate_batch(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
                                const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                float temperature, int top_k, float top_p, float repeat_penalty,
-                               bool do_sample, uint64_t seed, int eos_token_id);
+                               int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id);
 
 // ============================================================================
 // Interactive chat

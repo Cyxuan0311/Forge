@@ -25,7 +25,7 @@ using namespace forge;
 GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& tokenizer,
                                    const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                    float temperature, int top_k, float top_p, float repeat_penalty,
-                                   bool do_sample, uint64_t seed, int eos_token_id) {
+                                   int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id) {
     GenerationStats stats;
     stats.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
 
@@ -42,6 +42,7 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     sampler_cfg.top_k = top_k;
     sampler_cfg.top_p = top_p;
     sampler_cfg.repeat_penalty = repeat_penalty;
+    sampler_cfg.repeat_last_n = repeat_last_n;
     sampler_cfg.do_sample = do_sample;
     sampler_cfg.seed = seed;
     sampler_cfg.logit_softcapping = ctx.model().config().f_final_logit_softcapping;
@@ -148,13 +149,14 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
 GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer,
                                const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                float temperature, int top_k, float top_p, float repeat_penalty,
-                               bool do_sample, uint64_t seed, int eos_token_id) {
+                               int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id) {
     GenerationConfig gen_cfg;
     gen_cfg.max_new_tokens = max_new_tokens;
     gen_cfg.temperature = temperature;
     gen_cfg.top_k = top_k;
     gen_cfg.top_p = top_p;
     gen_cfg.repeat_penalty = repeat_penalty;
+    gen_cfg.repeat_last_n = repeat_last_n;
     gen_cfg.do_sample = do_sample;
     gen_cfg.seed = seed;
     gen_cfg.eos_token_id = eos_token_id;
@@ -164,6 +166,7 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     sampler_cfg.top_k = top_k;
     sampler_cfg.top_p = top_p;
     sampler_cfg.repeat_penalty = repeat_penalty;
+    sampler_cfg.repeat_last_n = repeat_last_n;
     sampler_cfg.do_sample = do_sample;
     sampler_cfg.seed = seed;
     sampler_cfg.logit_softcapping = ctx.model().config().f_final_logit_softcapping;

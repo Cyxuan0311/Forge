@@ -78,12 +78,16 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
 #ifdef USE_CUDA
         if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
             PERF_SCOPE("sampler/repeat_penalty_gpu");
-            ensure_token_history_buffer(static_cast<int>(token_history_.size()));
-            cudaMemcpy(d_token_history_, token_history_.data(),
-                       token_history_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            int n = static_cast<int>(token_history_.size());
+            int last_n = config_.repeat_last_n;
+            int start = (last_n > 0 && last_n < n) ? (n - last_n) : 0;
+            int hist_count = n - start;
+            ensure_token_history_buffer(hist_count);
+            cudaMemcpy(d_token_history_, token_history_.data() + start,
+                       hist_count * sizeof(int32_t), cudaMemcpyHostToDevice);
             cuda::launch_repeat_penalty(static_cast<float*>(logits->data()),
                                          d_token_history_,
-                                         static_cast<int>(token_history_.size()),
+                                         hist_count,
                                          config_.repeat_penalty, vocab_size);
         }
         {
@@ -224,12 +228,16 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
         {
             PERF_SCOPE("sampler/gumbel_gpu");
             if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
-                ensure_token_history_buffer(static_cast<int>(token_history_.size()));
-                cudaMemcpy(d_token_history_, token_history_.data(),
-                           token_history_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                int n = static_cast<int>(token_history_.size());
+                int last_n = config_.repeat_last_n;
+                int start = (last_n > 0 && last_n < n) ? (n - last_n) : 0;
+                int hist_count = n - start;
+                ensure_token_history_buffer(hist_count);
+                cudaMemcpy(d_token_history_, token_history_.data() + start,
+                           hist_count * sizeof(int32_t), cudaMemcpyHostToDevice);
                 cuda::launch_repeat_penalty(static_cast<float*>(logits->data()),
                                             d_token_history_,
-                                            static_cast<int>(token_history_.size()),
+                                            hist_count,
                                             config_.repeat_penalty, vocab_size);
             }
             if (config_.logit_softcapping > 0.0f) {
@@ -486,7 +494,12 @@ const SamplerConfig& Sampler::config() const {
 
 void Sampler::apply_repeat_penalty(std::vector<float>& logits) const {
     float penalty = config_.repeat_penalty;
-    for (int32_t tid : token_history_) {
+    int n = static_cast<int>(token_history_.size());
+    int last_n = config_.repeat_last_n;
+    // last_n <= 0: use full history (legacy behavior); otherwise only the last N tokens.
+    int start = (last_n > 0 && last_n < n) ? (n - last_n) : 0;
+    for (int i = start; i < n; ++i) {
+        int32_t tid = token_history_[i];
         if (tid >= 0 && tid < static_cast<int>(logits.size())) {
             if (logits[tid] > 0.0f) {
                 logits[tid] /= penalty;

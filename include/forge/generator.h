@@ -18,6 +18,7 @@ struct GenerationConfig {
     int top_k = 0;
     float top_p = 1.0f;
     float repeat_penalty = 1.0f;
+    int repeat_last_n = 64;  // Window size for repeat penalty (<=0 means use full history)
     bool do_sample = true;
     uint64_t seed = 0;
     int eos_token_id = -1;

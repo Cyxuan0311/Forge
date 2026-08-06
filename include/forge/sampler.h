@@ -14,6 +14,7 @@ struct SamplerConfig {
     int top_k = 0;
     float top_p = 1.0f;
     float repeat_penalty = 1.0f;
+    int repeat_last_n = 64;  // Window size for repeat penalty (<=0 means use full history)
     bool do_sample = true;
     uint64_t seed = 0;
     float logit_softcapping = 0.0f;  // >0 means apply softcap: tanh(x/cap)*cap

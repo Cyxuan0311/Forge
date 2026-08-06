@@ -3,13 +3,14 @@
 void register_scheduler(py::module_& m) {
     py::class_<SamplerConfig>(m, "SamplerConfig")
         .def(py::init<>())
-        .def(py::init<float, int, float, float, bool, uint64_t>(), py::arg("temperature") = 1.0f,
+        .def(py::init<float, int, float, float, int, bool, uint64_t>(), py::arg("temperature") = 1.0f,
              py::arg("top_k") = 0, py::arg("top_p") = 1.0f, py::arg("repeat_penalty") = 1.0f,
-             py::arg("do_sample") = true, py::arg("seed") = 0)
+             py::arg("repeat_last_n") = 64, py::arg("do_sample") = true, py::arg("seed") = 0)
         .def_readwrite("temperature", &SamplerConfig::temperature)
         .def_readwrite("top_k", &SamplerConfig::top_k)
         .def_readwrite("top_p", &SamplerConfig::top_p)
         .def_readwrite("repeat_penalty", &SamplerConfig::repeat_penalty)
+        .def_readwrite("repeat_last_n", &SamplerConfig::repeat_last_n)
         .def_readwrite("do_sample", &SamplerConfig::do_sample)
         .def_readwrite("seed", &SamplerConfig::seed)
         .def_readwrite("logit_softcapping", &SamplerConfig::logit_softcapping);

@@ -35,6 +35,7 @@ static void print_usage(const char* prog) {
            "       --top-k N             Top-K sampling (default: 40, 0=disabled)\n"
            "       --top-p FLOAT         Top-P sampling (default: 0.9)\n"
            "       --repeat-penalty FLOAT Repeat penalty (default: 1.1)\n"
+           "       --repeat-last-n N    Window for repeat penalty (default: 64, 0=full history)\n"
            "       --seed N              Random seed (default: 0)\n"
            "\n"
            "Mode:\n"
@@ -161,6 +162,12 @@ CliArgs parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             args.repeat_penalty = std::stof(argv[i]);
+        } else if (arg == "--repeat-last-n") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.repeat_last_n = std::stoi(argv[i]);
         } else if (arg == "--seed") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";

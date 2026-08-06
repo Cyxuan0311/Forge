@@ -69,6 +69,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     sampler_cfg.top_k = config.top_k;
     sampler_cfg.top_p = config.top_p;
     sampler_cfg.repeat_penalty = config.repeat_penalty;
+    sampler_cfg.repeat_last_n = config.repeat_last_n;
     sampler_cfg.do_sample = config.do_sample;
     sampler_cfg.seed = config.seed;
     sampler_cfg.logit_softcapping = cfg.f_final_logit_softcapping;

@@ -557,12 +557,12 @@ int main(int argc, char** argv) {
         GenerationStats stats;
         if (args.no_stream) {
             stats = generate_batch(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
-                                   args.top_k, args.top_p, args.repeat_penalty, !args.no_sample,
-                                   args.seed, tokenizer.eos_token_id());
+                                   args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id());
         } else {
             stats = generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
-                                       args.top_k, args.top_p, args.repeat_penalty, !args.no_sample,
-                                       args.seed, tokenizer.eos_token_id());
+                                       args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
+                                       !args.no_sample, args.seed, tokenizer.eos_token_id());
         }
 
         std::cout << "\n\n";
