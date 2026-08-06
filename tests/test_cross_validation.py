@@ -10,7 +10,6 @@ Verifies:
 import os
 import sys
 import numpy as np
-import pytest
 
 build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):

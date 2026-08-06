@@ -31,7 +31,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)")
   endif()
 
   # AVX-512 VNNI: compile-time flag (runtime detection still needed)
-  check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vnni -mavx512vl -mf16c" COMPILER_SUPPORTS_AVX512_VNNI)
+  check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vnni -mavx512vl -mf16c"
+                          COMPILER_SUPPORTS_AVX512_VNNI)
   if(COMPILER_SUPPORTS_AVX512_VNNI)
     message(STATUS "AVX-512 VNNI supported - enabling AVX-512 GEMM kernels")
     add_compile_definitions(USE_AVX512_VNNI)

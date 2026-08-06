@@ -7,7 +7,11 @@
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
-#    include <cpuid.h>
+#    if defined(_MSC_VER)
+#        include <intrin.h>
+#    else
+#        include <cpuid.h>
+#    endif
 #endif
 
 #include "cpu_gemv.h"
@@ -27,9 +31,18 @@ namespace {
 
 bool cpu_has_avx512_vnni() {
     uint32_t eax, ebx, ecx, edx;
+#if defined(_MSC_VER)
+    int regs[4];
+    __cpuidex(regs, 7, 0);
+    eax = static_cast<uint32_t>(regs[0]);
+    ebx = static_cast<uint32_t>(regs[1]);
+    ecx = static_cast<uint32_t>(regs[2]);
+    edx = static_cast<uint32_t>(regs[3]);
+#else
     // CPUID leaf 7, sub-leaf 0
     if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0)
         return false;
+#endif
     // AVX-512F:  EBX[16]
     if (!(ebx & (1u << 16)))
         return false;
@@ -56,6 +69,8 @@ bool cached_has_avx512_vnni() { return false; }
 // ---- Q4_0 Weight Repack Cache ----
 // Repacked weights are keyed by the original Tensor data pointer.
 // This ensures each weight matrix is repacked at most once.
+#ifdef USE_AVX2
+
 struct RepackEntry {
     uint8_t* data = nullptr;
     size_t size = 0;
@@ -104,6 +119,8 @@ const uint8_t* get_repacked_q4_0(const void* orig_data, int64_t K, int64_t N) {
     cache[orig_data] = entry;
     return entry.data;
 }
+
+#endif  // USE_AVX2
 
 }  // namespace
 
