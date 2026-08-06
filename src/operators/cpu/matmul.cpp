@@ -1137,7 +1137,7 @@ static void gemv_iq3_s_q8k_transB_avx2(const float* a, const uint8_t* w, float* 
 //   bits from aux32[1] provide scale (top 4 bits) and signs (7*4 bits)
 // ============================================================================
 
-static const uint64_t iq2xxs_grid[256] = {
+extern const uint64_t iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
     0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
@@ -1246,7 +1246,7 @@ void dequantize_iq2_xxs_row(const uint8_t* q_data, float* out, int K, int row) {
 // Uses non-linear lookup table kvalues_iq4nl instead of linear -8..7
 // ============================================================================
 
-static const int8_t kvalues_iq4nl[16] = {
+extern const int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 

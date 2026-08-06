@@ -5,15 +5,13 @@
 
 // IQ-type constant tables.
 // NOTE: extern __constant__ does NOT reliably link across TUs with NVCC
-// separable compilation — the GEMV kernels read all-zeros from extern
-// constants defined in cuda_quant.cu.  Define local static copies here
-// and upload the data from THIS translation unit.
-extern __constant__ uint8_t  c_kmask_iq2xs[8];       // unused in GEMV kernels
-extern __constant__ uint64_t c_iq2xxs_grid[256];     // unused in IQ2_XS/IQ3_S path
-extern __constant__ uint64_t c_iq2s_grid[1024];      // unused in IQ2_XS/IQ3_S path
-extern __constant__ int8_t   c_kvalues_iq4nl[16];    // IQ4_NL path (verified working)
-
-// Local copies for IQ2_XS / IQ3_S GEMV kernels — uploaded by ensure_gemv_iq_tables()
+// separable compilation — nvcc treats the extern declaration as a per-TU
+// static definition, leaving the tables all-zeros here.  Define local static
+// copies for ALL I-quant GEMV kernels and upload the data from this TU.
+static __constant__ uint8_t  c_kmask_iq2xs[8];
+static __constant__ uint64_t c_iq2xxs_grid[256];
+static __constant__ uint64_t c_iq2s_grid[1024];
+static __constant__ int8_t   c_kvalues_iq4nl[16];
 static __constant__ uint8_t  c_ksigns_iq2xs[128];
 static __constant__ uint64_t c_iq2xs_grid[512];
 static __constant__ uint32_t c_iq3s_grid[512];
@@ -30,9 +28,14 @@ static const uint8_t h_ksigns_iq2xs_gemv[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
-// Host-side grid data (defined in cpu/matmul.cpp, declared extern in cuda_quant.cu)
+static const uint8_t h_kmask_iq2xs_gemv[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+// Host-side table data (defined in cpu/matmul.cpp)
 namespace forge {
 namespace ops {
+extern const uint64_t iq2s_grid[1024];
+extern const uint64_t iq2xxs_grid[256];
+extern const int8_t   kvalues_iq4nl[16];
 extern const uint64_t iq2xs_grid[512];
 extern const uint32_t iq3s_grid[512];
 }  // namespace ops
@@ -42,6 +45,10 @@ static bool gemv_iq_tables_uploaded = false;
 
 static void ensure_gemv_iq_tables() {
     if (gemv_iq_tables_uploaded) return;
+    cudaMemcpyToSymbol(c_kmask_iq2xs, h_kmask_iq2xs_gemv, sizeof(h_kmask_iq2xs_gemv));
+    cudaMemcpyToSymbol(c_iq2xxs_grid, forge::ops::iq2xxs_grid, sizeof(uint64_t) * 256);
+    cudaMemcpyToSymbol(c_iq2s_grid, forge::ops::iq2s_grid, sizeof(uint64_t) * 1024);
+    cudaMemcpyToSymbol(c_kvalues_iq4nl, forge::ops::kvalues_iq4nl, sizeof(int8_t) * 16);
     cudaMemcpyToSymbol(c_ksigns_iq2xs, h_ksigns_iq2xs_gemv, sizeof(h_ksigns_iq2xs_gemv));
     cudaMemcpyToSymbol(c_iq2xs_grid, forge::ops::iq2xs_grid, sizeof(uint64_t) * 512);
     cudaMemcpyToSymbol(c_iq3s_grid, forge::ops::iq3s_grid, sizeof(uint32_t) * 512);
@@ -1993,6 +2000,7 @@ __global__ void gemv_iq4_nl_q8_1_kernel(
 
 void launch_gemv_iq4_nl_q8_1(const float* x, const void* q_weight, float* out,
                                int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
     int num_q8_blocks = (K + 31) / 32;
     size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
     void* q8_buf = scratch_pool().ensure(q8_bytes);
@@ -2035,6 +2043,7 @@ __global__ void gemv_iq4_nl_q8_1_batch_kernel(
 
 void launch_gemv_iq4_nl_q8_1_batch(const float* x, const void* q_weight, float* out,
                                      int M, int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
     int k_per_row = (K + 31) / 32;
     int num_q8_blocks = M * k_per_row;
     size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
@@ -2119,6 +2128,7 @@ __global__ void gemv_iq2_xxs_q8_1_kernel(
 
 void launch_gemv_iq2_xxs_q8_1(const float* x, const void* q_weight, float* out,
                                 int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
     int num_q8_blocks = (K + 31) / 32;
     size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
     void* q8_buf = scratch_pool().ensure(q8_bytes);
@@ -2166,6 +2176,7 @@ __global__ void gemv_iq2_xxs_q8_1_batch_kernel(
 
 void launch_gemv_iq2_xxs_q8_1_batch(const float* x, const void* q_weight, float* out,
                                       int M, int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
     int k_per_row = (K + 31) / 32;
     int num_q8_blocks = M * k_per_row;
     size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
@@ -2263,6 +2274,7 @@ __global__ void gemv_iq2_s_q8_1_kernel(
 
 void launch_gemv_iq2_s_q8_1(const float* x, const void* q_weight, float* out,
                               int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
     int num_q8_blocks = (K + 31) / 32;
     size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
     void* q8_buf = scratch_pool().ensure(q8_bytes);
@@ -2310,6 +2322,7 @@ __global__ void gemv_iq2_s_q8_1_batch_kernel(
 
 void launch_gemv_iq2_s_q8_1_batch(const float* x, const void* q_weight, float* out,
                                     int M, int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
     int k_per_row = (K + 31) / 32;
     int num_q8_blocks = M * k_per_row;
     size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);

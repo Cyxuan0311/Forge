@@ -12,13 +12,6 @@
 
 #include "cuda_mmq.cuh"
 
-// IQ-type constant table extern declarations (defined in cuda_quant.cu)
-extern __constant__ uint8_t  c_ksigns_iq2xs[128];
-extern __constant__ uint8_t  c_kmask_iq2xs[8];
-extern __constant__ uint64_t c_iq2xxs_grid[256];
-extern __constant__ uint64_t c_iq2s_grid[1024];
-extern __constant__ int8_t   c_kvalues_iq4nl[16];
-
 namespace forge {
 namespace cuda {
 
