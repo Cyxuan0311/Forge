@@ -563,6 +563,9 @@ public:
         if (PerfProfiler::instance().use_cuda_events()) {
             use_cuda_ = true;
             slot_idx_ = PerfProfiler::instance().acquire_slot();
+            // Record start event on the CUDA stream (end event is recorded in destructor)
+            auto& slot = PerfProfiler::instance().thread_local_cuda_state().pool[slot_idx_];
+            cudaEventRecord(slot->start, stream_);
         } else {
             use_cuda_ = false;
             start_ = std::chrono::steady_clock::now();
