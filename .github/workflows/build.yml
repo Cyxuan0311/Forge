@@ -79,6 +79,16 @@ jobs:
             --ignore=tests/test_gguf_gpu.py \
             -x --timeout=120
 
+      - name: Verify phimoe inference (CPU)
+        # Runs the Phi-mini-MoE inference example end-to-end. Requires a model
+        # path; set it as a repository variable PHIMOE_MODEL (e.g. a URL or a
+        # downloaded .gguf) to enable. Skipped when not configured.
+        if: vars.PHIMOE_MODEL != ''
+        env:
+          PHIMOE_MODEL: ${{ vars.PHIMOE_MODEL }}
+        run: |
+          bash examples/verify_inference.sh --cpu-only --prompt "hi" --max-new-tokens 32 phimoe
+
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4

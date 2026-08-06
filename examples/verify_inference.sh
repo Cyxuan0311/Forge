@@ -23,7 +23,7 @@
 #
 # Per-script model path overrides (optional; otherwise script defaults are used):
 #   TINYLLAMA_MODEL, QWEN_MODEL, LLAMA3_MODEL, DEEPSEEK_MODEL,
-#   MIMO_MODEL, GEMMA4_MODEL, MINICPMV_MODEL, QWEN3VL_MODEL
+#   MIMO_MODEL, GEMMA4_MODEL, MINICPMV_MODEL, QWEN3VL_MODEL, PHIMOE_MODEL
 
 set -uo pipefail
 
@@ -64,6 +64,7 @@ TESTS=(
     "gemma4|gemma4_inference.py|GEMMA4_MODEL|"
     "minicpmv|minicpmv_cli_inference.py|MINICPMV_MODEL|"
     "qwen3vl|qwen3vl_inference.py|QWEN3VL_MODEL|"
+    "phimoe|phi_mini_moe_inference.py|PHIMOE_MODEL|"
 )
 
 usage() {
