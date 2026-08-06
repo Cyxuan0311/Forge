@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include "forge/cuda_kernels.h"
@@ -12,6 +13,26 @@
 
 namespace forge {
 namespace ops {
+
+#ifdef USE_CUDA
+// Cache CPU copies of GPU-resident embedding weights. The embedding weight is
+// constant during inference, so its data_ptr is a stable key. Without this
+// cache, every decode step re-transfers the full weight (e.g. ~38MB for
+// IQ2_XS) from GPU to host just to gather a single row.
+static const uint8_t* embedding_weight_cpu_ptr(const TensorPtr& weight) {
+    if (weight->device() == DeviceType::CPU) {
+        return static_cast<const uint8_t*>(weight->data());
+    }
+    static thread_local std::unordered_map<uintptr_t, std::vector<uint8_t>> cache;
+    auto key = reinterpret_cast<uintptr_t>(weight->data());
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second.data();
+    auto& entry = cache[key];
+    entry.resize(weight->nbytes());
+    cudaMemcpy(entry.data(), weight->data(), weight->nbytes(), cudaMemcpyDeviceToHost);
+    return entry.data();
+}
+#endif
 
 static inline float fp16_to_fp32_embed(uint16_t bits) {
     uint32_t sign = (bits >> 15) & 1;
@@ -464,14 +485,7 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
             if (dequant_fn) {
                 auto out_cpu = std::make_shared<Tensor>(
                     DataType::FP32, std::vector<int64_t>{num_indices, embed_dim}, DeviceType::CPU);
-                const uint8_t* q_data = static_cast<const uint8_t*>(weight->data());
-                std::vector<uint8_t> host_q;
-                if (weight->device() == DeviceType::CUDA) {
-                    size_t q_bytes = weight->nbytes();
-                    host_q.resize(q_bytes);
-                    cudaMemcpy(host_q.data(), q_data, q_bytes, cudaMemcpyDeviceToHost);
-                    q_data = host_q.data();
-                }
+                const uint8_t* q_data = embedding_weight_cpu_ptr(weight);
                 const int32_t* idx_data = static_cast<const int32_t*>(indices->data());
                 std::vector<int32_t> host_idx;
                 if (indices->device() == DeviceType::CUDA) {
@@ -484,7 +498,40 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                 dequant_fn(q_data, o_data, idx_data, num_indices, vocab_size, embed_dim);
                 out->copy_from(*out_cpu);
             } else {
-                out->zero_();
+                // Row-wise fallback for I-quant types (IQ2_S, IQ2_XS, IQ3_S, IQ4_NL)
+                auto row_fn = get_dequant_row_fn(weight->dtype());
+                if (row_fn) {
+                    auto out_cpu = std::make_shared<Tensor>(
+                        DataType::FP32, std::vector<int64_t>{num_indices, embed_dim},
+                        DeviceType::CPU);
+                    const uint8_t* q_data = embedding_weight_cpu_ptr(weight);
+                    const int32_t* idx_data =
+                        static_cast<const int32_t*>(indices->data());
+                    std::vector<int32_t> host_idx;
+                    if (indices->device() == DeviceType::CUDA) {
+                        host_idx.resize(num_indices);
+                        cudaMemcpy(host_idx.data(), idx_data,
+                                   num_indices * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost);
+                        idx_data = host_idx.data();
+                    }
+                    float* o_data = static_cast<float*>(out_cpu->data());
+                    std::vector<float> row_buf(embed_dim);
+                    for (int i = 0; i < num_indices; ++i) {
+                        int vocab_idx = idx_data[i];
+                        if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+                            std::memset(o_data + i * embed_dim, 0,
+                                        embed_dim * sizeof(float));
+                            continue;
+                        }
+                        row_fn(q_data, row_buf.data(), embed_dim, vocab_idx);
+                        std::memcpy(o_data + i * embed_dim, row_buf.data(),
+                                    embed_dim * sizeof(float));
+                    }
+                    out->copy_from(*out_cpu);
+                } else {
+                    out->zero_();
+                }
             }
         } else {
             cuda::launch_embedding_fp32(static_cast<const float*>(weight->data()),
@@ -511,13 +558,30 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                         fp32_weight = dequantize_q4_1_weight(weight);
                     } else {
                         // For quant types without pre-dequant cache, fall through to dequant path.
-                        // The weight data is stored vocab-contiguous, so dequant_by_row works.
                         auto fallback_fn = get_dequant_emb_fn(weight->dtype());
                         if (fallback_fn) {
                             fallback_fn(static_cast<const uint8_t*>(weight->data()), o_data,
                                         idx_data, num_indices, vocab_size, embed_dim);
                         } else {
-                            std::memset(o_data, 0, num_indices * embed_dim * sizeof(float));
+                            // Full dequantization fallback for I-quant types
+                            // (IQ2_S, IQ2_XS, IQ3_S, IQ4_NL, etc.)
+                            fp32_weight = dequantize_weight(weight);
+                            if (fp32_weight) {
+                                const float* w_data =
+                                    static_cast<const float*>(fp32_weight->data());
+                                for (int i = 0; i < num_indices; ++i) {
+                                    int vocab_idx = idx_data[i];
+                                    if (vocab_idx < 0 || vocab_idx >= vocab_size)
+                                        continue;
+                                    for (int d = 0; d < embed_dim; ++d) {
+                                        o_data[i * embed_dim + d] =
+                                            w_data[d * vocab_size + vocab_idx];
+                                    }
+                                }
+                            } else {
+                                std::memset(o_data, 0,
+                                            num_indices * embed_dim * sizeof(float));
+                            }
                         }
                         return out;
                     }
@@ -537,7 +601,27 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                     dequant_fn(static_cast<const uint8_t*>(weight->data()), o_data, idx_data,
                                num_indices, vocab_size, embed_dim);
                 } else {
-                    std::memset(o_data, 0, num_indices * embed_dim * sizeof(float));
+                    // Fall back to row-wise dequantization for types not in
+                    // get_dequant_emb_fn (e.g. IQ2_S, IQ2_XS, IQ3_S, IQ4_NL).
+                    auto row_fn = get_dequant_row_fn(weight->dtype());
+                    if (row_fn) {
+                        const uint8_t* q_data =
+                            static_cast<const uint8_t*>(weight->data());
+                        std::vector<float> row_buf(embed_dim);
+                        for (int i = 0; i < num_indices; ++i) {
+                            int vocab_idx = idx_data[i];
+                            if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+                                std::memset(o_data + i * embed_dim, 0,
+                                            embed_dim * sizeof(float));
+                                continue;
+                            }
+                            row_fn(q_data, row_buf.data(), embed_dim, vocab_idx);
+                            std::memcpy(o_data + i * embed_dim, row_buf.data(),
+                                        embed_dim * sizeof(float));
+                        }
+                    } else {
+                        std::memset(o_data, 0, num_indices * embed_dim * sizeof(float));
+                    }
                 }
             }
         } else {
