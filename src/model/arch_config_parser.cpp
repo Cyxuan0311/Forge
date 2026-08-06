@@ -217,6 +217,25 @@ ModelConfig parse_phi3_config(ModelLoader& loader, const std::string& arch) {
     return cfg;
 }
 
+ModelConfig parse_phimoe_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    // PhiMoE (Phi-3 based, like LLaMA) stores Q/K weights in standard format and
+    // expects half-split RoPE (rotating pairs (d, d+half_dim)) applied directly.
+    // Keep rope_type=NeoX so the NeoX kernel (half-split rotation) is used, but
+    // set use_neox_rope=false to skip inverse_neox_permute_rows, which would
+    // wrongly convert the RoPE convention to interleaved.
+    cfg.use_neox_rope = false;
+    cfg.rope_type = RopeType::NeoX;
+    cfg.ffn_type = FFNType::MoE;
+    cfg.ffn_activation = ActivationType::SiLU_GELU;
+    cfg.n_expert = static_cast<int>(loader.get_metadata_int(arch + ".expert_count", 0));
+    cfg.n_expert_used = static_cast<int>(loader.get_metadata_int(arch + ".expert_used_count", 0));
+    cfg.n_ff_exp = static_cast<int>(loader.get_metadata_int(arch + ".feed_forward_length", 0));
+    // phimoe uses full attention (sliding_window metadata exists but is NOT used).
+    // Do NOT read attention.sliding_window.
+    return cfg;
+}
+
 ModelConfig parse_gemma_config(ModelLoader& loader, const std::string& arch) {
     auto cfg = parse_common_gguf_config(loader, arch);
     cfg.use_neox_rope = true;

@@ -175,6 +175,11 @@ struct LayerWeights {
     TensorPtr bk() const { return get("bk"); }
     TensorPtr bv() const { return get("bv"); }
 
+    // Attention output bias + norm biases (phimoe)
+    TensorPtr bo() const { return get("bo"); }
+    TensorPtr attn_norm_bias() const { return get("attn_norm_bias"); }
+    TensorPtr ffn_norm_bias() const { return get("ffn_norm_bias"); }
+
     // MLA attention
     TensorPtr wq_a() const { return get("wq_a"); }
     TensorPtr wq_b() const { return get("wq_b"); }
@@ -231,7 +236,9 @@ struct ModelWeights {
     TensorPtr token_embedding;
     TensorPtr token_embedding_fp32;  // Pre-dequantized FP32 cache for CPU transposed embedding
     TensorPtr output_norm;
+    TensorPtr output_norm_bias;      // Optional output norm bias (phimoe)
     TensorPtr output_weight;
+    TensorPtr output_bias;           // Optional output projection bias (phimoe)
     TensorPtr output_weight_fp32;  // Pre-dequantized FP32 cache for CPU output_proj
     TensorPtr output_weight_fp16;  // Pre-dequantized FP16 cache for CUDA output_proj
     std::vector<LayerWeights> layers;

@@ -177,4 +177,30 @@ void init_gemma4_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "rope_freqs", base + ".rope_freqs");
 }
 
+void init_phimoe_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    // Attention weights (GQA + NeoX RoPE, weights already half-split permuted in model.cpp)
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "attn_norm_bias", base + ".attn_norm_bias");
+    load_if_present(store, lw, "wq", base + ".wq");
+    load_if_present(store, lw, "wk", base + ".wk");
+    load_if_present(store, lw, "wv", base + ".wv");
+    load_if_present(store, lw, "wo", base + ".wo");
+    load_if_present(store, lw, "bo", base + ".bo");
+    load_if_present(store, lw, "bq", base + ".bq");
+    load_if_present(store, lw, "bk", base + ".bk");
+    load_if_present(store, lw, "bv", base + ".bv");
+
+    // FFN norm + MoE weights
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+    load_if_present(store, lw, "ffn_norm_bias", base + ".ffn_norm_bias");
+    load_if_present(store, lw, "ffn_gate_inp", base + ".ffn_gate_inp");
+    load_if_present(store, lw, "ffn_gate_exps", base + ".ffn_gate_exps");
+    load_if_present(store, lw, "ffn_up_exps", base + ".ffn_up_exps");
+    load_if_present(store, lw, "ffn_down_exps", base + ".ffn_down_exps");
+}
+
 }  // namespace forge

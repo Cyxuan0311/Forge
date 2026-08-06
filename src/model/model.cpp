@@ -268,6 +268,14 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
             weight_store_.set("output_weight", te);
         }
 
+        // phimoe model-level biases (output_norm.bias, output.bias)
+        if (config_.arch_type == "phimoe") {
+            auto onb = load_tensor("output_norm.bias");
+            if (onb) weight_store_.set("output_norm_bias", onb);
+            auto ob = load_tensor("output.bias");
+            if (ob) weight_store_.set("output_bias", ob);
+        }
+
         // Gemma4 per-layer embedding weights (model-level, not per-blk)
         if (config_.arch_type == "gemma4") {
             auto ple = load_tensor("per_layer_token_embd.weight");
@@ -362,6 +370,21 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
                 set_if(base + ".kv_a_proj", blk + ".attn_kv_a.weight");
                 set_if(base + ".kv_b_proj", blk + ".attn_kv_b.weight");
                 set_if(base + ".wo", blk + ".attn_output.weight");
+            } else if (config_.arch_type == "phimoe") {
+                // phimoe: standard GQA attention weights + biases (attn_output.bias,
+                // attn_norm.bias, ffn_norm.bias) + MoE expert weights.
+                set_if(base + ".wq", blk + ".attn_q.weight");
+                set_if(base + ".wk", blk + ".attn_k.weight");
+                set_if(base + ".wv", blk + ".attn_v.weight");
+                set_if(base + ".wo", blk + ".attn_output.weight");
+                set_if(base + ".bo", blk + ".attn_output.bias");
+                set_if(base + ".attn_norm_bias", blk + ".attn_norm.bias");
+                set_if(base + ".ffn_norm_bias", blk + ".ffn_norm.bias");
+                // MoE weights (expert axis is last = 3rd dim)
+                set_if(base + ".ffn_gate_inp", blk + ".ffn_gate_inp.weight");
+                set_if(base + ".ffn_gate_exps", blk + ".ffn_gate_exps.weight");
+                set_if(base + ".ffn_up_exps", blk + ".ffn_up_exps.weight");
+                set_if(base + ".ffn_down_exps", blk + ".ffn_down_exps.weight");
             } else {
                 // Standard GQA attention
                 set_if(base + ".wq", blk + ".attn_q.weight");

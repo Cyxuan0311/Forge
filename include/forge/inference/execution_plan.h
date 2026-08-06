@@ -20,7 +20,7 @@ namespace forge {
 class LayerGraphBuilder;
 
 // 由哪个 engine 类执行。Gemma4 只对应 arch "gemma4"(Gemma4Engine 仅为它注册)。
-enum class EngineKind : int { Generic, DeepSeekMLA, Qwen35Hybrid, Gemma4 };
+enum class EngineKind : int { Generic, DeepSeekMLA, Qwen35Hybrid, Gemma4, Phimoe };
 
 enum class AttentionKind : int { GQA, MLA, HybridSSM };
 

@@ -246,6 +246,7 @@ add_library(
   src/inference/engines/deepseek_engine.cpp
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/gemma4_engine.cpp
+  src/inference/engines/phimoe_engine.cpp
   src/inference/engines/generic_engine.cpp
   src/inference/layers/norm_executor.cpp
   src/inference/layers/rope_executor.cpp

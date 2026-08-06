@@ -20,6 +20,7 @@
 #include "forge/engines/deepseek_engine.h"
 #include "forge/engines/gemma4_engine.h"
 #include "forge/engines/generic_engine.h"
+#include "forge/engines/phimoe_engine.h"
 #include "forge/engines/qwen35_engine.h"
 #include "forge/model.h"
 
@@ -97,6 +98,22 @@ static ConfigParserAutoRegister     _cfg_phi3("phi3", parse_phi3_config);
 static WeightInitAutoRegister       _winit_phi3("phi3", init_gqa_layer_weights);
 static ArchCapabilityAutoRegister   _cap_phi3("phi3",
     ArchCapability{.use_gqa = true, .use_neox_rope = true});
+
+// ============================================================================
+// phimoe (Phi-mini-MoE-instruct: GQA + NeoX RoPE + MoE FFN + norm biases)
+// ============================================================================
+
+static EngineAutoRegister           _eng_phimoe("phimoe",
+    [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        return std::make_unique<PhimoeEngine>(m, c);
+    });
+static ConfigParserAutoRegister     _cfg_phimoe("phimoe", parse_phimoe_config);
+static WeightInitAutoRegister       _winit_phimoe("phimoe", init_phimoe_layer_weights);
+static ArchCapabilityAutoRegister   _cap_phimoe("phimoe",
+    ArchCapability{.use_gqa = true,
+                   .use_neox_rope = true,
+                   .has_qkv_bias = true,
+                   .has_norm_bias = true});
 
 // ============================================================================
 // Gemma family (GeGLU + embedding_scale)

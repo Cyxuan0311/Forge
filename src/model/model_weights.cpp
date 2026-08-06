@@ -26,7 +26,9 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     }
 
     output_norm = store.get("output_norm");
+    output_norm_bias = store.get("output_norm_bias");
     output_weight = store.get("output_weight");
+    output_bias = store.get("output_bias");
 
     if (config.tie_embeddings && !output_weight) {
         output_weight = token_embedding;
@@ -162,10 +164,16 @@ void ModelWeights::move_output_weights(DeviceType target_dev) {
     if (output_norm && output_norm->device() != target_dev) {
         output_norm->to_device(target_dev);
     }
+    if (output_norm_bias && output_norm_bias->device() != target_dev) {
+        output_norm_bias->to_device(target_dev);
+    }
     if (output_weight && output_weight->device() != target_dev) {
         if (output_weight.get() != token_embedding.get()) {
             output_weight->to_device(target_dev);
         }
+    }
+    if (output_bias && output_bias->device() != target_dev) {
+        output_bias->to_device(target_dev);
     }
 }
 

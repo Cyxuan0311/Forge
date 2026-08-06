@@ -16,6 +16,7 @@ const char* to_string(EngineKind k) {
         case EngineKind::DeepSeekMLA:  return "deepseek_mla";
         case EngineKind::Qwen35Hybrid: return "qwen35_hybrid";
         case EngineKind::Gemma4:       return "gemma4";
+        case EngineKind::Phimoe:       return "phimoe";
     }
     return "?";
 }
@@ -114,6 +115,7 @@ const char* engine_name_for(EngineKind kind) {
         case EngineKind::DeepSeekMLA:  return "deepseek_v2";
         case EngineKind::Qwen35Hybrid: return "qwen35";
         case EngineKind::Gemma4:       return "gemma4";
+        case EngineKind::Phimoe:       return "phimoe";
     }
     return "llama";
 }
@@ -145,6 +147,11 @@ ExecutionPlan build_execution_plan(const std::string& arch, const ModelConfig& c
         if (arch == "gemma4" || gemma4_layout) {
             plan.engine_kind = EngineKind::Gemma4;
             plan.memory_kind = MemoryKind::PerLayerKV;
+        } else if (arch == "phimoe" || cfg.ffn_type == FFNType::MoE) {
+            // phimoe: GQA + NeoX RoPE + MoE FFN with norm biases. GenericEngine
+            // cannot execute MoE, so a dedicated PhimoeEngine is required.
+            plan.engine_kind = EngineKind::Phimoe;
+            plan.memory_kind = MemoryKind::KV;
         } else {
             plan.engine_kind = EngineKind::Generic;
             plan.memory_kind = MemoryKind::KV;

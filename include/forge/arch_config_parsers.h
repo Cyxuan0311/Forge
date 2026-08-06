@@ -18,6 +18,7 @@ ModelConfig parse_deepseek_v2_config(ModelLoader& loader, const std::string& arc
 ModelConfig parse_deepseek_v3_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_qwen35_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_phi3_config(ModelLoader& loader, const std::string& arch);
+ModelConfig parse_phimoe_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_gemma_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_gemma2_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_falcon_config(ModelLoader& loader, const std::string& arch);
