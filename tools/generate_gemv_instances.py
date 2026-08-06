@@ -57,7 +57,7 @@ namespace cuda {{
 
 {instances}
 
-const GemvFn gemv_dispatch[18] = {{
+const GemvFn gemv_dispatch[20] = {{
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_gemv_q4_0_transB,                          // special smem/splitK
@@ -78,7 +78,7 @@ const GemvFn gemv_dispatch[18] = {{
     /* IQ4_NL=17  */ nullptr,
 }};
 
-const GemvBatchFn gemv_batch_dispatch[18] = {{
+const GemvBatchFn gemv_batch_dispatch[20] = {{
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_gemv_typed_transB_batch<DataType::Q4_0>,

@@ -167,5 +167,19 @@ TensorPtr quantize_q4_0_weight(const TensorPtr& fp32_weight);
 // Re-quantize Q8_0 weight to Q4_0 (dequantize → requantize)
 TensorPtr requantize_q8_0_to_q4_0(const TensorPtr& q8_weight);
 
+// Batched MoE gate/up matmul: shared input [1, K] × multiple weight matrices [N, K].
+// Quantizes input to Q8_K once, then GEMVs all weights in a single OpenMP region.
+// All weights must have the same dtype, K, and N. Returns [n_weights, N].
+// Supports IQ2_XS, IQ3_S, IQ4_NL, IQ2_S. Falls back to sequential for other dtypes.
+TensorPtr matmul_transB_shared_input(const TensorPtr& input,
+                                      const std::vector<TensorPtr>& weights);
+
+// Batched MoE down matmul: multiple (input, weight) pairs in one OpenMP region.
+// inputs: [n_pairs, K], weights: [n_pairs] of [N, K]. Returns [n_pairs, N].
+// Each input row pairs with the corresponding weight. Supports IQ2_XS, IQ3_S,
+// IQ4_NL, IQ2_S. Falls back to sequential for other dtypes.
+TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
+                                       const std::vector<TensorPtr>& weights);
+
 }  // namespace ops
 }  // namespace forge

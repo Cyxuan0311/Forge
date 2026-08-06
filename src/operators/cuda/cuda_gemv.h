@@ -9,14 +9,15 @@ namespace forge {
 namespace cuda {
 
 // ---- FP32 GEMV ----
+// Default args intentionally omitted here to avoid redefinition with cuda_kernels.h.
 void launch_gemv_transB(const float* x, const float* W, float* out, int K, int N,
-                        cudaStream_t stream = 0);
+                        cudaStream_t stream);
 
-void launch_gemv(const float* x, const float* W, float* out, int K, int N, cudaStream_t stream = 0);
+void launch_gemv(const float* x, const float* W, float* out, int K, int N, cudaStream_t stream);
 
 // ---- Q4_0 special GEMV (smem + splitK + dual) ----
 void launch_gemv_q4_0_transB(const float* x, const void* q_weight, float* out, int K, int N,
-                             cudaStream_t stream = 0);
+                             cudaStream_t stream);
 
 // ---- Q4_0 GEMV (Q8_1 + dp4a, replaces smem/splitK for decode) ----
 void launch_gemv_q4_0_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
@@ -68,6 +69,18 @@ void launch_gemv_iq2_s_q8_1(const float* x, const void* q_weight, float* out, in
 void launch_gemv_iq2_s_q8_1_batch(const float* x, const void* q_weight, float* out,
                                     int M, int K, int N, cudaStream_t stream = 0);
 
+// ---- IQ2_XS GEMV (Q8_1 + dp4a) ----
+void launch_gemv_iq2_xs_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                              cudaStream_t stream = 0);
+void launch_gemv_iq2_xs_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                    int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- IQ3_S GEMV (Q8_1 + dp4a) ----
+void launch_gemv_iq3_s_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                             cudaStream_t stream = 0);
+void launch_gemv_iq3_s_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream = 0);
+
 // ---- Q4_1 GEMV (Q8_1 + dp4a, Phase 5) ----
 void launch_gemv_q4_1_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
@@ -94,7 +107,7 @@ void launch_gemv_q6_k_q8_1_batch(const float* x, const void* q_weight, float* ou
 
 void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
                                   const void* q_weight2, int N2, float* out, int K,
-                                  cudaStream_t stream = 0);
+                                  cudaStream_t stream);
 
 // ---- Q3_K special GEMV (smem + dp4a) ----
 void launch_gemv_q3_k_smem(const float* x, const void* q_weight, float* out,
@@ -110,11 +123,11 @@ void launch_gemv_q4_k_q8_1(const float* x, const void* q_weight, float* out,
 
 // ---- FFN Up Fused: Q3_K gate + Q4_K up (shared Q8_1 + dp4a) ----
 void launch_ffn_up_fused_q3k_q4k(const float* x, const void* q_gate, const void* q_up,
-                                   float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
+                                   float* out, int K, int intermediate_dim, cudaStream_t stream);
 
 // ---- FFN Up Fused: Q2_K gate + Q2_K up (shared Q8_1 + dp4a) ----
 void launch_ffn_up_fused_q2k_q2k(const float* x, const void* q_gate, const void* q_up,
-                                   float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
+                                   float* out, int K, int intermediate_dim, cudaStream_t stream);
 
 // ---- Typed GEMV dispatch tables ----
 // Indexed by DataType enum value. nullptr for unsupported types.
@@ -123,8 +136,8 @@ void launch_ffn_up_fused_q2k_q2k(const float* x, const void* q_gate, const void*
 using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
 using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const GemvFn gemv_dispatch[18];
-extern const GemvBatchFn gemv_batch_dispatch[18];
+extern const GemvFn gemv_dispatch[20];
+extern const GemvBatchFn gemv_batch_dispatch[20];
 
 }  // namespace cuda
 }  // namespace forge

@@ -6,6 +6,8 @@ namespace forge {
 // Defined in src/operators/cpu/matmul.cpp (non-static, in namespace forge::ops).
 namespace ops {
 extern const uint64_t iq2s_grid[1024];
+extern const uint64_t iq2xs_grid[512];
+extern const uint32_t iq3s_grid[512];
 }  // namespace ops
 
 namespace cuda {
@@ -1450,6 +1452,165 @@ void launch_dequant_iq2_s_matrix(const void* q_data, float* out, int N, int K,
     int threads = 256;
     int64_t blocks = (total + threads - 1) / threads;
     dequant_iq2_s_matrix_kernel<<<(int)blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), out, N, K);
+}
+
+// =========================================================================
+// IQ2_XS CUDA Dequantization
+// block_iq2_xs: fp16 d (2B) + 32*uint16_t qs (64B) + 8B scales = 74B per 256 elements
+// Reference: llama.cpp dequantize_row_iq2_xs. Mirrors CPU dequantize_iq2_xs_row.
+// Reuses c_ksigns_iq2xs, c_kmask_iq2xs (uploaded by ensure_iq2_xxs_tables).
+// =========================================================================
+
+__constant__ uint64_t c_iq2xs_grid[512];
+
+static bool iq2_xs_tables_uploaded = false;
+
+void ensure_iq2_xs_tables() {
+    if (iq2_xs_tables_uploaded) return;
+    ensure_iq2_xxs_tables();  // uploads c_ksigns_iq2xs, c_kmask_iq2xs
+    cudaMemcpyToSymbol(c_iq2xs_grid, forge::ops::iq2xs_grid, sizeof(uint64_t) * 512);
+    iq2_xs_tables_uploaded = true;
+}
+
+// One thread per output element.
+__global__ void dequant_iq2_xs_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                             float* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int IQ2_XS_BLOCK_SIZE = 74;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * K;
+    if (idx >= total) return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int col_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (int64_t)row * blocks_per_row * IQ2_XS_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * IQ2_XS_BLOCK_SIZE;
+
+    float d = __half2float(
+        reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
+    const uint16_t* qs = reinterpret_cast<const uint16_t*>(block_ptr + 2);  // 32 uint16_t
+    const uint8_t* scales = block_ptr + 2 + 64;                              // 8 bytes
+
+    int ib32 = col_in_block / 32;       // 0..7
+    int l = (col_in_block % 32) / 8;    // 0..3
+    int j = col_in_block % 8;           // 0..7
+
+    // l in {0,1} -> low nibble of scales[ib32]; l in {2,3} -> high nibble.
+    float db = (l / 2 == 0)
+                   ? d * (0.5f + (scales[ib32] & 0xF)) * 0.25f
+                   : d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+
+    uint16_t q = qs[4 * ib32 + l];
+    const uint8_t* grid = reinterpret_cast<const uint8_t*>(&c_iq2xs_grid[q & 511]);
+    uint8_t signs = c_ksigns_iq2xs[q >> 9];
+
+    out[idx] = db * static_cast<float>(grid[j]) *
+               (signs & c_kmask_iq2xs[j] ? -1.f : 1.f);
+}
+
+void launch_dequant_iq2_xs_matrix(const void* q_data, float* out, int N, int K,
+                                  cudaStream_t stream) {
+    ensure_iq2_xs_tables();
+    int64_t total = (int64_t)N * K;
+    int threads = 256;
+    int64_t blocks = (total + threads - 1) / threads;
+    dequant_iq2_xs_matrix_kernel<<<(int)blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), out, N, K);
+}
+
+// =========================================================================
+// IQ3_S CUDA Dequantization
+// block_iq3_s: fp16 d (2B) + qs[64B] + qh[8B] + signs[32B] + scales[4B] = 110B per 256 elements
+// Reference: llama.cpp dequantize_row_iq3_s (pointer-increment style, unrolled
+// here into a direct col -> (iter, sub, l, j) mapping that matches the CPU loop).
+// Reuses c_ksigns_iq2xs, c_kmask_iq2xs (uploaded by ensure_iq2_xxs_tables).
+// =========================================================================
+
+__constant__ uint32_t c_iq3s_grid[512];
+
+static bool iq3_s_tables_uploaded = false;
+
+void ensure_iq3_s_tables() {
+    if (iq3_s_tables_uploaded) return;
+    ensure_iq2_xxs_tables();  // uploads c_ksigns_iq2xs, c_kmask_iq2xs
+    cudaMemcpyToSymbol(c_iq3s_grid, forge::ops::iq3s_grid, sizeof(uint32_t) * 512);
+    iq3_s_tables_uploaded = true;
+}
+
+// One thread per output element.
+__global__ void dequant_iq3_s_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                            float* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int IQ3_S_BLOCK_SIZE = 110;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * K;
+    if (idx >= total) return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int col_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (int64_t)row * blocks_per_row * IQ3_S_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * IQ3_S_BLOCK_SIZE;
+
+    float d = __half2float(
+        reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
+    const uint8_t* qs = block_ptr + 2;                       // 64 bytes
+    const uint8_t* qh = block_ptr + 2 + 64;                  // 8 bytes
+    const uint8_t* signs = block_ptr + 2 + 64 + 8;           // 32 bytes
+    const uint8_t* scales = block_ptr + 2 + 64 + 8 + 32;     // 4 bytes
+
+    // The CPU loop iterates ib32 in pairs (0,2,4,6). Each iteration (= "iter")
+    // covers 64 elements: sub-block pair (even=sub0, odd=sub1), 4 l, 8 j.
+    int iter = col_in_block / 64;          // 0..3  (ib32 = 2*iter)
+    int within = col_in_block % 64;        // 0..63
+    int sub = within / 32;                 // 0 (even, db1) or 1 (odd, db2)
+    int within_sub = within % 32;          // 0..31
+    int l = within_sub / 8;                // 0..3
+    int j = within_sub % 8;                // 0..7
+
+    // Per-iter byte offsets within the block (matching the pointer increments).
+    int qs_base = iter * 16 + sub * 8;
+    int signs_idx = iter * 8 + sub * 4 + l;
+    int qh_idx = iter * 2 + sub;
+
+    float db = (sub == 0)
+                   ? d * (1 + 2 * (scales[iter] & 0xF))
+                   : d * (1 + 2 * (scales[iter] >> 4));
+
+    uint8_t qh_byte = qh[qh_idx];
+    int grid1_idx = qs[qs_base + 2 * l + 0] | ((qh_byte << (8 - 2 * l)) & 256);
+    int grid2_idx = qs[qs_base + 2 * l + 1] | ((qh_byte << (7 - 2 * l)) & 256);
+
+    // Elements 0..3 of the 8-group come from grid1, 4..7 from grid2.
+    int grid_idx = (j < 4) ? grid1_idx : grid2_idx;
+    int grid_elem = j & 3;  // j % 4
+
+    const uint8_t* grid = reinterpret_cast<const uint8_t*>(&c_iq3s_grid[grid_idx]);
+    uint8_t sign_byte = signs[signs_idx];
+
+    out[idx] = db * static_cast<float>(grid[grid_elem]) *
+               (sign_byte & c_kmask_iq2xs[j] ? -1.f : 1.f);
+}
+
+void launch_dequant_iq3_s_matrix(const void* q_data, float* out, int N, int K,
+                                 cudaStream_t stream) {
+    ensure_iq3_s_tables();
+    int64_t total = (int64_t)N * K;
+    int threads = 256;
+    int64_t blocks = (total + threads - 1) / threads;
+    dequant_iq3_s_matrix_kernel<<<(int)blocks, threads, 0, stream>>>(
         static_cast<const uint8_t*>(q_data), out, N, K);
 }
 

@@ -86,6 +86,10 @@ static DataType ggml_dtype_to_dtype(GgmlDType dt) {
         return DataType::IQ2_XXS;
     case GgmlDType::IQ4_NL:
         return DataType::IQ4_NL;
+    case GgmlDType::IQ2_XS:
+        return DataType::IQ2_XS;
+    case GgmlDType::IQ3_S:
+        return DataType::IQ3_S;
     case GgmlDType::BF16:
         return DataType::BF16;
     default:

@@ -75,8 +75,12 @@ DequantMatrixFn device_dequant_matrix_fn(DataType dt) {
         return cuda::launch_dequant_q8_0_matrix;
     case DataType::IQ2_S:
         return cuda::launch_dequant_iq2_s_matrix;
+    case DataType::IQ2_XS:
+        return cuda::launch_dequant_iq2_xs_matrix;
     case DataType::IQ2_XXS:
         return cuda::launch_dequant_iq2_xxs_matrix;
+    case DataType::IQ3_S:
+        return cuda::launch_dequant_iq3_s_matrix;
     case DataType::IQ4_NL:
         return cuda::launch_dequant_iq4_nl_matrix;
     default:
@@ -86,21 +90,21 @@ DequantMatrixFn device_dequant_matrix_fn(DataType dt) {
 
 cuda::GemvFn device_gemv_fn(DataType dt) {
     int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 18)
+    if (idx < 0 || idx >= 20)
         return nullptr;
     return cuda::gemv_dispatch[idx];
 }
 
 cuda::GemvBatchFn device_gemv_batch_fn(DataType dt) {
     int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 18)
+    if (idx < 0 || idx >= 20)
         return nullptr;
     return cuda::gemv_batch_dispatch[idx];
 }
 
 cuda::MmqFn device_mmq_fn(DataType dt) {
     int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 18)
+    if (idx < 0 || idx >= 20)
         return nullptr;
     return cuda::mmq_dispatch[idx];
 }

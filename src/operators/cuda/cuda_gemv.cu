@@ -1,13 +1,52 @@
 #include "cuda_common.h"
 #include "cuda_gemv.h"
 #include "cuda_gemv_common.cuh"
+#include "forge/cuda_kernels.h"
 
-// IQ-type constant table extern declarations (defined in cuda_quant.cu)
-extern __constant__ uint8_t  c_ksigns_iq2xs[128];
-extern __constant__ uint8_t  c_kmask_iq2xs[8];
-extern __constant__ uint64_t c_iq2xxs_grid[256];
-extern __constant__ uint64_t c_iq2s_grid[1024];
-extern __constant__ int8_t   c_kvalues_iq4nl[16];
+// IQ-type constant tables.
+// NOTE: extern __constant__ does NOT reliably link across TUs with NVCC
+// separable compilation — the GEMV kernels read all-zeros from extern
+// constants defined in cuda_quant.cu.  Define local static copies here
+// and upload the data from THIS translation unit.
+extern __constant__ uint8_t  c_kmask_iq2xs[8];       // unused in GEMV kernels
+extern __constant__ uint64_t c_iq2xxs_grid[256];     // unused in IQ2_XS/IQ3_S path
+extern __constant__ uint64_t c_iq2s_grid[1024];      // unused in IQ2_XS/IQ3_S path
+extern __constant__ int8_t   c_kvalues_iq4nl[16];    // IQ4_NL path (verified working)
+
+// Local copies for IQ2_XS / IQ3_S GEMV kernels — uploaded by ensure_gemv_iq_tables()
+static __constant__ uint8_t  c_ksigns_iq2xs[128];
+static __constant__ uint64_t c_iq2xs_grid[512];
+static __constant__ uint32_t c_iq3s_grid[512];
+
+// Host-side ksigns data (mirrors h_ksigns_iq2xs in cuda_quant.cu)
+static const uint8_t h_ksigns_iq2xs_gemv[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+// Host-side grid data (defined in cpu/matmul.cpp, declared extern in cuda_quant.cu)
+namespace forge {
+namespace ops {
+extern const uint64_t iq2xs_grid[512];
+extern const uint32_t iq3s_grid[512];
+}  // namespace ops
+}  // namespace forge
+
+static bool gemv_iq_tables_uploaded = false;
+
+static void ensure_gemv_iq_tables() {
+    if (gemv_iq_tables_uploaded) return;
+    cudaMemcpyToSymbol(c_ksigns_iq2xs, h_ksigns_iq2xs_gemv, sizeof(h_ksigns_iq2xs_gemv));
+    cudaMemcpyToSymbol(c_iq2xs_grid, forge::ops::iq2xs_grid, sizeof(uint64_t) * 512);
+    cudaMemcpyToSymbol(c_iq3s_grid, forge::ops::iq3s_grid, sizeof(uint32_t) * 512);
+    gemv_iq_tables_uploaded = true;
+}
 
 namespace forge {
 namespace cuda {
@@ -2282,6 +2321,288 @@ void launch_gemv_iq2_s_q8_1_batch(const float* x, const void* q_weight, float* o
     int total_warps = M * N;
     int grid_blocks = (total_warps + warps_per_block - 1) / warps_per_block;
     gemv_iq2_s_q8_1_batch_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_weight), out, M, K, N);
+}
+
+// ============================================================================
+// IQ2_XS GEMV - Q8_1 + 2-bit table lookup (256 elem/block, 74 bytes)
+// block_iq2_xs: fp16 d (2B) + 32*uint16_t qs (64B) + 8B scales = 74B
+// Each uint16_t qs: low 9 bits = iq2xs_grid index, high 7 bits = ksigns index
+// ============================================================================
+
+// Expand 4 sign bits (low nibble of sb) into 4 byte-wide masks (0xFF per set bit).
+static __device__ __forceinline__ int expand_sign_mask_4(uint8_t sb, int half) {
+    uint32_t s = (half == 0) ? (sb & 0x0F) : ((sb >> 4) & 0x0F);
+    uint32_t bits = (s & 1) | ((s & 2) << 7) | ((s & 4) << 14) | ((s & 8) << 21);
+    return __vcmpne4(bits, 0u);
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
+    const void* __restrict__ vbq, const block_q8_1_gemv* __restrict__ bq8_1,
+    const int& kbx, const int& iqs)
+{
+    const uint8_t* bq2 = (const uint8_t*)vbq + kbx * 74;
+    const float d = __half2float(reinterpret_cast<const __half&>(*(const uint16_t*)bq2));
+    const uint16_t* qs = (const uint16_t*)(bq2 + 2);     // 32 uint16_t
+    const uint8_t* scales = bq2 + 66;                     // 8 bytes
+
+    const int ib32 = iqs;  // 0..7
+    const float db0 = (0.5f + (scales[ib32] & 0xF)) * 0.25f;  // l=0,1
+    const float db1 = (0.5f + (scales[ib32] >> 4)) * 0.25f;   // l=2,3
+
+    const block_q8_1_gemv& q8 = bq8_1[ib32];
+    const float d_q8 = __low2float(q8.ds);
+
+    int sum_l01 = 0, sum_l23 = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint16_t q = qs[4 * ib32 + l];
+        const int* grid_ptr = (const int*)&c_iq2xs_grid[q & 511];
+        const uint8_t sb = c_ksigns_iq2xs[q >> 9];
+        const int smask_lo = expand_sign_mask_4(sb, 0);
+        const int smask_hi = expand_sign_mask_4(sb, 4);
+        const int sgrid_lo = __vsub4(grid_ptr[0] ^ smask_lo, smask_lo);
+        const int sgrid_hi = __vsub4(grid_ptr[1] ^ smask_hi, smask_hi);
+        const int u_lo = get_int_b4(q8.qs, l * 2 + 0);
+        const int u_hi = get_int_b4(q8.qs, l * 2 + 1);
+        const int dp = forge_dp4a(sgrid_lo, u_lo, 0) + forge_dp4a(sgrid_hi, u_hi, 0);
+        if (l < 2) sum_l01 += dp; else sum_l23 += dp;
+    }
+    return d * d_q8 * ((float)sum_l01 * db0 + (float)sum_l23 * db1);
+}
+
+__global__ void gemv_iq2_xs_q8_1_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_weight, float* __restrict__ out, int K, int N)
+{
+    constexpr int BE = 256, BS = 74, QI = 8;
+    int num_blocks_row = (K + BE - 1) / BE;
+    const int q8_stride = 8;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (warp_id >= N) return;
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * num_blocks_row * BS;
+    float sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+        const block_q8_1_gemv* row_q8 = x_q8 + (size_t)bi * q8_stride;
+#pragma unroll
+        for (int iqs = 0; iqs < QI; ++iqs) {
+            sum += vec_dot_iq2_xs_q8_1(row_ptr, row_q8, bi, iqs);
+        }
+    }
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+    if (lane == 0) out[warp_id] = sum;
+}
+
+void launch_gemv_iq2_xs_q8_1(const float* x, const void* q_weight, float* out,
+                              int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+    int q8_threads = 256, q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, K);
+    int warps_per_block = 8, threads = warps_per_block * 32;
+    int grid_blocks = (N + warps_per_block - 1) / warps_per_block;
+    gemv_iq2_xs_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_weight), out, K, N);
+}
+
+__global__ void gemv_iq2_xs_q8_1_batch_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_weight, float* __restrict__ out, int M, int K, int N)
+{
+    constexpr int BE = 256, BS = 74, QI = 8;
+    int num_blocks_row = (K + BE - 1) / BE;
+    const int q8_stride = 8;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    int total_warps = M * N;
+    if (warp_id >= total_warps) return;
+    int m = warp_id / N, n = warp_id % N;
+    const block_q8_1_gemv* x_row = x_q8 + (size_t)m * num_blocks_row * q8_stride;
+    const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * BS;
+    float sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+        const block_q8_1_gemv* row_q8 = x_row + (size_t)bi * q8_stride;
+#pragma unroll
+        for (int iqs = 0; iqs < QI; ++iqs) {
+            sum += vec_dot_iq2_xs_q8_1(w_row, row_q8, bi, iqs);
+        }
+    }
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+    if (lane == 0) out[m * N + n] = sum;
+}
+
+void launch_gemv_iq2_xs_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                    int M, int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
+    int k_per_row = (K + 31) / 32;
+    int num_q8_blocks = M * k_per_row;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+    int q8_threads = 256, q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, M * K);
+    int warps_per_block = 8, threads = warps_per_block * 32;
+    int total_warps = M * N;
+    int grid_blocks = (total_warps + warps_per_block - 1) / warps_per_block;
+    gemv_iq2_xs_q8_1_batch_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_weight), out, M, K, N);
+}
+
+// ============================================================================
+// IQ3_S GEMV - Q8_1 + 3-bit table lookup (256 elem/block, 110 bytes)
+// block_iq3_s: fp16 d (2B) + qs[64B] + qh[8B] + signs[32B] + scales[4B] = 110B
+// 8 sub-blocks (iqs=0..7), each 32 elems. pair=iqs/2, half=iqs%2.
+// qs advances 8B/sub, signs 4B/sub, qh 2B/pair, scales 1B/pair.
+// ============================================================================
+
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+    const void* __restrict__ vbq, const block_q8_1_gemv* __restrict__ bq8_1,
+    const int& kbx, const int& iqs)
+{
+    const uint8_t* bq3 = (const uint8_t*)vbq + kbx * 110;
+    const float d = __half2float(reinterpret_cast<const __half&>(*(const uint16_t*)bq3));
+    const int pair = iqs / 2;
+    const int half = iqs & 1;
+    const uint8_t* qs = bq3 + 2 + iqs * 8;             // 8 bytes for this sub
+    const uint8_t qh_byte = bq3[2 + 64 + pair * 2 + half];
+    const uint8_t* signs = bq3 + 2 + 64 + 8 + iqs * 4;  // 4 bytes for this sub
+    const uint8_t scales_byte = bq3[2 + 64 + 8 + 32 + pair];
+    const float db_f = (half == 0)
+                           ? (float)(1 + 2 * (scales_byte & 0xF))
+                           : (float)(1 + 2 * (scales_byte >> 4));
+
+    const block_q8_1_gemv& q8 = bq8_1[iqs];
+    const float d_q8 = __low2float(q8.ds);
+
+    int s_all = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int idx1 = qs[2 * l + 0] | ((qh_byte << (8 - 2 * l)) & 256);
+        const int idx2 = qs[2 * l + 1] | ((qh_byte << (7 - 2 * l)) & 256);
+        const int grid1 = (int)c_iq3s_grid[idx1];
+        const int grid2 = (int)c_iq3s_grid[idx2];
+        const uint8_t sb = signs[l];
+        const int smask_lo = expand_sign_mask_4(sb, 0);
+        const int smask_hi = expand_sign_mask_4(sb, 4);
+        const int sgrid1 = __vsub4(grid1 ^ smask_lo, smask_lo);
+        const int sgrid2 = __vsub4(grid2 ^ smask_hi, smask_hi);
+        const int u_lo = get_int_b4(q8.qs, l * 2 + 0);
+        const int u_hi = get_int_b4(q8.qs, l * 2 + 1);
+        s_all += forge_dp4a(sgrid1, u_lo, 0) + forge_dp4a(sgrid2, u_hi, 0);
+    }
+    return d * d_q8 * (float)s_all * db_f;
+}
+
+__global__ void gemv_iq3_s_q8_1_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_weight, float* __restrict__ out, int K, int N)
+{
+    constexpr int BE = 256, BS = 110, QI = 8;
+    int num_blocks_row = (K + BE - 1) / BE;
+    const int q8_stride = 8;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (warp_id >= N) return;
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * num_blocks_row * BS;
+    float sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+        const block_q8_1_gemv* row_q8 = x_q8 + (size_t)bi * q8_stride;
+#pragma unroll
+        for (int iqs = 0; iqs < QI; ++iqs) {
+            sum += vec_dot_iq3_s_q8_1(row_ptr, row_q8, bi, iqs);
+        }
+    }
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+    if (lane == 0) out[warp_id] = sum;
+}
+
+void launch_gemv_iq3_s_q8_1(const float* x, const void* q_weight, float* out,
+                             int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+    int q8_threads = 256, q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, K);
+    int warps_per_block = 8, threads = warps_per_block * 32;
+    int grid_blocks = (N + warps_per_block - 1) / warps_per_block;
+    gemv_iq3_s_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_weight), out, K, N);
+}
+
+__global__ void gemv_iq3_s_q8_1_batch_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_weight, float* __restrict__ out, int M, int K, int N)
+{
+    constexpr int BE = 256, BS = 110, QI = 8;
+    int num_blocks_row = (K + BE - 1) / BE;
+    const int q8_stride = 8;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    int total_warps = M * N;
+    if (warp_id >= total_warps) return;
+    int m = warp_id / N, n = warp_id % N;
+    const block_q8_1_gemv* x_row = x_q8 + (size_t)m * num_blocks_row * q8_stride;
+    const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * BS;
+    float sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+        const block_q8_1_gemv* row_q8 = x_row + (size_t)bi * q8_stride;
+#pragma unroll
+        for (int iqs = 0; iqs < QI; ++iqs) {
+            sum += vec_dot_iq3_s_q8_1(w_row, row_q8, bi, iqs);
+        }
+    }
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+    if (lane == 0) out[m * N + n] = sum;
+}
+
+void launch_gemv_iq3_s_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                   int M, int K, int N, cudaStream_t stream) {
+    ensure_gemv_iq_tables();
+    int k_per_row = (K + 31) / 32;
+    int num_q8_blocks = M * k_per_row;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+    int q8_threads = 256, q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, M * K);
+    int warps_per_block = 8, threads = warps_per_block * 32;
+    int total_warps = M * N;
+    int grid_blocks = (total_warps + warps_per_block - 1) / warps_per_block;
+    gemv_iq3_s_q8_1_batch_kernel<<<grid_blocks, threads, 0, stream>>>(
         x_q8, static_cast<const uint8_t*>(q_weight), out, M, K, N);
 }
 

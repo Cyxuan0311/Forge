@@ -17,6 +17,8 @@ extern void dequantize_q6_k_row(const uint8_t*, float*, int, int);
 extern void dequantize_iq2_s_row(const uint8_t*, float*, int, int);
 extern void dequantize_iq2_xxs_row(const uint8_t*, float*, int, int);
 extern void dequantize_iq4_nl_row(const uint8_t*, float*, int, int);
+extern void dequantize_iq2_xs_row(const uint8_t*, float*, int, int);
+extern void dequantize_iq3_s_row(const uint8_t*, float*, int, int);
 }  // namespace ops
 }  // namespace forge
 
@@ -49,6 +51,8 @@ const DataTypeTraits data_type_traits[] = {
     /* 15 BF16     */ { "bf16",     2, 1,   0,   false, nullptr },
     /* 16 IQ2_XXS  */ { "iq2_xxs",  0, 256, 66,  true,  ops::dequantize_iq2_xxs_row },
     /* 17 IQ4_NL   */ { "iq4_nl",   0, 32,  18,  true,  ops::dequantize_iq4_nl_row },
+    /* 18 IQ2_XS   */ { "iq2_xs",   0, 256, 74,  true,  ops::dequantize_iq2_xs_row },
+    /* 19 IQ3_S    */ { "iq3_s",    0, 256, 110, true,  ops::dequantize_iq3_s_row },
 };
 
 }  // namespace forge

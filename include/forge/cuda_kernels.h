@@ -108,15 +108,15 @@ void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
 using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
 using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const GemvFn gemv_dispatch[18];
-extern const GemvBatchFn gemv_batch_dispatch[18];
+extern const GemvFn gemv_dispatch[20];
+extern const GemvBatchFn gemv_batch_dispatch[20];
 
 // ---- Phase 6: MMQ (Matrix-Matrix Quantized) ----
 // For large M (>32), replaces dequantize-to-FP32 + cuBLAS with dp4a.
 // Pre-quantizes FP32 activations to Q8_1_mmq, then tiled dp4a dot products.
 using MmqFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const MmqFn mmq_dispatch[18];
+extern const MmqFn mmq_dispatch[20];
 
 void launch_mmq_q3_k(const float* x, const void* q_weight, float* out,
                       int M, int K, int N, cudaStream_t stream = 0);
@@ -401,13 +401,25 @@ void launch_moe_expert_gemv(const float* x, const void* q_w_3d, float* out,
 void launch_gelu_tanh_multiply_split(const float* gate_up, float* out, int half_dim,
                                      int n_tokens, cudaStream_t stream = 0);
 
-// ---- I-Quant Dequantization (IQ2_XXS, IQ4_NL) ----
+// ---- I-Quant Dequantization (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_S, IQ4_NL) ----
 
 void launch_dequant_iq2_xxs_matrix(const void* q_data, float* out, int N, int K,
-                                    cudaStream_t stream = 0);
+                                   cudaStream_t stream = 0);
+
+void launch_dequant_iq2_xs_matrix(const void* q_data, float* out, int N, int K,
+                                  cudaStream_t stream = 0);
+
+void launch_dequant_iq3_s_matrix(const void* q_data, float* out, int N, int K,
+                                 cudaStream_t stream = 0);
 
 void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
-                                   cudaStream_t stream = 0);
+                                  cudaStream_t stream = 0);
+
+// Lazily upload IQ-type lookup tables (grids + sign tables) to constant memory.
+// Must be called before any GEMV/MMQ kernel that references them; safe to call
+// repeatedly (no-op after the first upload).
+void ensure_iq2_xs_tables();
+void ensure_iq3_s_tables();
 
 // ---- SSM kernels ----
 void launch_ssm_preprocess(

@@ -1598,7 +1598,7 @@ void launch_mmq_q2_k(const float* x, const void* q_weight, float* out,
 
 using MmqFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const MmqFn mmq_dispatch[18] = {
+extern const MmqFn mmq_dispatch[20] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_mmq_q4_0,
@@ -1617,6 +1617,8 @@ extern const MmqFn mmq_dispatch[18] = {
     /* BF16=15  */ nullptr,
     /* IQ2_XXS=16 */ nullptr,
     /* IQ4_NL=17  */ nullptr,
+    /* IQ2_XS=18 */ nullptr,
+    /* IQ3_S=19  */ nullptr,
 };
 
 }  // namespace cuda
