@@ -6,6 +6,7 @@
 #ifdef USE_VSX
 #include <altivec.h>
 #endif
+#include <cstdint>
 #include <cstring>
 #include <cmath>
 

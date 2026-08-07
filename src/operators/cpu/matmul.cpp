@@ -376,7 +376,7 @@ TensorPtr matmul_transB_shared_input(const TensorPtr& input,
     float* o_data = static_cast<float*>(out->data());
 
 #ifdef USE_AVX2
-    auto dot_fn = forge::cpu::get_dot_q8k_fn(dt);
+    auto dot_fn = get_dot_q8k_fn(dt);
     // Batched fast path requires uniform dtype + shape across all weights.
     // Mixed-precision experts (per-expert dtypes differ) must fall back.
     for (int w = 1; w < n_w && dot_fn; ++w) {
@@ -421,7 +421,7 @@ TensorPtr matmul_transB_shared_input(const TensorPtr& input,
 #elif defined(USE_NEON)
     // NEON batched MoE path — enable the same dot_q8k fast path
     {
-        auto dot_fn = forge::cpu::get_dot_q8k_fn(dt);
+        auto dot_fn = get_dot_q8k_fn(dt);
         for (int w = 1; w < n_w && dot_fn; ++w) {
             if (weights[w]->dtype() != dt ||
                 static_cast<int>(weights[w]->shape()[0]) != N ||
@@ -530,7 +530,7 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
 #elif defined(USE_NEON)
     // NEON batched MoE path — enable the same dot_q8k fast path
     {
-        auto dot_fn = forge::cpu::get_dot_q8k_fn(dt);
+        auto dot_fn = get_dot_q8k_fn(dt);
         for (int p = 1; p < n_pairs && dot_fn; ++p) {
             if (weights[p]->dtype() != dt ||
                 static_cast<int>(weights[p]->shape()[0]) != N ||

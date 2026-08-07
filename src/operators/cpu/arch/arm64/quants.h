@@ -802,17 +802,22 @@ static inline float32x4_t q3_k_sb_dot_neon(const uint8_t* q3_sb,
             uint8_t shift = sg * 2;
 
             // Extract low 2 bits
-            uint8x16_t q3l_0 = vandq_u8(vshrq_n_u8(q3_bytes0, shift), m3);
-            uint8x16_t q3l_1 = vandq_u8(vshrq_n_u8(q3_bytes1, shift), m3);
+            // shift is a runtime value (sg*2), so use the variable-shift
+            // intrinsic with a broadcast vector — Apple Clang rejects
+            // non-constant args to the v*_n_* immediate forms.
+            uint8x16_t shift_vec = vdupq_n_u8(shift);
+            uint8x16_t q3l_0 = vandq_u8(vshrq_u8(q3_bytes0, shift_vec), m3);
+            uint8x16_t q3l_1 = vandq_u8(vshrq_u8(q3_bytes1, shift_vec), m3);
 
             // Extract high bit from hmask:
             // q3h = ((~hmask & (1 << bit)) >> bit) << 2  →  0 or 4
             uint8_t bit_val = 1 << bit;
             uint8x16_t bit_mask = vdupq_n_u8(bit_val);
+            uint8x16_t bit_vec = vdupq_n_u8(bit);
             uint8x16_t q3h_0 = vbicq_u8(bit_mask, hmask0);
             uint8x16_t q3h_1 = vbicq_u8(bit_mask, hmask1);
-            q3h_0 = vshlq_n_u8(vshrq_n_u8(q3h_0, bit), 2);
-            q3h_1 = vshlq_n_u8(vshrq_n_u8(q3h_1, bit), 2);
+            q3h_0 = vshlq_n_u8(vshrq_u8(q3h_0, bit_vec), 2);
+            q3h_1 = vshlq_n_u8(vshrq_u8(q3h_1, bit_vec), 2);
             ++bit;
 
             // Compute q3l = q3_low - q3_high as signed int8
