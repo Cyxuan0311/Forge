@@ -988,4 +988,12 @@ static void gemv_q4_0_fused_ffn_up_neon(const float* a, const uint8_t* w_gate,
 #endif  // USE_NEON
 
 }  // namespace cpu
+
+// The dispatcher lives in forge::cpu (matching this file), but the batched
+// MoE drivers in forge::ops call it unqualified; mirror the x86 header by
+// re-exporting it into forge::ops.
+namespace ops {
+using cpu::get_dot_q8k_fn;
+}  // namespace ops
+
 }  // namespace forge
