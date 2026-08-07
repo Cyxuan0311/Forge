@@ -216,6 +216,17 @@ jobs:
             --ignore=tests/test_gguf_gpu.py \
             -x --timeout=120
 
+      - name: Verify inference (CPU-only)
+        # End-to-end CPU inference smoke test. Gated on repository variable
+        # VERIFY_MODEL (path to a GGUF model on the runner) to avoid CI cost
+        # without explicit opt-in. macOS runners are arm64 (Apple Silicon).
+        if: vars.VERIFY_MODEL != ''
+        env:
+          VERIFY_MODEL: ${{ vars.VERIFY_MODEL }}
+        run: |
+          bash examples/verify_inference.sh --cpu-only --prompt "hi" \
+            --max-new-tokens 16 "$VERIFY_MODEL"
+
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
