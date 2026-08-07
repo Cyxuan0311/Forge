@@ -802,22 +802,23 @@ static inline float32x4_t q3_k_sb_dot_neon(const uint8_t* q3_sb,
             uint8_t shift = sg * 2;
 
             // Extract low 2 bits
-            // shift is a runtime value (sg*2), so use the variable-shift
-            // intrinsic with a broadcast vector — Apple Clang rejects
-            // non-constant args to the v*_n_* immediate forms.
-            uint8x16_t shift_vec = vdupq_n_u8(shift);
-            uint8x16_t q3l_0 = vandq_u8(vshrq_u8(q3_bytes0, shift_vec), m3);
-            uint8x16_t q3l_1 = vandq_u8(vshrq_u8(q3_bytes1, shift_vec), m3);
+            // shift is a runtime value (sg*2). Apple Clang requires constant
+            // immediates for vshrq_n_u8 and has no variable-shift vshrq_u8
+            // intrinsic, so negate the shift and use vshlq_u8 (USHL shifts
+            // right with zero-fill for negative unsigned shift amounts).
+            int8x16_t neg_shift = vdupq_n_s8(-static_cast<int8_t>(shift));
+            uint8x16_t q3l_0 = vandq_u8(vshlq_u8(q3_bytes0, neg_shift), m3);
+            uint8x16_t q3l_1 = vandq_u8(vshlq_u8(q3_bytes1, neg_shift), m3);
 
             // Extract high bit from hmask:
             // q3h = ((~hmask & (1 << bit)) >> bit) << 2  →  0 or 4
             uint8_t bit_val = 1 << bit;
             uint8x16_t bit_mask = vdupq_n_u8(bit_val);
-            uint8x16_t bit_vec = vdupq_n_u8(bit);
+            int8x16_t neg_bit = vdupq_n_s8(-static_cast<int8_t>(bit));
             uint8x16_t q3h_0 = vbicq_u8(bit_mask, hmask0);
             uint8x16_t q3h_1 = vbicq_u8(bit_mask, hmask1);
-            q3h_0 = vshlq_n_u8(vshrq_u8(q3h_0, bit_vec), 2);
-            q3h_1 = vshlq_n_u8(vshrq_u8(q3h_1, bit_vec), 2);
+            q3h_0 = vshlq_n_u8(vshlq_u8(q3h_0, neg_bit), 2);
+            q3h_1 = vshlq_n_u8(vshlq_u8(q3h_1, neg_bit), 2);
             ++bit;
 
             // Compute q3l = q3_low - q3_high as signed int8
