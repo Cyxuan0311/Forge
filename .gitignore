@@ -93,3 +93,6 @@ chat-template.md
 gemm_microkernel_plan.md
 operator_develop.md
 文档.md
+/build_arm64_qemu
+/build_ppc64_qemu
+cpu_arch_split_plan.md

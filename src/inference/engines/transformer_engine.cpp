@@ -16,12 +16,10 @@
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 
+#include "cpu/simd.h"
+
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
-#endif
-
-#ifdef USE_AVX2
-#    include <immintrin.h>
 #endif
 
 #ifdef _OPENMP
@@ -627,43 +625,7 @@ TensorPtr TransformerEngine::expand_kv_heads(const TensorPtr& kv, int seq_len, i
     } else {
         const float* kv_data = static_cast<const float*>(kv->data());
         float* out_data = static_cast<float*>(expanded->data());
-#ifdef USE_AVX2
-// Vectorized expand: copy each KV head to all query heads in its group.
-// For TinyLlama: kv_groups=8, head_dim=64 (8 AVX2 vectors per head).
-// Process all seq_len positions, each KV head is replicated kv_groups times.
-#    pragma omp parallel for schedule(static)
-        for (int s = 0; s < seq_len; ++s) {
-            const float* kv_row = kv_data + s * num_kv_heads * head_dim;
-            float* out_row = out_data + s * num_heads * head_dim;
-            for (int kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
-                const float* src = kv_row + kv_h * head_dim;
-                // Replicate this KV head to all query heads in its group
-                for (int g = 0; g < kv_groups; ++g) {
-                    int dst_h = kv_h * kv_groups + g;
-                    float* dst = out_row + dst_h * head_dim;
-                    // head_dim is typically 64 = 8 * 8 floats, use AVX2
-                    for (int d = 0; d + 8 <= head_dim; d += 8) {
-                        __m256 v = _mm256_loadu_ps(src + d);
-                        _mm256_storeu_ps(dst + d, v);
-                    }
-                    // Handle remaining elements (unlikely for head_dim=64)
-                    for (int d = (head_dim / 8) * 8; d < head_dim; ++d) {
-                        dst[d] = src[d];
-                    }
-                }
-            }
-        }
-#else
-        for (int s = 0; s < seq_len; ++s) {
-            for (int h = 0; h < num_heads; ++h) {
-                int kv_h = h / kv_groups;
-                for (int d = 0; d < head_dim; ++d) {
-                    out_data[s * num_heads * head_dim + h * head_dim + d] =
-                        kv_data[s * num_kv_heads * head_dim + kv_h * head_dim + d];
-                }
-            }
-        }
-#endif
+        forge::cpu::expand_kv_heads_f32(kv_data, out_data, seq_len, num_heads, num_kv_heads, head_dim);
     }
 
     return expanded;

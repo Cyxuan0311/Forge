@@ -6,9 +6,7 @@
 #include "forge/cuda_kernels.h"
 #include "forge/operators.h"
 
-#ifdef USE_AVX2
-#    include <immintrin.h>
-#endif
+#include "cpu/simd.h"
 
 #ifdef _OPENMP
 #    include <omp.h>
@@ -552,37 +550,7 @@ TensorPtr AttentionExecutor::expand_kv_heads(const TensorPtr& kv, int seq_len, i
     } else {
         const float* kv_data = static_cast<const float*>(kv->data());
         float* out_data = static_cast<float*>(expanded->data());
-#ifdef USE_AVX2
-#    pragma omp parallel for schedule(static)
-        for (int s = 0; s < seq_len; ++s) {
-            const float* kv_row = kv_data + s * num_kv_heads * head_dim;
-            float* out_row = out_data + s * num_heads * head_dim;
-            for (int kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
-                const float* src = kv_row + kv_h * head_dim;
-                for (int g = 0; g < kv_groups; ++g) {
-                    int dst_h = kv_h * kv_groups + g;
-                    float* dst = out_row + dst_h * head_dim;
-                    for (int d = 0; d + 8 <= head_dim; d += 8) {
-                        __m256 v = _mm256_loadu_ps(src + d);
-                        _mm256_storeu_ps(dst + d, v);
-                    }
-                    for (int d = (head_dim / 8) * 8; d < head_dim; ++d) {
-                        dst[d] = src[d];
-                    }
-                }
-            }
-        }
-#else
-        for (int s = 0; s < seq_len; ++s) {
-            for (int h = 0; h < num_heads; ++h) {
-                int kv_h = h / kv_groups;
-                for (int d = 0; d < head_dim; ++d) {
-                    out_data[s * num_heads * head_dim + h * head_dim + d] =
-                        kv_data[s * num_kv_heads * head_dim + kv_h * head_dim + d];
-                }
-            }
-        }
-#endif
+        forge::cpu::expand_kv_heads_f32(kv_data, out_data, seq_len, num_heads, num_kv_heads, head_dim);
     }
 
     return expanded;

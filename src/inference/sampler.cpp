@@ -9,9 +9,7 @@
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
 
-#ifdef USE_AVX2
-#    include <immintrin.h>
-#endif
+#include "cpu/simd.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -126,93 +124,14 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
 
     {
         PERF_SCOPE("sampler/argmax_cpu");
-        int best = 0;
-        float best_val;
+        int best;
         bool has_softcap = (config_.logit_softcapping > 0.0f);
 
         if (has_softcap) {
-            // Fused softcap + argmax: apply tanh(x/cap)*cap in-place while finding max
             float cap = config_.logit_softcapping;
-#ifdef USE_AVX2
-            __m256 vcap = _mm256_set1_ps(cap);
-            __m256 vdiv = _mm256_set1_ps(1.0f / cap);
-            __m256 c27 = _mm256_set1_ps(27.0f);
-            __m256 c9 = _mm256_set1_ps(9.0f);
-            __m256 vminus_one = _mm256_set1_ps(-1.0f);
-            __m256 vone = _mm256_set1_ps(1.0f);
-            __m256 vmax = _mm256_set1_ps(-1e30f);
-            __m256i vidx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-            int i = 0;
-            for (; i + 8 <= vocab_size; i += 8) {
-                __m256 v = _mm256_loadu_ps(&host_logits[i]);
-                __m256 x = _mm256_mul_ps(v, vdiv);
-                __m256 x2 = _mm256_mul_ps(x, x);
-                __m256 num = _mm256_add_ps(c27, x2);
-                __m256 den = _mm256_add_ps(c27, _mm256_mul_ps(c9, x2));
-                __m256 th = _mm256_mul_ps(x, _mm256_div_ps(num, den));
-                th = _mm256_min_ps(_mm256_max_ps(th, vminus_one), vone);
-                __m256 sc = _mm256_mul_ps(th, vcap);
-                _mm256_storeu_ps(&host_logits[i], sc);
-                __m256 cmp = _mm256_cmp_ps(sc, vmax, _CMP_GT_OS);
-                vmax = _mm256_blendv_ps(vmax, sc, cmp);
-                __m256i new_idx = _mm256_add_epi32(_mm256_set1_epi32(i),
-                                                   _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-                vidx = _mm256_blendv_epi8(vidx, new_idx, _mm256_castps_si256(cmp));
-            }
-            float vals[8];
-            int idxs[8];
-            _mm256_storeu_ps(vals, vmax);
-            _mm256_storeu_si256((__m256i*)idxs, vidx);
-            best = idxs[0];
-            best_val = vals[0];
-            for (int j = 1; j < 8; ++j) {
-                if (vals[j] > best_val) { best_val = vals[j]; best = idxs[j]; }
-            }
-            for (; i < vocab_size; ++i) {
-                float xx = host_logits[i] / cap;
-                float x2 = xx * xx;
-                float t = xx * (27.0f + x2) / (27.0f + 9.0f * x2);
-                if (t > 1.0f) t = 1.0f; if (t < -1.0f) t = -1.0f;
-                host_logits[i] = t * cap;
-                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
-            }
-#else
-            best_val = host_logits[0];
-            for (int i = 0; i < vocab_size; ++i) {
-                host_logits[i] = std::tanh(host_logits[i] / cap) * cap;
-                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
-            }
-#endif
+            best = forge::cpu::softcap_and_argmax_f32(host_logits.data(), vocab_size, cap);
         } else {
-#ifdef USE_AVX2
-            best_val = host_logits[0];
-            __m256 vmax = _mm256_set1_ps(-1e30f);
-            __m256i vidx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-            int i = 0;
-            for (; i + 8 <= vocab_size; i += 8) {
-                __m256 v = _mm256_loadu_ps(&host_logits[i]);
-                __m256 cmp = _mm256_cmp_ps(v, vmax, _CMP_GT_OS);
-                vmax = _mm256_blendv_ps(vmax, v, cmp);
-                __m256i new_idx = _mm256_add_epi32(_mm256_set1_epi32(i),
-                                                   _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-                vidx = _mm256_blendv_epi8(vidx, new_idx, _mm256_castps_si256(cmp));
-            }
-            float vals[8];
-            int idxs[8];
-            _mm256_storeu_ps(vals, vmax);
-            _mm256_storeu_si256((__m256i*)idxs, vidx);
-            for (int j = 0; j < 8; ++j) {
-                if (vals[j] > best_val) { best_val = vals[j]; best = idxs[j]; }
-            }
-            for (; i < vocab_size; ++i) {
-                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
-            }
-#else
-            best_val = host_logits[0];
-            for (int i = 1; i < vocab_size; ++i) {
-                if (host_logits[i] > best_val) { best_val = host_logits[i]; best = i; }
-            }
-#endif
+            best = forge::cpu::argmax_f32(host_logits.data(), vocab_size);
         }
         return best;
     }
@@ -278,149 +197,21 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
     {
         PERF_SCOPE("sampler/softmax_sample");
 
-        // AVX2-accelerated softcap + max reduction (fused when softcap is needed)
         float max_val;
         bool has_softcap = (config_.logit_softcapping > 0.0f);
         if (has_softcap) {
             float cap = config_.logit_softcapping;
-#ifdef USE_AVX2
-            __m256 vcap = _mm256_set1_ps(cap);
-            __m256 vdiv = _mm256_set1_ps(1.0f / cap);
-            __m256 c27 = _mm256_set1_ps(27.0f);
-            __m256 c9 = _mm256_set1_ps(9.0f);
-            __m256 vminus_one = _mm256_set1_ps(-1.0f);
-            __m256 vone = _mm256_set1_ps(1.0f);
-            __m256 vmax = _mm256_set1_ps(-1e30f);
-            int i = 0;
-            for (; i + 8 <= vocab_size; i += 8) {
-                __m256 v = _mm256_loadu_ps(&host_logits[i]);
-                __m256 x = _mm256_mul_ps(v, vdiv);
-                __m256 x2 = _mm256_mul_ps(x, x);
-                __m256 num = _mm256_add_ps(c27, x2);
-                __m256 den = _mm256_add_ps(c27, _mm256_mul_ps(c9, x2));
-                __m256 th = _mm256_mul_ps(x, _mm256_div_ps(num, den));
-                th = _mm256_min_ps(_mm256_max_ps(th, vminus_one), vone);
-                __m256 sc = _mm256_mul_ps(th, vcap);
-                _mm256_storeu_ps(&host_logits[i], sc);
-                vmax = _mm256_max_ps(vmax, sc);
-            }
-            __m128 m = _mm256_castps256_ps128(vmax);
-            m = _mm_max_ps(m, _mm256_extractf128_ps(vmax, 1));
-            m = _mm_max_ps(m, _mm_movehl_ps(m, m));
-            m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
-            max_val = _mm_cvtss_f32(m);
-            for (; i < vocab_size; ++i) {
-                float xx = host_logits[i] / cap;
-                float x2 = xx * xx;
-                float t = xx * (27.0f + x2) / (27.0f + 9.0f * x2);
-                if (t > 1.0f) t = 1.0f; if (t < -1.0f) t = -1.0f;
-                host_logits[i] = t * cap;
-                if (host_logits[i] > max_val) max_val = host_logits[i];
-            }
-#else
-            max_val = host_logits[0];
-            for (int i = 0; i < vocab_size; ++i) {
-                host_logits[i] = std::tanh(host_logits[i] / cap) * cap;
-                if (host_logits[i] > max_val) max_val = host_logits[i];
-            }
-#endif
+            max_val = forge::cpu::softcap_and_max_f32(host_logits.data(), vocab_size, cap);
         } else {
-#ifdef USE_AVX2
-            {
-                __m256 vmax = _mm256_set1_ps(-1e30f);
-                int i = 0;
-                for (; i + 8 <= vocab_size; i += 8) {
-                    __m256 v = _mm256_loadu_ps(&host_logits[i]);
-                    vmax = _mm256_max_ps(vmax, v);
-                }
-                __m128 m = _mm256_castps256_ps128(vmax);
-                m = _mm_max_ps(m, _mm256_extractf128_ps(vmax, 1));
-                m = _mm_max_ps(m, _mm_movehl_ps(m, m));
-                m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
-                max_val = _mm_cvtss_f32(m);
-                for (; i < vocab_size; ++i) {
-                    if (host_logits[i] > max_val)
-                        max_val = host_logits[i];
-                }
-            }
-#else
-            max_val = *std::max_element(host_logits.begin(), host_logits.end());
-#endif
+            max_val = forge::cpu::max_f32(host_logits.data(), vocab_size);
         }
 
-        // AVX2-accelerated exp + sum
         std::vector<float> probs(vocab_size);
-        float sum = 0.0f;
         float inv_temp = 1.0f / temperature;
-#ifdef USE_AVX2
-        {
-            __m256 vsum = _mm256_setzero_ps();
-            __m256 vshift = _mm256_set1_ps(max_val);
-            __m256 vscale = _mm256_set1_ps(inv_temp);
-            int i = 0;
-            for (; i + 8 <= vocab_size; i += 8) {
-                __m256 v = _mm256_loadu_ps(&host_logits[i]);
-                v = _mm256_sub_ps(v, vshift);
-                v = _mm256_mul_ps(v, vscale);
-                // Fast exp approximation using AVX2 (max error ~1.5%)
-                // exp(x) = 2^(x/ln2), use polynomial for fractional part
-                __m256 exp_v;
-                // Clamp to [-88, 88] to avoid overflow
-                v = _mm256_min_ps(v, _mm256_set1_ps(88.0f));
-                v = _mm256_max_ps(v, _mm256_set1_ps(-88.0f));
-                // exp(x) = 2^(x * 1.44269504) = 2^(n + f) where n = floor(x*1.44269504)
-                __m256 x = _mm256_mul_ps(v, _mm256_set1_ps(1.44269504f));
-                __m256i n = _mm256_cvttps_epi32(x);
-                __m256 f = _mm256_sub_ps(x, _mm256_cvtepi32_ps(n));
-                // Polynomial: 2^f ≈ 1 + f*(0.693147 + f*(0.240227 + f*0.055504))
-                __m256 p = _mm256_fmadd_ps(f, _mm256_set1_ps(0.055504f), _mm256_set1_ps(0.240227f));
-                p = _mm256_fmadd_ps(f, p, _mm256_set1_ps(0.693147f));
-                p = _mm256_fmadd_ps(f, p, _mm256_set1_ps(1.0f));
-                // 2^n via bit manipulation
-                __m256i n_shifted =
-                    _mm256_slli_epi32(_mm256_add_epi32(n, _mm256_set1_epi32(127)), 23);
-                exp_v = _mm256_mul_ps(p, _mm256_castsi256_ps(n_shifted));
-                _mm256_storeu_ps(&probs[i], exp_v);
-                vsum = _mm256_add_ps(vsum, exp_v);
-            }
-            // Horizontal sum
-            __m128 hi = _mm256_extractf128_ps(vsum, 1);
-            __m128 lo = _mm256_castps256_ps128(vsum);
-            __m128 s = _mm_add_ps(lo, hi);
-            s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-            s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-            sum = _mm_cvtss_f32(s);
-            for (; i < vocab_size; ++i) {
-                probs[i] = std::exp((host_logits[i] - max_val) * inv_temp);
-                sum += probs[i];
-            }
-        }
-#else
-        for (int i = 0; i < vocab_size; ++i) {
-            probs[i] = std::exp((host_logits[i] - max_val) / temperature);
-            sum += probs[i];
-        }
-#endif
+        float sum = forge::cpu::exp_and_sum_f32(host_logits.data(), probs.data(), vocab_size, max_val, inv_temp);
 
-        // AVX2-accelerated normalization
         float inv_sum = 1.0f / sum;
-#ifdef USE_AVX2
-        {
-            __m256 vinv = _mm256_set1_ps(inv_sum);
-            int i = 0;
-            for (; i + 8 <= vocab_size; i += 8) {
-                __m256 v = _mm256_loadu_ps(&probs[i]);
-                _mm256_storeu_ps(&probs[i], _mm256_mul_ps(v, vinv));
-            }
-            for (; i < vocab_size; ++i) {
-                probs[i] *= inv_sum;
-            }
-        }
-#else
-        for (int i = 0; i < vocab_size; ++i) {
-            probs[i] /= sum;
-        }
-#endif
+        forge::cpu::scale_normalize_f32(probs.data(), vocab_size, inv_sum);
 
         if (config_.top_k > 0) {
             std::vector<std::pair<float, int>> indexed(vocab_size);

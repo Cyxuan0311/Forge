@@ -4,10 +4,6 @@
 #include "forge/operator_rope.h"
 #include "forge/perf_profiler.h"
 
-#ifdef USE_AVX2
-#    include <immintrin.h>
-#endif
-
 namespace forge {
 namespace ops {
 

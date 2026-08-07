@@ -15,7 +15,8 @@
 
 #ifdef USE_AVX2
 #    include <immintrin.h>
-#    include "quant_helpers.h"    // block_q8_K, block_q6_K, quantize_row_q8_K, get_scale_shuffle
+#    include "../../common/quant_helpers.h"  // block_q8_K, block_q6_K, quantize_row_q8_K, get_scale_shuffle
+#    include "scales.h"                       // get_scale_shuffle*, decode_q4_k_scales
 #    include "vec_dot.h"          // block_q8_0_act, quantize_row_q8_0_act, vdot::fp16_to_fp32
 #endif
 

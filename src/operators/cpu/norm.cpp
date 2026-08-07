@@ -7,9 +7,7 @@
 #include "forge/operator_norm.h"
 #include "forge/perf_profiler.h"
 
-#ifdef USE_AVX2
-#    include <immintrin.h>
-#endif
+#include "cpu/simd.h"
 
 #ifdef _OPENMP
 #    include <omp.h>
@@ -54,63 +52,7 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
         for (int r = 0; r < rows; ++r) {
             const float* x_row = x_data + r * cols;
             float* o_row = o_data + r * cols;
-#ifdef USE_AVX2
-            __m256 sum_sq_v = _mm256_setzero_ps();
-            int c = 0;
-            for (; c + 8 <= cols; c += 8) {
-                __m256 xv = _mm256_loadu_ps(x_row + c);
-                sum_sq_v = _mm256_fmadd_ps(xv, xv, sum_sq_v);
-            }
-            // Horizontal sum
-            __m128 hi128 = _mm256_extractf128_ps(sum_sq_v, 1);
-            __m128 lo128 = _mm256_castps256_ps128(sum_sq_v);
-            __m128 sum128 = _mm_add_ps(lo128, hi128);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            float sum_sq = _mm_cvtss_f32(sum128);
-            for (; c < cols; ++c) {
-                float v = x_row[c];
-                sum_sq += v * v;
-            }
-            float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
-            __m256 rms_v = _mm256_set1_ps(rms);
-            c = 0;
-            if (w_data) {
-                for (; c + 8 <= cols; c += 8) {
-                    __m256 xv = _mm256_loadu_ps(x_row + c);
-                    __m256 wv = _mm256_loadu_ps(w_data + c);
-                    __m256 ov = _mm256_mul_ps(_mm256_mul_ps(xv, rms_v), wv);
-                    _mm256_storeu_ps(o_row + c, ov);
-                }
-                for (; c < cols; ++c) {
-                    o_row[c] = x_row[c] * rms * w_data[c];
-                }
-            } else {
-                for (; c + 8 <= cols; c += 8) {
-                    __m256 xv = _mm256_loadu_ps(x_row + c);
-                    _mm256_storeu_ps(o_row + c, _mm256_mul_ps(xv, rms_v));
-                }
-                for (; c < cols; ++c) {
-                    o_row[c] = x_row[c] * rms;
-                }
-            }
-#else
-            float sum_sq = 0.0f;
-            for (int c = 0; c < cols; ++c) {
-                float v = x_row[c];
-                sum_sq += v * v;
-            }
-            float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
-            if (w_data) {
-                for (int c = 0; c < cols; ++c) {
-                    o_row[c] = x_row[c] * rms * w_data[c];
-                }
-            } else {
-                for (int c = 0; c < cols; ++c) {
-                    o_row[c] = x_row[c] * rms;
-                }
-            }
-#endif
+            forge::cpu::rms_norm_row_f32(x_row, w_data, o_row, cols, eps);
         }
     }
     return out;

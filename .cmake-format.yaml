@@ -1,0 +1,2 @@
+# Treat all comments as literal: never reflow/wrap aligned comment blocks.
+literal_comment_pattern: ".*"

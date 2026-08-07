@@ -12,38 +12,76 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+option(FORGE_NATIVE_BUILD
+       "Build with -march=native (x86) or -mcpu=apple-m1 (macOS arm64)" ON)
+option(FORGE_TUNE_MARCH "Override -march flag (empty = auto)" "")
+
 if(MSVC)
   set(CMAKE_CXX_FLAGS_RELEASE "/O2")
 else()
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
-  set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -Wno-deprecated-gpu-targets")
+  if(FORGE_NATIVE_BUILD)
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
+      # macOS arm64: -march=native is not well-supported by Apple Clang
+      set(CMAKE_CXX_FLAGS_RELEASE "-O3 -mcpu=apple-m1")
+      set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -Wno-deprecated-gpu-targets")
+      message(STATUS "Native build: -mcpu=apple-m1 (macOS arm64)")
+    else()
+      set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
+      set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -Wno-deprecated-gpu-targets")
+      message(STATUS "Native build: -march=native")
+    endif()
+  else()
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+    set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -Wno-deprecated-gpu-targets")
+    message(STATUS "Portable build: no -march flag (FORGE_NATIVE_BUILD=OFF)")
+  endif()
+  if(FORGE_TUNE_MARCH)
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 ${FORGE_TUNE_MARCH}")
+    message(STATUS "Custom march: ${FORGE_TUNE_MARCH}")
+  endif()
 endif()
 
-# Detect AVX2 support (x86/x86_64 only)
-include(CheckCXXCompilerFlag)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)")
-  check_cxx_compiler_flag("-mavx2 -mfma -mf16c" COMPILER_SUPPORTS_AVX2)
-  if(COMPILER_SUPPORTS_AVX2)
-    message(STATUS "AVX2/FMA/F16C supported - enabling optimized CPU kernels")
-    add_compile_definitions(USE_AVX2)
-  else()
-    message(STATUS "AVX2 not supported - using scalar CPU kernels")
-  endif()
+# ---- CPU feature detection (two-level: arch + SIMD) ----
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(detect_cpu_features)
 
-  # AVX-512 VNNI: compile-time flag (runtime detection still needed)
-  check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vnni -mavx512vl -mf16c"
-                          COMPILER_SUPPORTS_AVX512_VNNI)
-  if(COMPILER_SUPPORTS_AVX512_VNNI)
-    message(STATUS "AVX-512 VNNI supported - enabling AVX-512 GEMM kernels")
-    add_compile_definitions(USE_AVX512_VNNI)
-  else()
-    message(STATUS "AVX-512 VNNI not supported - AVX-512 GEMM kernels disabled")
-  endif()
-else()
-  message(
-    STATUS
-      "Non-x86 architecture (${CMAKE_SYSTEM_PROCESSOR}) - using scalar CPU kernels"
-  )
+# ---- forge_cpu_features INTERFACE target ----
+# All targets that need arch-specific headers or SIMD compile flags link to
+# this.
+add_library(forge_cpu_features INTERFACE)
+target_compile_definitions(forge_cpu_features
+                           INTERFACE FORGE_ARCH_${FORGE_ARCH})
+target_include_directories(forge_cpu_features
+                           INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src/operators)
+
+if(FORGE_CPU_HAS_AVX2)
+  target_compile_definitions(forge_cpu_features INTERFACE USE_AVX2)
+  target_compile_options(forge_cpu_features INTERFACE -mavx2 -mfma -mf16c)
+endif()
+if(FORGE_CPU_HAS_AVX512_VNNI)
+  target_compile_definitions(forge_cpu_features INTERFACE USE_AVX512_VNNI)
+  target_compile_options(
+    forge_cpu_features INTERFACE -mavx512f -mavx512bw -mavx512vnni -mavx512vl
+                                 -mf16c)
+endif()
+if(FORGE_CPU_HAS_NEON)
+  target_compile_definitions(forge_cpu_features INTERFACE USE_NEON)
+endif()
+if(FORGE_CPU_HAS_DOTPROD)
+  target_compile_definitions(forge_cpu_features INTERFACE USE_DOTPROD)
+  target_compile_options(
+    forge_cpu_features
+    INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod>)
+endif()
+if(FORGE_CPU_HAS_MATMUL_INT8)
+  target_compile_definitions(forge_cpu_features INTERFACE USE_MATMUL_INT8)
+  target_compile_options(
+    forge_cpu_features
+    INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+i8mm>)
+endif()
+if(FORGE_CPU_HAS_VSX)
+  target_compile_definitions(forge_cpu_features INTERFACE USE_VSX)
+  target_compile_options(forge_cpu_features INTERFACE -mcpu=power8)
 endif()
 
 option(USE_CUBLAS "Use cuBLAS for GPU matrix operations" ON)
@@ -107,21 +145,29 @@ if(CUDAToolkit_FOUND)
 endif()
 
 find_package(OpenMP)
-find_package(
-  Python3
-  COMPONENTS Interpreter Development NumPy
-  REQUIRED)
 
-set(FETCHCONTENT_BASE_DIR
-    "${CMAKE_SOURCE_DIR}/.cache/fetchcontent"
-    CACHE PATH "FetchContent cache directory")
+option(FORGE_BUILD_PYTHON
+       "Build Python bindings (requires Python3 development)" ON)
+if(FORGE_BUILD_PYTHON)
+  find_package(
+    Python3
+    COMPONENTS Interpreter Development NumPy
+    REQUIRED)
 
-include(FetchContent)
-FetchContent_Declare(
-  pybind11
-  GIT_REPOSITORY https://ghproxy.net/https://github.com/pybind/pybind11.git
-  GIT_TAG v2.13.6)
-FetchContent_MakeAvailable(pybind11)
+  set(FETCHCONTENT_BASE_DIR
+      "${CMAKE_SOURCE_DIR}/.cache/fetchcontent"
+      CACHE PATH "FetchContent cache directory")
+
+  include(FetchContent)
+  FetchContent_Declare(
+    pybind11
+    GIT_REPOSITORY https://ghproxy.net/https://github.com/pybind/pybind11.git
+    GIT_TAG v2.13.6)
+  FetchContent_MakeAvailable(pybind11)
+else()
+  message(
+    STATUS "Python bindings disabled (FORGE_BUILD_PYTHON=OFF) - CLI-only build")
+endif()
 
 # ---- Core library (static) ----
 add_library(
@@ -136,63 +182,21 @@ add_library(
   src/core/compute_graph.cpp
   src/debug/logger.cpp
   src/inference/kv_cache.cpp)
-target_include_directories(forge_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                                             ${CUDAToolkit_INCLUDE_DIRS})
+target_include_directories(
+  forge_core
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CUDAToolkit_INCLUDE_DIRS}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/operators)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge_core PUBLIC USE_CUDA)
   target_link_libraries(forge_core PUBLIC CUDA::cudart)
 endif()
 target_link_libraries(forge_core
                       PUBLIC $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+target_link_libraries(forge_core PUBLIC forge_cpu_features)
 
 # ---- Operators library (static) ----
-add_library(
-  forge_ops STATIC
-  src/operators/cpu/norm.cpp
-  src/operators/cpu/activation.cpp
-  src/operators/cpu/matmul.cpp
-  src/operators/cpu/quant_traits.cpp
-  src/operators/cpu/embedding.cpp
-  src/operators/cpu/rope.cpp
-  src/operators/cpu/elementwise.cpp
-  src/operators/cpu/attention.cpp)
-if(CUDAToolkit_FOUND)
-  target_sources(
-    forge_ops
-    PRIVATE src/operators/cuda/cuda_rms_norm.cu
-            src/operators/cuda/matmul_cuda.cpp
-            src/operators/cuda/cuda_activation.cu
-            src/operators/cuda/cuda_elementwise.cu
-            src/operators/cuda/cuda_rope.cu
-            src/operators/cuda/cuda_flash_attn.cu
-            src/operators/cuda/cuda_embedding.cu
-            src/operators/cuda/cuda_gemv.cu
-            src/operators/cuda/cuda_gemv_instances.cu
-            src/operators/cuda/cuda_fused.cu
-            src/operators/cuda/cuda_quant.cu
-            src/operators/cuda/cuda_gemm.cu
-            src/operators/cuda/cuda_fused_attn.cu
-            src/operators/cuda/cuda_logit_softcap.cu
-            src/operators/cuda/cuda_moe.cu
-            src/operators/cuda/cuda_sampler.cu
-            src/operators/cuda/cuda_ssm.cu
-            src/operators/cuda/cuda_mmq.cu)
-  target_compile_definitions(forge_ops PUBLIC USE_CUDA)
-endif()
-
-target_include_directories(forge_ops PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                                            ${CUDAToolkit_INCLUDE_DIRS})
-target_compile_definitions(forge_ops
-                           PRIVATE FORGE_USE_CUBLAS=$<BOOL:${USE_CUBLAS}>)
-target_compile_definitions(forge_ops
-                           PRIVATE FORGE_USE_OPENBLAS=$<BOOL:${USE_OPENBLAS}>)
-target_include_directories(forge_ops PRIVATE ${OPENBLAS_INCLUDE_DIRS})
-target_link_libraries(
-  forge_ops PUBLIC forge_core $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
-                   $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
-if(CUDAToolkit_FOUND)
-  target_link_libraries(forge_ops PUBLIC $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
-endif()
+# Defined in src/operators/CMakeLists.txt
+add_subdirectory(src/operators)
 
 # ---- Model library (static) ----
 add_library(
@@ -278,14 +282,16 @@ add_library(
   src/inference/request_scheduler.cpp
   src/inference/speculative.cpp)
 target_include_directories(
-  forge_infer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                     ${CUDAToolkit_INCLUDE_DIRS})
+  forge_infer
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CUDAToolkit_INCLUDE_DIRS}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/operators)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge_infer PUBLIC USE_CUDA)
 endif()
 target_link_libraries(
   forge_infer PUBLIC forge_core forge_ops forge_model
                      $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+target_link_libraries(forge_infer PUBLIC forge_cpu_features)
 
 # ---- CLI executable ----
 add_executable(
@@ -318,36 +324,38 @@ if(CUDAToolkit_FOUND)
 endif()
 
 # ---- Python bindings ----
-pybind11_add_module(
-  forge
-  src/bindings/forge_py.cpp
-  src/bindings/core_types.cpp
-  src/bindings/model.cpp
-  src/bindings/tokenizer.cpp
-  src/bindings/multimodal.cpp
-  src/bindings/scheduler.cpp
-  src/bindings/backend.cpp
-  src/bindings/logger.cpp
-  src/bindings/profiler.cpp)
-target_link_libraries(
-  forge
-  PRIVATE forge_infer
-          forge_model
-          forge_ops
-          forge_core
-          forge_tokenizer
-          forge_vision
-          Python3::Python
-          Python3::NumPy
-          $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
-target_include_directories(forge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
-                                         ${CUDAToolkit_INCLUDE_DIRS})
-target_compile_definitions(forge PRIVATE VERSION_INFO=${PROJECT_VERSION})
-if(CUDAToolkit_FOUND)
-  target_compile_definitions(forge PRIVATE USE_CUDA)
-  set_target_properties(
+if(FORGE_BUILD_PYTHON)
+  pybind11_add_module(
     forge
-    PROPERTIES CUDA_SEPARABLE_COMPILATION ON
-               CUDA_RESOLVE_DEVICE_SYMBOLS ON
-               CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}")
+    src/bindings/forge_py.cpp
+    src/bindings/core_types.cpp
+    src/bindings/model.cpp
+    src/bindings/tokenizer.cpp
+    src/bindings/multimodal.cpp
+    src/bindings/scheduler.cpp
+    src/bindings/backend.cpp
+    src/bindings/logger.cpp
+    src/bindings/profiler.cpp)
+  target_link_libraries(
+    forge
+    PRIVATE forge_infer
+            forge_model
+            forge_ops
+            forge_core
+            forge_tokenizer
+            forge_vision
+            Python3::Python
+            Python3::NumPy
+            $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
+  target_include_directories(forge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                           ${CUDAToolkit_INCLUDE_DIRS})
+  target_compile_definitions(forge PRIVATE VERSION_INFO=${PROJECT_VERSION})
+  if(CUDAToolkit_FOUND)
+    target_compile_definitions(forge PRIVATE USE_CUDA)
+    set_target_properties(
+      forge
+      PROPERTIES CUDA_SEPARABLE_COMPILATION ON
+                 CUDA_RESOLVE_DEVICE_SYMBOLS ON
+                 CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}")
+  endif()
 endif()

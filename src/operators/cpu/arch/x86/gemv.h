@@ -5,7 +5,8 @@
 #include <cstdint>
 #include <cstring>
 
-#include "quant_helpers.h"
+#include "../../common/quant_helpers.h"
+#include "scales.h"
 #include "vec.h"
 #ifdef _OPENMP
 #    include <omp.h>

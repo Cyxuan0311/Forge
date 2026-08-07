@@ -5,9 +5,7 @@
 #include "forge/op_dispatch.h"
 #include "forge/operators.h"
 
-#ifdef USE_AVX2
-#    include <immintrin.h>
-#endif
+#include "cpu/simd.h"
 
 #ifdef _OPENMP
 #    include <omp.h>
@@ -34,19 +32,7 @@ void add_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const i
         const float* a_data = static_cast<const float*>(a->data());
         const float* b_data = static_cast<const float*>(b->data());
         float* o_data = static_cast<float*>(dst->data());
-#ifdef USE_AVX2
-        int i = 0;
-        for (; i + 8 <= n; i += 8) {
-            __m256 av = _mm256_loadu_ps(a_data + i);
-            __m256 bv = _mm256_loadu_ps(b_data + i);
-            _mm256_storeu_ps(o_data + i, _mm256_add_ps(av, bv));
-        }
-        for (; i < n; ++i)
-            o_data[i] = a_data[i] + b_data[i];
-#else
-        for (int i = 0; i < n; ++i)
-            o_data[i] = a_data[i] + b_data[i];
-#endif
+        forge::cpu::add_f32_vec(a_data, b_data, o_data, n);
     }
 }
 
@@ -65,19 +51,7 @@ void mul_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const i
         const float* a_data = static_cast<const float*>(a->data());
         const float* b_data = static_cast<const float*>(b->data());
         float* o_data = static_cast<float*>(dst->data());
-#ifdef USE_AVX2
-        int i = 0;
-        for (; i + 8 <= n; i += 8) {
-            __m256 av = _mm256_loadu_ps(a_data + i);
-            __m256 bv = _mm256_loadu_ps(b_data + i);
-            _mm256_storeu_ps(o_data + i, _mm256_mul_ps(av, bv));
-        }
-        for (; i < n; ++i)
-            o_data[i] = a_data[i] * b_data[i];
-#else
-        for (int i = 0; i < n; ++i)
-            o_data[i] = a_data[i] * b_data[i];
-#endif
+        forge::cpu::mul_f32_vec(a_data, b_data, o_data, n);
     }
 }
 
@@ -138,49 +112,7 @@ void rms_norm_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst,
         for (int r = 0; r < rows; ++r) {
             const float* x_row = x_data + r * cols;
             float* o_row = o_data + r * cols;
-#ifdef USE_AVX2
-            __m256 sum_sq_v = _mm256_setzero_ps();
-            int c = 0;
-            for (; c + 8 <= cols; c += 8) {
-                __m256 xv = _mm256_loadu_ps(x_row + c);
-                sum_sq_v = _mm256_fmadd_ps(xv, xv, sum_sq_v);
-            }
-            __m128 hi128 = _mm256_extractf128_ps(sum_sq_v, 1);
-            __m128 lo128 = _mm256_castps256_ps128(sum_sq_v);
-            __m128 sum128 = _mm_add_ps(lo128, hi128);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            float sum_sq = _mm_cvtss_f32(sum128);
-            for (; c < cols; ++c) {
-                float v = x_row[c];
-                sum_sq += v * v;
-            }
-            float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
-            __m256 rms_v = _mm256_set1_ps(rms);
-            c = 0;
-            if (w_data) {
-                for (; c + 8 <= cols; c += 8) {
-                    __m256 xv = _mm256_loadu_ps(x_row + c);
-                    __m256 wv = _mm256_loadu_ps(w_data + c);
-                    _mm256_storeu_ps(o_row + c, _mm256_mul_ps(_mm256_mul_ps(xv, rms_v), wv));
-                }
-            } else {
-                for (; c + 8 <= cols; c += 8) {
-                    __m256 xv = _mm256_loadu_ps(x_row + c);
-                    _mm256_storeu_ps(o_row + c, _mm256_mul_ps(xv, rms_v));
-                }
-            }
-            for (; c < cols; ++c) {
-                o_row[c] = x_row[c] * rms * (w_data ? w_data[c] : 1.0f);
-            }
-#else
-            float sum_sq = 0.0f;
-            for (int c = 0; c < cols; ++c)
-                sum_sq += x_row[c] * x_row[c];
-            float rms = 1.0f / std::sqrt(sum_sq / cols + eps);
-            for (int c = 0; c < cols; ++c)
-                o_row[c] = x_row[c] * rms * (w_data ? w_data[c] : 1.0f);
-#endif
+            forge::cpu::rms_norm_row_f32(x_row, w_data, o_row, cols, eps);
         }
     }
 }

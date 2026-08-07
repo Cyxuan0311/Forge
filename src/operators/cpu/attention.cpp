@@ -5,9 +5,7 @@
 #include "forge/operator_attention.h"
 #include "forge/perf_profiler.h"
 
-#ifdef USE_AVX2
-#    include <immintrin.h>
-#endif
+#include "cpu/simd.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -19,41 +17,6 @@
 
 namespace forge {
 namespace ops {
-
-#ifdef USE_AVX2
-static inline float hsum_avx2(__m256 v) {
-    __m128 hi128 = _mm256_extractf128_ps(v, 1);
-    __m128 lo128 = _mm256_castps256_ps128(v);
-    __m128 sum128 = _mm_add_ps(lo128, hi128);
-    sum128 = _mm_hadd_ps(sum128, sum128);
-    sum128 = _mm_hadd_ps(sum128, sum128);
-    return _mm_cvtss_f32(sum128);
-}
-
-static inline float dot_avx2(const float* a, const float* b, int n) {
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 16 <= n; i += 16) {
-        __m256 a0 = _mm256_loadu_ps(a + i);
-        __m256 b0 = _mm256_loadu_ps(b + i);
-        acc0 = _mm256_fmadd_ps(a0, b0, acc0);
-        __m256 a1 = _mm256_loadu_ps(a + i + 8);
-        __m256 b1 = _mm256_loadu_ps(b + i + 8);
-        acc1 = _mm256_fmadd_ps(a1, b1, acc1);
-    }
-    __m256 acc = _mm256_add_ps(acc0, acc1);
-    for (; i + 8 <= n; i += 8) {
-        __m256 av = _mm256_loadu_ps(a + i);
-        __m256 bv = _mm256_loadu_ps(b + i);
-        acc = _mm256_fmadd_ps(av, bv, acc);
-    }
-    float sum = hsum_avx2(acc);
-    for (; i < n; ++i)
-        sum += a[i] * b[i];
-    return sum;
-}
-#endif
 
 TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v,
                                        bool causal) {
@@ -184,20 +147,11 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
             // Online softmax: process one KV position at a time
             float max_val = -1e30f;
             float sum_exp = 0.0f;
-#ifdef USE_AVX2
-            const int NV = head_dim / 8;  // number of __m256 vectors per head
-#endif
             std::memset(out_row, 0, head_dim * sizeof(float));
 
             for (int j = 0; j < kv_len; ++j) {
                 const float* k_row = k_data + j * num_heads * head_dim + h * head_dim;
-#ifdef USE_AVX2
-                float dot = dot_avx2(q_row, k_row, head_dim);
-#else
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d)
-                    dot += q_row[d] * k_row[d];
-#endif
+                float dot = forge::cpu::dot_f32(q_row, k_row, head_dim);
                 float score = dot * scale;
 
                 // Apply mask bias for decode (single row: mask[j])
@@ -213,48 +167,20 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                 // Rescale existing accumulator
                 if (new_max > max_val) {
                     sum_exp *= rescale;
-#ifdef USE_AVX2
-                    __m256 r = _mm256_set1_ps(rescale);
-                    for (int v = 0; v < NV; ++v) {
-                        __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                        _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, r));
-                    }
-#else
-                    for (int d = 0; d < head_dim; ++d)
-                        out_row[d] *= rescale;
-#endif
+                    forge::cpu::scale_f32(out_row, head_dim, rescale);
                 }
 
                 float exp_score = std::exp(score - new_max);
                 sum_exp += exp_score;
 
                 const float* v_row = v_data + j * num_heads * head_dim + h * head_dim;
-#ifdef USE_AVX2
-                __m256 w_vec = _mm256_set1_ps(exp_score);
-                for (int v = 0; v < NV; ++v) {
-                    __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                    __m256 vr = _mm256_loadu_ps(v_row + v * 8);
-                    _mm256_storeu_ps(out_row + v * 8, _mm256_fmadd_ps(w_vec, vr, a));
-                }
-#else
-                for (int d = 0; d < head_dim; ++d)
-                    out_row[d] += exp_score * v_row[d];
-#endif
+                forge::cpu::fmadd_f32(out_row, v_row, head_dim, exp_score);
                 max_val = new_max;
             }
 
             // Final normalization
             float inv_sum = 1.0f / (sum_exp + 1e-30f);
-#ifdef USE_AVX2
-            __m256 inv_vec = _mm256_set1_ps(inv_sum);
-            for (int v = 0; v < NV; ++v) {
-                __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, inv_vec));
-            }
-#else
-            for (int d = 0; d < head_dim; ++d)
-                out_row[d] *= inv_sum;
-#endif
+            forge::cpu::scale_f32(out_row, head_dim, inv_sum);
         }
     } else {
         // General path: prefill or causal attention
@@ -285,14 +211,7 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                             continue;
                         }
                         const float* k_row = k_data + j * num_heads * head_dim + h * head_dim;
-#ifdef USE_AVX2
-                        float dot = dot_avx2(q_row, k_row, head_dim);
-#else
-                        float dot = 0.0f;
-                        for (int d = 0; d < head_dim; ++d) {
-                            dot += q_row[d] * k_row[d];
-                        }
-#endif
+                        float dot = forge::cpu::dot_f32(q_row, k_row, head_dim);
                         scores_buf[j] = dot * scale + m;
                         max_val = std::max(max_val, scores_buf[j]);
                     }
@@ -309,23 +228,7 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
                     for (int j = 0; j < kv_len; ++j) {
                         float w = scores_buf[j] * inv_sum;
                         const float* v_row = v_data + j * num_heads * head_dim + h * head_dim;
-#ifdef USE_AVX2
-                        __m256 w_vec = _mm256_set1_ps(w);
-                        int d = 0;
-                        for (; d + 8 <= head_dim; d += 8) {
-                            __m256 v_v = _mm256_loadu_ps(v_row + d);
-                            __m256 o_v = _mm256_loadu_ps(out_row + d);
-                            o_v = _mm256_fmadd_ps(w_vec, v_v, o_v);
-                            _mm256_storeu_ps(out_row + d, o_v);
-                        }
-                        for (; d < head_dim; ++d) {
-                            out_row[d] += w * v_row[d];
-                        }
-#else
-                        for (int d = 0; d < head_dim; ++d) {
-                            out_row[d] += w * v_row[d];
-                        }
-#endif
+                        forge::cpu::fmadd_f32(out_row, v_row, head_dim, w);
                     }
                 }
             }
@@ -477,21 +380,12 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
 
             float max_val = -1e30f;
             float sum_exp = 0.0f;
-#ifdef USE_AVX2
-            const int NV = head_dim / 8;
-#endif
             std::memset(out_row, 0, head_dim * sizeof(float));
 
             for (int j = 0; j < kv_len; ++j) {
                 // Direct GQA mapping: use kv_h instead of h
                 const float* k_row = k_data + j * num_kv_heads * head_dim + kv_h * head_dim;
-#ifdef USE_AVX2
-                float dot = dot_avx2(q_row, k_row, head_dim);
-#else
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d)
-                    dot += q_row[d] * k_row[d];
-#endif
+                float dot = forge::cpu::dot_f32(q_row, k_row, head_dim);
                 float score = dot * scale;
 
                 // Apply mask bias for decode (single row: mask[j])
@@ -506,47 +400,19 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
 
                 if (new_max > max_val) {
                     sum_exp *= rescale;
-#ifdef USE_AVX2
-                    __m256 r = _mm256_set1_ps(rescale);
-                    for (int v = 0; v < NV; ++v) {
-                        __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                        _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, r));
-                    }
-#else
-                    for (int d = 0; d < head_dim; ++d)
-                        out_row[d] *= rescale;
-#endif
+                    forge::cpu::scale_f32(out_row, head_dim, rescale);
                 }
 
                 float exp_score = std::exp(score - new_max);
                 sum_exp += exp_score;
 
                 const float* v_row = v_data + j * num_kv_heads * head_dim + kv_h * head_dim;
-#ifdef USE_AVX2
-                __m256 w_vec = _mm256_set1_ps(exp_score);
-                for (int v = 0; v < NV; ++v) {
-                    __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                    __m256 vr = _mm256_loadu_ps(v_row + v * 8);
-                    _mm256_storeu_ps(out_row + v * 8, _mm256_fmadd_ps(w_vec, vr, a));
-                }
-#else
-                for (int d = 0; d < head_dim; ++d)
-                    out_row[d] += exp_score * v_row[d];
-#endif
+                forge::cpu::fmadd_f32(out_row, v_row, head_dim, exp_score);
                 max_val = new_max;
             }
 
             float inv_sum = 1.0f / (sum_exp + 1e-30f);
-#ifdef USE_AVX2
-            __m256 inv_vec = _mm256_set1_ps(inv_sum);
-            for (int v = 0; v < NV; ++v) {
-                __m256 a = _mm256_loadu_ps(out_row + v * 8);
-                _mm256_storeu_ps(out_row + v * 8, _mm256_mul_ps(a, inv_vec));
-            }
-#else
-            for (int d = 0; d < head_dim; ++d)
-                out_row[d] *= inv_sum;
-#endif
+            forge::cpu::scale_f32(out_row, head_dim, inv_sum);
         }
     } else {
         // Prefill path with GQA
@@ -576,14 +442,7 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                             continue;
                         }
                         const float* k_row = k_data + j * num_kv_heads * head_dim + kv_h * head_dim;
-#ifdef USE_AVX2
-                        float dot = dot_avx2(q_row, k_row, head_dim);
-#else
-                        float dot = 0.0f;
-                        for (int d = 0; d < head_dim; ++d) {
-                            dot += q_row[d] * k_row[d];
-                        }
-#endif
+                        float dot = forge::cpu::dot_f32(q_row, k_row, head_dim);
                         scores_buf[j] = dot * scale + m;
                         max_val = std::max(max_val, scores_buf[j]);
                     }
@@ -600,23 +459,7 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                     for (int j = 0; j < kv_len; ++j) {
                         float w = scores_buf[j] * inv_sum;
                         const float* v_row = v_data + j * num_kv_heads * head_dim + kv_h * head_dim;
-#ifdef USE_AVX2
-                        __m256 w_vec = _mm256_set1_ps(w);
-                        int d = 0;
-                        for (; d + 8 <= head_dim; d += 8) {
-                            __m256 v_v = _mm256_loadu_ps(v_row + d);
-                            __m256 o_v = _mm256_loadu_ps(out_row + d);
-                            o_v = _mm256_fmadd_ps(w_vec, v_v, o_v);
-                            _mm256_storeu_ps(out_row + d, o_v);
-                        }
-                        for (; d < head_dim; ++d) {
-                            out_row[d] += w * v_row[d];
-                        }
-#else
-                        for (int d = 0; d < head_dim; ++d) {
-                            out_row[d] += w * v_row[d];
-                        }
-#endif
+                        forge::cpu::fmadd_f32(out_row, v_row, head_dim, w);
                     }
                 }
             }
