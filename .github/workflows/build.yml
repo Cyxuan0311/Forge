@@ -237,6 +237,48 @@ jobs:
             build/forge*.so
             build/*.a
 
+  build-ppc64le:
+    # GitHub has no native ppc64le runner, so the full project is
+    # cross-compiled with the PPC64LE toolchain (auto-detects PPC64 -> VSX
+    # kernels via cmake/detect_cpu_features.cmake) and the resulting binary
+    # is smoke-tested under QEMU user-mode emulation.
+    name: Linux PPC64LE (CPU-only, cross-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cross-compile toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++-powerpc64le-linux-gnu \
+            qemu-user-static \
+            ninja-build
+
+      - name: Verify environment
+        run: |
+          echo "OS: $(uname -a)"
+          powerpc64le-linux-gnu-g++ --version | head -1
+          qemu-ppc64le-static --version | head -1
+
+      - name: Configure CMake (PPC64LE cross)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain_ppc64le.cmake \
+            -DFORGE_USE_CUDA=OFF \
+            -DFORGE_BUILD_PYTHON=OFF
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Smoke-test CLI (QEMU)
+        # qemu-ppc64le-static + -L point the dynamic loader at the
+        # powerpc64le sysroot so the cross-built binary can actually run.
+        run: |
+          qemu-ppc64le-static -L /usr/powerpc64le-linux-gnu ./build/forge-cli --help
+
   build-windows:
     name: Windows (CPU-only)
     runs-on: windows-latest
