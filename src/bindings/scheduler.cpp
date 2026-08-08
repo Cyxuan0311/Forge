@@ -37,7 +37,7 @@ void register_scheduler(py::module_& m) {
         .def_readonly("valid", &CachedPrompt::valid);
 
     py::class_<PyRequestScheduler>(m, "RequestScheduler")
-        .def(py::init<PyModel&, int, int>(), py::arg("model"), py::arg("block_size") = 16,
+        .def(py::init<py::object, int, int>(), py::arg("model"), py::arg("block_size") = 16,
              py::arg("max_num_seqs") = 4)
         .def("submit", &PyRequestScheduler::submit, py::arg("prompt_tokens"),
              py::arg("max_new_tokens") = 256, py::arg("eos_token_id") = -1,
@@ -54,5 +54,11 @@ void register_scheduler(py::module_& m) {
         .def_property("n_batch", &PyRequestScheduler::n_batch, &PyRequestScheduler::set_n_batch)
         .def_property("n_ubatch", &PyRequestScheduler::n_ubatch, &PyRequestScheduler::set_n_ubatch)
         .def_property("n_threads", &PyRequestScheduler::n_threads, &PyRequestScheduler::set_n_threads)
-        .def_property("n_threads_batch", &PyRequestScheduler::n_threads_batch, &PyRequestScheduler::set_n_threads_batch);
+        .def_property("n_threads_batch", &PyRequestScheduler::n_threads_batch, &PyRequestScheduler::set_n_threads_batch)
+        .def("memory_stats", &PyRequestScheduler::memory_stats)
+        // Phase 6: high-level generate() wrapper
+        .def("generate", &PyRequestScheduler::generate,
+             py::arg("prompt_tokens"), py::arg("generation_config") = GenerationConfig{},
+             py::arg("sampler_config") = SamplerConfig{},
+             "Submit prompt and run step loop until finished. Returns list of GenerateRequest.");
 }

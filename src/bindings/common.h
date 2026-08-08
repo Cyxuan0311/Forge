@@ -1,6 +1,10 @@
 #pragma once
 // Shared header for Forge Python bindings modules.
 
+#include <cstdlib>
+#include <memory>
+#include <string>
+
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -12,6 +16,7 @@
 #include "forge/backend.h"
 #include "forge/compute_graph.h"
 #include "forge/context.h"
+#include "forge/context_config.h"
 #include "forge/engine.h"
 #include "forge/engines/transformer_engine.h"
 #include "forge/generator.h"
@@ -162,6 +167,69 @@ public:
     }
     DeviceType device() const { return ctx_.device(); }
 
+    // ---- Phase 1: Generator primitives (reuse persistent KV cache) ----
+
+    GenerationResult generate(const std::vector<int32_t>& tokens,
+                              const GenerationConfig& config = GenerationConfig{}) {
+        SamplerConfig sampler_cfg;
+        sampler_cfg.temperature = config.temperature;
+        sampler_cfg.top_k = config.top_k;
+        sampler_cfg.top_p = config.top_p;
+        sampler_cfg.repeat_penalty = config.repeat_penalty;
+        sampler_cfg.repeat_last_n = config.repeat_last_n;
+        sampler_cfg.do_sample = config.do_sample;
+        sampler_cfg.seed = config.seed;
+        sampler_cfg.logit_softcapping = ctx_.model().config().f_final_logit_softcapping;
+
+        Generator gen(ctx_, sampler_cfg);
+        {
+            py::gil_scoped_release release;
+            return gen.generate(tokens, config);
+        }
+    }
+
+    void generate_stream(const std::vector<int32_t>& tokens,
+                         const GenerationConfig& config,
+                         py::object callback) {
+        SamplerConfig sampler_cfg;
+        sampler_cfg.temperature = config.temperature;
+        sampler_cfg.top_k = config.top_k;
+        sampler_cfg.top_p = config.top_p;
+        sampler_cfg.repeat_penalty = config.repeat_penalty;
+        sampler_cfg.repeat_last_n = config.repeat_last_n;
+        sampler_cfg.do_sample = config.do_sample;
+        sampler_cfg.seed = config.seed;
+        sampler_cfg.logit_softcapping = ctx_.model().config().f_final_logit_softcapping;
+
+        Generator gen(ctx_, sampler_cfg);
+
+        auto token_cb = [&callback](int32_t token_id, int step) {
+            py::gil_scoped_acquire acquire;
+            callback(token_id, step);
+        };
+
+        {
+            py::gil_scoped_release release;
+            gen.generate(tokens, config, token_cb);
+        }
+    }
+
+    // ---- Phase 2: KV-preserving generate (multi-turn context reuse) ----
+    // Identical to generate()/generate_stream() but explicitly named to indicate
+    // context-driven generation with configurable KV reset.
+
+    GenerationResult generate_kv(const std::vector<int32_t>& tokens,
+                                 const GenerationConfig& config = GenerationConfig{}) {
+        return generate(tokens, config);
+    }
+
+    void generate_stream_kv(const std::vector<int32_t>& tokens,
+                            const GenerationConfig& config,
+                            py::object callback) {
+        return generate_stream(tokens, config, std::move(callback));
+    }
+
+
     py::array_t<float> forward(py::array_t<int32_t, py::array::c_style> input_ids,
                                int start_pos = 0) {
         auto buf = input_ids.request();
@@ -293,6 +361,11 @@ public:
 
         const KVCache* cache = tfm_eng->kv_cache();
         stats["kv_cache_nbytes"] = static_cast<int64_t>(cache->nbytes());
+        stats["kv_cache_active_bytes"] = static_cast<int64_t>(cache->active_bytes());
+        stats["kv_cache_free_slots"] = cache->num_free_slots();
+        stats["kv_cache_filled"] = cache->filled(0);  // layer 0 representative
+        stats["kv_cache_page_size"] = 0;  // contiguous mode: no pages
+        stats["kv_cache_free_pages"] = 0;
         // Report per-K/V types
         auto dtype_str = [](KVCacheDType dt) -> const char* {
             switch (dt) {
@@ -307,7 +380,58 @@ public:
         stats["kv_cache_dtype"] = dtype_str(cache->kv_dtype());
         stats["kv_cache_type_k"] = dtype_str(cache->type_k());
         stats["kv_cache_type_v"] = dtype_str(cache->type_v());
+        // Phase 5: prefix cache stats (from KVMemory)
+        auto* kv_mem = tfm_eng->kv_memory();
+        if (kv_mem) {
+            stats["prefix_cache_hits"] = kv_mem->prefix_hits();
+            stats["prefix_cache_tokens"] = kv_mem->prefix_tokens();
+        } else {
+            stats["prefix_cache_hits"] = 0;
+            stats["prefix_cache_tokens"] = 0;
+        }
         return stats;
+    }
+
+    // ---- Sequence-level KV operations (Phase 5: Session fork / prefix sharing) ----
+
+    bool seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1) {
+        auto* engine = ctx_.engine();
+        if (!engine) return false;
+        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
+        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        return tfm_eng->kv_memory()->seq_share(src_seq, dst_seq, p0, p1);
+    }
+
+    bool seq_remove(int seq_id, int64_t p0, int64_t p1) {
+        auto* engine = ctx_.engine();
+        if (!engine) return false;
+        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
+        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        return tfm_eng->kv_memory()->seq_remove(seq_id, p0, p1);
+    }
+
+    bool seq_keep(int seq_id) {
+        auto* engine = ctx_.engine();
+        if (!engine) return false;
+        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
+        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        return tfm_eng->kv_memory()->seq_keep(seq_id);
+    }
+
+    void seq_release(int seq_id) {
+        auto* engine = ctx_.engine();
+        if (!engine) return;
+        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
+        if (!tfm_eng || !tfm_eng->kv_memory()) return;
+        tfm_eng->kv_memory()->release(seq_id);
+    }
+
+    bool is_paged() const {
+        auto* engine = ctx_.engine();
+        if (!engine) return false;
+        auto* tfm_eng = dynamic_cast<const TransformerEngine*>(engine);
+        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        return tfm_eng->kv_memory()->is_paged();
     }
 
 private:
@@ -322,7 +446,8 @@ public:
               int num_layers, int num_heads, int num_kv_heads, int head_dim, float rope_theta,
               float rms_norm_eps, int max_seq_len, const std::string& arch_type,
               const std::string& norm_type_str, const std::string& activation_str,
-              bool tie_embeddings, const std::string& device_str) {
+              bool tie_embeddings, const std::string& device_str,
+              int n_swa = 0, const std::vector<int>& swa_layers = {}) {
         ensure_loaders_registered();
         ensure_engines_registered();
         ModelConfig cfg;
@@ -338,6 +463,8 @@ public:
         cfg.max_seq_len = max_seq_len;
         cfg.arch_type = arch_type;
         cfg.tie_embeddings = tie_embeddings;
+        cfg.n_swa = n_swa;
+        if (!swa_layers.empty()) cfg.swa_layers = swa_layers;
 
         if (norm_type_str == "layernorm") {
             cfg.norm_type = NormType::LayerNorm;
@@ -395,6 +522,13 @@ public:
 
         auto ctx = std::make_unique<PyInferenceContext>(model_);
 
+        // Internal feature flag: enable paged KV storage via environment variable.
+        // Not exposed as a Python API parameter (Phase 3 requirement).
+        const char* storage_mode_env = std::getenv("FORGE_KV_STORAGE_MODE");
+        if (storage_mode_env && std::string(storage_mode_env) == "paged") {
+            ctx->get().params_mut().kv_storage_mode = KVStorageMode::Paged;
+        }
+
         const auto& cfg = model_.config();
         auto engine = EngineRegistry::instance().create(cfg.arch_type, model_, ctx->get());
         if (!engine) {
@@ -440,14 +574,47 @@ public:
         return Model::detect_format(path);
     }
 
+    /// Phase 1: ensure a default context exists (lazily created on first use).
+    /// The default context preserves KV cache across generate() calls.
+    /// Phase 2: FORGE_DISABLE_CONTEXT_REUSE=1 disables caching (rollback to old path).
+    PyInferenceContext* ensure_default_context(const std::string& kv_cache_dtype_str = "fp32",
+                                                int gpu_layers = -1) {
+        // Phase 2 rollback: disable context reuse via env var
+        const char* disable_reuse = std::getenv("FORGE_DISABLE_CONTEXT_REUSE");
+        if (disable_reuse && std::string(disable_reuse) == "1") {
+            default_ctx_.reset(create_context(kv_cache_dtype_str, gpu_layers));
+            return default_ctx_.get();
+        }
+        if (default_ctx_) {
+            // Already created; the dtype/layers are locked to the first call's values.
+            return default_ctx_.get();
+        }
+        default_ctx_.reset(create_context(kv_cache_dtype_str, gpu_layers));
+        return default_ctx_.get();
+    }
+
+    /// Phase 1: release the default context (explicit reset).
+    void release_default_context() {
+        default_ctx_.reset();
+    }
+
+    /// Access the default context (may be nullptr if never created).
+    PyInferenceContext* default_context() const { return default_ctx_.get(); }
+
 private:
     Model model_;
+    std::unique_ptr<PyInferenceContext> default_ctx_;  // Phase 1: persistent KV cache context
 };
 
 class PyRequestScheduler {
 public:
-    PyRequestScheduler(PyModel& model, int block_size = 16, int max_num_seqs = 4)
-        : scheduler_(init_scheduler(model.get_model(), block_size, max_num_seqs)) {}
+    // Accept py::object (not PyModel&) so we can store a strong reference,
+    // preventing the Python Model from being garbage-collected while the
+    // scheduler holds a C++ Model& reference to it.
+    PyRequestScheduler(py::object model, int block_size = 16, int max_num_seqs = 4)
+        : model_ref_(std::move(model)),
+          scheduler_(init_scheduler(model_ref_.cast<PyModel&>().get_model(), block_size,
+                                    max_num_seqs)) {}
 
     static RequestScheduler init_scheduler(Model& model, int block_size, int max_num_seqs) {
         ensure_engines_registered();
@@ -479,6 +646,65 @@ public:
     int prefix_cache_hits() const { return scheduler_.prefix_cache_hits(); }
     int prefix_cache_misses() const { return scheduler_.prefix_cache_misses(); }
 
+    // Phase 6: expose per-layer page pool sizes for SWA isolation verification.
+    py::dict memory_stats() const {
+        py::dict stats;
+        auto* engine = scheduler_.context().engine();
+        if (!engine) return stats;
+        auto* tfm_eng = dynamic_cast<const TransformerEngine*>(engine);
+        if (!tfm_eng) return stats;
+
+        auto* mem = tfm_eng->kv_memory();
+        auto* cache = tfm_eng->kv_cache();
+
+        if (mem && mem->is_paged()) {
+            auto& storage = mem->storage();
+            stats["kv_cache_nbytes"] = static_cast<int64_t>(storage.nbytes());
+            stats["kv_cache_active_bytes"] = static_cast<int64_t>(storage.active_bytes());
+            stats["kv_cache_free_slots"] = storage.num_free_slots();
+            stats["kv_cache_page_size"] = storage.page_size();
+            stats["kv_cache_free_pages"] = storage.num_free_pages();
+            stats["kv_cache_filled"] = storage.filled(0);
+            // Phase 6: per-layer pool max_pages (SWA layers should be smaller)
+            auto pool_sizes = storage.layer_pool_max_pages();
+            py::list pool_list;
+            for (int s : pool_sizes) pool_list.append(s);
+            stats["layer_pool_max_pages"] = pool_list;
+        } else {
+            stats["kv_cache_nbytes"] = static_cast<int64_t>(cache->nbytes());
+            stats["kv_cache_active_bytes"] = static_cast<int64_t>(cache->active_bytes());
+            stats["kv_cache_free_slots"] = cache->num_free_slots();
+            stats["kv_cache_filled"] = cache->filled(0);
+            stats["kv_cache_page_size"] = 0;
+            stats["kv_cache_free_pages"] = 0;
+        }
+        // Phase 5: prefix cache stats
+        stats["prefix_cache_hits"] = prefix_cache_hits();
+        stats["prefix_cache_misses"] = prefix_cache_misses();
+        if (mem) {
+            stats["prefix_cache_tokens"] = mem->prefix_tokens();
+        } else {
+            stats["prefix_cache_tokens"] = 0;
+        }
+        return stats;
+    }
+
+    // Phase 6: high-level generate() – submit → step loop → collect finished
+    py::list generate(const std::vector<int32_t>& prompt_tokens,
+                      const GenerationConfig& gen_cfg = GenerationConfig{},
+                      const SamplerConfig& sampler_cfg = SamplerConfig{}) {
+        py::list result;
+        scheduler_.submit(prompt_tokens, gen_cfg.max_new_tokens,
+                          gen_cfg.eos_token_id, sampler_cfg);
+        while (scheduler_.has_pending()) {
+            scheduler_.step();
+            auto finished = scheduler_.get_finished();
+            for (auto& req : finished)
+                result.append(std::move(req));
+        }
+        return result;
+    }
+
     int n_batch() const { return scheduler_.context().params().n_batch; }
     void set_n_batch(int v) { scheduler_.context().params_mut().n_batch = v; }
     int n_ubatch() const { return scheduler_.context().params().n_ubatch; }
@@ -490,6 +716,7 @@ public:
     void set_n_threads_batch(int v) { scheduler_.context().params_mut().n_threads_batch = v; }
 
 private:
+    py::object model_ref_;    // keeps PyModel alive (prevents GC of Model&)
     RequestScheduler scheduler_;
 };
 

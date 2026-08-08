@@ -20,7 +20,7 @@
 
 PYBIND11_MODULE(forge, m) {
     m.doc() = "Forge: Lightweight LLM inference engine";
-    m.attr("__version__") = "0.5.0";
+    m.attr("__version__") = "0.7.0";
 
     register_core_types(m);
     register_model(m);

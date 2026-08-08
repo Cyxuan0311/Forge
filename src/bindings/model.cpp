@@ -7,12 +7,17 @@ py::dict PyModel::generate(py::array_t<int32_t, py::array::c_style> prompt_ids, 
                            bool do_sample, uint64_t seed, int eos_token_id,
                            const std::string& kv_cache_dtype_str, int gpu_layers,
                            const std::vector<int32_t>& stop_token_ids) {
-    auto ctx = std::unique_ptr<PyInferenceContext>(create_context(kv_cache_dtype_str, gpu_layers));
+    // Phase 1: 旧签名保留，内部复用持久 context。打 DeprecationWarning。
+    PyErr_WarnEx(PyExc_DeprecationWarning,
+                 "Model.generate() with scalar parameters is deprecated; "
+                 "use ctx.generate(tokens, GenerationConfig(...)) for KV cache reuse",
+                 1);
+
+    auto* ctx = ensure_default_context(kv_cache_dtype_str, gpu_layers);
 
     auto buf = prompt_ids.request();
     if (buf.ndim != 1)
         throw std::runtime_error("prompt_ids must be 1D");
-
     int prompt_len = static_cast<int>(buf.shape[0]);
     std::vector<int32_t> tokens(prompt_len);
     std::memcpy(tokens.data(), buf.ptr, prompt_len * sizeof(int32_t));
@@ -41,6 +46,7 @@ py::dict PyModel::generate(py::array_t<int32_t, py::array::c_style> prompt_ids, 
 
     py::dict out;
     out["token_ids"] = py::cast(result.token_ids);
+    out["text"] = result.text;
     out["num_prompt_tokens"] = result.num_prompt_tokens;
     out["num_generated_tokens"] = result.num_generated_tokens;
     out["finished"] = result.finished;
@@ -53,12 +59,17 @@ void PyModel::generate_stream(py::array_t<int32_t, py::array::c_style> prompt_id
                               float top_p, float repeat_penalty, bool do_sample, uint64_t seed,
                               int eos_token_id, const std::string& kv_cache_dtype_str,
                               int gpu_layers, const std::vector<int32_t>& stop_token_ids) {
-    auto ctx = std::unique_ptr<PyInferenceContext>(create_context(kv_cache_dtype_str, gpu_layers));
+    // Phase 1: 旧签名保留，内部复用持久 context。打 DeprecationWarning。
+    PyErr_WarnEx(PyExc_DeprecationWarning,
+                 "Model.generate_stream() with scalar parameters is deprecated; "
+                 "use ctx.generate_stream(tokens, callback, GenerationConfig(...))",
+                 1);
+
+    auto* ctx = ensure_default_context(kv_cache_dtype_str, gpu_layers);
 
     auto buf = prompt_ids.request();
     if (buf.ndim != 1)
         throw std::runtime_error("prompt_ids must be 1D");
-
     int prompt_len = static_cast<int>(buf.shape[0]);
     std::vector<int32_t> tokens(prompt_len);
     std::memcpy(tokens.data(), buf.ptr, prompt_len * sizeof(int32_t));
@@ -104,7 +115,8 @@ void register_model(py::module_& m) {
              py::arg("rms_norm_eps") = 1e-6f, py::arg("max_seq_len") = 4096,
              py::arg("arch_type") = "llama", py::arg("norm_type") = "rmsnorm",
              py::arg("activation") = "silu_gelu", py::arg("tie_embeddings") = false,
-             py::arg("device") = "cuda")
+             py::arg("device") = "cuda",
+             py::arg("n_swa") = 0, py::arg("swa_layers") = std::vector<int>{})
         .def("load_gguf", &PyModel::load_gguf, py::arg("path"), py::arg("device") = "cuda",
              py::arg("quant_policy") = QuantPolicy{})
         .def("load_auto", &PyModel::load_auto, py::arg("path"), py::arg("device") = "cuda")
@@ -133,7 +145,13 @@ void register_model(py::module_& m) {
         .def("detect_format", &PyModel::detect_format)
         .def_property_readonly("config", &PyModel::config,
                                py::return_value_policy::reference_internal)
-        .def_property_readonly("device", &PyModel::device);
+        .def_property_readonly("device", &PyModel::device)
+        .def("release_default_context", &PyModel::release_default_context)
+        .def_property_readonly("default_context", &PyModel::default_context,
+                               py::return_value_policy::reference_internal)
+        .def("ensure_default_context", &PyModel::ensure_default_context,
+             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
+             py::return_value_policy::reference_internal);
 
     py::class_<PyInferenceContext>(m, "InferenceContext")
         .def("forward", &PyInferenceContext::forward, py::arg("input_ids"),
@@ -155,6 +173,14 @@ void register_model(py::module_& m) {
         .def("set_cuda_graph_enabled", &PyInferenceContext::set_cuda_graph_enabled, py::arg("v"))
         .def("cuda_graph_enabled", &PyInferenceContext::cuda_graph_enabled)
         .def("memory_stats", &PyInferenceContext::memory_stats)
+        // Phase 5: seq-level KV operations for Session fork / prefix sharing
+        .def("seq_share", &PyInferenceContext::seq_share,
+             py::arg("src_seq"), py::arg("dst_seq"), py::arg("p0"), py::arg("p1"))
+        .def("seq_remove", &PyInferenceContext::seq_remove,
+             py::arg("seq_id"), py::arg("p0"), py::arg("p1"))
+        .def("seq_keep", &PyInferenceContext::seq_keep, py::arg("seq_id"))
+        .def("seq_release", &PyInferenceContext::seq_release, py::arg("seq_id"))
+        .def("is_paged", &PyInferenceContext::is_paged)
         .def_property("n_batch",
             [](PyInferenceContext& self) { return self.get().params().n_batch; },
             [](PyInferenceContext& self, int v) { self.get().params_mut().n_batch = v; })
@@ -167,5 +193,18 @@ void register_model(py::module_& m) {
         .def_property("n_threads_batch",
             [](PyInferenceContext& self) { return self.get().params().n_threads_batch; },
             [](PyInferenceContext& self, int v) { self.get().params_mut().n_threads_batch = v; })
+        .def("generate", &PyInferenceContext::generate, py::arg("tokens"),
+             py::arg("config") = GenerationConfig{},
+             "Generate tokens using this context (KV cache may be reused across calls).")
+        .def("generate_stream", &PyInferenceContext::generate_stream, py::arg("tokens"),
+             py::arg("config"), py::arg("callback"),
+             "Streaming generation using this context.")
+        // Phase 2: explicit KV-driven generation aliases (multi-turn context reuse)
+        .def("generate_kv", &PyInferenceContext::generate_kv, py::arg("tokens"),
+             py::arg("config") = GenerationConfig{},
+             "Legacy Compatibility: Alias for generate() to explicitly indicate context-KV generation.")
+        .def("generate_stream_kv", &PyInferenceContext::generate_stream_kv, py::arg("tokens"),
+             py::arg("config"), py::arg("callback"),
+             "Legacy Compatibility: Alias for generate_stream() to explicitly indicate context-KV generation.")
         .def_property_readonly("device", &PyInferenceContext::device);
 }

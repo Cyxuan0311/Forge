@@ -1,4 +1,5 @@
 #include "common.h"
+#include "forge/context_config.h"
 
 void register_core_types(py::module_& m) {
     // ---- Enums ----
@@ -67,6 +68,14 @@ void register_core_types(py::module_& m) {
         .value("Q4_0", KVCacheDType::Q4_0)
         .value("Q4_K", KVCacheDType::Q4_K);
 
+    // Phase 6: per-layer memory policy (None_ avoids the Python `None` keyword).
+    py::enum_<KVLayerPolicy>(m, "KVLayerPolicy")
+        .value("None_", KVLayerPolicy::None)
+        .value("Full", KVLayerPolicy::Full)
+        .value("SlidingWindow", KVLayerPolicy::SlidingWindow)
+        .value("Recurrent", KVLayerPolicy::Recurrent)
+        .export_values();
+
     // ---- QuantPolicy ----
     py::class_<QuantPolicy>(m, "QuantPolicy")
         .def(py::init<>())
@@ -86,6 +95,51 @@ void register_core_types(py::module_& m) {
         .def_readwrite("ngram_n", &SpeculativeConfig::ngram_n)
         .def_readwrite("ngram_min", &SpeculativeConfig::ngram_min)
         .def_readwrite("enabled", &SpeculativeConfig::enabled);
+
+    // ---- GenerationConfig ----
+    py::class_<GenerationConfig>(m, "GenerationConfig")
+        .def(py::init<>())
+        .def_readwrite("max_new_tokens", &GenerationConfig::max_new_tokens)
+        .def_readwrite("temperature", &GenerationConfig::temperature)
+        .def_readwrite("top_k", &GenerationConfig::top_k)
+        .def_readwrite("top_p", &GenerationConfig::top_p)
+        .def_readwrite("repeat_penalty", &GenerationConfig::repeat_penalty)
+        .def_readwrite("repeat_last_n", &GenerationConfig::repeat_last_n)
+        .def_readwrite("do_sample", &GenerationConfig::do_sample)
+        .def_readwrite("seed", &GenerationConfig::seed)
+        .def_readwrite("eos_token_id", &GenerationConfig::eos_token_id)
+        .def_readwrite("stop_token_ids", &GenerationConfig::stop_token_ids)
+        .def_readwrite("reset_kv_cache", &GenerationConfig::reset_kv_cache);
+
+    // ---- GenerationResult ----
+    py::class_<GenerationResult>(m, "GenerationResult")
+        .def(py::init<>())
+        .def_readonly("token_ids", &GenerationResult::token_ids)
+        .def_readonly("text", &GenerationResult::text)
+        .def_readonly("num_prompt_tokens", &GenerationResult::num_prompt_tokens)
+        .def_readonly("num_generated_tokens", &GenerationResult::num_generated_tokens)
+        .def_readonly("finished", &GenerationResult::finished)
+        .def_readonly("finish_reason", &GenerationResult::finish_reason);
+
+    // ---- ContextConfig ----
+    py::class_<ContextConfig>(m, "ContextConfig")
+        .def(py::init<>())
+        .def_readwrite("kv_cache_dtype", &ContextConfig::kv_cache_dtype)
+        .def_readwrite("kv_cache_type_k", &ContextConfig::kv_cache_type_k)
+        .def_readwrite("kv_cache_type_v", &ContextConfig::kv_cache_type_v)
+        .def_readwrite("kv_storage", &ContextConfig::kv_storage)
+        .def_readwrite("page_size", &ContextConfig::page_size)
+        .def_readwrite("max_seq_len", &ContextConfig::max_seq_len)
+        .def_readwrite("max_num_seqs", &ContextConfig::max_num_seqs)
+        .def_readwrite("gpu_layers", &ContextConfig::gpu_layers)
+        .def_readwrite("n_batch", &ContextConfig::n_batch)
+        .def_readwrite("n_ubatch", &ContextConfig::n_ubatch)
+        .def_readwrite("n_threads", &ContextConfig::n_threads)
+        .def_readwrite("n_threads_batch", &ContextConfig::n_threads_batch)
+        .def_readwrite("prefix_cache", &ContextConfig::prefix_cache)
+        .def_readwrite("prefix_cache_bytes", &ContextConfig::prefix_cache_bytes)
+        .def_readwrite("swa_window", &ContextConfig::swa_window)
+        .def_readwrite("device", &ContextConfig::device);
 
     // ---- Tensor ----
     py::class_<Tensor, TensorPtr>(m, "Tensor")
