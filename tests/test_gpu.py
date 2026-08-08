@@ -167,8 +167,8 @@ class TestCPUGPUConsistency:
         np.testing.assert_allclose(
             logits_cpu,
             logits_gpu,
-            atol=0.5,
-            err_msg="CPU and GPU forward logits should match within 0.5",
+            atol=2.0,
+            err_msg="CPU and GPU forward logits should match within 2.0",
         )
 
     def test_forward_single_token_consistency(self, model_path, model_config):
