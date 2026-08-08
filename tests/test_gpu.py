@@ -98,52 +98,79 @@ class TestGPUGenerate:
     def test_gpu_generate_basic(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.do_sample = False
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=5, do_sample=False)
-        assert "token_ids" in result
-        assert result["num_prompt_tokens"] == 3
-        assert result["num_generated_tokens"] >= 1
-        assert result["num_generated_tokens"] <= 5
-        assert result["finished"] is True
+        result = ctx.generate(prompt, cfg)
+        assert hasattr(result, "token_ids")
+        assert result.num_prompt_tokens == 3
+        assert result.num_generated_tokens >= 1
+        assert result.num_generated_tokens <= 5
+        assert result.finished is True
 
     def test_gpu_generate_greedy_deterministic(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.do_sample = False
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        r1 = model.generate(prompt, max_new_tokens=10, do_sample=False)
-        r2 = model.generate(prompt, max_new_tokens=10, do_sample=False)
-        assert list(r1["token_ids"]) == list(r2["token_ids"])
+        r1 = ctx.generate(prompt, cfg)
+        r2 = ctx.generate(prompt, cfg)
+        assert list(r1.token_ids) == list(r2.token_ids)
 
     def test_gpu_generate_max_tokens_limit(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 3
+        cfg.do_sample = False
         prompt = np.array([1, 2], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=3, do_sample=False)
-        assert result["num_generated_tokens"] <= 3
-        assert result["finish_reason"] == "length"
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens <= 3
+        assert result.finish_reason == "length"
 
     def test_gpu_generate_with_temperature(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.temperature = 0.8
+        cfg.do_sample = True
+        cfg.seed = 42
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=5, temperature=0.8, do_sample=True, seed=42)
-        assert result["num_generated_tokens"] >= 1
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
 
     def test_gpu_generate_with_eos(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.eos_token_id = 5
+        cfg.do_sample = False
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=10, eos_token_id=5, do_sample=False)
-        assert result["finished"] is True
-        if result["finish_reason"] == "eos":
-            assert result["token_ids"][-1] == 5
+        result = ctx.generate(prompt, cfg)
+        assert result.finished is True
+        if result.finish_reason == "eos":
+            assert result.token_ids[-1] == 5
 
     def test_gpu_generate_token_ids_valid(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, device="cuda", **model_config)
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.do_sample = False
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=5, do_sample=False)
-        for tid in result["token_ids"]:
+        result = ctx.generate(prompt, cfg)
+        for tid in result.token_ids:
             assert 0 <= tid < model_config["vocab_size"]
 
 
@@ -196,12 +223,20 @@ class TestCPUGPUConsistency:
         model_gpu = forge.Model()
         model_gpu.load(model_path, device="cuda", **model_config)
 
+        ctx_cpu = model_cpu.create_context()
+        ctx_gpu = model_gpu.create_context()
+        cfg_cpu = forge.GenerationConfig()
+        cfg_cpu.max_new_tokens = 10
+        cfg_cpu.do_sample = False
+        cfg_gpu = forge.GenerationConfig()
+        cfg_gpu.max_new_tokens = 10
+        cfg_gpu.do_sample = False
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result_cpu = model_cpu.generate(prompt, max_new_tokens=10, do_sample=False)
-        result_gpu = model_gpu.generate(prompt, max_new_tokens=10, do_sample=False)
+        result_cpu = ctx_cpu.generate(prompt, cfg_cpu)
+        result_gpu = ctx_gpu.generate(prompt, cfg_gpu)
 
-        assert list(result_cpu["token_ids"]) == list(result_gpu["token_ids"]), (
-            f"CPU tokens: {result_cpu['token_ids']}, GPU tokens: {result_gpu['token_ids']}"
+        assert list(result_cpu.token_ids) == list(result_gpu.token_ids), (
+            f"CPU tokens: {result_cpu.token_ids}, GPU tokens: {result_gpu.token_ids}"
         )
 
     def test_generate_longer_prompt_consistency(self, model_path, model_config):
@@ -210,12 +245,20 @@ class TestCPUGPUConsistency:
         model_gpu = forge.Model()
         model_gpu.load(model_path, device="cuda", **model_config)
 
+        ctx_cpu = model_cpu.create_context()
+        ctx_gpu = model_gpu.create_context()
+        cfg_cpu = forge.GenerationConfig()
+        cfg_cpu.max_new_tokens = 8
+        cfg_cpu.do_sample = False
+        cfg_gpu = forge.GenerationConfig()
+        cfg_gpu.max_new_tokens = 8
+        cfg_gpu.do_sample = False
         prompt = np.array([5, 10, 15, 20, 25], dtype=np.int32)
-        result_cpu = model_cpu.generate(prompt, max_new_tokens=8, do_sample=False)
-        result_gpu = model_gpu.generate(prompt, max_new_tokens=8, do_sample=False)
+        result_cpu = ctx_cpu.generate(prompt, cfg_cpu)
+        result_gpu = ctx_gpu.generate(prompt, cfg_gpu)
 
-        assert list(result_cpu["token_ids"]) == list(result_gpu["token_ids"]), (
-            f"CPU tokens: {result_cpu['token_ids']}, GPU tokens: {result_gpu['token_ids']}"
+        assert list(result_cpu.token_ids) == list(result_gpu.token_ids), (
+            f"CPU tokens: {result_cpu.token_ids}, GPU tokens: {result_gpu.token_ids}"
         )
 
     def test_forward_different_seq_lens_consistency(self, model_path, model_config):

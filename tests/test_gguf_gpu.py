@@ -161,21 +161,26 @@ class TestGGUFCPUGPUConsistency:
 
         model_cpu = forge.Model()
         model_cpu.load_gguf(TINYLLAMA_Q4_PATH, device="cpu")
-        result_cpu = model_cpu.generate(
-            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
-        )
+        ctx_cpu = model_cpu.create_context(kv_cache_dtype="fp32", gpu_layers=0)
+        cfg_cpu = forge.GenerationConfig()
+        cfg_cpu.max_new_tokens = 10
+        cfg_cpu.do_sample = False
+        result_cpu = ctx_cpu.generate(prompt, cfg_cpu)
+        del ctx_cpu
         del model_cpu
         gc.collect()
 
         model_gpu = forge.Model()
         model_gpu.load_gguf(TINYLLAMA_Q4_PATH, device="cuda")
-        result_gpu = model_gpu.generate(
-            prompt, max_new_tokens=10, do_sample=False, gpu_layers=-1, kv_cache_dtype="fp32"
-        )
+        ctx_gpu = model_gpu.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
+        cfg_gpu = forge.GenerationConfig()
+        cfg_gpu.max_new_tokens = 10
+        cfg_gpu.do_sample = False
+        result_gpu = ctx_gpu.generate(prompt, cfg_gpu)
 
-        match = sum(1 for a, b in zip(result_cpu["token_ids"], result_gpu["token_ids"]) if a == b)
+        match = sum(1 for a, b in zip(result_cpu.token_ids, result_gpu.token_ids) if a == b)
         assert match >= 2, (
-            f"CPU/GPU should match at least 2/10 tokens, got {match}/10. CPU: {result_cpu['token_ids']}, GPU: {result_gpu['token_ids']}"
+            f"CPU/GPU should match at least 2/10 tokens, got {match}/10. CPU: {result_cpu.token_ids}, GPU: {result_gpu.token_ids}"
         )
 
 
@@ -207,10 +212,12 @@ class TestGPULayers:
 class TestGGUFGeneration:
     def test_gpu_generate_no_repeat(self, gpu_model):
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = gpu_model.generate(
-            prompt, max_new_tokens=20, do_sample=False, gpu_layers=-1, kv_cache_dtype="fp32"
-        )
-        tokens = result["token_ids"]
+        ctx = gpu_model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 20
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        tokens = result.token_ids
         unique_ratio = len(set(tokens)) / len(tokens) if len(tokens) > 0 else 0
         assert unique_ratio > 0.3, (
             f"Generated tokens should not be highly repetitive, unique_ratio={unique_ratio}"
@@ -224,32 +231,27 @@ class TestGGUFGeneration:
         def on_token(tid, step):
             collected_tokens.append(tid)
 
-        gpu_model.generate_stream(
-            prompt_ids=prompt,
-            callback=on_token,
-            max_new_tokens=10,
-            temperature=0.0,
-            top_k=1,
-            do_sample=False,
-            gpu_layers=-1,
-            kv_cache_dtype="fp32",
-        )
+        ctx = gpu_model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.temperature = 0.0
+        cfg.top_k = 1
+        cfg.do_sample = False
+        ctx.generate_stream(prompt.tolist(), cfg, on_token)
         assert len(collected_tokens) >= 1, "Should generate at least one token"
 
     def test_gpu_generate_with_sampling(self, gpu_model):
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = gpu_model.generate(
-            prompt,
-            max_new_tokens=10,
-            temperature=0.8,
-            top_k=40,
-            top_p=0.9,
-            do_sample=True,
-            seed=42,
-            gpu_layers=-1,
-            kv_cache_dtype="fp32",
-        )
-        assert result["num_generated_tokens"] >= 1
+        ctx = gpu_model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.temperature = 0.8
+        cfg.top_k = 40
+        cfg.top_p = 0.9
+        cfg.do_sample = True
+        cfg.seed = 42
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
 
 
 @skip_no_cuda
