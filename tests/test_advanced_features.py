@@ -65,50 +65,84 @@ class TestTopKTopPSampling:
         model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=10, top_k=5, do_sample=True, seed=42)
-        assert result["num_generated_tokens"] >= 1
-        assert result["finished"] is True
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.top_k = 5
+        cfg.do_sample = True
+        cfg.seed = 42
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
+        assert result.finished is True
 
     def test_top_p_sampling(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=10, top_p=0.8, do_sample=True, seed=42)
-        assert result["num_generated_tokens"] >= 1
-        assert result["finished"] is True
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.top_p = 0.8
+        cfg.do_sample = True
+        cfg.seed = 42
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
+        assert result.finished is True
 
     def test_top_k_and_top_p_combined(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(
-            prompt, max_new_tokens=10, top_k=10, top_p=0.9, do_sample=True, seed=42
-        )
-        assert result["num_generated_tokens"] >= 1
+        ctx = model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.top_k = 10
+        cfg.top_p = 0.9
+        cfg.do_sample = True
+        cfg.seed = 42
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
 
     def test_repeat_penalty(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
 
-        result_no_penalty = model.generate(
-            prompt, max_new_tokens=10, repeat_penalty=1.0, do_sample=True, seed=42
-        )
-        result_with_penalty = model.generate(
-            prompt, max_new_tokens=10, repeat_penalty=1.5, do_sample=True, seed=42
-        )
+        ctx1 = model.create_context()
+        cfg1 = forge.GenerationConfig()
+        cfg1.max_new_tokens = 10
+        cfg1.repeat_penalty = 1.0
+        cfg1.do_sample = True
+        cfg1.seed = 42
+        result_no_penalty = ctx1.generate(prompt, cfg1)
+        ctx2 = model.create_context()
+        cfg2 = forge.GenerationConfig()
+        cfg2.max_new_tokens = 10
+        cfg2.repeat_penalty = 1.5
+        cfg2.do_sample = True
+        cfg2.seed = 42
+        result_with_penalty = ctx2.generate(prompt, cfg2)
 
-        assert result_no_penalty["num_generated_tokens"] >= 1
-        assert result_with_penalty["num_generated_tokens"] >= 1
+        assert result_no_penalty.num_generated_tokens >= 1
+        assert result_with_penalty.num_generated_tokens >= 1
 
     def test_temperature_zero_is_greedy(self, model_path, model_config):
         model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
 
-        result1 = model.generate(prompt, max_new_tokens=10, temperature=0.0, do_sample=True)
-        result2 = model.generate(prompt, max_new_tokens=10, do_sample=False)
-        assert list(result1["token_ids"]) == list(result2["token_ids"])
+        ctx1 = model.create_context()
+        cfg1 = forge.GenerationConfig()
+        cfg1.max_new_tokens = 10
+        cfg1.temperature = 0.0
+        cfg1.do_sample = True
+        result1 = ctx1.generate(prompt, cfg1)
+        ctx2 = model.create_context()
+        cfg2 = forge.GenerationConfig()
+        cfg2.max_new_tokens = 10
+        cfg2.do_sample = False
+        result2 = ctx2.generate(prompt, cfg2)
+        assert list(result1.token_ids) == list(result2.token_ids)
 
 
 class TestCPUOffload:
@@ -132,9 +166,13 @@ class TestCPUOffload:
         model = forge.Model()
         model.load(model_path, arch_type="llama", **model_config)
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=5, do_sample=False, gpu_layers=0)
-        assert result["num_generated_tokens"] >= 1
-        assert result["finished"] is True
+        ctx = model.create_context(gpu_layers=0)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
+        assert result.finished is True
 
     def test_cpu_offload_forward_matches_default(self, model_path, model_config):
         model_default = forge.Model()

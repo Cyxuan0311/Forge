@@ -225,10 +225,12 @@ class TestTinyLlamaGeneration:
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(
-            prompt, max_new_tokens=20, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
-        )
-        tokens = result["token_ids"]
+        ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 20
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        tokens = result.token_ids
         unique_ratio = len(set(tokens)) / len(tokens) if len(tokens) > 0 else 0
         assert unique_ratio > 0.3, (
             f"Generated tokens should not be highly repetitive, unique_ratio={unique_ratio}"
@@ -238,28 +240,26 @@ class TestTinyLlamaGeneration:
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(
-            prompt,
-            max_new_tokens=50,
-            eos_token_id=2,
-            do_sample=False,
-            gpu_layers=0,
-            kv_cache_dtype="fp32",
-        )
-        if result["finish_reason"] == "eos":
-            assert result["token_ids"][-1] == 2
+        ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 50
+        cfg.eos_token_id = 2
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        if result.finish_reason == "eos":
+            assert result.token_ids[-1] == 2
 
     def test_generate_deterministic(self):
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result1 = model.generate(
-            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
-        )
-        result2 = model.generate(
-            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
-        )
-        assert list(result1["token_ids"]) == list(result2["token_ids"]), (
+        ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.do_sample = False
+        result1 = ctx.generate(prompt, cfg)
+        result2 = ctx.generate(prompt, cfg)
+        assert list(result1.token_ids) == list(result2.token_ids), (
             "Greedy generation should be deterministic"
         )
 
@@ -267,15 +267,13 @@ class TestTinyLlamaGeneration:
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(
-            prompt,
-            max_new_tokens=10,
-            temperature=0.8,
-            top_k=40,
-            top_p=0.9,
-            do_sample=True,
-            seed=42,
-            gpu_layers=0,
-            kv_cache_dtype="fp32",
-        )
-        assert result["num_generated_tokens"] >= 1
+        ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.temperature = 0.8
+        cfg.top_k = 40
+        cfg.top_p = 0.9
+        cfg.do_sample = True
+        cfg.seed = 42
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
