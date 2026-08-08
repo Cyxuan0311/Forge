@@ -21,6 +21,17 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
 
     // GQA decode (seq_len == 1): prefer fused quantized KV if available
     if (p.seq_len == 1) {
+        // Paged KV cache (Phase 4): traverse the page table directly.
+        // Only quantized paged KV has a dedicated kernel; FP32 paged falls
+        // through to the materialize-then-attend FP32 decode path.
+        if (p.paged && p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
+            switch (p.kv_type_k) {
+            case KVCacheDType::Q4_0: return AttentionPath::CUDA_PAGED_Q4_0_DECODE;
+            case KVCacheDType::F16:  return AttentionPath::CUDA_PAGED_F16_DECODE;
+            case KVCacheDType::Q8_0: return AttentionPath::CUDA_PAGED_Q8_0_DECODE;
+            default: break;  // Unsupported symmetric type → FP32 fallback
+            }
+        }
         if (p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
             switch (p.kv_type_k) {
             case KVCacheDType::Q4_0: return AttentionPath::CUDA_FUSED_Q4_0_DECODE;
@@ -47,6 +58,9 @@ const char* attention_path_name(AttentionPath path) {
     case AttentionPath::CUDA_FUSED_Q4_0_DECODE: return "CUDA_FUSED_Q4_0_DECODE";
     case AttentionPath::CUDA_FUSED_F16_DECODE:  return "CUDA_FUSED_F16_DECODE";
     case AttentionPath::CUDA_FUSED_Q8_0_DECODE: return "CUDA_FUSED_Q8_0_DECODE";
+    case AttentionPath::CUDA_PAGED_Q4_0_DECODE: return "CUDA_PAGED_Q4_0_DECODE";
+    case AttentionPath::CUDA_PAGED_F16_DECODE:  return "CUDA_PAGED_F16_DECODE";
+    case AttentionPath::CUDA_PAGED_Q8_0_DECODE: return "CUDA_PAGED_Q8_0_DECODE";
     case AttentionPath::UNSUPPORTED:            return "UNSUPPORTED";
     default:                                    return "UNKNOWN";
     }

@@ -12,4 +12,9 @@ namespace forge {
 // (EngineAutoRegister, ConfigParserAutoRegister, etc.) are constructed.
 extern volatile bool _arch_registrations_linked;
 
+// Call from any binary that links forge_model directly (e.g. forge-inspect) so
+// the linker pulls in arch_registrations.o and its static auto-registration
+// objects. No-op at runtime.
+void force_link_arch_registrations();
+
 }  // namespace forge

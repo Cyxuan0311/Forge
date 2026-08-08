@@ -21,7 +21,8 @@
 namespace forge {
 
 PhimoeEngine::PhimoeEngine(Model& model, InferenceContext& ctx)
-    : TransformerEngine(model, ctx), attention_executor_(kv_cache_) {
+    : TransformerEngine(model, ctx),
+      attention_executor_(kv_cache_, kv_memory_ ? &kv_memory_->storage() : nullptr) {
     if (!init_weights()) {
         throw std::runtime_error("PhimoeEngine: failed to initialize weights");
     }
@@ -294,17 +295,48 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     // ---- 4. KV cache update ----
     {
         PERF_SCOPE("layer/kv_cache_update");
-        kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len);
 
-        const auto& kv_cfg = kv_cache_.kv_config();
-        bool use_fused_decode =
-            (dev == DeviceType::CUDA && seq_len == 1 &&
-             kv_cache_.d_q_key_cache(layer_idx) != nullptr &&
-             ((kv_cfg.type_k == KVCacheDType::Q4_0 && kv_cfg.type_v == KVCacheDType::Q4_0) ||
-              (kv_cfg.type_k == KVCacheDType::F16 && kv_cfg.type_v == KVCacheDType::F16) ||
-              (kv_cfg.type_k == KVCacheDType::Q8_0 && kv_cfg.type_v == KVCacheDType::Q8_0)));
-        if (!use_fused_decode && kv_cache_.kv_dtype() != KVCacheDType::FP32) {
-            kv_cache_.dequantize_layer(layer_idx);
+        bool paged = kv_memory_ && kv_memory_->is_paged();
+
+        if (paged) {
+            // CUDA-backed paged storage takes device pointers directly (no D2H);
+            // CPU-backed paged storage needs the data on CPU.
+            DeviceType storage_dev = kv_memory_->storage().device();
+            const float* k_data;
+            const float* v_data;
+            TensorPtr k_cpu, v_cpu;
+            if (storage_dev == DeviceType::CUDA) {
+                k_data = static_cast<const float*>(k_rope->data());
+                v_data = static_cast<const float*>(v->data());
+            } else {
+                k_cpu = k_rope;
+                v_cpu = v;
+                if (k_cpu->device() == DeviceType::CUDA) {
+                    k_cpu = std::make_shared<Tensor>(k_cpu->dtype(), k_cpu->shape(), DeviceType::CPU);
+                    k_cpu->copy_from(*k_rope);
+                }
+                if (v_cpu->device() == DeviceType::CUDA) {
+                    v_cpu = std::make_shared<Tensor>(v_cpu->dtype(), v_cpu->shape(), DeviceType::CPU);
+                    v_cpu->copy_from(*v);
+                }
+                k_data = static_cast<const float*>(k_cpu->data());
+                v_data = static_cast<const float*>(v_cpu->data());
+            }
+            kv_memory_->storage().write_kv_seq(layer_idx, lctx.seq_id(), start_pos,
+                                               seq_len, k_data, v_data);
+        } else {
+            kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len);
+
+            const auto& kv_cfg = kv_cache_.kv_config();
+            bool use_fused_decode =
+                (dev == DeviceType::CUDA && seq_len == 1 &&
+                 kv_cache_.d_q_key_cache(layer_idx) != nullptr &&
+                 ((kv_cfg.type_k == KVCacheDType::Q4_0 && kv_cfg.type_v == KVCacheDType::Q4_0) ||
+                  (kv_cfg.type_k == KVCacheDType::F16 && kv_cfg.type_v == KVCacheDType::F16) ||
+                  (kv_cfg.type_k == KVCacheDType::Q8_0 && kv_cfg.type_v == KVCacheDType::Q8_0)));
+            if (!use_fused_decode && kv_cache_.kv_dtype() != KVCacheDType::FP32) {
+                kv_cache_.dequantize_layer(layer_idx);
+            }
         }
     }
 
@@ -312,7 +344,8 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     TensorPtr attn_out;
     {
         PERF_SCOPE("layer/attention");
-        attn_out = attention_executor_.attend(q_rope, cfg, layer_idx, seq_len, dev);
+        attn_out = attention_executor_.attend(q_rope, cfg, layer_idx, seq_len, dev,
+                                              nullptr, lctx.seq_id());
     }
 
     // ---- 6. Attention output projection + bias ----

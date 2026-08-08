@@ -89,16 +89,16 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
              ", head_dim_swa=" + std::to_string(cfg.head_dim_swa));
 
     kv_cache_.init_per_layer(cfg.num_layers, kv_dims, kv_max_seq, kv_dev);
-    // Enable ring buffer for SWA layers only — window_size = n_swa
-    // Only SWA layers (swa_layers[i] == 1) use ring buffer eviction;
+    // Phase 6: set per-layer policies (replaces set_ring_buffer calls).
+    // SlidingWindow layers (swa_layers[i] == 1) use ring buffer eviction;
     // full-attention layers grow linearly without windowing.
     if (cfg.n_swa > 0) {
-        kv_cache_.set_ring_buffer(cfg.n_swa);  // init window_size and per-layer arrays (all false)
+        std::vector<KVLayerPolicy> policies(cfg.num_layers, KVLayerPolicy::Full);
         for (int i = 0; i < cfg.num_layers; ++i) {
-            if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1) {
-                kv_cache_.set_ring_buffer(cfg.n_swa, i);  // enable ring buffer for this SWA layer
-            }
+            if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1)
+                policies[i] = KVLayerPolicy::SlidingWindow;
         }
+        kv_cache_.set_layer_policies(policies, cfg.n_swa);
     }
     // Place each layer's KV cache on the corresponding device
     if (!layer_devices_.empty()) {

@@ -8,6 +8,12 @@ struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
 namespace forge {
+// Forward declaration — full definition in forge/kv_cache.h.
+// Used only as a parameter type in the paged KV launch functions below.
+enum class KVCacheDType : int;
+}  // namespace forge
+
+namespace forge {
 namespace cuda {
 
 void launch_rms_norm(const float* x, const float* weight, float* out, int rows, int cols, float eps,
@@ -379,6 +385,53 @@ void launch_fused_flash_attention_gqa_decode_q8_0(
     const float* Q, const void* q_K, const void* q_V, float* O,
     int kv_len, int num_heads, int num_kv_heads, int head_dim,
     size_t q_row_size, const float* mask_row = nullptr,
+    cudaStream_t stream = 0);
+
+// ---- Paged Flash Attention (Phase 4) ----
+// KV cache is held in fixed-size pages; the sequence page table (page_ids)
+// maps logical KV index -> physical page id. K/V rows are resolved through
+// the page table at access time, never materialized into a contiguous buffer.
+//
+// launch_kv_scatter: writes n_tokens FP32 K/V rows starting at logical
+// position `pos` into the paged cache, quantizing to `dtype` in-place.
+//   k_src/v_src:       device FP32 source rows (n_tokens * kv_dim each)
+//   k_page_ptrs/v_page_ptrs: device array of page base pointers (per layer)
+//   page_ids:          device array, logical page idx -> physical page id
+//   k_row_bytes/v_row_bytes: bytes per K/V row (kv_dim * dtype element size)
+//
+// launch_paged_flash_attention_gqa_decode_*: paged decode (seq_len==1)
+//   Q:                 device FP32 query, [num_heads, head_dim]
+//   k_page_ptrs/v_page_ptrs / page_ids: as above
+//   O:                 device FP32 output, [num_heads, head_dim]
+//   q_row_size:        bytes per KV row (full kv_dim = num_kv_heads*head_dim)
+
+void launch_kv_scatter(
+    const float* k_src, const float* v_src,
+    void* const* k_page_ptrs, void* const* v_page_ptrs,
+    const int32_t* page_ids,
+    int n_tokens, int64_t pos, int page_size, int kv_dim,
+    size_t k_row_bytes, size_t v_row_bytes,
+    KVCacheDType dtype, cudaStream_t stream = 0);
+
+void launch_paged_flash_attention_gqa_decode_q4_0(
+    const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs,
+    const int32_t* page_ids, float* O,
+    int kv_len, int num_heads, int num_kv_heads, int head_dim,
+    int page_size, size_t q_row_size, const float* mask_row = nullptr,
+    cudaStream_t stream = 0);
+
+void launch_paged_flash_attention_gqa_decode_f16(
+    const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs,
+    const int32_t* page_ids, float* O,
+    int kv_len, int num_heads, int num_kv_heads, int head_dim,
+    int page_size, size_t q_row_size, const float* mask_row = nullptr,
+    cudaStream_t stream = 0);
+
+void launch_paged_flash_attention_gqa_decode_q8_0(
+    const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs,
+    const int32_t* page_ids, float* O,
+    int kv_len, int num_heads, int num_kv_heads, int head_dim,
+    int page_size, size_t q_row_size, const float* mask_row = nullptr,
     cudaStream_t stream = 0);
 
 // ---- MoE Router ----

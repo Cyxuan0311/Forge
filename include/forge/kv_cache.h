@@ -16,6 +16,24 @@ enum class KVCacheDType : int {
     Q4_K = 4,
 };
 
+// Internal feature flag: selects the KV storage backend.
+// Default is Contiguous (existing KVCache). Paged is reserved for future phases.
+enum class KVStorageMode : int {
+    Contiguous = 0,
+    Paged      = 1,
+};
+
+// Phase 6: per-layer memory policy.
+// Inspired by llama.cpp's llama_kv_cache_iswa — different layers can use
+// different eviction/memory strategies. This formalizes the previously
+// implicit use_ring_buffer_ bool into a first-class concept.
+enum class KVLayerPolicy : int {
+    None           = 0,  // unset / default
+    Full           = 1,  // full attention, linear KV growth
+    SlidingWindow  = 2,  // SWA: ring buffer, window_size eviction
+    Recurrent      = 3,  // recurrent state (future: SSM/Mamba) — stub
+};
+
 // K/V can have different quantization types (asymmetric KV cache).
 struct KVCacheTypeConfig {
     KVCacheDType type_k = KVCacheDType::FP32;
@@ -113,7 +131,9 @@ struct KVCacheStorage {
 struct KVCacheLayer {
     KVCacheStorage key_store;
     KVCacheStorage value_store;
-    int filled = 0;
+    int filled = 0;             // physical write cursor for non-ring; logical pos_max for ring
+    int logical_filled = 0;     // monotonic logical position max (all layers, for rollback/seq_rm)
+    int dequantized_filled = 0; // how many rows have been dequantized (for incremental dequant)
 
     // Cell metadata — size max_seq_len, parallel to KV rows
     std::vector<KVCellMeta> cells;
@@ -144,6 +164,14 @@ public:
 
     // Per-layer device query
     DeviceType layer_device(int layer) const;
+
+    // --- Phase 6: per-layer memory policy ---
+    // Set per-layer policies. SlidingWindow layers will use ring buffer
+    // eviction with window_size = swa_window (typically cfg.n_swa).
+    // Full layers grow linearly. Recurrent is a stub (treated as Full).
+    // This replaces the older set_ring_buffer() calls with a unified API.
+    void set_layer_policies(const std::vector<KVLayerPolicy>& policies, int swa_window = 0);
+    KVLayerPolicy layer_policy(int layer) const;
 
     // Set the CUDA stream for all KV cache operations (default: stream 0)
     void set_cuda_stream(void* stream);
@@ -229,8 +257,19 @@ public:
 
     size_t nbytes() const;
 
+    // Number of bytes actively occupied by filled cells (sum across all layers, K+V).
+    size_t active_bytes() const;
+
+    // Number of free cell slots across all layers.
+    int num_free_slots() const;
+
     static size_t q4_0_block_nbytes(int n);
     static size_t block_nbytes(KVCacheDType dtype, int n);
+
+    // Quantize/dequantize a single row (public for PagedKVStorage reuse).
+    // For FP32: memcpy. For F16/Q8_0/Q4_0/Q4_K: calls the appropriate CPU quantizer.
+    static void quantize_row(KVCacheDType dtype, const float* src, uint8_t* dst, int n);
+    static void dequantize_row(KVCacheDType dtype, const uint8_t* src, float* dst, int n);
 
     // Dequantize a layer's KV data into FP32 (on-demand, for non-fused attention paths).
     // Returns the FP32 key/value tensor pair. Results are cached per-layer.
@@ -271,6 +310,10 @@ private:
     // Per-layer ring cursors: next slot to write (wraps at window_size_).
     // Only meaningful for SWA layers; non-SWA layers use normal linear filling.
     std::vector<int> ring_cursor_;
+
+    // Phase 6: per-layer memory policy (formalizes use_ring_buffer_).
+    // SlidingWindow → ring buffer; Full → linear; Recurrent → stub (linear).
+    std::vector<KVLayerPolicy> layer_policies_;
 
     // CUDA stream for KV cache operations (default: nullptr = default stream)
     void* cuda_stream_ = nullptr;

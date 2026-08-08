@@ -41,8 +41,12 @@ static inline void* forge_mmap(void*, size_t length, int, int, int fd, long long
     HANDLE hFile = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
     if (hFile == INVALID_HANDLE_VALUE)
         return (void*)-1;
-    HANDLE hMap =
-        CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, static_cast<DWORD>(length), nullptr);
+    // Use 64-bit size so files >4GB map correctly (CreateFileMapping takes the
+    // size as high/low DWORD parts; a plain cast to DWORD truncates to 4GB).
+    ULARGE_INTEGER sz;
+    sz.QuadPart = static_cast<ULONGLONG>(length);
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, sz.HighPart,
+                                     sz.LowPart, nullptr);
     if (!hMap)
         return (void*)-1;
     void* ptr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
@@ -52,6 +56,15 @@ static inline void* forge_mmap(void*, size_t length, int, int, int fd, long long
 
 static inline int forge_munmap(void* addr, size_t) {
     return UnmapViewOfFile(addr) ? 0 : -1;
+}
+
+// Eagerly pull the mapped range into memory (cold-cache readahead). No-op on
+// Windows versions without PrefetchVirtualMemory (Win8+).
+static inline void forge_prefetch(void* addr, size_t length) {
+#if _WIN32_WINNT >= 0x0602
+    WIN32_MEMORY_RANGE_ENTRY entry{addr, length};
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+#endif
 }
 
 #else
@@ -69,6 +82,9 @@ static inline void* forge_mmap(void* a, size_t l, int p, int f, int fd, off_t o)
 }
 static inline int forge_munmap(void* a, size_t l) {
     return munmap(a, l);
+}
+static inline void forge_prefetch(void* addr, size_t length) {
+    madvise(addr, length, MADV_WILLNEED);
 }
 #define FORGE_MAP_FAILED MAP_FAILED
 static inline int forge_open(const char* path, int flags) {

@@ -10,6 +10,7 @@
 
 #include "context.h"
 #include "model.h"
+#include "prefix_cache.h"
 #include "sampler.h"
 
 namespace forge {
@@ -77,17 +78,25 @@ public:
     const InferenceContext& context() const { return ctx_; }
 
     // Prefix cache stats
-    int prefix_cache_hits() const { return prefix_cache_hits_; }
-    int prefix_cache_misses() const { return prefix_cache_misses_; }
+    int prefix_cache_hits() const {
+        return paged_mode_ ? prefix_cache_.hits() : prefix_cache_hits_;
+    }
+    int prefix_cache_misses() const {
+        return paged_mode_ ? prefix_cache_.misses() : prefix_cache_misses_;
+    }
 
 private:
     void schedule();
 
-    // Prefix cache helpers
+    // Prefix cache helpers (contiguous mode: legacy prompt_cache_)
     static size_t hash_prompt(const std::vector<int32_t>& tokens);
     bool try_prefix_cache(GenerateRequest& req);
     void evict_prefix_cache(int seq_id);
     void preserve_prefix_cache(int seq_id, int prompt_len);
+
+    // Prefix cache helpers (paged mode: page-level PrefixCache)
+    bool try_prefix_cache_paged(GenerateRequest& req);
+    void finish_request_paged(GenerateRequest& req);
 
     // Release a sequence's KV cache entries
     void release_seq_kv(int seq_id, int prompt_len = 0);
@@ -107,6 +116,10 @@ private:
     std::unordered_map<size_t, CachedPrompt> prompt_cache_;
     int prefix_cache_hits_ = 0;
     int prefix_cache_misses_ = 0;
+
+    // Page-level prefix cache (paged mode only)
+    PrefixCache prefix_cache_;
+    bool paged_mode_ = false;
 
     mutable std::mutex mutex_;
 };

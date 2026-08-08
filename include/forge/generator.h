@@ -23,6 +23,7 @@ struct GenerationConfig {
     uint64_t seed = 0;
     int eos_token_id = -1;
     std::vector<int32_t> stop_token_ids;  // Additional stop tokens beyond eos
+    bool reset_kv_cache = true;           // If false, append to existing KV (multi-turn)
 };
 
 struct GenerationResult {

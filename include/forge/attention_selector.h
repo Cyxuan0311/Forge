@@ -34,6 +34,13 @@ enum class AttentionPath {
     CUDA_FUSED_F16_DECODE,   // CUDA GQA decode with F16 KV
     CUDA_FUSED_Q8_0_DECODE,  // CUDA GQA decode with Q8_0 KV
 
+    // CUDA paged paths (Phase 4): KV held in fixed-size pages; the decode kernel
+    // traverses the per-sequence page table directly. No materialization.
+    // FP32 paged KV falls back to CUDA_FP32_DECODE (materialize then attend).
+    CUDA_PAGED_Q4_0_DECODE,  // CUDA paged GQA decode with Q4_0 KV
+    CUDA_PAGED_F16_DECODE,   // CUDA paged GQA decode with F16 KV
+    CUDA_PAGED_Q8_0_DECODE,  // CUDA paged GQA decode with Q8_0 KV
+
     // Fallback
     UNSUPPORTED,
 };
@@ -51,6 +58,12 @@ struct AttentionProblem {
     bool has_quantized_kv = false;        // d_q_K && d_q_V available
     KVCacheDType kv_type_k = KVCacheDType::FP32;
     KVCacheDType kv_type_v = KVCacheDType::FP32;
+
+    // Paged KV cache (Phase 4). When true and device==CUDA, the decode path
+    // resolves K/V rows through the per-sequence page table instead of reading
+    // a contiguous tensor. seq_id selects which sequence's page table to use.
+    bool paged = false;
+    int seq_id = -1;
 };
 
 // ---- Selector function ----

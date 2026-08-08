@@ -22,6 +22,7 @@ struct ContextParams {
     int gpu_layers = -1;
     KVCacheDType kv_cache_dtype = KVCacheDType::FP32;  // legacy: sets both K and V
     KVCacheTypeConfig kv_cache_config;                  // per-K/V type config
+    KVStorageMode kv_storage_mode = KVStorageMode::Contiguous;  // internal: storage backend
     DeviceType device = DeviceType::CUDA;
     int batch_size = 1;
     int n_batch = 512;          // max tokens per forward_batch() call

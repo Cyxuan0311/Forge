@@ -1,11 +1,13 @@
 #include "forge/request_scheduler.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
 #include "forge/engine.h"
 #include "forge/kv_cache.h"
+#include "forge/kv_memory.h"
 #include "forge/logger.h"
 
 #ifdef USE_CUDA
@@ -36,8 +38,8 @@ bool RequestScheduler::try_prefix_cache(GenerateRequest& req) {
     if (!engine)
         return false;
 
-    KVCache* kv = engine->kv_cache();
-    if (!kv)
+    KVMemory* memory = engine->kv_memory();
+    if (!memory)
         return false;
 
     size_t h = hash_prompt(req.prompt_tokens);
@@ -47,11 +49,11 @@ bool RequestScheduler::try_prefix_cache(GenerateRequest& req) {
         auto& cached = it->second;
 
         // Verify the cached seq_id still has cells in the KV cache
-        if (cached.seq_id >= 0 && kv->seq_filled(0, cached.seq_id) >=
+        if (cached.seq_id >= 0 && memory->storage().seq_filled(0, cached.seq_id) >=
             static_cast<int>(cached.tokens.size())) {
-            // Cache hit: zero-copy share prefix via seq_cp
-            kv->seq_cp(cached.seq_id, req.request_id, 0,
-                       static_cast<int64_t>(cached.tokens.size()));
+            // Cache hit: zero-copy share prefix via seq_share
+            memory->seq_share(cached.seq_id, req.request_id, 0,
+                              static_cast<int64_t>(cached.tokens.size()));
 
             req.prefix_len = static_cast<int>(cached.tokens.size());
             req.prefix_seq_id = cached.seq_id;
@@ -99,8 +101,8 @@ void RequestScheduler::preserve_prefix_cache(int seq_id, int prompt_len) {
     if (!engine)
         return;
 
-    KVCache* kv = engine->kv_cache();
-    if (!kv)
+    KVMemory* memory = engine->kv_memory();
+    if (!memory)
         return;
 
     // Find the cache entry owned by this seq_id
@@ -108,8 +110,8 @@ void RequestScheduler::preserve_prefix_cache(int seq_id, int prompt_len) {
         if (cached.seq_id == seq_id && cached.valid) {
             // Allocate a new persistent seq_id to hold the prefix KV cells
             int new_seq_id = next_request_id_++;
-            kv->seq_cp(seq_id, new_seq_id, 0, prompt_len);
-            kv->seq_rm(seq_id, 0, prompt_len);
+            memory->seq_share(seq_id, new_seq_id, 0, prompt_len);
+            memory->seq_remove(seq_id, 0, prompt_len);
 
             // Update cache entry to point to the new persistent seq_id
             cached.seq_id = new_seq_id;
@@ -121,11 +123,72 @@ void RequestScheduler::preserve_prefix_cache(int seq_id, int prompt_len) {
     }
 }
 
+// ---- Page-level prefix cache (paged mode) ----
+
+bool RequestScheduler::try_prefix_cache_paged(GenerateRequest& req) {
+    auto* engine = ctx_.engine();
+    if (!engine)
+        return false;
+
+    KVMemory* memory = engine->kv_memory();
+    if (!memory || !memory->is_paged())
+        return false;
+
+    int prefix_len = prefix_cache_.try_lookup(
+        req.prompt_tokens, req.request_id, memory->storage());
+
+    if (prefix_len > 0) {
+        req.prefix_len = prefix_len;
+        req.prefix_seq_id = -1;  // not used in paged mode; PrefixCache tracks internally
+        req.from_cache = true;
+        req.current_pos = prefix_len;
+        memory->record_prefix_hit(prefix_len);
+        return true;
+    }
+
+    req.prefix_len = 0;
+    req.prefix_seq_id = -1;
+    req.from_cache = false;
+    return false;
+}
+
+void RequestScheduler::finish_request_paged(GenerateRequest& req) {
+    auto* engine = ctx_.engine();
+    if (!engine)
+        return;
+
+    KVMemory* memory = engine->kv_memory();
+    if (!memory || !memory->is_paged())
+        return;
+
+    if (req.from_cache) {
+        // Request used a cached prefix: release its prefix reference.
+        // Suffix pages (beyond prefix) are released by release_seq_kv below.
+        prefix_cache_.release_prefix(req.request_id, memory->storage());
+    } else if (static_cast<int>(req.prompt_tokens.size()) >= MIN_CACHE_PROMPT_LEN) {
+        // Request owns a new prefix: register it in the page-level cache.
+        // register_prefix transfers prefix page ownership to a cache seq_id
+        // and removes them from the request's page table.
+        prefix_cache_.register_prefix(
+            req.prompt_tokens, req.request_id, memory->storage());
+    }
+
+    // Evict LRU entries to keep cache bounded
+    prefix_cache_.evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, memory->storage());
+}
+
 // ---- Constructor ----
 
 RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seqs)
     : model_(model), ctx_(model), sampler_(SamplerConfig{}), max_num_seqs_(max_num_seqs) {
     (void)block_size;  // block_size no longer needed with engine KVCache
+
+    // Check for paged storage mode (same env var as PyModel::create_context).
+    const char* storage_mode_env = std::getenv("FORGE_KV_STORAGE_MODE");
+    if (storage_mode_env && std::string(storage_mode_env) == "paged") {
+        ctx_.params_mut().kv_storage_mode = KVStorageMode::Paged;
+        paged_mode_ = true;
+    }
 
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, ctx_);
     if (engine) {
@@ -139,18 +202,16 @@ void RequestScheduler::release_seq_kv(int seq_id, int prompt_len) {
     auto* engine = ctx_.engine();
     if (!engine)
         return;
-    KVCache* kv = engine->kv_cache();
-    if (!kv)
+    KVMemory* memory = engine->kv_memory();
+    if (!memory)
         return;
 
     // Remove the sequence from all its KV cells
-    // Use prompt_len to know the range, or scan all positions
-    int max_pos = kv->max_seq_len();
     if (prompt_len > 0) {
-        kv->seq_rm(seq_id, 0, prompt_len);
+        memory->seq_remove(seq_id, 0, prompt_len);
     } else {
-        // No position info: scan all positions
-        kv->seq_rm(seq_id, 0, max_pos);
+        // No position info: release all cells
+        memory->release_sequence(seq_id);
     }
 }
 
@@ -191,7 +252,7 @@ bool RequestScheduler::step() {
     if (!engine)
         return false;
 
-    KVCache* kv = engine->kv_cache();
+    KVMemory* memory = engine->kv_memory();
 
     // Build InferenceBatch from active requests
     InferenceBatch batch;
@@ -213,7 +274,10 @@ bool RequestScheduler::step() {
         if (req.status == RequestStatus::Prefilling) {
             // Check prefix cache for this request
             if (!req.from_cache) {
-                try_prefix_cache(req);
+                if (paged_mode_)
+                    try_prefix_cache_paged(req);
+                else
+                    try_prefix_cache(req);
             }
 
             if (req.from_cache && req.prefix_len > 0) {
@@ -329,9 +393,10 @@ bool RequestScheduler::step() {
             req.current_pos = static_cast<int>(req.prompt_tokens.size());
             req.status = RequestStatus::Decoding;
 
-            // Register this prompt in the prefix cache (if eligible)
-            if (!req.from_cache &&
-                static_cast<int>(req.prompt_tokens.size()) >= MIN_CACHE_PROMPT_LEN && kv) {
+            // Register this prompt in the legacy prefix cache (contiguous mode only).
+            // Paged mode registers on request finish via finish_request_paged().
+            if (!paged_mode_ && !req.from_cache &&
+                static_cast<int>(req.prompt_tokens.size()) >= MIN_CACHE_PROMPT_LEN && memory) {
                 size_t h = hash_prompt(req.prompt_tokens);
                 // Only register if not already cached
                 if (prompt_cache_.find(h) == prompt_cache_.end()) {
@@ -357,18 +422,21 @@ bool RequestScheduler::step() {
         }
 
         if (req.status == RequestStatus::Finished || req.status == RequestStatus::Failed) {
-            // Handle prefix cache: if this request owns a cached prefix, preserve it
-            if (kv && req.from_cache && req.prefix_seq_id >= 0) {
-                // The request used a cached prefix — just clean up its own cells
+            // Handle prefix cache cleanup
+            if (paged_mode_) {
+                // Paged mode: page-level prefix cache handles register/release
+                finish_request_paged(req);
+            } else if (memory && req.from_cache && req.prefix_seq_id >= 0) {
+                // Contiguous mode: request used a cached prefix — clean up its own cells
                 // The prefix cells are still owned by prefix_seq_id (and possibly other sequences)
                 // Remove only this request's cells beyond the prefix
                 if (req.current_pos > req.prefix_len) {
-                    kv->seq_rm(rid, req.prefix_len, req.current_pos);
+                    memory->seq_remove(rid, req.prefix_len, req.current_pos);
                 }
                 // Remove this seq_id from prefix cells
-                kv->seq_rm(rid, 0, req.prefix_len);
-            } else if (kv) {
-                // This request owns a prefix cache entry — preserve it
+                memory->seq_remove(rid, 0, req.prefix_len);
+            } else if (memory) {
+                // Contiguous mode: this request owns a prefix cache entry — preserve it
                 preserve_prefix_cache(rid, static_cast<int>(req.prompt_tokens.size()));
             }
 
@@ -385,15 +453,15 @@ bool RequestScheduler::step() {
 
 void RequestScheduler::schedule() {
     auto* engine = ctx_.engine();
-    KVCache* kv = engine ? engine->kv_cache() : nullptr;
+    KVMemory* memory = engine ? engine->kv_memory() : nullptr;
 
     while (!waiting_queue_.empty() && static_cast<int>(active_ids_.size()) < max_num_seqs_) {
         // Check KV cache capacity: need at least some free slots.
         // If KV cache is not yet initialized (max_seq_len == 0), allow admission
         // since it will be initialized on first forward.
         bool has_capacity = true;
-        if (kv && kv->max_seq_len() > 0) {
-            int free_slots = kv->max_seq_len() - kv->filled(0);
+        if (memory && memory->max_seq_len() > 0) {
+            int free_slots = memory->num_free_slots();
             if (free_slots <= 0)
                 has_capacity = false;
         }
@@ -486,6 +554,7 @@ void RequestScheduler::reset() {
     while (!waiting_queue_.empty())
         waiting_queue_.pop();
     prompt_cache_.clear();
+    prefix_cache_.clear();
     prefix_cache_hits_ = 0;
     prefix_cache_misses_ = 0;
 }

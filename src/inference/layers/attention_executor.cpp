@@ -348,25 +348,66 @@ AttentionExecutor::QKVResult AttentionExecutor::project_qkv(const TensorPtr& x,
 }
 
 TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, int layer_idx,
-                                   int seq_len, DeviceType dev, const TensorPtr& mask) {
+                                   int seq_len, DeviceType dev, const TensorPtr& mask,
+                                   int seq_id) {
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
     int head_dim = cfg.head_dim;
 
-    int total_len = kv_cache_.filled(layer_idx);
-    auto k_sliced = kv_cache_.get_key_filled(layer_idx);
-    auto v_sliced = kv_cache_.get_value_filled(layer_idx);
+    // Paged mode: read K/V from PagedKVStorage instead of KVCache
+    bool paged = (storage_ != nullptr && storage_->is_paged());
 
-    // Ensure KV cache data is on the correct device
-    if (dev == DeviceType::CUDA && k_sliced->device() == DeviceType::CPU) {
-        auto k_cuda = std::make_shared<Tensor>(DataType::FP32, k_sliced->shape(), DeviceType::CUDA);
-        k_cuda->copy_from(*k_sliced);
-        k_sliced = k_cuda;
-
-        auto v_cuda = std::make_shared<Tensor>(DataType::FP32, v_sliced->shape(), DeviceType::CUDA);
-        v_cuda->copy_from(*v_sliced);
-        v_sliced = v_cuda;
+    // Paged mode attends only to the current sequence's pages (per-seq).
+    // This is critical when pages are shared across sequences (prefix cache),
+    // since read_key/filled would otherwise duplicate shared-page data.
+    // Contiguous mode keeps the all-sequence aggregate (mask handles per-seq).
+    int total_len;
+    if (paged && seq_id >= 0) {
+        total_len = storage_->seq_filled(layer_idx, seq_id);
+    } else if (paged) {
+        total_len = storage_->filled(layer_idx);
+    } else {
+        total_len = kv_cache_.filled(layer_idx);
     }
+
+    // Empty view: nothing in KV cache yet (first token of first sequence).
+    // Return zero output — causal attention has no valid keys to attend to.
+    if (total_len == 0) {
+        auto out = std::make_shared<Tensor>(DataType::FP32,
+                                             std::vector<int64_t>{seq_len, num_heads * head_dim},
+                                             dev);
+        out->zero_();
+        return out;
+    }
+
+    // Helper: fetch and ensure FP32 K/V tensors on the target device.
+    // Only needed for non-fused attention paths.
+    auto get_kv_on_device = [&](TensorPtr& k_out, TensorPtr& v_out) {
+        if (paged) {
+            // Per-sequence read: avoids duplicating shared-page data.
+            // Falls back to all-sequence read if seq_id is invalid.
+            if (seq_id >= 0) {
+                k_out = storage_->read_key_seq(layer_idx, seq_id);
+                v_out = storage_->read_value_seq(layer_idx, seq_id);
+            }
+            if (!k_out || !v_out) {
+                k_out = storage_->read_key(layer_idx);
+                v_out = storage_->read_value(layer_idx);
+            }
+        } else {
+            k_out = kv_cache_.get_key_filled(layer_idx);
+            v_out = kv_cache_.get_value_filled(layer_idx);
+        }
+        if (dev == DeviceType::CUDA && k_out && k_out->device() == DeviceType::CPU) {
+            auto k_cuda = std::make_shared<Tensor>(DataType::FP32, k_out->shape(), DeviceType::CUDA);
+            k_cuda->copy_from(*k_out);
+            k_out = k_cuda;
+
+            auto v_cuda = std::make_shared<Tensor>(DataType::FP32, v_out->shape(), DeviceType::CUDA);
+            v_cuda->copy_from(*v_out);
+            v_out = v_cuda;
+        }
+    };
 
     // Prepare mask data pointer for CUDA kernels
     const float* mask_data = nullptr;
@@ -393,8 +434,16 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     problem.num_kv_heads = num_kv_heads;
     problem.head_dim = head_dim;
 
-    // Quantized KV state (only relevant for CUDA decode)
-    if (dev == DeviceType::CUDA && seq_len == 1) {
+    // Quantized KV state for path selection.
+    // - Paged CUDA decode: KV lives in pages; the storage reports the dtype.
+    // - Contiguous CUDA decode: query the KVCache's quantized device pointers.
+    if (dev == DeviceType::CUDA && seq_len == 1 && paged) {
+        problem.paged = true;
+        problem.seq_id = seq_id;
+        problem.has_quantized_kv = true;  // paged CUDA always quantized-or-FP32
+        problem.kv_type_k = storage_->kv_type_k();
+        problem.kv_type_v = storage_->kv_type_v();
+    } else if (dev == DeviceType::CUDA && seq_len == 1 && !paged) {
         void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
         void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
         problem.has_quantized_kv = (d_q_K != nullptr && d_q_V != nullptr);
@@ -409,24 +458,32 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     TensorPtr attn_out;
 
     switch (path) {
-    case AttentionPath::CPU_MHA:
+    case AttentionPath::CPU_MHA: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
         attn_out = ops::scaled_dot_product_attention_2d(q, k_sliced, v_sliced, seq_len,
                                                         total_len, num_heads, head_dim, mask,
                                                         true);
         break;
-
-    case AttentionPath::CPU_GQA:
+    }
+    case AttentionPath::CPU_GQA: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
         attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
                                                             total_len, num_heads, num_kv_heads,
                                                             head_dim, mask, true);
         break;
-
-    case AttentionPath::CUDA_GENERIC_MHA:
+    }
+    case AttentionPath::CUDA_GENERIC_MHA: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
         attn_out = ops::scaled_dot_product_attention_2d(q, k_sliced, v_sliced, seq_len, total_len,
                                                         num_heads, head_dim, mask, true);
         break;
-
-    case AttentionPath::CUDA_FP32_PREFILL:
+    }
+    case AttentionPath::CUDA_FP32_PREFILL: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(DataType::FP32,
                                             std::vector<int64_t>{seq_len, num_heads * head_dim},
@@ -442,8 +499,10 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                                                             head_dim, mask, true);
 #endif
         break;
-
-    case AttentionPath::CUDA_FP32_DECODE:
+    }
+    case AttentionPath::CUDA_FP32_DECODE: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(DataType::FP32,
                                             std::vector<int64_t>{seq_len, num_heads * head_dim},
@@ -460,9 +519,10 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                                                             head_dim, mask, true);
 #endif
         break;
-
+    }
     case AttentionPath::CUDA_FUSED_Q4_0_DECODE:
 #ifdef USE_CUDA
+        // Fused decode reads quantized KV directly — no materialize.
         attn_out = std::make_shared<Tensor>(DataType::FP32,
                                             std::vector<int64_t>{seq_len, num_heads * head_dim},
                                             DeviceType::CUDA);
@@ -476,9 +536,9 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                 head_dim, q_row_size, mask_row, 0);
         }
 #else
-        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
-                                                            total_len, num_heads, num_kv_heads,
-                                                            head_dim, mask, true);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx),
+            seq_len, total_len, num_heads, num_kv_heads, head_dim, mask, true);
 #endif
         break;
 
@@ -497,9 +557,9 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                 head_dim, q_row_size, mask_row, 0);
         }
 #else
-        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
-                                                            total_len, num_heads, num_kv_heads,
-                                                            head_dim, mask, true);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx),
+            seq_len, total_len, num_heads, num_kv_heads, head_dim, mask, true);
 #endif
         break;
 
@@ -518,9 +578,80 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                 head_dim, q_row_size, mask_row, 0);
         }
 #else
-        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
-                                                            total_len, num_heads, num_kv_heads,
-                                                            head_dim, mask, true);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx),
+            seq_len, total_len, num_heads, num_kv_heads, head_dim, mask, true);
+#endif
+        break;
+
+    // ---- Paged CUDA decode (Phase 4) ----
+    // KV rows are resolved through the per-sequence page table; no materialize.
+    case AttentionPath::CUDA_PAGED_Q4_0_DECODE:
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{seq_len, num_heads * head_dim},
+                                            DeviceType::CUDA);
+        {
+            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            size_t q_row_size = KVCache::block_nbytes(KVCacheDType::Q4_0, num_kv_heads * head_dim);
+            cuda::launch_paged_flash_attention_gqa_decode_q4_0(
+                static_cast<const float*>(q->data()),
+                storage_->d_key_page_ptrs(layer_idx), storage_->d_value_page_ptrs(layer_idx),
+                d_page_ids, static_cast<float*>(attn_out->data()),
+                total_len, num_heads, num_kv_heads, head_dim,
+                storage_->page_size(), q_row_size, mask_row, 0);
+        }
+#else
+        { TensorPtr k_, v_; get_kv_on_device(k_, v_);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_, v_, seq_len, total_len,
+                                                            num_heads, num_kv_heads, head_dim,
+                                                            mask, true); }
+#endif
+        break;
+
+    case AttentionPath::CUDA_PAGED_F16_DECODE:
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{seq_len, num_heads * head_dim},
+                                            DeviceType::CUDA);
+        {
+            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            size_t q_row_size = KVCache::block_nbytes(KVCacheDType::F16, num_kv_heads * head_dim);
+            cuda::launch_paged_flash_attention_gqa_decode_f16(
+                static_cast<const float*>(q->data()),
+                storage_->d_key_page_ptrs(layer_idx), storage_->d_value_page_ptrs(layer_idx),
+                d_page_ids, static_cast<float*>(attn_out->data()),
+                total_len, num_heads, num_kv_heads, head_dim,
+                storage_->page_size(), q_row_size, mask_row, 0);
+        }
+#else
+        { TensorPtr k_, v_; get_kv_on_device(k_, v_);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_, v_, seq_len, total_len,
+                                                            num_heads, num_kv_heads, head_dim,
+                                                            mask, true); }
+#endif
+        break;
+
+    case AttentionPath::CUDA_PAGED_Q8_0_DECODE:
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(DataType::FP32,
+                                            std::vector<int64_t>{seq_len, num_heads * head_dim},
+                                            DeviceType::CUDA);
+        {
+            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            size_t q_row_size = KVCache::block_nbytes(KVCacheDType::Q8_0, num_kv_heads * head_dim);
+            cuda::launch_paged_flash_attention_gqa_decode_q8_0(
+                static_cast<const float*>(q->data()),
+                storage_->d_key_page_ptrs(layer_idx), storage_->d_value_page_ptrs(layer_idx),
+                d_page_ids, static_cast<float*>(attn_out->data()),
+                total_len, num_heads, num_kv_heads, head_dim,
+                storage_->page_size(), q_row_size, mask_row, 0);
+        }
+#else
+        { TensorPtr k_, v_; get_kv_on_device(k_, v_);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_, v_, seq_len, total_len,
+                                                            num_heads, num_kv_heads, head_dim,
+                                                            mask, true); }
 #endif
         break;
 

@@ -6,6 +6,7 @@
 #include "forge/inference/graph/graph_runtime.h"
 #include "forge/inference/layer_execution_context.h"
 #include "forge/kv_cache.h"
+#include "forge/kv_memory.h"
 #include "forge/memory_pool.h"
 #include "forge/model.h"
 
@@ -28,6 +29,9 @@ public:
     const KVCache* kv_cache() const override { return &kv_cache_; }
     KVCache& kv_cache_ref() { return kv_cache_; }
     const KVCache& kv_cache_ref() const { return kv_cache_; }
+
+    KVMemory* kv_memory() override { return kv_memory_.get(); }
+    const KVMemory* kv_memory() const override { return kv_memory_.get(); }
 
     // InferenceContext 通过此入口在首次 forward 之前完成 KV cache 分配,
     // 使 CLI/bindings 可以在推理前读取 cache 统计信息。
@@ -88,6 +92,7 @@ protected:
     // Memory 由 InferenceContext 持有, engine 只引用。
     InferenceMemory& memory_;
     KVCache& kv_cache_;
+    std::unique_ptr<KVMemory> kv_memory_;
     ModelWeights weights_;
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
     MemoryPool workspace_pool_;

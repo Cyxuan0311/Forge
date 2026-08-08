@@ -17,6 +17,7 @@ namespace forge {
 class Model;
 class InferenceContext;
 class KVCache;
+class KVMemory;
 
 class InferenceEngine {
 public:
@@ -42,11 +43,15 @@ public:
     virtual void set_gpu_layers(int layers) { (void)layers; }
     virtual int gpu_layers() const { return -1; }
 
-    // Access the engine's KV cache (returns nullptr if not available).
-    // The cache itself is owned by InferenceContext; this is a forwarding
-    // accessor kept for scheduler / generator / bindings compatibility.
+    // Access the engine's KV cache (for attention_executor / memory_stats).
+    // The cache itself is owned by InferenceContext; this is a forwarding accessor.
     virtual KVCache* kv_cache() { return nullptr; }
     virtual const KVCache* kv_cache() const { return nullptr; }
+
+    // Access the engine's KV memory (unified interface for scheduler).
+    // Returns nullptr if not available.
+    virtual KVMemory* kv_memory() { return nullptr; }
+    virtual const KVMemory* kv_memory() const { return nullptr; }
 
     // Allocate the engine's runtime memory (KV cache and, later, recurrent
     // state) if it has not been allocated yet. InferenceContext calls this so

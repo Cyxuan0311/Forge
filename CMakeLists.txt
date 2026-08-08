@@ -181,7 +181,10 @@ add_library(
   src/core/memory_planner.cpp
   src/core/compute_graph.cpp
   src/debug/logger.cpp
-  src/inference/kv_cache.cpp)
+  src/inference/kv_cache.cpp
+  src/inference/kv_memory.cpp
+  src/inference/kv_storage.cpp
+  src/inference/prefix_cache.cpp)
 target_include_directories(
   forge_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CUDAToolkit_INCLUDE_DIRS}
@@ -323,6 +326,25 @@ if(CUDAToolkit_FOUND)
                CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}")
 endif()
 
+# ---- forge-inspect (GGUF introspection tool) ----
+add_library(
+  forge_inspect STATIC
+  src/inspect/perf/gguf_scanner.cpp src/inspect/color.cpp
+  src/inspect/arch_ops.cpp src/inspect/meta_groups.cpp src/inspect/report.cpp
+  src/inspect/format.cpp)
+target_include_directories(
+  forge_inspect PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                       ${CMAKE_CURRENT_SOURCE_DIR}/src/inspect)
+target_link_libraries(forge_inspect PUBLIC forge_model forge_core forge_ops
+                                           forge_infer)
+
+add_executable(forge-inspect src/inspect/main.cpp)
+target_include_directories(
+  forge-inspect PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                        ${CMAKE_CURRENT_SOURCE_DIR}/src/inspect)
+target_link_libraries(forge-inspect PRIVATE forge_inspect forge_model
+                                            forge_core forge_ops forge_infer)
+
 # ---- Python bindings ----
 if(FORGE_BUILD_PYTHON)
   pybind11_add_module(
@@ -358,4 +380,14 @@ if(FORGE_BUILD_PYTHON)
                  CUDA_RESOLVE_DEVICE_SYMBOLS ON
                  CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}")
   endif()
+
+  # Copy tools/python/forge_llm.py to build directory alongside forge.so
+  add_custom_command(
+    TARGET forge
+    POST_BUILD
+    COMMAND
+      ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/tools/python/forge_llm.py"
+      "$<TARGET_FILE_DIR:forge>/forge_llm.py"
+    COMMENT "Copying forge_llm.py to build dir")
 endif()

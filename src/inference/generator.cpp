@@ -76,7 +76,9 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     sampler_.set_config(sampler_cfg);
     sampler_.clear_history();
 
-    ctx_.reset_kv_cache();
+    if (config.reset_kv_cache) {
+        ctx_.reset_kv_cache();
+    }
 
     int prompt_len = static_cast<int>(prompt_tokens.size());
 

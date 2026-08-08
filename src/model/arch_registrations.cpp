@@ -31,6 +31,10 @@ namespace forge {
 // in shared library builds.
 volatile bool _arch_registrations_linked = true;
 
+void force_link_arch_registrations() {
+    _arch_registrations_linked = true;
+}
+
 // ============================================================================
 // Helper: GenericEngine creator lambda (reused by most GQA architectures)
 // ============================================================================
