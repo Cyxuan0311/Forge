@@ -180,42 +180,48 @@ static void fp32_to_fp16_batch_simd(const float* src, uint16_t* dst, int n) {
 #endif  // USE_NEON
 
 #ifdef USE_VSX
-// VSX software fp16 batch conversion: processes 4 elements at a time using
+// VSX software fp16 batch conversion: processes 8 elements at a time using
 // 128-bit vector integer bit manipulation. POWER8+ has no hardware F16C;
 // subnormal fp16 inputs are treated as zero (acceptable for NN KV cache).
+static __vector unsigned int vsx_half_to_float4(__vector unsigned int h) {
+    __vector unsigned int shift16 = vec_splats(16U);
+    __vector unsigned int shift10 = vec_splats(10U);
+    __vector unsigned int shift23 = vec_splats(23U);
+    __vector unsigned int shift13 = vec_splats(13U);
+
+    __vector unsigned int sign = vec_sl(
+        vec_and(h, vec_splats(0x8000U)), shift16);
+    __vector unsigned int mant = vec_and(h, vec_splats(0x03FFU));
+    __vector unsigned int exp  = vec_sr(
+        vec_and(h, vec_splats(0x7C00U)), shift10);
+
+    __vector unsigned int biased_exp = vec_add(exp, vec_splats(112U));
+    __vector unsigned int is_inf_nan =
+        (__vector unsigned int)vec_cmpeq(exp, vec_splats(0x1FU));
+
+    __vector unsigned int norm_f32 = vec_or(sign,
+        vec_or(vec_sl(biased_exp, shift23),
+               vec_sl(mant, shift13)));
+    __vector unsigned int inf_f32  = vec_or(sign,
+        vec_or(vec_sl(vec_splats(0xFFU), shift23),
+               vec_sl(mant, shift13)));
+
+    return vec_sel(norm_f32, inf_f32, is_inf_nan);
+}
+
 static void fp16_to_fp32_batch_simd(const uint16_t* src, float* dst, int n) {
     int i = 0;
-    for (; i + 4 <= n; i += 4) {
+    for (; i + 8 <= n; i += 8) {
         __vector unsigned short hv = vec_xl(0,
             (const unsigned short*)(src + i));
-        __vector unsigned int   h  =
-            (__vector unsigned int)vec_unpackl(hv);
-
-        __vector unsigned int shift16 = vec_splats(16U);
-        __vector unsigned int shift10 = vec_splats(10U);
-        __vector unsigned int shift23 = vec_splats(23U);
-        __vector unsigned int shift13 = vec_splats(13U);
-
-        __vector unsigned int sign = vec_sl(
-            vec_and(h, vec_splats(0x8000U)), shift16);
-        __vector unsigned int mant = vec_and(h, vec_splats(0x03FFU));
-        __vector unsigned int exp  = vec_sr(
-            vec_and(h, vec_splats(0x7C00U)), shift10);
-
-        __vector unsigned int biased_exp = vec_add(exp, vec_splats(112U));
-        __vector unsigned int is_inf_nan =
-            (__vector unsigned int)vec_cmpeq(exp, vec_splats(0x1FU));
-
-        __vector unsigned int norm_f32 = vec_or(sign,
-            vec_or(vec_sl(biased_exp, shift23),
-                   vec_sl(mant, shift13)));
-        __vector unsigned int inf_f32  = vec_or(sign,
-            vec_or(vec_sl(vec_splats(0xFFU), shift23),
-                   vec_sl(mant, shift13)));
-
-        __vector unsigned int f32 =
-            vec_sel(norm_f32, inf_f32, is_inf_nan);
-        vec_xst((__vector float)f32, 0, dst + i);
+        __vector unsigned int h_lo = vec_and(
+            (__vector unsigned int)vec_unpackl((__vector signed short)hv),
+            vec_splats(0x0000FFFFU));
+        __vector unsigned int h_hi = vec_and(
+            (__vector unsigned int)vec_unpackh((__vector signed short)hv),
+            vec_splats(0x0000FFFFU));
+        vec_xst((__vector float)vsx_half_to_float4(h_hi), 0, dst + i);
+        vec_xst((__vector float)vsx_half_to_float4(h_lo), 0, dst + i + 4);
     }
     for (; i < n; ++i) {
         dst[i] = fp16_to_fp32(src[i]);
@@ -1304,12 +1310,12 @@ void KVCache::dequantize_layer(int layer) {
         }
         if (kv.key_store.device == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cudaMemcpy(kv.key_store.tensor->data() + start * kv_dim,
+            cudaMemcpy(static_cast<float*>(kv.key_store.tensor->data()) + start * kv_dim,
                        h_out.data(), new_rows * kv_dim * sizeof(float),
                        cudaMemcpyHostToDevice);
 #endif
         } else {
-            std::memcpy(kv.key_store.tensor->data() + start * kv_dim,
+            std::memcpy(static_cast<float*>(kv.key_store.tensor->data()) + start * kv_dim,
                         h_out.data(), new_rows * kv_dim * sizeof(float));
         }
     }
@@ -1323,12 +1329,12 @@ void KVCache::dequantize_layer(int layer) {
         }
         if (kv.value_store.device == DeviceType::CUDA) {
 #ifdef USE_CUDA
-            cudaMemcpy(kv.value_store.tensor->data() + start * kv_dim,
+            cudaMemcpy(static_cast<float*>(kv.value_store.tensor->data()) + start * kv_dim,
                        h_out.data(), new_rows * kv_dim * sizeof(float),
                        cudaMemcpyHostToDevice);
 #endif
         } else {
-            std::memcpy(kv.value_store.tensor->data() + start * kv_dim,
+            std::memcpy(static_cast<float*>(kv.value_store.tensor->data()) + start * kv_dim,
                         h_out.data(), new_rows * kv_dim * sizeof(float));
         }
     }
