@@ -107,8 +107,11 @@ class TestGraphModeAPI:
         ctx = model.create_context()
         ctx.set_use_graph(True)
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = model.generate(prompt, max_new_tokens=5, do_sample=False)
-        assert result["num_generated_tokens"] >= 1
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
 
     def test_graph_mode_deterministic(self, model_path, model_config):
         model = forge.Model()
@@ -192,10 +195,12 @@ class TestGraphModeTinyLlama:
         model = forge.Model()
         model.load_auto(TINYLLAMA_Q4_PATH, device="cpu")
         prompt = np.array([1, 450, 4996, 29901], dtype=np.int32)
-        result = model.generate(
-            prompt, max_new_tokens=10, do_sample=False, gpu_layers=0, kv_cache_dtype="fp32"
-        )
-        assert result["num_generated_tokens"] >= 1
+        ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=0)
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
 
 
 # ---- Phase 10: CUDA Graph tests ----

@@ -168,57 +168,92 @@ class TestModelConfigEnums:
 class TestGenerate:
     def test_generate_basic(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = loaded_model.generate(prompt, max_new_tokens=5, do_sample=False)
-        assert "token_ids" in result
-        assert "num_prompt_tokens" in result
-        assert "num_generated_tokens" in result
-        assert "finished" in result
-        assert "finish_reason" in result
-        assert result["num_prompt_tokens"] == 3
-        assert result["num_generated_tokens"] <= 5
-        assert result["num_generated_tokens"] >= 1
-        assert result["finished"] is True
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        assert hasattr(result, "token_ids")
+        assert hasattr(result, "num_prompt_tokens")
+        assert hasattr(result, "num_generated_tokens")
+        assert hasattr(result, "finished")
+        assert hasattr(result, "finish_reason")
+        assert result.num_prompt_tokens == 3
+        assert result.num_generated_tokens <= 5
+        assert result.num_generated_tokens >= 1
+        assert result.finished is True
 
     def test_generate_greedy_deterministic(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result1 = loaded_model.generate(prompt, max_new_tokens=10, do_sample=False)
-        result2 = loaded_model.generate(prompt, max_new_tokens=10, do_sample=False)
-        assert list(result1["token_ids"]) == list(result2["token_ids"])
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.do_sample = False
+        result1 = ctx.generate(prompt, cfg)
+        result2 = ctx.generate(prompt, cfg)
+        assert list(result1.token_ids) == list(result2.token_ids)
 
     def test_generate_with_temperature(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = loaded_model.generate(
-            prompt, max_new_tokens=5, temperature=0.8, do_sample=True, seed=42
-        )
-        assert result["num_generated_tokens"] >= 1
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.temperature = 0.8
+        cfg.do_sample = True
+        cfg.seed = 42
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
 
     def test_generate_max_tokens_limit(self, loaded_model):
         prompt = np.array([1, 2], dtype=np.int32)
-        result = loaded_model.generate(prompt, max_new_tokens=3, do_sample=False)
-        assert result["num_generated_tokens"] <= 3
-        assert result["finish_reason"] == "length"
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 3
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens <= 3
+        assert result.finish_reason == "length"
 
     def test_generate_single_token_prompt(self, loaded_model):
         prompt = np.array([5], dtype=np.int32)
-        result = loaded_model.generate(prompt, max_new_tokens=4, do_sample=False)
-        assert result["num_prompt_tokens"] == 1
-        assert result["num_generated_tokens"] >= 1
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 4
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        assert result.num_prompt_tokens == 1
+        assert result.num_generated_tokens >= 1
 
     def test_generate_with_eos(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = loaded_model.generate(prompt, max_new_tokens=10, eos_token_id=5, do_sample=False)
-        assert result["finished"] is True
-        if result["finish_reason"] == "eos":
-            assert result["token_ids"][-1] == 5
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 10
+        cfg.eos_token_id = 5
+        cfg.do_sample = False
+        result = ctx.generate(prompt, cfg)
+        assert result.finished is True
+        if result.finish_reason == "eos":
+            assert result.token_ids[-1] == 5
 
     def test_generate_with_top_k(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = loaded_model.generate(prompt, max_new_tokens=5, top_k=10, do_sample=True, seed=123)
-        assert result["num_generated_tokens"] >= 1
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.top_k = 10
+        cfg.do_sample = True
+        cfg.seed = 123
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
 
     def test_generate_with_top_p(self, loaded_model):
         prompt = np.array([1, 2, 3], dtype=np.int32)
-        result = loaded_model.generate(
-            prompt, max_new_tokens=5, top_p=0.9, do_sample=True, seed=456
-        )
-        assert result["num_generated_tokens"] >= 1
+        ctx = loaded_model.create_context()
+        cfg = forge.GenerationConfig()
+        cfg.max_new_tokens = 5
+        cfg.top_p = 0.9
+        cfg.do_sample = True
+        cfg.seed = 456
+        result = ctx.generate(prompt, cfg)
+        assert result.num_generated_tokens >= 1
