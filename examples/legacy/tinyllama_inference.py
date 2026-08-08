@@ -39,7 +39,8 @@ from chat_utils import (
 )
 
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Moved to legacy/ — one extra dirname to reach project root
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODELS_DIR = os.path.join(PROJECT_DIR, "models")
 GGUF_MODEL_PATH = os.path.join(MODELS_DIR, "tinyllama-1.1b-chat-v1.0.Q4_0.gguf")
 TOKENIZER_DIR = os.path.join(MODELS_DIR, "tinyllama-tokenizer")

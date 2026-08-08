@@ -38,6 +38,10 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
 TEMPERATURE="${TEMPERATURE:-0}"
 TIMEOUT="${TIMEOUT:-600}"
 
+# Ensure forge (C++) and forge_llm (python) can be imported, and legacy scripts
+# can still find chat_utils.py in examples/.
+export PYTHONPATH="${PROJECT_DIR}/build:${PROJECT_DIR}/examples${PYTHONPATH:+:${PYTHONPATH}}"
+
 RUN_CPU=1
 RUN_GPU=1
 SELECTED=()
@@ -52,19 +56,20 @@ fi
 
 # Test registry: "key|script_file|model_env_var|extra_args"
 # key           - short name used for CLI selection
-# script_file   - filename under examples/
+# script_file   - path relative to project root
 # model_env_var - env var name that (if set) supplies --model-path
 # extra_args    - additional args always passed to the script
 TESTS=(
-    "tinyllama|tinyllama_inference.py|TINYLLAMA_MODEL|"
-    "qwen|qwen_inference.py|QWEN_MODEL|"
-    "llama3|llama3_inference.py|LLAMA3_MODEL|"
-    "deepseek|deepseek_r1_inference.py|DEEPSEEK_MODEL|"
-    "mimo|mimo_inference.py|MIMO_MODEL|"
-    "gemma4|gemma4_inference.py|GEMMA4_MODEL|"
-    "minicpmv|minicpmv_cli_inference.py|MINICPMV_MODEL|"
-    "qwen3vl|qwen3vl_inference.py|QWEN3VL_MODEL|"
-    "phimoe|phi_mini_moe_inference.py|PHIMOE_MODEL|"
+    # ---- Legacy scripts (kept for compatibility) ----
+    "tinyllama|examples/legacy/tinyllama_inference.py|TINYLLAMA_MODEL|"
+    "qwen|examples/legacy/qwen_inference.py|QWEN_MODEL|"
+    "llama3|examples/legacy/llama3_inference.py|LLAMA3_MODEL|"
+    "deepseek|examples/legacy/deepseek_r1_inference.py|DEEPSEEK_MODEL|"
+    "mimo|examples/legacy/mimo_inference.py|MIMO_MODEL|"
+    "gemma4|examples/legacy/gemma4_inference.py|GEMMA4_MODEL|"
+    "minicpmv|examples/legacy/minicpmv_cli_inference.py|MINICPMV_MODEL|"
+    "qwen3vl|examples/legacy/qwen3vl_inference.py|QWEN3VL_MODEL|"
+    "phimoe|examples/legacy/phi_mini_moe_inference.py|PHIMOE_MODEL|"
 )
 
 usage() {
@@ -129,7 +134,7 @@ run_one() {
     local out
     # shellcheck disable=SC2086
     out="$(printf '%s\n/quit\n' "$PROMPT" | timeout "$TIMEOUT" \
-        "$PYTHON" "examples/${script}" \
+        "$PYTHON" "${script}" \
         $dev_args $model_args \
         --temperature "$TEMPERATURE" \
         --max-new-tokens "$MAX_NEW_TOKENS" $extra 2>&1)"

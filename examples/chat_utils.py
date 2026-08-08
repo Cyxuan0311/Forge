@@ -257,7 +257,8 @@ def generate_streaming(
 
     Args:
         model: Forge Model instance.
-        ctx: Forge Context instance (not used directly, kept for API compat).
+        ctx: Forge InferenceContext instance (used when provided; falls back to
+             model.generate_stream when ctx is None).
         tokenizer: Forge Tokenizer instance.
         input_ids: List of prompt token IDs.
         max_new_tokens: Maximum tokens to generate.
@@ -266,8 +267,8 @@ def generate_streaming(
         top_p: Top-P sampling parameter.
         repeat_penalty: Repetition penalty.
         eos_token_id: End-of-sequence token ID.
-        kv_cache_dtype: KV cache data type.
-        gpu_layers: Number of GPU layers.
+        kv_cache_dtype: KV cache data type (ignored when ctx is provided).
+        gpu_layers: Number of GPU layers (ignored when ctx is provided).
         stop_token_ids: Additional stop token IDs (e.g., Gemma4 turn-end).
 
     Returns:
@@ -312,23 +313,37 @@ def generate_streaming(
     if profiling_enabled:
         perf.start("generate_stream/total")
 
-    np_ids = np.array(input_ids, dtype=np.int32)
-    gen_kwargs = dict(
-        prompt_ids=np_ids,
-        callback=on_token,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        repeat_penalty=repeat_penalty,
-        do_sample=temperature > 0,
-        eos_token_id=eos_token_id,
-        kv_cache_dtype=kv_cache_dtype,
-        gpu_layers=gpu_layers,
-    )
-    if stop_token_ids:
-        gen_kwargs["stop_token_ids"] = stop_token_ids
-    model.generate_stream(**gen_kwargs)
+    # Phase 2: use ctx when provided (context reuse), fallback to model for compat
+    if ctx is not None:
+        gen_cfg = forge.GenerationConfig()
+        gen_cfg.max_new_tokens = max_new_tokens
+        gen_cfg.temperature = temperature
+        gen_cfg.top_k = top_k
+        gen_cfg.top_p = top_p
+        gen_cfg.repeat_penalty = repeat_penalty
+        gen_cfg.do_sample = temperature > 0
+        gen_cfg.eos_token_id = eos_token_id
+        if stop_token_ids:
+            gen_cfg.stop_token_ids = stop_token_ids
+        ctx.generate_stream_kv(input_ids, gen_cfg, on_token)
+    else:
+        np_ids = np.array(input_ids, dtype=np.int32)
+        gen_kwargs = dict(
+            prompt_ids=np_ids,
+            callback=on_token,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repeat_penalty=repeat_penalty,
+            do_sample=temperature > 0,
+            eos_token_id=eos_token_id,
+            kv_cache_dtype=kv_cache_dtype,
+            gpu_layers=gpu_layers,
+        )
+        if stop_token_ids:
+            gen_kwargs["stop_token_ids"] = stop_token_ids
+        model.generate_stream(**gen_kwargs)
 
     if profiling_enabled:
         perf.stop("generate_stream/total")
@@ -354,6 +369,7 @@ def generate_batch(
     model,
     tokenizer,
     input_ids,
+    ctx=None,
     max_new_tokens=256,
     temperature=0.7,
     top_k=40,
@@ -365,6 +381,10 @@ def generate_batch(
     stop_token_ids=None,
 ):
     """Batch-generate tokens (non-streaming).
+
+    Args:
+        ctx: If provided, uses ctx.generate_kv() for context reuse.
+             Falls back to model.generate() when None.
 
     Returns:
         (num_generated, elapsed_seconds)
@@ -378,29 +398,41 @@ def generate_batch(
         perf.start("generate/total")
 
     start_time = time.time()
-    np_ids = np.array(input_ids, dtype=np.int32)
-    gen_kwargs = dict(
-        prompt_ids=np_ids,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        repeat_penalty=repeat_penalty,
-        do_sample=temperature > 0,
-        eos_token_id=eos_token_id,
-        kv_cache_dtype=kv_cache_dtype,
-        gpu_layers=gpu_layers,
-    )
-    if stop_token_ids:
-        gen_kwargs["stop_token_ids"] = stop_token_ids
-    result = model.generate(**gen_kwargs)
+
+    if ctx is not None:
+        gen_cfg = forge.GenerationConfig()
+        gen_cfg.max_new_tokens = max_new_tokens
+        gen_cfg.temperature = temperature
+        gen_cfg.top_k = top_k
+        gen_cfg.top_p = top_p
+        gen_cfg.repeat_penalty = repeat_penalty
+        gen_cfg.do_sample = temperature > 0
+        gen_cfg.eos_token_id = eos_token_id
+        if stop_token_ids:
+            gen_cfg.stop_token_ids = stop_token_ids
+        result = ctx.generate_kv(input_ids, gen_cfg)
+        num_generated = result.num_generated_tokens
+        new_tokens = list(result.token_ids)
+    else:
+        np_ids = np.array(input_ids, dtype=np.int32)
+        gen_kwargs = dict(
+            prompt_ids=np_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repeat_penalty=repeat_penalty,
+            do_sample=temperature > 0,
+            eos_token_id=eos_token_id,
+            kv_cache_dtype=kv_cache_dtype,
+            gpu_layers=gpu_layers,
+        )
+        if stop_token_ids:
+            gen_kwargs["stop_token_ids"] = stop_token_ids
+        result = model.generate(**gen_kwargs)
+        num_generated = result["num_generated_tokens"]
+        new_tokens = list(result["token_ids"])
     elapsed = time.time() - start_time
-
-    if profiling_enabled:
-        perf.stop("generate/total")
-
-    num_generated = result["num_generated_tokens"]
-    new_tokens = list(result["token_ids"])
 
     if profiling_enabled:
         perf.start("decode/tokenize")
@@ -444,7 +476,10 @@ def interactive_chat(
     global profiling_enabled
 
     conversation = [system_msg] if system_msg else []
-    ctx = None
+    ctx = model.create_context(
+        kv_cache_dtype=getattr(args, "kv_cache_dtype", "fp32"),
+        gpu_layers=getattr(args, "gpu_layers", -1),
+    )
 
     print("\n" + "=" * 60)
     print(f"  {model_name} Interactive Chat (Forge)")
@@ -471,6 +506,7 @@ def interactive_chat(
             break
         elif user_input == "/clear":
             conversation = [system_msg] if system_msg else []
+            ctx.reset_kv()
             perf.reset()
             print("[Conversation cleared]\n")
             continue
@@ -518,7 +554,7 @@ def interactive_chat(
 
         if getattr(args, "no_stream", False):
             num_generated, elapsed = generate_batch(
-                model, tokenizer, input_ids,
+                model, tokenizer, input_ids, ctx=ctx,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
@@ -533,13 +569,6 @@ def interactive_chat(
                 list(range(num_generated)), skip_special=True, strip_leading_space=False
             ) if num_generated == 0 else ""
         else:
-            if ctx is not None:
-                del ctx
-                gc.collect()
-            ctx = model.create_context(
-                kv_cache_dtype=args.kv_cache_dtype,
-                gpu_layers=args.gpu_layers,
-            )
             generated_tokens, elapsed = generate_streaming(
                 model, ctx, tokenizer, input_ids,
                 max_new_tokens=args.max_new_tokens,
