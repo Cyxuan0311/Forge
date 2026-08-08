@@ -41,6 +41,7 @@ if(CUDAToolkit_FOUND)
             cuda/cuda_quant.cu
             cuda/cuda_gemm.cu
             cuda/cuda_fused_attn.cu
+            cuda/cuda_paged_kv.cu
             cuda/cuda_logit_softcap.cu
             cuda/cuda_moe.cu
             cuda/cuda_sampler.cu
