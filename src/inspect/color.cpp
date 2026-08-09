@@ -4,7 +4,7 @@
 
 #ifdef _WIN32
 #include <io.h>
-#define ISATTY(fd) _isatty(_fileno(fd))
+#define ISATTY(fd) _isatty(fd)
 #else
 #include <unistd.h>
 #define ISATTY(fd) isatty(fd)

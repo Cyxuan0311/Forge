@@ -6,7 +6,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <windows.h>
+#undef NOMINMAX
 #endif
 
 #include "arch_ops.h"

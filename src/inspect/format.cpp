@@ -5,7 +5,9 @@
 #include <cstdlib>
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <windows.h>
+#undef NOMINMAX
 #else
 #include <sys/ioctl.h>
 #include <unistd.h>
