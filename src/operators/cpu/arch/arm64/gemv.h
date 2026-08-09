@@ -18,68 +18,75 @@ namespace cpu {
 // ---- FP32 GEMV: out[n] = sum_k(a[k] * w[n][k]) ----
 // NR=4 row-level unrolling. Each iteration processes 4 output rows,
 // dotting a[K] with 4 rows of w concurrently via NEON fma.
+// Supports both M=1 (decode) and M>1 (prefill / batched) by looping over
+// the M dimension; each output row group is written independently.
 static inline void gemv_fp32_transB_neon(const float* a, const float* b,
                                           float* out, int M, int K, int N) {
-    // M=1 decode path only
-    const int NR = 4;
-    int n = 0;
-    for (; n + NR - 1 < N; n += NR) {
-        float32x4_t acc0 = vdupq_n_f32(0.0f);
-        float32x4_t acc1 = vdupq_n_f32(0.0f);
-        float32x4_t acc2 = vdupq_n_f32(0.0f);
-        float32x4_t acc3 = vdupq_n_f32(0.0f);
+    // M=1 decode fast path
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        const int NR = 4;
+        int n = 0;
+        for (; n + NR - 1 < N; n += NR) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
 
-        int k = 0;
-        for (; k + 3 < K; k += 4) {
-            float32x4_t av = vld1q_f32(a + k);
-            acc0 = vmlaq_f32(acc0, av, vld1q_f32(b + n * K + k));
-            acc1 = vmlaq_f32(acc1, av, vld1q_f32(b + (n+1) * K + k));
-            acc2 = vmlaq_f32(acc2, av, vld1q_f32(b + (n+2) * K + k));
-            acc3 = vmlaq_f32(acc3, av, vld1q_f32(b + (n+3) * K + k));
+            int k = 0;
+            for (; k + 3 < K; k += 4) {
+                float32x4_t av = vld1q_f32(a_row + k);
+                acc0 = vmlaq_f32(acc0, av, vld1q_f32(b + (size_t)n * K + k));
+                acc1 = vmlaq_f32(acc1, av, vld1q_f32(b + (size_t)(n+1) * K + k));
+                acc2 = vmlaq_f32(acc2, av, vld1q_f32(b + (size_t)(n+2) * K + k));
+                acc3 = vmlaq_f32(acc3, av, vld1q_f32(b + (size_t)(n+3) * K + k));
+            }
+            // Scalar tail
+            float sum0 = vaddvq_f32(acc0);
+            float sum1 = vaddvq_f32(acc1);
+            float sum2 = vaddvq_f32(acc2);
+            float sum3 = vaddvq_f32(acc3);
+            for (; k < K; ++k) {
+                float ak = a_row[k];
+                sum0 += ak * b[(size_t)n * K + k];
+                sum1 += ak * b[(size_t)(n+1) * K + k];
+                sum2 += ak * b[(size_t)(n+2) * K + k];
+                sum3 += ak * b[(size_t)(n+3) * K + k];
+            }
+            o_row[n]   = sum0;
+            o_row[n+1] = sum1;
+            o_row[n+2] = sum2;
+            o_row[n+3] = sum3;
         }
-        // Scalar tail
-        float sum0 = vaddvq_f32(acc0);
-        float sum1 = vaddvq_f32(acc1);
-        float sum2 = vaddvq_f32(acc2);
-        float sum3 = vaddvq_f32(acc3);
-        for (; k < K; ++k) {
-            float ak = a[k];
-            sum0 += ak * b[n * K + k];
-            sum1 += ak * b[(n+1) * K + k];
-            sum2 += ak * b[(n+2) * K + k];
-            sum3 += ak * b[(n+3) * K + k];
+        // Remaining rows
+        for (; n < N; ++n) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 7 < K; k += 8) {
+                float32x4_t a0 = vld1q_f32(a_row + k);
+                float32x4_t a1 = vld1q_f32(a_row + k + 4);
+                acc0 = vmlaq_f32(acc0, a0, vld1q_f32(b + (size_t)n * K + k));
+                acc1 = vmlaq_f32(acc1, a1, vld1q_f32(b + (size_t)n * K + k + 4));
+            }
+            for (; k + 3 < K; k += 4) {
+                acc0 = vmlaq_f32(acc0, vld1q_f32(a_row + k), vld1q_f32(b + (size_t)n * K + k));
+            }
+            float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+            for (; k < K; ++k) sum += a_row[k] * b[(size_t)n * K + k];
+            o_row[n] = sum;
         }
-        out[n]   = sum0;
-        out[n+1] = sum1;
-        out[n+2] = sum2;
-        out[n+3] = sum3;
-    }
-    // Remaining rows
-    for (; n < N; ++n) {
-        float32x4_t acc0 = vdupq_n_f32(0.0f);
-        float32x4_t acc1 = vdupq_n_f32(0.0f);
-        int k = 0;
-        for (; k + 7 < K; k += 8) {
-            float32x4_t a0 = vld1q_f32(a + k);
-            float32x4_t a1 = vld1q_f32(a + k + 4);
-            acc0 = vmlaq_f32(acc0, a0, vld1q_f32(b + n * K + k));
-            acc1 = vmlaq_f32(acc1, a1, vld1q_f32(b + n * K + k + 4));
-        }
-        for (; k + 3 < K; k += 4) {
-            acc0 = vmlaq_f32(acc0, vld1q_f32(a + k), vld1q_f32(b + n * K + k));
-        }
-        float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
-        for (; k < K; ++k) sum += a[k] * b[n * K + k];
-        out[n] = sum;
     }
 }
 
 // block_q8_0_act and quantize_row_q8_0_act are defined in vec_dot.h.
 // This file provides its own inline GEMV implementations that call them.
 
-// ---- Q4_0 GEMV: quantize a once, then dot product with all weight rows ----
+// ---- Q4_0 GEMV: quantize a once per row, then dot product with all weight rows ----
 // Q4_0 block = 18 bytes: d[2](fp16) + qs[16](32 nibbles).
 // K is the total activation dimension, must equal N * 32 * nb.
+// Supports both M=1 (decode) and M>1 (prefill) by looping over M.
 static inline void gemv_q4_0_transB_neon(const float* a, const uint8_t* w,
                                           float* out, int M, int K, int N) {
     const int QK = 32;
@@ -87,11 +94,15 @@ static inline void gemv_q4_0_transB_neon(const float* a, const uint8_t* w,
     int nb = K / QK;
     int blocks_per_row = nb;
 
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+
     // Quantize activation to Q8_0_act blocks
     // Using stack for small-activation decode case (common: K <= 4096 → 128 blocks)
     // For prefill (M large), caller should use gemm path instead.
     std::vector<block_q8_0_act> q8_act(blocks_per_row);
-    quantize_row_q8_0_act(a, q8_act.data(), K);
+    quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     const int NR = 4;
     int n = 0;
@@ -119,9 +130,9 @@ static inline void gemv_q4_0_transB_neon(const float* a, const uint8_t* w,
                 { // fp16 to fp32 inline
                     uint32_t s = (ws >> 15) & 1;
                     uint32_t e = (ws >> 10) & 0x1F;
-                    uint32_t m = ws & 0x3FF;
-                    if (e == 0) scale_w = std::ldexp((float)m / 1024.0f, -14);
-                    else scale_w = std::ldexp(1.0f + (float)m / 1024.0f, (int)e - 15);
+                    uint32_t mw = ws & 0x3FF;
+                    if (e == 0) scale_w = std::ldexp((float)mw / 1024.0f, -14);
+                    else scale_w = std::ldexp(1.0f + (float)mw / 1024.0f, (int)e - 15);
                     if (s) scale_w = -scale_w;
                 }
                 float scale = scale_w * scale_a;
@@ -164,7 +175,7 @@ static inline void gemv_q4_0_transB_neon(const float* a, const uint8_t* w,
             }
             acc = vaddq_f32(acc, vld1q_f32(row_sum));
         }
-        vst1q_f32(out + n, acc);
+        vst1q_f32(o_row + n, acc);
     }
     // Remaining rows
     for (; n < N; ++n) {
@@ -177,9 +188,9 @@ static inline void gemv_q4_0_transB_neon(const float* a, const uint8_t* w,
             {
                 uint32_t s = (ws >> 15) & 1;
                 uint32_t e = (ws >> 10) & 0x1F;
-                uint32_t m = ws & 0x3FF;
-                if (e == 0) scale_w = std::ldexp((float)m / 1024.0f, -14);
-                else scale_w = std::ldexp(1.0f + (float)m / 1024.0f, (int)e - 15);
+                uint32_t mw = ws & 0x3FF;
+                if (e == 0) scale_w = std::ldexp((float)mw / 1024.0f, -14);
+                else scale_w = std::ldexp(1.0f + (float)mw / 1024.0f, (int)e - 15);
                 if (s) scale_w = -scale_w;
             }
             float scale = scale_w * q8_act[bi].d;
@@ -220,12 +231,14 @@ static inline void gemv_q4_0_transB_neon(const float* a, const uint8_t* w,
 #endif
             sum += scale * (float)dot_i32;
         }
-        out[n] = sum;
+        o_row[n] = sum;
     }
+    }  // end M loop
 }
 
 // ---- Q8_0 GEMV: same pattern as Q4_0 but simpler (no nibble expansion) ----
 // Q8_0 block = 34 bytes: d[2](fp16) + qs[32](signed int8)
+// Supports both M=1 (decode) and M>1 (prefill) by looping over M.
 static inline void gemv_q8_0_transB_neon(const float* a, const uint8_t* w,
                                           float* out, int M, int K, int N) {
     const int QK = 32;
@@ -233,8 +246,12 @@ static inline void gemv_q8_0_transB_neon(const float* a, const uint8_t* w,
     int nb = K / QK;
     int blocks_per_row = nb;
 
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+
     std::vector<block_q8_0_act> q8_act(blocks_per_row);
-    quantize_row_q8_0_act(a, q8_act.data(), K);
+    quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     int n = 0;
     for (; n < N; ++n) {
@@ -247,9 +264,9 @@ static inline void gemv_q8_0_transB_neon(const float* a, const uint8_t* w,
             {
                 uint32_t sgn = (ws >> 15) & 1;
                 uint32_t e = (ws >> 10) & 0x1F;
-                uint32_t m = ws & 0x3FF;
-                if (e == 0) scale_w = std::ldexp((float)m / 1024.0f, -14);
-                else scale_w = std::ldexp(1.0f + (float)m / 1024.0f, (int)e - 15);
+                uint32_t mw = ws & 0x3FF;
+                if (e == 0) scale_w = std::ldexp((float)mw / 1024.0f, -14);
+                else scale_w = std::ldexp(1.0f + (float)mw / 1024.0f, (int)e - 15);
                 if (sgn) scale_w = -scale_w;
             }
             float scale = scale_w * q8_act[bi].d;
@@ -276,8 +293,9 @@ static inline void gemv_q8_0_transB_neon(const float* a, const uint8_t* w,
 #endif
             sum += scale * (float)dot_i32;
         }
-        out[n] = sum;
+        o_row[n] = sum;
     }
+    }  // end M loop
 }
 
 #endif // USE_NEON
