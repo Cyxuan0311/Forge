@@ -115,13 +115,14 @@ std::string trim(const std::string& s) {
 
 void print_logo() {
     std::cout << "\n";
-    std::cout << "  ______           _                \n";
-    std::cout << " |  ____|         | |               \n";
-    std::cout << " | |__   _ __   __| | ___  _ __ ___ \n";
-    std::cout << " |  __| | '_ \\ / _` |/ _ \\| '__/ __|\n";
-    std::cout << " | |____| | | | (_| | (_) | | | (__ \n";
-    std::cout << " |______|_| |_|\\__,_|\\___/|_|  \\___|\n";
-    std::cout << "                                    \n";
+    std::cout << "  ______                   \n";
+    std::cout << " |  ___|                  \n";
+    std::cout << " | |_ ___  _ __ __ _  ___ \n";
+    std::cout << " |  _/ _ \\| '__/ _` |/ _ \\ \n";
+    std::cout << " | || (_) | | | (_| |  __/ \n";
+    std::cout << " \\_| \\___/|_|  \\__, |\\___| \n";
+    std::cout << "                __/ |     \n";
+    std::cout << "               |___/      \n";
 }
 
 // ============================================================================
@@ -133,7 +134,7 @@ void print_model_info(const Model& model, const Tokenizer& tokenizer) {
 
     std::cout << "\n";
     std::cout << "╔══════════════════════════════════════════════════╗\n";
-    std::cout << "║            Forge - Model Info               ║\n";
+    std::cout << "║               Forge - Model Info                ║\n";
     std::cout << "╚══════════════════════════════════════════════════╝\n";
     std::cout << "\n";
 
@@ -246,7 +247,7 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
 
     std::cout << "\n";
     std::cout << "╔══════════════════════════════════════════════════╗\n";
-    std::cout << "║            Forge - Benchmark                ║\n";
+    std::cout << "║                Forge - Benchmark                 ║\n";
     std::cout << "╚══════════════════════════════════════════════════╝\n";
     std::cout << "\n";
 
