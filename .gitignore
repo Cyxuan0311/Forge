@@ -16,6 +16,9 @@ TOM_and_JERRY.mp4
 .mimocode/
 .trae/
 
+# Compiled test binaries (cross-compiled for QEMU)
+tests/arch/*/test_gemv_m_multi_row
+
 # Compiled objects
 *.o
 *.a
