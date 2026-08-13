@@ -505,9 +505,24 @@ public:
     Model() = default;
     ~Model() = default;
 
+    // Original overload: single device for all layers (backward compatible)
     bool load(const std::string& model_path, DeviceType device = DeviceType::CUDA);
+
+    // New overload: per-layer device placement via n_gpu_layers.
+    // n_gpu_layers < 0 = all layers on device; 0 = all CPU;
+    // n_gpu_layers > 0 = first N layers on CUDA, remainder on CPU.
+    bool load(const std::string& model_path, int n_gpu_layers);
+
+    // Explicit per-layer device vector (for future multi-GPU / tensor split)
+    bool load(const std::string& model_path, const std::vector<DeviceType>& layer_devices);
+
+    // Multi-GPU per-layer device vector with device_id (Phase 5)
+    bool load(const std::string& model_path, const std::vector<DeviceTarget>& layer_devices);
+
     bool load_with_config(const std::string& model_path, const ModelConfig& config,
                           DeviceType device = DeviceType::CUDA);
+    bool load_with_config(const std::string& model_path, const ModelConfig& config,
+                          const std::vector<DeviceType>& layer_devices);
 
     // Load vision/mmproj weights from a separate GGUF file (e.g., mmproj-model-f16.gguf)
     bool load_vision_weights(const std::string& mmproj_path, DeviceType device = DeviceType::CPU);
@@ -524,12 +539,23 @@ public:
     void set_device(DeviceType device);
     void set_quant_policy(const QuantPolicy& policy);
 
+    // Load mode: "mmap" (default), "mlock" (pin CPU weights in RAM), "mmap_mlock"
+    // Only affects CPU-side weights. Must be set before calling load().
+    void set_load_mode(const std::string& mode) { load_mode_ = mode; }
+    const std::string& load_mode() const { return load_mode_; }
+
+    // When true (default), token_embedding follows the first layer's device.
+    // When false, token_embedding stays on CPU during partial offload (aligns with llama.cpp).
+    void set_offload_embedding(bool v) { offload_embedding_ = v; }
+    bool offload_embedding() const { return offload_embedding_; }
+
     TensorPtr get_weight(const std::string& name) const;
 
     static std::string detect_format(const std::string& path);
 
 private:
-    bool load_from_loader(ModelLoader& loader, DeviceType device);
+    bool load_from_loader(ModelLoader& loader, const std::vector<DeviceType>& layer_devices);
+    bool load_from_loader(ModelLoader& loader, const std::vector<DeviceTarget>& layer_devices);
     ModelConfig parse_config_from_gguf(ModelLoader& loader);
     ModelConfig parse_config_from_ninf(ModelLoader& loader);
 
@@ -544,6 +570,9 @@ private:
     // Keep loader alive so mmap'd data remains valid for zero-copy tensors
     ModelLoaderPtr loader_;
     ModelLoaderPtr vision_loader_;  // For mmproj/vision weights
+
+    std::string load_mode_;        // "mmap" (default), "mlock", "mmap_mlock"
+    bool offload_embedding_ = true; // default: follow first layer device
 };
 
 }  // namespace forge

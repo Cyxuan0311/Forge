@@ -32,6 +32,29 @@ enum class DeviceType : uint32_t {
     CUDA = 1,
 };
 
+// DeviceTarget extends DeviceType with a GPU device index (0-based).
+// For CPU devices, device_id is ignored.
+// Used for multi-GPU layer splitting where different layers reside on
+// different GPUs. Backward-compatible: DeviceTarget::cuda(0) == legacy CUDA.
+struct DeviceTarget {
+    DeviceType type = DeviceType::CPU;
+    int device_id = 0;
+
+    bool operator==(const DeviceTarget& o) const {
+        return type == o.type && (type == DeviceType::CPU || device_id == o.device_id);
+    }
+    bool operator!=(const DeviceTarget& o) const { return !(*this == o); }
+
+    bool is_cuda() const { return type == DeviceType::CUDA; }
+    bool is_cpu() const  { return type == DeviceType::CPU; }
+
+    static DeviceTarget cpu() { return {DeviceType::CPU, 0}; }
+    static DeviceTarget cuda(int id = 0) { return {DeviceType::CUDA, id}; }
+
+    // Implicit conversion from DeviceType for backward compatibility
+    DeviceTarget(DeviceType dev = DeviceType::CPU, int id = 0) : type(dev), device_id(id) {}
+};
+
 }  // namespace forge
 
 // Include quant_traits.h after DataType enum is defined.

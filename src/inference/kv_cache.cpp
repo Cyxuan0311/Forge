@@ -1040,6 +1040,37 @@ void KVCache::set_layer_devices(const std::vector<DeviceType>& layer_devices) {
              std::to_string(layers_.size()) + " layers on CUDA");
 }
 
+void KVCache::set_layer_devices(const std::vector<DeviceTarget>& layer_devices) {
+    // Convert DeviceTarget → DeviceType for the internal layer_devices_ vector
+    std::vector<DeviceType> type_vec;
+    type_vec.reserve(layer_devices.size());
+    for (auto& dt : layer_devices) type_vec.push_back(dt.type);
+    set_layer_devices(type_vec);
+
+    // For multi-GPU: cudaSetDevice before each layer's allocation
+#ifdef USE_CUDA
+    for (int i = 0; i < static_cast<int>(layers_.size()) && i < static_cast<int>(layer_devices.size()); ++i) {
+        if (layer_devices[i].is_cuda()) {
+            cudaSetDevice(layer_devices[i].device_id);
+        }
+        auto& kv = layers_[i];
+        DeviceType target = layer_devices[i].type;
+
+        // Re-allocate quantized storage on the correct GPU
+        if (kv.key_store.device != target) {
+            size_t k_row_bytes = kv.key_store.row_bytes;
+            size_t v_row_bytes = kv.value_store.row_bytes;
+            int rows = kv.key_store.max_rows;
+            kv.key_store = KVCacheStorage();
+            kv.value_store = KVCacheStorage();
+            kv.key_store.alloc(kv_config_.type_k, target, rows, k_row_bytes);
+            kv.value_store.alloc(kv_config_.type_v, target, rows, v_row_bytes);
+            kv.dequantized_filled = 0;
+        }
+    }
+#endif
+}
+
 DeviceType KVCache::layer_device(int layer) const {
     if (layer_devices_.empty() || layer < 0 || layer >= static_cast<int>(layer_devices_.size()))
         return device_;

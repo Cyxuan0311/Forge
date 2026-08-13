@@ -24,11 +24,19 @@ static void print_usage(const char* prog) {
            "       --image PATH          Input image path (multimodal mode)\n"
            "\n"
            "Performance:\n"
-           "  -ngl,--n-gpu-layers N      GPU layers (default: -1=all, 0=CPU only)\n"
+           "  -ngl,--n-gpu-layers N      GPU layers (default: -1=auto=all, 0=CPU only, N=first N layers on GPU, \"auto\"/\"all\" supported)\n"
+           "                           Multi-GPU: -ngl N:M (e.g., -ngl 16:16 = GPU0:16 layers + GPU1:16 layers)\n"
+           "  -kvo,--kv-offload           Offload KV cache to GPU (default: on)\n"
+           "  -nkvo,--no-kv-offload        Keep KV cache on CPU (for long context + small VRAM)\n"
            "  -t,  --threads N           CPU threads (default: auto)\n"
            "  -b,  --batch-size N        Prompt processing batch size (default: 512)\n"
            "       --kv-cache-dtype TYPE KV cache dtype: fp32, q4_0 (default: fp32)\n"
            "       --cuda-graph          Enable CUDA Graph for decode (default: off)\n"
+           "\n"
+           "Memory:\n"
+           "       --load-mode MODE      Memory mapping mode: mmap (default), mlock, mmap_mlock\n"
+           "       --offload-embedding    Offload token_embedding to GPU (default: on)\n"
+           "       --no-offload-embedding Keep token_embedding on CPU during partial offload\n"
            "\n"
            "Sampling:\n"
            "       --temp FLOAT          Sampling temperature (default: 0.7, 0=greedy)\n"
@@ -117,7 +125,37 @@ CliArgs parse_args(int argc, char** argv) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.n_gpu_layers = std::stoi(argv[i]);
+            std::string val = argv[i];
+            if (val == "auto" || val == "-1") {
+                args.n_gpu_layers = -1;  // auto: all layers on GPU (llama.cpp auto default)
+            } else if (val == "all" || val == "-2") {
+                args.n_gpu_layers = -2;  // all: explicit all-on-GPU
+            } else {
+                // Check for multi-GPU syntax: N:M or N:M:K...
+                size_t colon_pos = val.find(':');
+                if (colon_pos != std::string::npos) {
+                    // Multi-GPU: parse "16:16" → [16, 16]
+                    size_t pos = 0;
+                    while (pos < val.size()) {
+                        size_t next = val.find(':', pos);
+                        std::string part = val.substr(pos, next - pos);
+                        if (!part.empty()) {
+                            args.gpu_layers_per_dev.push_back(std::stoi(part));
+                        }
+                        if (next == std::string::npos) break;
+                        pos = next + 1;
+                    }
+                    // Sum all per-device layers as total gpu_layers
+                    args.n_gpu_layers = 0;
+                    for (int n : args.gpu_layers_per_dev) args.n_gpu_layers += n;
+                } else {
+                    args.n_gpu_layers = std::stoi(val);
+                }
+            }
+        } else if (arg == "-kvo" || arg == "--kv-offload") {
+            args.offload_kqv = true;
+        } else if (arg == "-nkvo" || arg == "--no-kv-offload") {
+            args.offload_kqv = false;
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
@@ -200,6 +238,21 @@ CliArgs parse_args(int argc, char** argv) {
             args.system_prompt = argv[i];
         } else if (arg == "--cuda-graph") {
             args.cuda_graph = true;
+        } else if (arg == "--load-mode") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.load_mode = argv[i];
+            if (args.load_mode != "mmap" && args.load_mode != "mlock" && args.load_mode != "mmap_mlock") {
+                std::cerr << "Error: Invalid --load-mode: " << args.load_mode
+                          << ". Valid: mmap, mlock, mmap_mlock\n";
+                std::exit(1);
+            }
+        } else if (arg == "--offload-embedding") {
+            args.offload_embedding = true;
+        } else if (arg == "--no-offload-embedding") {
+            args.offload_embedding = false;
         } else if (arg == "--no-jinja") {
             args.no_jinja = true;
         } else if (arg == "--info") {

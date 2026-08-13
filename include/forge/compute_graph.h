@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -99,6 +100,16 @@ public:
     // Get the current scheduling plan (if applied)
     const SchedulingPlan* schedule() const { return schedule_ ? &*schedule_ : nullptr; }
 
+    // Phase 3: Insert cross-device copy nodes after device assignment.
+    // For every edge where producer.device != consumer.device,
+    // inserts a CUSTOM copy node that transfers the tensor between devices.
+    // Called after BackendScheduler::schedule() + apply_schedule().
+    // Returns the number of copy nodes inserted.
+    int insert_copy_nodes();
+
+    // Phase 3: Check if per-backend buffers have been allocated
+    bool has_per_backend_buffers() const { return !graph_buffers_.empty(); }
+
     TensorPtr last_output() const;
 
 private:
@@ -112,9 +123,16 @@ private:
     bool auto_transfer_ = false;
     bool release_intermediates_ = false;
 
-    // Memory planner and pre-allocated buffer
+    // Memory planner (works on full graph; offsets remapped per-backend in allocate_graph)
     std::unique_ptr<MemoryPlanner> planner_;
-    std::unique_ptr<GraphBuffer> graph_buffer_;
+    // Phase 3: per-backend graph buffers (replaces single graph_buffer_)
+    std::unordered_map<DeviceType, std::unique_ptr<GraphBuffer>> graph_buffers_;
+    // Phase 3: per-node buffer mapping for O(1) access during execute()
+    struct NodeBufferMapping {
+        GraphBuffer* buffer = nullptr;
+        size_t offset = 0;
+    };
+    std::vector<NodeBufferMapping> node_buffer_map_;
     bool graph_allocated_ = false;
 
     // Scheduling plan (optional)

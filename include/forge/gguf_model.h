@@ -93,6 +93,10 @@ public:
     }
     const std::vector<GgufLoadedTensor>& tensors() const { return tensors_; }
 
+    // Lock the mmap region in physical RAM (mlock). Returns true on success.
+    // No-op if already locked or no mmap active. Only affects CPU-side weights.
+    bool mlock_mmap();
+
 private:
     int fd_ = -1;
     void* mapped_data_ = nullptr;

@@ -149,7 +149,8 @@ std::string border(const std::string& left, const std::string& connector,
                    const std::vector<int>& widths) {
     std::string out = left;
     for (size_t c = 0; c < widths.size(); ++c) {
-        out += std::string(static_cast<size_t>(widths[c]) + 2, fill[0]);
+        for (int i = 0; i < widths[c] + 2; ++i)
+            out += fill;
         out += (c + 1 < widths.size()) ? connector : right;
     }
     return out + "\n";
@@ -157,11 +158,15 @@ std::string border(const std::string& left, const std::string& connector,
 
 std::string data_row(const std::string& sep, const char* edge,
                      const std::vector<int>& widths,
-                     const std::vector<std::string>& cells) {
+                     const std::vector<std::string>& cells,
+                     bool header = false) {
     std::string out = edge;
     for (size_t c = 0; c < widths.size(); ++c) {
         const std::string cell = c < cells.size() ? cells[c] : "";
-        out += " " + pad_cell(cell, widths[c], is_numeric(cell)) + " ";
+        // Data rows: first column (label) left-aligned, all value columns
+        // right-aligned. Header row keeps its original alignment.
+        const bool right = header ? is_numeric(cell) : (c > 0 || is_numeric(cell));
+        out += " " + pad_cell(cell, widths[c], right) + " ";
         out += (c + 1 < widths.size()) ? sep : edge;
     }
     return out + "\n";
@@ -182,7 +187,7 @@ std::string box_table(const std::vector<std::string>& headers,
             widths[c] = std::max(widths[c], cell_width(row[c]));
 
     std::string out = border("┌", "┬", "┐", "─", widths);
-    out += data_row("│", "│", widths, headers);
+    out += data_row("│", "│", widths, headers, /*header=*/true);
     out += border("├", "┼", "┤", "─", widths);
     for (const auto& row : rows)
         out += data_row("│", "│", widths, row);

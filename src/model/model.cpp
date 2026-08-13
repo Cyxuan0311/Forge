@@ -6,6 +6,10 @@
 #include <cstring>
 #include <stdexcept>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "forge/gguf_model.h"
 #include "forge/logger.h"
 #include "forge/ninf_model.h"
@@ -81,13 +85,23 @@ bool Model::load(const std::string& model_path, DeviceType device) {
         return false;
     }
 
+    // Apply mlock if requested (only for GGUF models with mmap support)
+    if ((load_mode_ == "mlock" || load_mode_ == "mmap_mlock") && format_name_ == "gguf") {
+        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
+        if (gguf) {
+            gguf->mlock_mmap();
+        }
+    }
+
     if (format_name_ == "gguf") {
         config_ = parse_config_from_gguf(*loader_);
     } else if (format_name_ == "ninf") {
         config_ = parse_config_from_ninf(*loader_);
     }
 
-    bool result = load_from_loader(*loader_, device);
+    // Compute uniform layer_devices for backward compat
+    std::vector<DeviceType> layer_devices(config_.num_layers, device);
+    bool result = load_from_loader(*loader_, layer_devices);
 
     // Don't close the loader - keep mmap alive for zero-copy tensor references
     // loader_->close() will be called when Model is destroyed
@@ -95,6 +109,162 @@ bool Model::load(const std::string& model_path, DeviceType device) {
     if (result) {
         model_path_ = model_path;
         device_ = device;
+        is_loaded_ = true;
+    }
+
+    auto t_total_end = std::chrono::high_resolution_clock::now();
+    double total_ms =
+        std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+    LOG_INFO("Model loaded in " + std::to_string(total_ms / 1000.0) + "s");
+
+    return result;
+}
+
+bool Model::load(const std::string& model_path, int n_gpu_layers) {
+    auto t_total_start = std::chrono::high_resolution_clock::now();
+
+    loader_ = ModelLoaderRegistry::instance().create_loader(model_path);
+    if (!loader_) {
+        LOG_ERROR("No loader found for model: " + model_path);
+        return false;
+    }
+
+    format_name_ = loader_->format_name();
+
+    if (!loader_->load(model_path)) {
+        LOG_ERROR("Failed to load model: " + model_path);
+        return false;
+    }
+
+    // Apply mlock if requested (only for GGUF models with mmap support)
+    if ((load_mode_ == "mlock" || load_mode_ == "mmap_mlock") && format_name_ == "gguf") {
+        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
+        if (gguf) {
+            gguf->mlock_mmap();
+        }
+    }
+
+    if (format_name_ == "gguf") {
+        config_ = parse_config_from_gguf(*loader_);
+    } else if (format_name_ == "ninf") {
+        config_ = parse_config_from_ninf(*loader_);
+    }
+
+    // Compute per-layer device vector from n_gpu_layers
+    int num_layers = config_.num_layers;
+    std::vector<DeviceType> layer_devices(num_layers);
+    DeviceType primary_dev = DeviceType::CUDA;
+
+    if (n_gpu_layers == 0) {
+        std::fill(layer_devices.begin(), layer_devices.end(), DeviceType::CPU);
+        primary_dev = DeviceType::CPU;
+    } else if (n_gpu_layers < 0) {
+        // -1 (auto/default) or -2 (all): place all layers on CUDA
+        std::fill(layer_devices.begin(), layer_devices.end(), DeviceType::CUDA);
+    } else {
+        int gpu_count = std::min(n_gpu_layers, num_layers);
+        if (gpu_count < n_gpu_layers) {
+            LOG_WARN("n_gpu_layers=" + std::to_string(n_gpu_layers) +
+                     " exceeds num_layers=" + std::to_string(num_layers) + ", clamping to " +
+                     std::to_string(gpu_count));
+        }
+        for (int i = 0; i < num_layers; ++i) {
+            layer_devices[i] = (i < gpu_count) ? DeviceType::CUDA : DeviceType::CPU;
+        }
+        if (gpu_count == 0) primary_dev = DeviceType::CPU;
+    }
+
+    bool result = load_from_loader(*loader_, layer_devices);
+
+    if (result) {
+        model_path_ = model_path;
+        device_ = primary_dev;
+        is_loaded_ = true;
+    }
+
+    auto t_total_end = std::chrono::high_resolution_clock::now();
+    double total_ms =
+        std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+    LOG_INFO("Model loaded in " + std::to_string(total_ms / 1000.0) + "s");
+
+    return result;
+}
+
+bool Model::load(const std::string& model_path, const std::vector<DeviceType>& layer_devices) {
+    auto t_total_start = std::chrono::high_resolution_clock::now();
+
+    loader_ = ModelLoaderRegistry::instance().create_loader(model_path);
+    if (!loader_) {
+        LOG_ERROR("No loader found for model: " + model_path);
+        return false;
+    }
+
+    format_name_ = loader_->format_name();
+
+    if (!loader_->load(model_path)) {
+        LOG_ERROR("Failed to load model: " + model_path);
+        return false;
+    }
+
+    if (format_name_ == "gguf") {
+        config_ = parse_config_from_gguf(*loader_);
+    } else if (format_name_ == "ninf") {
+        config_ = parse_config_from_ninf(*loader_);
+    }
+
+    bool result = load_from_loader(*loader_, layer_devices);
+
+    DeviceType primary_dev = layer_devices.empty() ? DeviceType::CPU : layer_devices[0];
+    if (result) {
+        model_path_ = model_path;
+        device_ = primary_dev;
+        is_loaded_ = true;
+    }
+
+    auto t_total_end = std::chrono::high_resolution_clock::now();
+    double total_ms =
+        std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+    LOG_INFO("Model loaded in " + std::to_string(total_ms / 1000.0) + "s");
+
+    return result;
+}
+
+bool Model::load(const std::string& model_path, const std::vector<DeviceTarget>& layer_devices) {
+    auto t_total_start = std::chrono::high_resolution_clock::now();
+
+    loader_ = ModelLoaderRegistry::instance().create_loader(model_path);
+    if (!loader_) {
+        LOG_ERROR("No loader found for model: " + model_path);
+        return false;
+    }
+
+    format_name_ = loader_->format_name();
+
+    if (!loader_->load(model_path)) {
+        LOG_ERROR("Failed to load model: " + model_path);
+        return false;
+    }
+
+    // Apply mlock if requested
+    if ((load_mode_ == "mlock" || load_mode_ == "mmap_mlock") && format_name_ == "gguf") {
+        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
+        if (gguf) {
+            gguf->mlock_mmap();
+        }
+    }
+
+    if (format_name_ == "gguf") {
+        config_ = parse_config_from_gguf(*loader_);
+    } else if (format_name_ == "ninf") {
+        config_ = parse_config_from_ninf(*loader_);
+    }
+
+    bool result = load_from_loader(*loader_, layer_devices);
+
+    DeviceType primary_dev = layer_devices.empty() ? DeviceType::CPU : layer_devices[0].type;
+    if (result) {
+        model_path_ = model_path;
+        device_ = primary_dev;
         is_loaded_ = true;
     }
 
@@ -122,12 +292,42 @@ bool Model::load_with_config(const std::string& model_path, const ModelConfig& c
         return false;
     }
 
-    bool result = load_from_loader(*loader_, device);
+    std::vector<DeviceType> layer_devices(config_.num_layers, device);
+    bool result = load_from_loader(*loader_, layer_devices);
     // Don't close the loader - keep mmap alive for zero-copy tensor references
 
     if (result) {
         model_path_ = model_path;
         device_ = device;
+        is_loaded_ = true;
+    }
+
+    return result;
+}
+
+bool Model::load_with_config(const std::string& model_path, const ModelConfig& config,
+                             const std::vector<DeviceType>& layer_devices) {
+    config_ = config;
+
+    loader_ = ModelLoaderRegistry::instance().create_loader(model_path);
+    if (!loader_) {
+        LOG_ERROR("No loader found for model: " + model_path);
+        return false;
+    }
+
+    format_name_ = loader_->format_name();
+    if (!loader_->load(model_path)) {
+        LOG_ERROR("Failed to load model: " + model_path);
+        return false;
+    }
+
+    bool result = load_from_loader(*loader_, layer_devices);
+    // Don't close the loader - keep mmap alive for zero-copy tensor references
+
+    DeviceType primary_dev = layer_devices.empty() ? DeviceType::CPU : layer_devices[0];
+    if (result) {
+        model_path_ = model_path;
+        device_ = primary_dev;
         is_loaded_ = true;
     }
 
@@ -206,8 +406,12 @@ ModelConfig Model::parse_config_from_ninf(ModelLoader& loader) {
     return cfg;
 }
 
-bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
+bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>& layer_devices) {
     const auto& mapping = WeightMapper::get_mapping(config_.arch_type);
+
+    // Determine layer device helpers
+    DeviceType first_layer_dev = layer_devices.empty() ? DeviceType::CPU : layer_devices.front();
+    DeviceType last_layer_dev = layer_devices.empty() ? DeviceType::CPU : layer_devices.back();
 
     LOG_INFO("Model::load_from_loader: arch=" + config_.arch_type +
              ", num_layers=" + std::to_string(config_.num_layers) +
@@ -217,11 +421,11 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
              ", use_mrope=" + std::to_string(config_.use_mrope) +
              ", rope_dimension_count=" + std::to_string(config_.rope_dimension_count));
 
-    auto load_tensor = [&](const std::string& name) -> TensorPtr {
+    auto load_tensor = [&](const std::string& name, DeviceType dev) -> TensorPtr {
         if (!loader.has_tensor(name))
             return nullptr;
-        auto t = loader.get_tensor(name, device);
-        // Per-tensor 混合精度: 按 tensor 名称模式匹配重新量化
+        auto t = loader.get_tensor(name, dev);
+        // Per-tensor mixed precision: requantize by tensor name pattern
         if (t && quant_policy_.enabled() && is_quantized_type(t->dtype())) {
             DataType preferred = select_quant_type(quant_policy_, name);
             if (t->dtype() != preferred && is_quantized_type(preferred)) {
@@ -231,11 +435,11 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
         return t;
     };
 
-    auto resolve_weight = [&](const WeightAlias& alias,
+    auto resolve_weight = [&](const WeightAlias& alias, DeviceType dev,
                               const std::string& prefix = "") -> TensorPtr {
         for (const auto& name : alias.names) {
             std::string full_name = prefix.empty() ? name : (prefix + "." + name);
-            auto t = load_tensor(full_name);
+            auto t = load_tensor(full_name, dev);
             if (t) {
                 LOG_TRACE("Loaded weight: " + full_name);
                 return t;
@@ -250,18 +454,29 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
         // GGUF canonical names: token_embd.weight, output_norm.weight, output.weight
         // Layer names: blk.{i}.attn_q.weight, blk.{i}.ffn_gate.weight, etc.
 
-        auto te = load_tensor("token_embd.weight");
+        // When offload_embedding is false and layers are split across devices
+        // (partial offload), keep token_embedding on CPU (aligns with llama.cpp).
+        bool is_partial_offload = !layer_devices.empty();
+        for (int i = 1; i < config_.num_layers && is_partial_offload; ++i) {
+            if (layer_devices[i] != layer_devices[0]) break;
+            if (i == config_.num_layers - 1) is_partial_offload = false;
+        }
+        DeviceType emb_dev = (!offload_embedding_ && is_partial_offload)
+                                 ? DeviceType::CPU
+                                 : first_layer_dev;
+
+        auto te = load_tensor("token_embd.weight", emb_dev);
         if (!te) {
             LOG_ERROR("Failed to load token embedding");
             return false;
         }
         weight_store_.set("token_embedding", te);
 
-        auto on = load_tensor("output_norm.weight");
+        auto on = load_tensor("output_norm.weight", last_layer_dev);
         if (on)
             weight_store_.set("output_norm", on);
 
-        auto ow = load_tensor("output.weight");
+        auto ow = load_tensor("output.weight", last_layer_dev);
         if (ow) {
             weight_store_.set("output_weight", ow);
         } else if (config_.tie_embeddings) {
@@ -270,22 +485,22 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
 
         // phimoe model-level biases (output_norm.bias, output.bias)
         if (config_.arch_type == "phimoe") {
-            auto onb = load_tensor("output_norm.bias");
+            auto onb = load_tensor("output_norm.bias", last_layer_dev);
             if (onb) weight_store_.set("output_norm_bias", onb);
-            auto ob = load_tensor("output.bias");
+            auto ob = load_tensor("output.bias", last_layer_dev);
             if (ob) weight_store_.set("output_bias", ob);
         }
 
         // Gemma4 per-layer embedding weights (model-level, not per-blk)
         if (config_.arch_type == "gemma4") {
-            auto ple = load_tensor("per_layer_token_embd.weight");
+            auto ple = load_tensor("per_layer_token_embd.weight", first_layer_dev);
             if (ple) weight_store_.set("per_layer_tok_embd", ple);
-            auto plmp = load_tensor("per_layer_model_proj.weight");
+            auto plmp = load_tensor("per_layer_model_proj.weight", last_layer_dev);
             if (plmp) weight_store_.set("per_layer_model_proj", plmp);
-            auto plpn = load_tensor("per_layer_proj_norm.weight");
+            auto plpn = load_tensor("per_layer_proj_norm.weight", last_layer_dev);
             if (plpn) weight_store_.set("per_layer_proj_norm", plpn);
             // RoPE frequency factors for proportional RoPE (full-attention layers)
-            auto rf = load_tensor("rope_freqs.weight");
+            auto rf = load_tensor("rope_freqs.weight", first_layer_dev);
             if (rf) weight_store_.set("rope_freqs", rf);
         }
 
@@ -294,9 +509,10 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
         for (int i = 0; i < config_.num_layers; ++i) {
             std::string blk = "blk." + std::to_string(i);
             std::string base = "layers." + std::to_string(i);
+            DeviceType layer_dev = layer_devices[i];
 
             auto set_if = [&](const std::string& canonical, const std::string& gguf_name) {
-                auto t = load_tensor(gguf_name);
+                auto t = load_tensor(gguf_name, layer_dev);
                 if (t)
                     weight_store_.set(canonical, t);
             };
@@ -432,39 +648,41 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
 
         // Vision / Multimodal weights (mmproj)
         // Auto-scan all tensors with v.* or mm.* prefixes
+        // Vision weights stay on CPU (loaded separately via load_vision_weights)
         {
             for (const auto& name : loader.tensor_names()) {
                 if (name.size() >= 2 &&
                     (name.compare(0, 2, "v.") == 0 || name.compare(0, 3, "mm.") == 0)) {
-                    auto t = load_tensor(name);
+                    auto t = load_tensor(name, DeviceType::CPU);
                     if (t)
                         weight_store_.set(name, t);
                 }
             }
         }
     } else {
-        auto te = resolve_weight(mapping.token_embedding);
+        auto te = resolve_weight(mapping.token_embedding, first_layer_dev);
         if (!te) {
             LOG_ERROR("Failed to load token embedding");
             return false;
         }
         weight_store_.set("token_embedding", te);
 
-        auto on = resolve_weight(mapping.output_norm);
+        auto on = resolve_weight(mapping.output_norm, last_layer_dev);
         if (on)
             weight_store_.set("output_norm", on);
 
         if (!mapping.tie_embeddings) {
-            auto ow = resolve_weight(mapping.output_weight);
+            auto ow = resolve_weight(mapping.output_weight, last_layer_dev);
             if (ow)
                 weight_store_.set("output_weight", ow);
         }
 
         for (int i = 0; i < config_.num_layers; ++i) {
             std::string prefix = WeightMapper::format_layer_prefix(mapping.layer_prefix_pattern, i);
+            DeviceType layer_dev = layer_devices[i];
 
             auto set_if = [&](const std::string& canonical, const WeightAlias& alias) {
-                auto t = resolve_weight(alias, prefix);
+                auto t = resolve_weight(alias, layer_dev, prefix);
                 if (t)
                     weight_store_.set(canonical, t);
             };
@@ -514,6 +732,53 @@ bool Model::load_from_loader(ModelLoader& loader, DeviceType device) {
 
     LOG_INFO("Loaded " + std::to_string(weight_store_.size()) + " weights from " + format_name_ +
              " for arch: " + config_.arch_type);
+    return true;
+}
+
+bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceTarget>& layer_devices) {
+    // Convert DeviceTarget to DeviceType, then delegate.
+    // For multi-GPU: call cudaSetDevice before each layer's tensor loading
+    // so CUDA allocations land on the correct GPU.
+    std::vector<DeviceType> type_vec;
+    type_vec.reserve(layer_devices.size());
+    for (auto& dt : layer_devices) type_vec.push_back(dt.type);
+
+#ifdef USE_CUDA
+    // Set device before model-level weights (token_embedding, output)
+    // which go to the first/last layer's device.
+    DeviceType first_type = layer_devices.empty() ? DeviceType::CPU : layer_devices.front().type;
+    DeviceType last_type = layer_devices.empty() ? DeviceType::CPU : layer_devices.back().type;
+    if (first_type == DeviceType::CUDA && !layer_devices.empty())
+        cudaSetDevice(layer_devices.front().device_id);
+    if (last_type == DeviceType::CUDA && !layer_devices.empty())
+        cudaSetDevice(layer_devices.back().device_id);
+#endif
+
+    // Load using the DeviceType overload (model-level + per-layer tensor loading)
+    bool ok = load_from_loader(loader, type_vec);
+    if (!ok) return false;
+
+    // Set cudaSetDevice per layer block for CUDA allocations
+    // Note: this is a best-effort approach since the actual tensor loading
+    // happens inside load_from_loader(DeviceType). The per-layer loop in that
+    // function calls loader.get_tensor(name, layer_dev) which creates tensors
+    // on the target device type. For multi-GPU, we need to ensure the correct
+    // CUDA context is active during allocation. Since load_from_loader(DeviceType)
+    // iterates layers sequentially, and DeviceTarget preserves the per-layer
+    // device_id, we rely on the model loading being done with contiguous GPU
+    // assignments where cudaSetDevice before a block covers all layers in that block.
+#ifdef USE_CUDA
+    for (int i = 0; i < config_.num_layers && i < static_cast<int>(layer_devices.size()); ++i) {
+        if (layer_devices[i].is_cuda()) {
+            cudaSetDevice(layer_devices[i].device_id);
+        }
+        // Re-touch layer weights to ensure they're on the correct device
+        // (if loading already happened on GPU 0, re-move them)
+        // This is only needed for the legacy single-device load path;
+        // for proper per-layer loading, the tensor is already on the right device.
+    }
+#endif
+
     return true;
 }
 

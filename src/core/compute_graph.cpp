@@ -1,5 +1,6 @@
 #include "forge/compute_graph.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "forge/backend.h"
@@ -11,6 +12,17 @@
 #endif
 
 namespace forge {
+
+// Helper: get backend name for logging
+namespace {
+const char* device_name(DeviceType dev) {
+    switch (dev) {
+    case DeviceType::CPU: return "CPU";
+    case DeviceType::CUDA: return "CUDA";
+    default: return "?";
+    }
+}
+}  // namespace
 
 int ComputeGraph::add_input(const TensorPtr& tensor) {
     int idx = static_cast<int>(inputs_.size());
@@ -89,23 +101,62 @@ bool ComputeGraph::allocate_graph() {
     }
 
     planner_ = std::make_unique<MemoryPlanner>();
-    // Phase 2: pass backend to planner for backend-specific allocation size
     planner_->set_backend(backend);
     planner_->plan(*this, release_intermediates_);
 
-    size_t total_size = planner_->total_buffer_size();
-    if (total_size == 0) {
-        graph_allocated_ = true;
-        return true;
+    // Phase 3: per-backend buffer compaction.
+    // MemoryPlanner produces interleaved offsets across all devices.
+    // We remap offsets within each device to eliminate gaps from other-device nodes.
+    int n = num_nodes();
+    node_buffer_map_.clear();
+    node_buffer_map_.resize(n);
+
+    // Collect allocations per device, sorted by original offset (preserves allocation order)
+    std::unordered_map<DeviceType, std::vector<std::pair<int, size_t>>> per_dev_allocs;
+    for (int i = 0; i < n; ++i) {
+        auto* alloc = planner_->get_allocation(i);
+        if (!alloc || alloc->alloc_size == 0) continue;
+        per_dev_allocs[nodes_[i].device].push_back({i, alloc->offset});
     }
 
-    graph_buffer_ = std::make_unique<GraphBuffer>(
-        BackendManager::instance().get_backend(backend->device_type()), total_size);
+    for (auto& [dev, allocs] : per_dev_allocs) {
+        // Sort by original offset (stable order within this device)
+        std::sort(allocs.begin(), allocs.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
 
-    if (!graph_buffer_->valid()) {
-        LOG_ERROR("ComputeGraph: failed to allocate graph buffer of " + std::to_string(total_size) +
-                  " bytes");
-        return false;
+        // Compact: reassign offsets sequentially, removing gaps
+        size_t current_offset = 0;
+        for (const auto& [node_idx, orig_offset] : allocs) {
+            auto* alloc = planner_->get_allocation(node_idx);
+            if (!alloc) continue;
+            current_offset = (current_offset + 255) & ~255ULL;  // 256-byte alignment
+            node_buffer_map_[node_idx] = {nullptr, current_offset};
+            current_offset += alloc->alloc_size;
+        }
+
+        size_t buf_size = current_offset;
+        if (buf_size == 0) continue;
+
+        auto buf = std::make_unique<GraphBuffer>(
+            BackendManager::instance().get_backend(dev), buf_size);
+        if (!buf->valid()) {
+            LOG_ERROR("ComputeGraph: failed to allocate " + std::to_string(buf_size) +
+                      " bytes for " + device_name(dev) + " backend");
+            return false;
+        }
+
+        // Fill in buffer pointers for all nodes on this device
+        for (const auto& [node_idx, orig_offset] : allocs) {
+            if (node_buffer_map_[node_idx].offset == SIZE_MAX) continue;
+            node_buffer_map_[node_idx].buffer = buf.get();
+        }
+
+        graph_buffers_[dev] = std::move(buf);
+    }
+
+    if (!graph_buffers_.empty()) {
+        LOG_INFO("ComputeGraph: per-backend buffers allocated across " +
+                 std::to_string(graph_buffers_.size()) + " backends");
     }
 
     graph_allocated_ = true;
@@ -113,7 +164,8 @@ bool ComputeGraph::allocate_graph() {
 }
 
 void ComputeGraph::release_graph() {
-    graph_buffer_.reset();
+    graph_buffers_.clear();
+    node_buffer_map_.clear();
     planner_.reset();
     graph_allocated_ = false;
 }
@@ -182,16 +234,19 @@ TensorPtr ComputeGraph::execute() {
             // Phase 3: prefer dst injection when a dst kernel is registered
             bool has_dst = OpDispatch::instance().has_dst_kernel(node.op_type, node.device);
             const PlannedAllocation* alloc =
-                (has_dst && graph_buffer_ && graph_buffer_->valid() && planner_)
-                    ? planner_->get_allocation(i)
-                    : nullptr;
+                (has_dst && planner_) ? planner_->get_allocation(i) : nullptr;
 
-            if (has_dst && alloc && alloc->size > 0 &&
-                alloc->offset + alloc->size <= graph_buffer_->size()) {
-                // Construct dst view into pre-allocated graph buffer — no allocation, no memcpy
+            // Phase 3: per-backend buffer lookup
+            NodeBufferMapping* buf_map = nullptr;
+            if (i < static_cast<int>(node_buffer_map_.size()) && node_buffer_map_[i].buffer) {
+                buf_map = &node_buffer_map_[i];
+            }
+
+            if (has_dst && alloc && alloc->size > 0 && buf_map) {
+                // Construct dst view into pre-allocated per-backend buffer
                 void* planned_ptr =
-                    static_cast<char*>(graph_buffer_->data()) + alloc->offset;
-                DeviceType buf_dev = graph_buffer_->device();
+                    static_cast<char*>(buf_map->buffer->data()) + buf_map->offset;
+                DeviceType buf_dev = buf_map->buffer->device();
                 auto dst = std::make_shared<Tensor>(Tensor::from_buffer(
                     planned_ptr, DataType::FP32, node.resolved_inputs[0]->shape(), buf_dev, false));
                 OpDispatch::instance().execute_dst(node.op_type, node.device, node.resolved_inputs,
@@ -202,13 +257,12 @@ TensorPtr ComputeGraph::execute() {
                 node.output = OpDispatch::instance().execute(node.op_type, node.device,
                                                              node.resolved_inputs, node.op_params);
 
-                // Copy to pre-allocated buffer and free temp memory
-                if (node.output && graph_buffer_ && graph_buffer_->valid() && planner_) {
+                // Copy to pre-allocated per-backend buffer and free temp memory
+                if (node.output && buf_map) {
                     const PlannedAllocation* legacy_alloc = planner_->get_allocation(i);
-                    if (legacy_alloc && legacy_alloc->size > 0 &&
-                        legacy_alloc->offset + legacy_alloc->size <= graph_buffer_->size()) {
+                    if (legacy_alloc && legacy_alloc->size > 0) {
                         void* planned_ptr =
-                            static_cast<char*>(graph_buffer_->data()) + legacy_alloc->offset;
+                            static_cast<char*>(buf_map->buffer->data()) + buf_map->offset;
                         size_t copy_size = std::min(node.output->nbytes(), legacy_alloc->size);
 
                         if (copy_size > 0 && planned_ptr != node.output->data()) {
@@ -326,6 +380,68 @@ void ComputeGraph::set_workspace_backend(std::shared_ptr<Backend> backend) {
 
 Backend* ComputeGraph::workspace_backend() {
     return workspace_backend_ ? workspace_backend_.get() : nullptr;
+}
+
+int ComputeGraph::insert_copy_nodes() {
+    int n = static_cast<int>(nodes_.size());
+    if (n == 0) return 0;
+
+    // Collect all cross-device edges: (producer_idx, consumer_idx, input_slot)
+    struct CrossDevEdge {
+        int producer;
+        int consumer;
+        int input_slot;
+    };
+    std::vector<CrossDevEdge> edges;
+
+    for (int i = 0; i < n; ++i) {
+        for (size_t j = 0; j < nodes_[i].input_indices.size(); ++j) {
+            int ref = nodes_[i].input_indices[j];
+            if (ref >= 0) continue;  // graph input
+            int prod = -ref - 1;
+            if (prod < 0 || prod >= n) continue;
+            if (nodes_[prod].device == nodes_[i].device) continue;
+
+            edges.push_back({prod, i, static_cast<int>(j)});
+        }
+    }
+
+    if (edges.empty()) return 0;
+
+    // Process in reverse consumer order so indices stay valid
+    std::sort(edges.begin(), edges.end(),
+              [](const CrossDevEdge& a, const CrossDevEdge& b) {
+                  return a.consumer > b.consumer;
+              });
+
+    int inserted = 0;
+    for (const auto& e : edges) {
+        DeviceType dst_dev = nodes_[e.consumer].device;
+        int copy_idx = add_node(
+            "copy_device",
+            "copy_device",
+            {-(e.producer + 1)},
+            [dst_dev](const std::vector<TensorPtr>& inputs) -> TensorPtr {
+                auto src = inputs[0];
+                auto dst = std::make_shared<Tensor>(src->dtype(), src->shape(), dst_dev);
+                dst->copy_from(*src);
+                return dst;
+            },
+            dst_dev  // COPY node runs on the destination (consumer's) device
+        );
+
+        // Reroute the consumer to read from the copy node instead
+        nodes_[e.consumer].input_indices[e.input_slot] = -(copy_idx + 1);
+        inserted++;
+    }
+
+    if (inserted > 0) {
+        LOG_INFO("ComputeGraph: inserted " + std::to_string(inserted) +
+                 " cross-device copy nodes (auto_transfer disabled)");
+        auto_transfer_ = false;  // copies are now explicit graph nodes
+    }
+
+    return inserted;
 }
 
 void ComputeGraph::apply_schedule(const SchedulingPlan& plan) {

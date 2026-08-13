@@ -517,7 +517,8 @@ public:
         }
     }
 
-    PyInferenceContext* create_context(const std::string& kv_cache_dtype_str, int gpu_layers) {
+    PyInferenceContext* create_context(const std::string& kv_cache_dtype_str, int gpu_layers,
+                                       bool offload_kqv = true) {
         ensure_engines_registered();
 
         auto ctx = std::make_unique<PyInferenceContext>(model_);
@@ -528,6 +529,8 @@ public:
         if (storage_mode_env && std::string(storage_mode_env) == "paged") {
             ctx->get().params_mut().kv_storage_mode = KVStorageMode::Paged;
         }
+
+        ctx->get().params_mut().offload_kqv = offload_kqv;
 
         const auto& cfg = model_.config();
         auto engine = EngineRegistry::instance().create(cfg.arch_type, model_, ctx->get());
@@ -763,8 +766,10 @@ public:
     }
 
     PyInferenceContext* create_context(const std::string& kv_cache_dtype_str = "fp32",
-                                       int gpu_layers = -1) {
+                                       int gpu_layers = -1, bool offload_kqv = true) {
         auto ctx = new PyInferenceContext(model_);
+
+        ctx->get().params_mut().offload_kqv = offload_kqv;
 
         auto engine =
             EngineRegistry::instance().create(model_.config().arch_type, model_, ctx->get());

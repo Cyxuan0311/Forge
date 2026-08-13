@@ -12,7 +12,7 @@ TensorPtr DeepSeekLayerExecutor::attend_gqa(const TensorPtr& normed,
     const auto& lw = lctx.weights;
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
-    const DeviceType dev = lctx.device;
+    const DeviceType dev = lctx.device.type;
     const int num_heads = cfg.num_heads;
     const int num_kv_heads = cfg.num_kv_heads;
     const int head_dim = cfg.head_dim;

@@ -261,7 +261,7 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
     const int64_t start_pos = lctx.start_pos();
-    const DeviceType dev = lctx.device;
+    const DeviceType dev = lctx.device.type;
     const auto& lw = lctx.weights;
 
     bool has_qkv_bias = (lw.bq() && lw.bq()->numel() > 0);

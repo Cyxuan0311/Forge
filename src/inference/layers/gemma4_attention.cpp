@@ -81,7 +81,7 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
     const int64_t start_pos = lctx.start_pos();
-    const DeviceType dev = lctx.device;
+    const DeviceType dev = lctx.device.type;
 
     bool is_swa_layer = (layer_idx < (int)cfg.swa_layers.size() && cfg.swa_layers[layer_idx] == 1);
     bool has_kv = (layer_idx < cfg.n_layer_kv_from_start);

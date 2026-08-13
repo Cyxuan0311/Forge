@@ -256,5 +256,6 @@ void register_multimodal(py::module_& m) {
                                py::return_value_policy::reference)
         .def("create_context", &PyMultimodalModel::create_context,
              py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
+             py::arg("offload_kqv") = true,
              py::return_value_policy::take_ownership);
 }

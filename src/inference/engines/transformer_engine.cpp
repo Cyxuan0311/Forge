@@ -51,31 +51,88 @@ void TransformerEngine::reset() {
 }
 
 void TransformerEngine::set_gpu_layers(int gpu_layers) {
+    // Default: all layers on GPU 0
+    std::vector<int> per_dev = {gpu_layers};
+    set_gpu_layers(gpu_layers, per_dev);
+}
+
+void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& gpu_layers_per_dev) {
     graph_runtime_.invalidate();
     gpu_layers_ = gpu_layers;
     const auto& cfg = model_.config();
     int num_layers = cfg.num_layers;
 
-    // Build per-layer device vector
+    // Build per-layer DeviceTarget vector from per-GPU layer counts.
+    // gpu_layers_per_dev[0] = layers on GPU 0, gpu_layers_per_dev[1] = layers on GPU 1, etc.
+    // If gpu_layers_per_dev is empty, fall back to single-GPU behavior (all on GPU 0).
     layer_devices_.resize(num_layers);
-    for (int i = 0; i < num_layers; ++i) {
-        layer_devices_[i] = (gpu_layers_ < 0) ? model_.device()
-                         : (i < gpu_layers_)  ? DeviceType::CUDA
-                                              : DeviceType::CPU;
+    if (gpu_layers_per_dev.empty()) {
+        for (int i = 0; i < num_layers; ++i) {
+            layer_devices_[i] = (gpu_layers_ < 0) ? DeviceTarget::cuda(0)
+                               : (i < gpu_layers_)  ? DeviceTarget::cuda(0)
+                                                    : DeviceTarget::cpu();
+        }
+    } else {
+        int offset = 0;
+        for (size_t dev_id = 0; dev_id < gpu_layers_per_dev.size() && offset < num_layers; ++dev_id) {
+            int n = gpu_layers_per_dev[dev_id];
+            for (int i = 0; i < n && offset < num_layers; ++i, ++offset) {
+                layer_devices_[offset] = n > 0 ? DeviceTarget::cuda(static_cast<int>(dev_id))
+                                                : DeviceTarget::cpu();
+            }
+        }
+        // Remaining layers (if any) go to CPU
+        for (int i = offset; i < num_layers; ++i) {
+            layer_devices_[i] = DeviceTarget::cpu();
+        }
+        // If gpu_layers < 0 (auto), mark all remaining as GPU 0
+        if (gpu_layers_ < 0) {
+            for (int i = offset; i < num_layers; ++i) {
+                layer_devices_[i] = DeviceTarget::cuda(0);
+            }
+        }
     }
 
-    // Move model weights to per-layer devices
+    // Validation mode: weights are already placed during loading.
     DeviceType first_dev = layer_device(0);
     auto token_emb = model_.weights().get("token_embedding");
     if (token_emb && token_emb->device() != first_dev) {
-        token_emb->to_device(first_dev);
+        if (!ctx_.params().offload_embedding && first_dev == DeviceType::CUDA &&
+            token_emb->device() == DeviceType::CPU) {
+            LOG_INFO("set_gpu_layers: token_embedding kept on CPU (offload_embedding=false)");
+        } else {
+            LOG_WARN("set_gpu_layers: token_embedding is on " +
+                     std::to_string(static_cast<int>(token_emb->device())) +
+                     " but expected " + std::to_string(static_cast<int>(first_dev)) +
+                     ". Moving to target device (legacy loading path).");
+            token_emb->to_device(first_dev);
+        }
     }
 
+    // Validate + repair layer weights
     for (int i = 0; i < num_layers; ++i) {
-        weights_.move_layer_weights(i, layer_devices_[i]);
+        DeviceType expected_type = layer_devices_[i].type;
+        auto& lw = weights_.layers[i];
+        for (auto& [name, tensor] : lw.weights) {
+            if (tensor && tensor->device() != expected_type) {
+                LOG_WARN("set_gpu_layers: layer " + std::to_string(i) + " weight '" + name +
+                          "' is on device " + std::to_string(static_cast<int>(tensor->device())) +
+                          " but expected " + std::to_string(static_cast<int>(expected_type)) +
+                          ". Moving to target device (legacy loading path).");
+                tensor->to_device(expected_type);
+            }
+        }
     }
 
-    DeviceType last_dev = layer_devices_[num_layers - 1];
+    DeviceType last_dev = layer_devices_[num_layers - 1].type;
+    auto out_w = weights_.output_weight;
+    if (out_w && out_w->device() != last_dev) {
+        LOG_WARN("set_gpu_layers: output_weight is on " +
+                 std::to_string(static_cast<int>(out_w->device())) +
+                 " but expected " + std::to_string(static_cast<int>(last_dev)) +
+                 ". Moving to target device (legacy loading path).");
+    }
+
     weights_.move_output_weights(last_dev);
 
     // Update KV cache per-layer devices (if already initialized)
@@ -84,14 +141,14 @@ void TransformerEngine::set_gpu_layers(int gpu_layers) {
     }
 
     int num_cuda = 0;
-    for (auto d : layer_devices_) if (d == DeviceType::CUDA) ++num_cuda;
+    for (auto d : layer_devices_) if (d.is_cuda()) ++num_cuda;
     LOG_INFO("CPU offload configured: gpu_layers=" + std::to_string(gpu_layers) + "/" +
              std::to_string(num_layers) + ", CUDA layers=" + std::to_string(num_cuda));
 }
 
 DeviceType TransformerEngine::layer_device(int layer_idx) const {
     if (!layer_devices_.empty() && layer_idx >= 0 && layer_idx < static_cast<int>(layer_devices_.size()))
-        return layer_devices_[layer_idx];
+        return layer_devices_[layer_idx].type;
     if (gpu_layers_ < 0)
         return model_.device();
     if (layer_idx < gpu_layers_)
@@ -99,10 +156,50 @@ DeviceType TransformerEngine::layer_device(int layer_idx) const {
     return DeviceType::CPU;
 }
 
-TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceType target) const {
-    if (hidden->device() == target)
+DeviceTarget TransformerEngine::layer_device_target(int layer_idx) const {
+    if (!layer_devices_.empty() && layer_idx >= 0 && layer_idx < static_cast<int>(layer_devices_.size()))
+        return layer_devices_[layer_idx];
+    if (gpu_layers_ < 0)
+        return DeviceTarget::cuda(0);
+    if (layer_idx < gpu_layers_)
+        return DeviceTarget::cuda(0);
+    return DeviceTarget::cpu();
+}
+
+TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceTarget target) const {
+    if (hidden->device() == target.type)
         return hidden;
-    auto transferred = std::make_shared<Tensor>(hidden->dtype(), hidden->shape(), target);
+
+#ifdef USE_CUDA
+    // Cross-GPU peer transfer: use cudaMemcpyPeer when both src and dst are CUDA
+    // but on different GPUs
+    if (hidden->device() == DeviceType::CUDA && target.is_cuda()) {
+        int current_dev = -1;
+        cudaGetDevice(&current_dev);
+        // Get source device from hidden — since Tensor doesn't carry device_id,
+        // we must infer it. For now, use the current CUDA device as source.
+        // The caller should have called cudaSetDevice(src_device_id) before.
+        int src_dev = current_dev;
+        int dst_dev = target.device_id;
+
+        if (src_dev != dst_dev) {
+            // Enable peer access (once; no-op if already enabled)
+            cudaDeviceEnablePeerAccess(dst_dev, 0);
+            cudaDeviceEnablePeerAccess(src_dev, 0);
+
+            cudaSetDevice(src_dev);
+            auto transferred = std::make_shared<Tensor>(hidden->dtype(), hidden->shape(),
+                                                        DeviceType::CUDA);
+            cudaMemcpyPeer(transferred->data(), dst_dev,
+                           hidden->data(), src_dev,
+                           hidden->nbytes());
+            cudaSetDevice(dst_dev);
+            return transferred;
+        }
+    }
+#endif
+
+    auto transferred = std::make_shared<Tensor>(hidden->dtype(), hidden->shape(), target.type);
     transferred->copy_from(*hidden);
     return transferred;
 }
@@ -117,8 +214,10 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
 
     init_kv_cache(cfg);
 
-    DeviceType first_dev = layer_device(0);
-    auto ids_on_dev = transfer_hidden(req.input_ids, first_dev);
+    DeviceTarget first_dev = layer_device_target(0);
+#ifdef USE_CUDA
+    if (first_dev.is_cuda()) cudaSetDevice(first_dev.device_id);
+#endif
 
     auto token_emb = model_.weights().get("token_embedding");
     if (!token_emb) {
@@ -127,15 +226,26 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
         return nullptr;
     }
 
+    // When token_embedding is on CPU (offload_embedding=false), run embedding on CPU
+    // then transfer result to the first layer's device.
+    DeviceType emb_dev = token_emb->device();
+    auto ids_for_embed = transfer_hidden(req.input_ids,
+                                         (emb_dev != first_dev.type && emb_dev == DeviceType::CPU)
+                                             ? DeviceTarget::cpu() : first_dev);
+
     TensorPtr hidden;
     {
         PERF_SCOPE("forward/embedding");
-        hidden = ops::embedding(token_emb, ids_on_dev, weights_.token_embedding_fp32);
+        hidden = ops::embedding(token_emb, ids_for_embed, weights_.token_embedding_fp32);
     }
     if (!hidden) {
         fprintf(stderr, "[FATAL] embedding returned NULL!\n");
         fflush(stderr);
         return nullptr;
+    }
+
+    if (emb_dev != first_dev.type) {
+        hidden = transfer_hidden(hidden, first_dev);
     }
 
     return forward_layers(hidden, req);
@@ -177,7 +287,10 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
             continue;
 
         // ==== Step 1: Fused embedding for all tokens ====
-        DeviceType first_dev = layer_device(0);
+        DeviceTarget first_dev = layer_device_target(0);
+#ifdef USE_CUDA
+        if (first_dev.is_cuda()) cudaSetDevice(first_dev.device_id);
+#endif
 
         // Build flat [total_tokens] token ID tensor
         auto flat_ids = std::make_shared<Tensor>(DataType::INT32,
@@ -196,20 +309,35 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
             return nullptr;
         }
 
+        // When token_embedding is intentionally on CPU (offload_embedding=false),
+        // run embedding on CPU then transfer result to the first layer's device.
+        DeviceType emb_dev = token_emb->device();
+        TensorPtr ids_for_embed = ids_on_dev;
+        if (emb_dev != first_dev.type && emb_dev == DeviceType::CPU) {
+            ids_for_embed = transfer_hidden(flat_ids, DeviceTarget::cpu());
+        }
+
         TensorPtr hidden;
         {
             PERF_SCOPE("forward_batch/embedding");
-            hidden = ops::embedding(token_emb, ids_on_dev, weights_.token_embedding_fp32);
+            hidden = ops::embedding(token_emb, ids_for_embed, weights_.token_embedding_fp32);
         }
         if (!hidden) {
             LOG_ERROR("forward_batch: embedding returned NULL");
             return nullptr;
         }
+
+        if (emb_dev != first_dev.type) {
+            hidden = transfer_hidden(hidden, first_dev);
+        }
         // hidden shape: [total_tokens, hidden_dim]
 
         // ==== Step 2: Per-layer forward (split by sequence, forward_layer, concat) ====
         for (int layer = 0; layer < cfg.num_layers; ++layer) {
-            DeviceType layer_dev = layer_device(layer);
+            DeviceTarget layer_dev = layer_device_target(layer);
+#ifdef USE_CUDA
+            if (layer_dev.is_cuda()) cudaSetDevice(layer_dev.device_id);
+#endif
             hidden = transfer_hidden(hidden, layer_dev);
 
             // Split hidden by sequence, forward_layer per sequence, concat back
@@ -217,7 +345,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
             int hidden_dim = static_cast<int>(hidden->shape().back());
             auto layer_out = std::make_shared<Tensor>(DataType::FP32,
                                                        std::vector<int64_t>{total_tokens, hidden_dim},
-                                                       layer_dev);
+                                                       layer_dev.type);
             float* dst = static_cast<float*>(layer_out->data());
 
             for (int i = 0; i < ubatch.size(); i++) {
@@ -231,7 +359,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                 // Forward through this layer for this sequence
                 {
                     PERF_SCOPE_FMT("forward_batch/layer_%d", layer);
-                    SET_PERF_CONTEXT(item.seq_id, "layer", layer, layer_dev == DeviceType::CUDA ? "cuda" : "cpu", seq_len);
+                    SET_PERF_CONTEXT(item.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu", seq_len);
                     auto seq_req = ForwardRequest::from_hidden(seq_len, item.start_pos, item.seq_id);
                     seq_hidden =
                         forward_layer(seq_hidden, make_layer_context(layer, seq_req, layer_dev));
@@ -390,8 +518,15 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         kv_max_seq = KV_MAX_SEQ_CAP;
     }
 
-    // Determine the primary KV device and check CUDA memory
-    DeviceType kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
+    // Determine the primary KV device.
+    // When offload_kqv is false, KV cache stays on CPU even if layers are on GPU.
+    // This enables "weights on GPU, KV on CPU" for long-context scenarios.
+    DeviceType kv_dev;
+    if (ctx_.params().offload_kqv) {
+        kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
+    } else {
+        kv_dev = DeviceType::CPU;
+    }
 
     // If CUDA, check available memory and reduce if needed
     if (kv_dev == DeviceType::CUDA) {
@@ -454,10 +589,10 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         kv_cache_.set_layer_policies(policies, cfg.n_swa);
     }
 
-    // Place each layer's KV cache on the corresponding device
-    // If layer_devices_ is populated (from set_gpu_layers), use it.
-    // Otherwise, all layers stay on kv_dev.
-    if (!layer_devices_.empty()) {
+    // Place each layer's KV cache on the corresponding device.
+    // When offload_kqv is false, skip per-layer device placement so KV stays on CPU
+    // even if the layer weights are on GPU.
+    if (!layer_devices_.empty() && ctx_.params().offload_kqv) {
         kv_cache_.set_layer_devices(layer_devices_);
     }
 
@@ -493,7 +628,7 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
 
 LayerExecutionContext TransformerEngine::make_layer_context(int layer_idx,
                                                             const ForwardRequest& req,
-                                                            DeviceType dev) const {
+                                                            DeviceTarget dev) const {
     return LayerExecutionContext{model_.config(), weights_.layers[layer_idx], req, layer_idx, dev};
 }
 
@@ -521,11 +656,14 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
 
     auto cur_hidden = hidden;
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
-        DeviceType layer_dev = layer_device(layer);
+        DeviceTarget layer_dev = layer_device_target(layer);
+#ifdef USE_CUDA
+        if (layer_dev.is_cuda()) cudaSetDevice(layer_dev.device_id);
+#endif
         cur_hidden = transfer_hidden(cur_hidden, layer_dev);
         {
             PERF_SCOPE_FMT("forward/layer_%d", layer);
-            SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev == DeviceType::CUDA ? "cuda" : "cpu", req.n_tokens);
+            SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu", req.n_tokens);
             cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
         }
         if (!cur_hidden) {
@@ -550,7 +688,8 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     // CPU: output_weight keeps its native quantized format in ModelWeights::init()
     // (Q4_0/Q8_0/Q4_1/Q4_K/Q6_K supported), dispatched to fused GEMV kernels by matmul_transB.
     if (output_weight) {
-        cur_hidden = transfer_hidden(cur_hidden, output_weight->device());
+        // output_weight->device() returns DeviceType; implicit conversion to DeviceTarget
+        cur_hidden = transfer_hidden(cur_hidden, DeviceTarget(output_weight->device()));
     }
     TensorPtr logits;
     {

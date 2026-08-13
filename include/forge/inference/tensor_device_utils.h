@@ -7,6 +7,7 @@
 // 需要共享, 因此提取为 inline helper。
 
 #include "forge/tensor.h"
+#include "forge/types.h"
 
 namespace forge {
 
@@ -24,6 +25,11 @@ inline TensorPtr restore_device(const TensorPtr& t, DeviceType target) {
     auto on_dev = std::make_shared<Tensor>(t->dtype(), t->shape(), target);
     on_dev->copy_from(*t);
     return on_dev;
+}
+
+// DeviceTarget overload for multi-GPU compatibility
+inline TensorPtr restore_device(const TensorPtr& t, DeviceTarget target) {
+    return restore_device(t, target.type);
 }
 
 }  // namespace forge

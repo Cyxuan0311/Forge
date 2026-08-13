@@ -31,11 +31,17 @@ struct CliArgs {
 
     // Performance tuning
     int n_gpu_layers = -1;
+    std::vector<int> gpu_layers_per_dev;   // -ngl N:M => [N, M] (Phase 5 multi-GPU)
+    bool offload_kqv = true;  // true = KV on GPU when layers on GPU
     int threads = -1;
     int batch_size = 512;
     int n_predict = -1;
     std::string kv_cache_dtype = "fp32";
     bool cuda_graph = false;  // Phase 10: CUDA Graph for decode
+
+    // Memory / load tuning
+    std::string load_mode;          // "mmap" (default), "mlock", "mmap_mlock"
+    bool offload_embedding = true;  // true = token_embedding follows first layer device
 
     // Sampling control
     float temperature = 0.7f;

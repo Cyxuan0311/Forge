@@ -11,7 +11,7 @@ TensorPtr MlaExecutor::attend(const TensorPtr& normed, const LayerExecutionConte
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
     const int64_t start_pos = lctx.start_pos();
-    const DeviceType dev = lctx.device;
+    const DeviceType dev = lctx.device.type;
     const int num_heads = cfg.num_heads;
     const int head_dim = cfg.head_dim;
     const int kv_lora_rank = cfg.kv_lora_rank;

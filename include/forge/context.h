@@ -20,6 +20,8 @@ class InferenceEngine;
 struct ContextParams {
     int max_seq_len = 4096;
     int gpu_layers = -1;
+    bool offload_kqv = true;  // false = keep KV cache on CPU even when layers are on GPU
+    bool offload_embedding = true;  // false = keep token_embedding on CPU during partial offload
     KVCacheDType kv_cache_dtype = KVCacheDType::FP32;  // legacy: sets both K and V
     KVCacheTypeConfig kv_cache_config;                  // per-K/V type config
     KVStorageMode kv_storage_mode = KVStorageMode::Contiguous;  // internal: storage backend

@@ -16,7 +16,7 @@ void GraphRuntime::inject_runtime(const ForwardRequest& req) {
 }
 
 void GraphRuntime::build(const TensorPtr& hidden, const ModelConfig& cfg, ModelWeights& weights,
-                         KVCache& kv_cache, const std::vector<DeviceType>& layer_devices,
+                         KVCache& kv_cache, const std::vector<DeviceTarget>& layer_devices,
                          DeviceType default_device, int seq_len) {
     graph_ = std::make_unique<ComputeGraph>();
     start_pos_slots_.clear();
@@ -24,7 +24,7 @@ void GraphRuntime::build(const TensorPtr& hidden, const ModelConfig& cfg, ModelW
     int cur_idx = graph_->add_input(hidden);
 
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
-        DeviceType dev = (layer < static_cast<int>(layer_devices.size())) ? layer_devices[layer]
+        DeviceType dev = (layer < static_cast<int>(layer_devices.size())) ? layer_devices[layer].type
                                                                          : default_device;
         // 第一层 hidden_idx=0 是 graph input; 后续层 cur_idx 是节点索引,
         // 必须用负数引用(ref)以免被 execute() 误当作 graph input。
@@ -42,6 +42,15 @@ void GraphRuntime::build(const TensorPtr& hidden, const ModelConfig& cfg, ModelW
     SchedulingPlan sched = scheduler.schedule(*graph_);
     if (sched.valid) {
         graph_->apply_schedule(sched);
+    }
+
+    // Phase 3: insert cross-device copy nodes after device assignment.
+    // This converts implicit auto_transfer() calls into explicit graph COPY nodes,
+    // enabling proper lifetime tracking and per-backend buffer planning.
+    int copies_inserted = graph_->insert_copy_nodes();
+    if (copies_inserted > 0) {
+        LOG_INFO("GraphRuntime: " + std::to_string(copies_inserted) +
+                 " cross-device copies inserted");
     }
 }
 
@@ -68,7 +77,7 @@ bool GraphRuntime::cuda_graph_enabled() const {
 
 TensorPtr GraphRuntime::run(const TensorPtr& hidden, const ForwardRequest& req,
                             const GraphKey& key, const ModelConfig& cfg, ModelWeights& weights,
-                            KVCache& kv_cache, const std::vector<DeviceType>& layer_devices,
+                            KVCache& kv_cache, const std::vector<DeviceTarget>& layer_devices,
                             DeviceType default_device) {
     if (!builder_) return nullptr;
 

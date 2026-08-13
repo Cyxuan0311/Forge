@@ -561,4 +561,17 @@ std::vector<int64_t> GgufModel::get_tensor_shape(const std::string& name) const 
     return tensors_[it->second].shape;
 }
 
+bool GgufModel::mlock_mmap() {
+    if (!mapped_data_ || mapped_size_ == 0)
+        return false;
+    int rc = forge_mlock(mapped_data_, mapped_size_);
+    if (rc != 0) {
+        LOG_WARN("mlock failed for mmap region (" + std::to_string(mapped_size_) +
+                 " bytes): may need higher ulimit -l or root");
+        return false;
+    }
+    LOG_INFO("mlock succeeded: " + std::to_string(mapped_size_) + " bytes pinned");
+    return true;
+}
+
 }  // namespace forge

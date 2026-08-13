@@ -66,7 +66,12 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
         kv_max_seq = KV_MAX_SEQ_CAP;
     }
 
-    DeviceType kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
+    DeviceType kv_dev;
+    if (ctx_.params().offload_kqv) {
+        kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
+    } else {
+        kv_dev = DeviceType::CPU;
+    }
 
     // Gemma4: per-layer KV cache with different head dimensions
     // Full-attention layers use head_dim, SWA layers use head_dim_swa

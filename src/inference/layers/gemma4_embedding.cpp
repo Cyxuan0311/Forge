@@ -107,7 +107,7 @@ TensorPtr Gemma4Embedding::apply_per_layer(const TensorPtr& output,
     const int n_layer = cfg.num_layers;
     const int seq_len = lctx.seq_len();
     const int layer_idx = lctx.layer_idx;
-    const DeviceType dev = lctx.device;
+    const DeviceType dev = lctx.device.type;
 
     auto gated = ops::matmul_transB(output, lw.per_layer_inp_gate());
 

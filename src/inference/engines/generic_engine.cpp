@@ -133,7 +133,7 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
     const int64_t start_pos = lctx.start_pos();
-    const DeviceType dev = lctx.device;
+    const DeviceType dev = lctx.device.type;
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
     int head_dim = cfg.head_dim;

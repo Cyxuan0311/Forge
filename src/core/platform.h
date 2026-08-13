@@ -67,6 +67,14 @@ static inline void forge_prefetch(void* addr, size_t length) {
 #endif
 }
 
+// Lock the mapped range into physical RAM (prevent paging). Returns 0 on success.
+static inline int forge_mlock(const void* addr, size_t length) {
+    return VirtualLock(const_cast<LPVOID>(addr), length) ? 0 : -1;
+}
+static inline int forge_munlock(const void* addr, size_t length) {
+    return VirtualUnlock(const_cast<LPVOID>(addr), length) ? 0 : -1;
+}
+
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -85,6 +93,12 @@ static inline int forge_munmap(void* a, size_t l) {
 }
 static inline void forge_prefetch(void* addr, size_t length) {
     madvise(addr, length, MADV_WILLNEED);
+}
+static inline int forge_mlock(const void* addr, size_t length) {
+    return mlock(addr, length);
+}
+static inline int forge_munlock(const void* addr, size_t length) {
+    return munlock(addr, length);
 }
 #define FORGE_MAP_FAILED MAP_FAILED
 static inline int forge_open(const char* path, int flags) {

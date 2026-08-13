@@ -432,9 +432,14 @@ int main(int argc, char** argv) {
     // ---- Load model ----
     auto t2 = std::chrono::high_resolution_clock::now();
     Model model;
-    DeviceType device = (args.n_gpu_layers == 0) ? DeviceType::CPU : DeviceType::CUDA;
 
-    bool load_ok = model.load(args.model_path, device);
+    // Apply memory tuning options before loading
+    if (!args.load_mode.empty()) {
+        model.set_load_mode(args.load_mode);
+    }
+    model.set_offload_embedding(args.offload_embedding);
+
+    bool load_ok = model.load(args.model_path, args.n_gpu_layers);
     if (!load_ok) {
         std::cerr << "Error: Failed to load model: " << args.model_path << "\n";
         return 1;
@@ -509,14 +514,20 @@ int main(int argc, char** argv) {
         if (args.kv_cache_dtype == "q4_0")
             kv_dtype = KVCacheDType::Q4_0;
         tfm_eng->set_kv_cache_dtype(kv_dtype);
-        tfm_eng->set_gpu_layers(args.n_gpu_layers);
-        if (args.cuda_graph && device == DeviceType::CUDA) {
+        if (!args.gpu_layers_per_dev.empty()) {
+            tfm_eng->set_gpu_layers(args.n_gpu_layers, args.gpu_layers_per_dev);
+        } else {
+            tfm_eng->set_gpu_layers(args.n_gpu_layers);
+        }
+        if (args.cuda_graph && model.device() == DeviceType::CUDA) {
             tfm_eng->set_use_graph(true);
             tfm_eng->set_cuda_graph_enabled(true);
         }
     }
     ctx.set_engine(std::move(engine));
 
+    ctx.params_mut().offload_kqv = args.offload_kqv;
+    ctx.params_mut().offload_embedding = model.offload_embedding();
     ctx.init_kv_cache();
     if (tfm_eng) {
         const KVCache* cache = tfm_eng->kv_cache();
@@ -526,7 +537,7 @@ int main(int argc, char** argv) {
                   << ", max_seq=" << cache->max_seq_len() << "\n";
     }
 
-    if (device == DeviceType::CUDA) {
+    if (model.device() == DeviceType::CUDA) {
         std::cout << "CUDA warmup...\n";
         try {
             ctx.warmup();

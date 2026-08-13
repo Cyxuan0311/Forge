@@ -21,6 +21,8 @@ public:
     TensorPtr forward_from_hidden(const TensorPtr& hidden, int64_t start_pos) override;
     void reset() override;
     void set_gpu_layers(int gpu_layers) override;
+    // Multi-GPU overload: gpu_layers_per_dev[i] = layers on GPU i
+    void set_gpu_layers(int gpu_layers, const std::vector<int>& gpu_layers_per_dev);
     int gpu_layers() const override { return gpu_layers_; }
     void set_kv_cache_dtype(KVCacheDType dtype) { kv_cache_dtype_ = dtype; }
     KVCacheDType kv_cache_dtype() const { return kv_cache_dtype_; }
@@ -69,15 +71,16 @@ protected:
     // 按层构造 LayerExecutionContext。集中处理权重查找和 per-layer device 分配,
     // 避免每个 engine 各自实现一套。
     LayerExecutionContext make_layer_context(int layer_idx, const ForwardRequest& req,
-                                             DeviceType dev) const;
+                                             DeviceTarget dev) const;
 
     // Request-based layer driving. The ForwardRequest carries n_tokens, start_pos
     // and seq_id, so no layer can silently drop or reorder them.
     TensorPtr forward_layers(const TensorPtr& hidden, const ForwardRequest& req);
 
     DeviceType layer_device(int layer_idx) const;
-    const std::vector<DeviceType>& layer_devices() const { return layer_devices_; }
-    TensorPtr transfer_hidden(const TensorPtr& hidden, DeviceType target) const;
+    DeviceTarget layer_device_target(int layer_idx) const;
+    const std::vector<DeviceTarget>& layer_devices() const { return layer_devices_; }
+    TensorPtr transfer_hidden(const TensorPtr& hidden, DeviceTarget target) const;
 
     void apply_rope_standard(const float* q_data, const float* k_data, float* q_out, float* k_out,
                              int seq_len, int num_heads, int num_kv_heads, int head_dim,
@@ -97,7 +100,7 @@ protected:
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
     MemoryPool workspace_pool_;
     int gpu_layers_ = -1;
-    std::vector<DeviceType> layer_devices_;  // per-layer device assignment
+    std::vector<DeviceTarget> layer_devices_;  // per-layer (device_type, device_id) assignment
     bool use_graph_ = false;
     // graph 的构建/缓存/执行全部由 GraphRuntime 负责, builder 来自 ExecutionPlan。
     GraphRuntime graph_runtime_;

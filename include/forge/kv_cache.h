@@ -162,6 +162,9 @@ public:
     // layer_devices[i] = device for layer i. Empty = all layers stay on `device`.
     void set_layer_devices(const std::vector<DeviceType>& layer_devices);
 
+    // Multi-GPU variant: accepts DeviceTarget to specify per-layer GPU device_id.
+    void set_layer_devices(const std::vector<DeviceTarget>& layer_devices);
+
     // Per-layer device query
     DeviceType layer_device(int layer) const;
 

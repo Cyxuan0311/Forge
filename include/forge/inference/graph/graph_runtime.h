@@ -53,7 +53,7 @@ public:
     // 执行一次前向。图不可复用时先重建。返回 logits。
     TensorPtr run(const TensorPtr& hidden, const ForwardRequest& req, const GraphKey& key,
                   const ModelConfig& cfg, ModelWeights& weights, KVCache& kv_cache,
-                  const std::vector<DeviceType>& layer_devices, DeviceType default_device);
+                  const std::vector<DeviceTarget>& layer_devices, DeviceType default_device);
 
     int num_nodes() const { return graph_ ? graph_->num_nodes() : 0; }
 
@@ -63,7 +63,7 @@ public:
 
 private:
     void build(const TensorPtr& hidden, const ModelConfig& cfg, ModelWeights& weights,
-               KVCache& kv_cache, const std::vector<DeviceType>& layer_devices,
+               KVCache& kv_cache, const std::vector<DeviceTarget>& layer_devices,
                DeviceType default_device, int seq_len);
 
     // 把本次请求的 start_pos / seq_id 写入图: 闭包节点通过 runtime_state_ 读,

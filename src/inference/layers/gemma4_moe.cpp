@@ -93,7 +93,7 @@ TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionC
     const auto& cfg = lctx.config;
     const auto& lw = lctx.weights;
     const int seq_len = lctx.seq_len();
-    const DeviceType dev = lctx.device;
+    const DeviceType dev = lctx.device.type;
 
     // ---- Shared expert (标准 GeGLU FFN) ----
     TensorPtr shared_out;

@@ -32,7 +32,8 @@ struct LayerExecutionContext {
     int layer_idx = 0;
 
     // 本层的执行设备。可能与其他层不同(gpu_layers offload)。
-    DeviceType device = DeviceType::CPU;
+    // DeviceTarget carries both device type and GPU device_id for multi-GPU setups.
+    DeviceTarget device = DeviceTarget::cpu();
 
     // ---- 便捷访问 ----
     int seq_len() const { return request.n_tokens; }
