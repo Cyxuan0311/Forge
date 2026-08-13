@@ -793,6 +793,7 @@ private:
 void register_core_types(py::module_& m);
 void register_model(py::module_& m);
 void register_tokenizer(py::module_& m);
+void register_chat_template(py::module_& m);
 void register_multimodal(py::module_& m);
 void register_scheduler(py::module_& m);
 void register_backend(py::module_& m);

@@ -25,6 +25,7 @@ PYBIND11_MODULE(forge, m) {
     register_core_types(m);
     register_model(m);
     register_tokenizer(m);
+    register_chat_template(m);
     register_multimodal(m);
     register_scheduler(m);
     register_backend(m);

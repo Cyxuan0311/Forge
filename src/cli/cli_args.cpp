@@ -43,6 +43,8 @@ static void print_usage(const char* prog) {
            "       --no-stream           Disable streaming output\n"
            "       --system-prompt TEXT  System prompt\n"
            "\n"
+           "       --no-jinja             Force fallback to hardcoded chat templates\n"
+           "\n"
            "Info & Debug:\n"
            "       --info                Show model info and exit\n"
            "       --bench               Run performance benchmark\n"
@@ -198,6 +200,8 @@ CliArgs parse_args(int argc, char** argv) {
             args.system_prompt = argv[i];
         } else if (arg == "--cuda-graph") {
             args.cuda_graph = true;
+        } else if (arg == "--no-jinja") {
+            args.no_jinja = true;
         } else if (arg == "--info") {
             args.info_only = true;
         } else if (arg == "--bench") {

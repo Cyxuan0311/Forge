@@ -33,8 +33,11 @@ public:
     /// @param add_dummy_prefix If true, add SPM dummy prefix (▁) at the start.
     ///                         Should be false when encoding text that follows a
     ///                         special token or newline (no leading space desired).
+    /// @param parse_special If true, scan text for special tokens (e.g. <|im_start|>,
+    ///                      [INST]) and encode them as single tokens rather than
+    ///                      splitting into subword pieces.
     std::vector<int32_t> encode(const std::string& text, bool add_bos = true, bool add_eos = false,
-                                bool add_dummy_prefix = true) const;
+                                bool add_dummy_prefix = true, bool parse_special = false) const;
 
     /// Decode token IDs back to text.
     /// @param strip_leading_space If true, remove the leading space from SPM dummy prefix.
@@ -111,6 +114,11 @@ private:
     // Byte-level BPE lookup tables
     std::unordered_map<uint8_t, std::string> byte_to_unicode_char_;
     std::unordered_map<std::string, uint8_t> unicode_char_to_byte_;
+
+    // Special token cache for parse_special (lazy-initialized)
+    mutable std::vector<std::pair<std::string, int32_t>> special_tokens_cache_;
+    mutable bool special_tokens_cached_ = false;
+    void ensure_special_tokens_cached() const;
 };
 
 }  // namespace forge

@@ -11,11 +11,11 @@ void register_tokenizer(py::module_& m) {
         .def(
             "encode",
             [](const Tokenizer& tok, const std::string& text, bool add_bos, bool add_eos,
-               bool add_dummy_prefix) {
-                return tok.encode(text, add_bos, add_eos, add_dummy_prefix);
+               bool add_dummy_prefix, bool parse_special) {
+                return tok.encode(text, add_bos, add_eos, add_dummy_prefix, parse_special);
             },
             py::arg("text"), py::arg("add_bos") = true, py::arg("add_eos") = false,
-            py::arg("add_dummy_prefix") = true)
+            py::arg("add_dummy_prefix") = true, py::arg("parse_special") = false)
         .def(
             "decode",
             [](const Tokenizer& tok, const std::vector<int32_t>& ids, bool skip_special,

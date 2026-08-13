@@ -250,6 +250,7 @@ add_library(
   forge_infer STATIC
   src/inference/perf_profiler.cpp
   src/inference/execution_plan.cpp
+  src/inference/chat_template.cpp
   src/inference/engines/transformer_engine.cpp
   src/inference/engines/deepseek_engine.cpp
   src/inference/engines/qwen35_engine.cpp
@@ -283,11 +284,21 @@ add_library(
   src/inference/paged_kv_cache.cpp
   src/inference/attention_mask.cpp
   src/inference/request_scheduler.cpp
-  src/inference/speculative.cpp)
+  src/inference/speculative.cpp
+  # Jinja engine (vendored from llama.cpp, MIT licensed)
+  third_party/jinja/lexer.cpp
+  third_party/jinja/parser.cpp
+  third_party/jinja/runtime.cpp
+  third_party/jinja/jinja_string.cpp
+  third_party/jinja/value.cpp
+  third_party/jinja/caps.cpp
+  third_party/jinja/unicode.cpp)
 target_include_directories(
   forge_infer
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CUDAToolkit_INCLUDE_DIRS}
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/operators)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/operators
+          ${CMAKE_CURRENT_SOURCE_DIR}/third_party/jinja
+          ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge_infer PUBLIC USE_CUDA)
 endif()
@@ -353,6 +364,7 @@ if(FORGE_BUILD_PYTHON)
     src/bindings/core_types.cpp
     src/bindings/model.cpp
     src/bindings/tokenizer.cpp
+    src/bindings/chat_template.cpp
     src/bindings/multimodal.cpp
     src/bindings/scheduler.cpp
     src/bindings/backend.cpp

@@ -7,6 +7,7 @@
 #include <iostream>
 
 #include "cli_common.h"
+#include "forge/chat_template.h"
 #include "forge/context.h"
 #include "forge/engine.h"
 #include "forge/engines/transformer_engine.h"
@@ -21,7 +22,21 @@ using namespace forge;
 void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
                       const CliArgs& args) {
     const auto& cfg = model.config();
-    auto tmpl_type = detect_template_type(tokenizer);
+
+    // Build ChatTemplateEngine — jinja path is the default;
+    // --no-jinja forces fallback to hardcoded templates.
+    auto build_engine = [&]() -> ChatTemplateEngine {
+        if (args.no_jinja) {
+            std::cout << "  [Note: Jinja disabled by --no-jinja, using fallback templates]\n";
+            return ChatTemplateEngine();
+        }
+        auto eng = ChatTemplateEngine::from_tokenizer(tokenizer);
+        if (!eng.uses_jinja()) {
+            std::cout << "  [Note: Using fallback chat template (no GGUF chat_template found)]\n";
+        }
+        return eng;
+    };
+    ChatTemplateEngine tmpl_engine = build_engine();
 
     std::vector<ChatMessage> conversation;
     std::string current_system = args.system_prompt;
@@ -120,7 +135,25 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
 
         conversation.push_back({"user", user_input});
 
-        auto prompt_ids = apply_chat_template(tokenizer, conversation, tmpl_type, true);
+        // Build ChatTemplateInput: extract system message, pass rest as messages
+        ChatTemplateInput tmpl_input;
+        tmpl_input.add_generation_prompt = true;
+        for (const auto& msg : conversation) {
+            if (msg.role == "system") {
+                tmpl_input.system_prompt = msg.content;
+            } else {
+                tmpl_input.messages.push_back({msg.role, msg.content});
+            }
+        }
+
+        std::vector<int32_t> prompt_ids;
+        if (tmpl_engine.uses_jinja() || !args.no_jinja) {
+            prompt_ids = tmpl_engine.apply(tmpl_input);
+        } else {
+            // --no-jinja: use legacy fallback directly
+            auto tmpl_type = detect_template_type(tokenizer);
+            prompt_ids = apply_chat_template(tokenizer, conversation, tmpl_type, true);
+        }
 
         ctx = std::make_unique<InferenceContext>(model);
 

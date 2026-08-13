@@ -25,330 +25,23 @@ import forge  # noqa: E402
 
 
 # ===========================================================================
-#  Unified Chat Template Engine
+#  Helpers
 # ===========================================================================
 
 
-class _ChatTemplate:
-    """Base class for chat templates."""
-
-    name = "plain"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True) -> list:
-        """Convert messages to token IDs."""
-        raise NotImplementedError
-
-    @staticmethod
-    def detect(tokenizer) -> "_ChatTemplate":
-        """Auto-detect the appropriate chat template from tokenizer metadata."""
-        template_str = tokenizer.chat_template
-
-        # 1. Try detection from GGUF chat_template string
-        if template_str:
-            tl = template_str.lower()
-            if "<|im_start|>" in tl or "chatml" in tl:
-                return _ChatMLTemplate()
-            if "<|start_header_id|>" in tl or "llama3" in tl or "llama 3" in tl:
-                return _Llama3Template()
-            if "<|user|>" in tl and "<|assistant|>" in tl:
-                return _ZephyrTemplate()
-            if "[inst]" in tl or "llama-2" in tl:
-                return _Llama2Template()
-            if "<|turn" in tl or "gemma" in tl:
-                return _Gemma4Template()
-            if "<｜User｜>" in tl or "deepseek" in tl:
-                return _DeepSeekTemplate()
-            if "phi" in tl or "<|user|" in tl:
-                return _Phi3Template()
-
-        # 2. Fallback: detect by model_type
-        try:
-            model_type = str(tokenizer.model_type).lower() if tokenizer.model_type else ""
-        except Exception:
-            model_type = ""
-        if "qwen" in model_type:
-            return _ChatMLTemplate()
-        if "llama" in model_type:
-            return _Llama3Template()
-        if "gemma" in model_type:
-            return _Gemma4Template()
-        if "deepseek" in model_type:
-            return _DeepSeekTemplate()
-        if "phi" in model_type:
-            return _Phi3Template()
-
-        return _PlainTemplate()
-
-
-class _ChatMLTemplate(_ChatTemplate):
-    """ChatML format: <|im_start|>role\ncontent<|im_end|>\n (Qwen, MiniCPM, MiMo)."""
-
-    name = "chatml"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        im_start = tokenizer.token_to_id("<|im_start|>")
-        im_end = tokenizer.token_to_id("<|im_end|>")
-        if im_start < 0 or im_end < 0:
-            return _PlainTemplate().apply(tokenizer, messages, add_generation_prompt)
-
-        ids = []
-        for msg in messages:
-            ids.append(im_start)
-            ids.extend(tokenizer.encode(msg["role"] + "\n", add_bos=False))
-            ids.extend(tokenizer.encode(msg["content"], add_bos=False))
-            ids.append(im_end)
-            ids.extend(tokenizer.encode("\n", add_bos=False))
-
-        if add_generation_prompt:
-            ids.append(im_start)
-            ids.extend(tokenizer.encode("assistant\n", add_bos=False))
-
-        return ids
-
-
-class _Llama3Template(_ChatTemplate):
-    """LLaMA 3.1 format: <|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>."""
-
-    name = "llama3"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        start_h = tokenizer.token_to_id("<|start_header_id|>")
-        end_h = tokenizer.token_to_id("<|end_header_id|>")
-        eot = tokenizer.token_to_id("<|eot_id|>")
-
-        ids = []
-        bos = tokenizer.bos_token_id
-        if bos >= 0:
-            ids.append(bos)
-
-        for msg in messages:
-            ids.append(start_h)
-            ids.extend(tokenizer.encode(msg["role"], add_bos=False))
-            ids.append(end_h)
-            ids.extend(tokenizer.encode("\n\n", add_bos=False))
-            ids.extend(tokenizer.encode(msg["content"], add_bos=False))
-            ids.append(eot)
-
-        if add_generation_prompt:
-            ids.append(start_h)
-            ids.extend(tokenizer.encode("assistant", add_bos=False))
-            ids.append(end_h)
-            ids.extend(tokenizer.encode("\n\n", add_bos=False))
-
-        return ids
-
-
-class _ZephyrTemplate(_ChatTemplate):
-    """Zephyr format: <|user|>\n...<eos>\n<|assistant|>\n...<eos>\n (TinyLlama)."""
-
-    name = "zephyr"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        ids = []
-        for msg in messages:
-            role = msg["role"]
-            if role == "system":
-                ids.extend(tokenizer.encode("<|system|>\n", add_bos=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
-                ids.append(tokenizer.eos_token_id)
-                ids.extend(tokenizer.encode("\n", add_bos=False, add_dummy_prefix=False))
-            elif role == "user":
-                ids.extend(tokenizer.encode("<|user|>\n", add_bos=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
-                ids.append(tokenizer.eos_token_id)
-                ids.extend(tokenizer.encode("\n", add_bos=False, add_dummy_prefix=False))
-            elif role == "assistant":
-                ids.extend(
-                    tokenizer.encode("<|assistant|>\n", add_bos=False, add_dummy_prefix=False)
-                )
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
-                ids.append(tokenizer.eos_token_id)
-                ids.extend(tokenizer.encode("\n", add_bos=False, add_dummy_prefix=False))
-
-        if add_generation_prompt:
-            ids.extend(tokenizer.encode("<|assistant|>\n", add_bos=False, add_dummy_prefix=False))
-
-        return ids
-
-
-class _Llama2Template(_ChatTemplate):
-    """Llama-2 format: [INST] ... [/INST] ..."""
-
-    name = "llama2"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        ids = []
-        for msg in messages:
-            if msg["role"] == "user":
-                ids.append(tokenizer.bos_token_id)
-                ids.extend(tokenizer.encode("[INST] ", add_bos=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
-                ids.extend(tokenizer.encode(" [/INST]", add_bos=False))
-            elif msg["role"] == "assistant":
-                ids.extend(tokenizer.encode(" ", add_bos=False, add_dummy_prefix=False))
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False, add_dummy_prefix=False))
-                ids.append(tokenizer.eos_token_id)
-
-        return ids
-
-
-class _Gemma4Template(_ChatTemplate):
-    """Gemma 4 format: <|turn>role\ncontent<turn|>\n with optional thinking."""
-
-    name = "gemma4"
-
-    def __init__(self, enable_thinking=False):
-        self._thinking = enable_thinking
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        bos = tokenizer.bos_token_id
-        turn_start = tokenizer.token_to_id("<|turn>")
-        turn_end = tokenizer.token_to_id("<turn|>")
-        newline = 108  # Gemma4 newline token
-
-        user_id = tokenizer.token_to_id("user")
-        model_id = tokenizer.token_to_id("model")
-        system_id = tokenizer.token_to_id("system")
-
-        ids = []
-        if bos >= 0:
-            ids.append(bos)
-
-        if self._thinking:
-            think_id = tokenizer.token_to_id("<|think|>")
-            if think_id is not None and think_id >= 0:
-                ids.append(turn_start)
-                ids.append(system_id)
-                ids.append(newline)
-                ids.append(think_id)
-                ids.append(newline)
-                ids.append(turn_end)
-                ids.append(newline)
-
-        for msg in messages:
-            role = msg["role"]
-            if role == "system":
-                role_id = system_id
-            elif role == "user":
-                role_id = user_id
-            elif role == "assistant":
-                role_id = model_id
-            else:
-                role_id = user_id
-
-            ids.append(turn_start)
-            ids.append(role_id)
-            ids.append(newline)
-            ids.extend(tokenizer.encode(msg["content"], add_bos=False))
-            ids.append(turn_end)
-            ids.append(newline)
-
-        if add_generation_prompt:
-            ids.append(turn_start)
-            ids.append(model_id)
-            ids.append(newline)
-
-        return ids
-
-
-class _DeepSeekTemplate(_ChatTemplate):
-    """DeepSeek-R1 format: <｜User｜>content<｜Assistant｜>content"""
-
-    name = "deepseek"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        bos = tokenizer.bos_token_id
-        eos = tokenizer.eos_token_id
-        user_id = tokenizer.token_to_id("<｜User｜>")
-        asst_id = tokenizer.token_to_id("<｜Assistant｜>")
-
-        ids = []
-        if bos >= 0:
-            ids.append(bos)
-
-        for msg in messages:
-            if msg["role"] == "system":
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False))
-            elif msg["role"] == "user":
-                ids.append(user_id)
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False))
-            elif msg["role"] == "assistant":
-                ids.append(asst_id)
-                ids.extend(tokenizer.encode(msg["content"], add_bos=False))
-                ids.append(eos)
-
-        if add_generation_prompt:
-            ids.append(asst_id)
-
-        return ids
-
-
-class _Phi3Template(_ChatTemplate):
-    """Phi-3 Mini format: <|user|>\ncontent<|end|>\n<|assistant|>\ncontent<|end|>\n"""
-
-    name = "phi3"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        ids = []
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            ids.extend(tokenizer.encode(f"<|{role}|>\n", add_bos=False))
-            ids.extend(tokenizer.encode(content, add_bos=False))
-            ids.extend(tokenizer.encode("<|end|>\n", add_bos=False))
-
-        if add_generation_prompt:
-            ids.extend(tokenizer.encode("<|assistant|>\n", add_bos=False))
-
-        return ids
-
-
-class _PlainTemplate(_ChatTemplate):
-    """Plain fallback: role: content\\n"""
-
-    name = "plain"
-
-    def apply(self, tokenizer, messages, add_generation_prompt=True):
-        ids = []
-        bos = tokenizer.bos_token_id
-        if bos >= 0:
-            ids.append(bos)
-        for msg in messages:
-            ids.extend(tokenizer.encode(f"{msg['role']}: {msg['content']}\n", add_bos=False))
-        if add_generation_prompt:
-            ids.extend(tokenizer.encode("assistant: ", add_bos=False))
-        return ids
-
-
-# Registry of all supported templates
-_TEMPLATES = {
-    "chatml": _ChatMLTemplate,
-    "llama3": _Llama3Template,
-    "zephyr": _ZephyrTemplate,
-    "llama2": _Llama2Template,
-    "gemma4": _Gemma4Template,
-    "deepseek": _DeepSeekTemplate,
-    "phi3": _Phi3Template,
-    "plain": _PlainTemplate,
-}
-
-
-def detect_chat_template(tokenizer, template_name=None) -> _ChatTemplate:
-    """Detect or select a chat template.
-
-    Args:
-        tokenizer: forge.Tokenizer instance (may be None for plain fallback).
-        template_name: Optional explicit template name (e.g. "chatml", "llama3").
-                       If None, auto-detection is used.
-
-    Returns:
-        A _ChatTemplate instance.
-    """
-    if template_name and template_name in _TEMPLATES:
-        return _TEMPLATES[template_name]()
-    if tokenizer is None:
-        return _PlainTemplate()
-    return _ChatTemplate.detect(tokenizer)
+def _build_template_input(messages):
+    """Convert Python message dicts to forge.ChatTemplateInput."""
+    inp = forge.ChatTemplateInput()
+    inp.add_generation_prompt = True
+    for msg in messages:
+        if msg["role"] == "system":
+            inp.system_prompt = msg["content"]
+        else:
+            m = forge.ChatTemplateMessage()
+            m.role = msg["role"]
+            m.content = msg["content"]
+            inp.messages.append(m)
+    return inp
 
 
 # ===========================================================================
@@ -381,7 +74,7 @@ class LLM:
         device="cuda",
         n_gpu_layers=-1,
         kv_dtype="fp16",
-        template_name=None,
+        no_jinja=False,
         **kwargs,
     ):
         """Create an LLM from a GGUF model file.
@@ -391,7 +84,7 @@ class LLM:
             device: "cuda" or "cpu".
             n_gpu_layers: Number of layers on GPU (-1 = all).
             kv_dtype: KV cache dtype ("fp32", "fp16", "q8_0", "q4_0", "q4_k").
-            template_name: Optional chat template name override.
+            no_jinja: If True, skip Jinja rendering and use fallback templates.
             **kwargs: Additional args passed to create_context.
 
         Returns:
@@ -411,27 +104,30 @@ class LLM:
         # Create context
         llm._ctx = llm._model.create_context(kv_cache_dtype=kv_dtype, gpu_layers=n_gpu_layers)
 
-        # Detect chat template
-        llm._template = detect_chat_template(llm._tokenizer, template_name)
+        # Build chat template engine
+        if no_jinja:
+            llm._template = forge.ChatTemplateEngine()
+        else:
+            llm._template = forge.ChatTemplateEngine.from_tokenizer(llm._tokenizer)
 
         return llm
 
     # ---- Properties ----
 
     @property
-    def model(self) -> forge.Model:
+    def model(self):
         return self._model
 
     @property
-    def tokenizer(self) -> forge.Tokenizer:
+    def tokenizer(self):
         return self._tokenizer
 
     @property
-    def context(self) -> forge.InferenceContext:
+    def context(self):
         return self._ctx
 
     @property
-    def template(self) -> _ChatTemplate:
+    def template(self):
         return self._template
 
     @property
@@ -576,7 +272,8 @@ class LLM:
 
     def _apply_chat_template(self, messages):
         """Apply chat template to messages, return token IDs."""
-        return self._template.apply(self._tokenizer, messages, add_generation_prompt=True)
+        inp = _build_template_input(messages)
+        return self._template.apply(inp)
 
     def chat(
         self,
@@ -716,9 +413,9 @@ class Session:
         return self._prefix_token_count
 
     def _apply_template(self, add_generation_prompt=True) -> list:
-        return self._llm.template.apply(
-            self._llm.tokenizer, self._messages, add_generation_prompt=add_generation_prompt
-        )
+        inp = _build_template_input(self._messages)
+        inp.add_generation_prompt = add_generation_prompt
+        return self._llm.template.apply(inp)
 
     def send(
         self,
@@ -922,7 +619,7 @@ class VisionLLM:
         self._kv_dtype = kv_cache_dtype
         self._gpu_layers = gpu_layers
         self._ctx = None
-        self._template = _ChatTemplate.detect(self.tokenizer)
+        self._template = forge.ChatTemplateEngine.from_tokenizer(self.tokenizer)
 
     @classmethod
     def from_gguf(
@@ -1000,6 +697,11 @@ class VisionLLM:
             text_embeddings[img_insert_pos : img_insert_pos + num_img_tokens] = image_embeddings
         return text_embeddings
 
+    def _apply_template(self, messages):
+        """Apply chat template to messages, return token IDs."""
+        inp = _build_template_input(messages)
+        return self._template.apply(inp)
+
     def generate_stream(
         self,
         prompt,
@@ -1028,7 +730,7 @@ class VisionLLM:
 
         # Build prompt tokens
         messages = [{"role": "user", "content": prompt}]
-        prompt_ids = self._template.apply(self.tokenizer, messages)
+        prompt_ids = self._apply_template(messages)
 
         ctx = self.context
         if has_image and image_embeddings is not None:
@@ -1094,7 +796,7 @@ class VisionLLM:
         Yields:
             Decoded text fragments.
         """
-        prompt_ids = self._template.apply(self.tokenizer, messages)
+        prompt_ids = self._apply_template(messages)
         # Encode full prompt tokens as prompt string (template handles formatting)
         prompt = self.tokenizer.decode(prompt_ids, skip_special=True)
         yield from self.generate_stream(prompt, image=image, **kwargs)

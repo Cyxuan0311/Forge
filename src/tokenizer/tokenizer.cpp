@@ -380,17 +380,132 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
 
 // ===== Encode =====
 
+void Tokenizer::ensure_special_tokens_cached() const {
+    if (special_tokens_cached_)
+        return;
+
+    special_tokens_cache_.clear();
+
+    for (int32_t i = 0; i < static_cast<int32_t>(vocab_.tokens.size()); ++i) {
+        const auto& token = vocab_.tokens[i];
+        if (token.empty())
+            continue;
+
+        bool is_special = false;
+
+        // 1. Check GGUF token type: CONTROL(3), USER_DEFINED(4), UNUSED(5) are special
+        if (i < static_cast<int32_t>(vocab_.token_types.size())) {
+            int tt = vocab_.token_types[i];
+            if (tt == 3 || tt == 4 || tt == 5) {
+                is_special = true;
+            }
+        }
+
+        // 2. Heuristic: tokens containing control-like characters are special
+        if (!is_special) {
+            for (char c : token) {
+                if (c == '<' || c == '>' || c == '|' || c == '[' || c == ']') {
+                    is_special = true;
+                    break;
+                }
+            }
+        }
+
+        // 3. Skip byte tokens (type 6) and pure whitespace tokens
+        if (is_special) {
+            if (i < static_cast<int32_t>(vocab_.token_types.size()) &&
+                vocab_.token_types[i] == 6) {
+                continue;  // skip byte tokens
+            }
+            // Skip pure whitespace tokens
+            bool all_space = true;
+            for (char c : token) {
+                if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+                    all_space = false;
+                    break;
+                }
+            }
+            if (!all_space) {
+                special_tokens_cache_.push_back({token, i});
+            }
+        }
+    }
+
+    // Sort by length descending for longest-match greedy
+    std::sort(special_tokens_cache_.begin(), special_tokens_cache_.end(),
+              [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+
+    special_tokens_cached_ = true;
+}
+
 std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_bos, bool add_eos,
-                                       bool add_dummy_prefix) const {
+                                       bool add_dummy_prefix, bool parse_special) const {
     if (!loaded_)
         return {};
 
+    if (!parse_special) {
+        std::vector<int32_t> result;
+        if (model_type_ == TokenizerModelType::BPE) {
+            result = encode_bpe(text, add_bos, add_eos);
+        } else {
+            result = encode_spm(text, add_bos, add_eos, add_dummy_prefix);
+        }
+        return result;
+    }
+
+    // ---- parse_special mode ----
+    ensure_special_tokens_cached();
+
     std::vector<int32_t> result;
 
-    if (model_type_ == TokenizerModelType::BPE) {
-        result = encode_bpe(text, add_bos, add_eos);
-    } else {
-        result = encode_spm(text, add_bos, add_eos, add_dummy_prefix);
+    if (add_bos && bos_id_ >= 0) {
+        result.push_back(bos_id_);
+    }
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Try to match a special token at current position (longest match first)
+        bool matched = false;
+        for (const auto& [token_str, tid] : special_tokens_cache_) {
+            if (text.compare(pos, token_str.size(), token_str) == 0) {
+                result.push_back(tid);
+                pos += token_str.size();
+                matched = true;
+                break;
+            }
+        }
+
+        if (matched)
+            continue;
+
+        // Find the next occurrence of any special token
+        size_t next_special = std::string::npos;
+        for (const auto& [token_str, tid] : special_tokens_cache_) {
+            size_t found = text.find(token_str, pos);
+            if (found != std::string::npos && found < next_special) {
+                next_special = found;
+            }
+        }
+
+        if (next_special == std::string::npos) {
+            // No more special tokens — encode the rest as regular text
+            std::string regular = text.substr(pos);
+            auto regular_ids = encode(regular, false, false, add_dummy_prefix && (pos == 0), false);
+            result.insert(result.end(), regular_ids.begin(), regular_ids.end());
+            break;
+        }
+
+        // Encode the regular text segment before the next special token
+        if (next_special > pos) {
+            std::string regular = text.substr(pos, next_special - pos);
+            auto regular_ids = encode(regular, false, false, add_dummy_prefix && (pos == 0), false);
+            result.insert(result.end(), regular_ids.begin(), regular_ids.end());
+        }
+        pos = next_special;
+    }
+
+    if (add_eos && eos_id_ >= 0) {
+        result.push_back(eos_id_);
     }
 
     return result;

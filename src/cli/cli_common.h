@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "forge/chat_template.h"
+
 // Forward declarations
 namespace forge {
 class Tokenizer;
@@ -49,6 +51,9 @@ struct CliArgs {
     bool no_stream = false;
     bool info_only = false;
     bool bench = false;
+
+    // Chat template
+    bool no_jinja = false;  // Force fallback to hardcoded templates
 
     // System prompt
     std::string system_prompt;
