@@ -985,6 +985,165 @@ static void gemv_q4_0_fused_ffn_up_neon(const float* a, const uint8_t* w_gate,
     }
 }
 
+// K-quant row dots shared by GEMM and fused projections.
+static inline int dot_s8_16_neon(int8x16_t x, int8x16_t y) {
+#ifdef USE_DOTPROD
+    return vaddvq_s32(vdotq_s32(vdupq_n_s32(0), x, y));
+#else
+    return vaddvq_s32(vaddq_s32(vpaddlq_s16(vmull_s8(vget_low_s8(x), vget_low_s8(y))),
+                                  vpaddlq_s16(vmull_s8(vget_high_s8(x), vget_high_s8(y)))));
+#endif
+}
+
+static inline float dot_q2_K_q8_K_row_neon(const uint8_t* row,
+                                             const block_q8_K* q8, int nb) {
+    float acc = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto* x = reinterpret_cast<const block_q2_K*>(row) + bi;
+        const auto* y = q8 + bi;
+        const float d = y->d * fp16_to_float_scalar(x->d);
+        const float dmin = -y->d * fp16_to_float_scalar(x->dmin);
+        for (int half = 0; half < 2; ++half) for (int j = 0; j < 4; ++j) {
+            const int group = half * 8 + j * 2;
+            const uint8_t shift = j * 2;
+            for (int part = 0; part < 2; ++part) {
+                alignas(16) int8_t values[16];
+                const uint8_t* src = x->qs + half * 32 + part * 16;
+                for (int l = 0; l < 16; ++l) values[l] = (src[l] >> shift) & 3;
+                const int gi = group + part;
+                const int dot = dot_s8_16_neon(vld1q_s8(values), vld1q_s8(y->qs + gi * 16));
+                acc += d * (x->scales[gi] & 0x0f) * dot +
+                       dmin * (x->scales[gi] >> 4) * y->bsums[gi];
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float dot_q3_K_q8_K_row_neon(const uint8_t* row,
+                                             const block_q8_K* q8, int nb) {
+    float acc = 0.0f;
+    for (int bi = 0; bi < nb; ++bi)
+        acc += vgetq_lane_f32(q3_k_sb_dot_neon(row + (size_t)bi * sizeof(block_q3_K), q8 + bi), 0);
+    return acc;
+}
+
+static inline float dot_q5_K_q8_K_row_neon(const uint8_t* row,
+                                             const block_q8_K* q8, int nb) {
+    float acc = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto* x = reinterpret_cast<const block_q5_K*>(row) + bi;
+        const auto* y = q8 + bi;
+        uint8_t sc[8], mn[8];
+        decode_q4_k_scales_neon(x->scales, sc, mn);
+        const float d = y->d * fp16_to_float_scalar(x->d);
+        const float dmin = -y->d * fp16_to_float_scalar(x->dmin);
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            alignas(16) int8_t values[16];
+            const uint8_t* ql = x->ql + chunk * 32;
+            const uint8_t low_bit = 1u << (2 * chunk);
+            const uint8_t high_bit = 1u << (2 * chunk + 1);
+            int lo_dot = 0, hi_dot = 0;
+            for (int part = 0; part < 2; ++part) {
+                for (int l = 0; l < 16; ++l)
+                    values[l] = (ql[part * 16 + l] & 0x0f) + ((x->qh[part * 16 + l] & low_bit) ? 16 : 0);
+                lo_dot += dot_s8_16_neon(vld1q_s8(values), vld1q_s8(y->qs + chunk * 64 + part * 16));
+                for (int l = 0; l < 16; ++l)
+                    values[l] = (ql[part * 16 + l] >> 4) + ((x->qh[part * 16 + l] & high_bit) ? 16 : 0);
+                hi_dot += dot_s8_16_neon(vld1q_s8(values), vld1q_s8(y->qs + chunk * 64 + 32 + part * 16));
+            }
+            acc += d * (sc[2 * chunk] * lo_dot + sc[2 * chunk + 1] * hi_dot) +
+                   dmin * (mn[2 * chunk] * (y->bsums[chunk * 4] + y->bsums[chunk * 4 + 1]) +
+                           mn[2 * chunk + 1] * (y->bsums[chunk * 4 + 2] + y->bsums[chunk * 4 + 3]));
+        }
+    }
+    return acc;
+}
+
+static inline float dot_q6_K_q8_K_row_neon(const uint8_t* row,
+                                             const block_q8_K* q8, int nb) {
+    float acc = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+        const auto* x = reinterpret_cast<const block_q6_K*>(row) + bi;
+        const auto* y = q8 + bi;
+        const float d = y->d * fp16_to_float_scalar(x->d);
+        for (int g = 0; g < 16; ++g) {
+            const int half = g / 8, pos = g % 8;
+            const int ql_offset = half * 64 + (pos == 2 || pos == 3 || pos == 6 || pos == 7 ? 32 : 0) + (pos & 1) * 16;
+            const int qh_offset = half * 32 + (pos & 1) * 16;
+            const int shift = (pos / 2) * 2;
+            const bool high_nibble = pos >= 4;
+            alignas(16) int8_t values[16];
+            for (int l = 0; l < 16; ++l) {
+                const uint8_t ql = x->ql[ql_offset + l];
+                const int low = high_nibble ? (ql >> 4) : (ql & 0x0f);
+                values[l] = (low | (((x->qh[qh_offset + l] >> shift) & 3) << 4)) - 32;
+            }
+            acc += d * x->scales[g] * dot_s8_16_neon(vld1q_s8(values), vld1q_s8(y->qs + g * 16));
+        }
+    }
+    return acc;
+}
+
+template <typename DotFn>
+static inline void fused_ffn_up_k_neon(const float* a, const uint8_t* gate, const uint8_t* up,
+                                       float* out, int K, int N, size_t block_bytes, DotFn dot) {
+    const int nb = (K + 255) / 256;
+    std::vector<block_q8_K> q8(nb);
+    quantize_row_q8_K(a, q8.data(), K);
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const float g = dot(gate + (size_t)n * nb * block_bytes, q8.data(), nb);
+        const float u = dot(up + (size_t)n * nb * block_bytes, q8.data(), nb);
+        out[n] = (g / (1.0f + std::exp(-g))) * u;
+    }
+}
+
+template <typename DotFn>
+static inline void fused_qkv_k_neon(const float* a, const uint8_t* wq, const uint8_t* wk,
+                                    const uint8_t* wv, float* oq, float* ok, float* ov,
+                                    int K, int Nq, int Nk, int Nv, size_t block_bytes, DotFn dot) {
+    const int nb = (K + 255) / 256;
+    std::vector<block_q8_K> q8(nb);
+    quantize_row_q8_K(a, q8.data(), K);
+    auto run = [&](const uint8_t* w, float* o, int N) {
+        #pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n)
+            o[n] = dot(w + (size_t)n * nb * block_bytes, q8.data(), nb);
+    };
+    run(wq, oq, Nq); run(wk, ok, Nk); run(wv, ov, Nv);
+}
+
+template <typename DotFn>
+static inline void fused_residual_k_neon(const float* a, const uint8_t* w, const float* residual,
+                                         float* out, int K, int N, size_t block_bytes, DotFn dot) {
+    const int nb = (K + 255) / 256;
+    std::vector<block_q8_K> q8(nb);
+    quantize_row_q8_K(a, q8.data(), K);
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n)
+        out[n] = residual[n] + dot(w + (size_t)n * nb * block_bytes, q8.data(), nb);
+}
+
+static inline void gemv_q3_K_fused_ffn_up_neon(const float* a, const uint8_t* g, const uint8_t* u, float* o, int K, int N) { fused_ffn_up_k_neon(a,g,u,o,K,N,sizeof(block_q3_K),dot_q3_K_q8_K_row_neon); }
+static inline void gemv_q4_K_fused_ffn_up_neon(const float* a, const uint8_t* g, const uint8_t* u, float* o, int K, int N) { fused_ffn_up_k_neon(a,g,u,o,K,N,sizeof(block_q4_K),dot_q4_K_q8_K_row_neon); }
+static inline void gemv_q5_K_fused_ffn_up_neon(const float* a, const uint8_t* g, const uint8_t* u, float* o, int K, int N) { fused_ffn_up_k_neon(a,g,u,o,K,N,sizeof(block_q5_K),dot_q5_K_q8_K_row_neon); }
+static inline void gemv_q2_K_fused_ffn_up_neon(const float* a, const uint8_t* g, const uint8_t* u, float* o, int K, int N) { fused_ffn_up_k_neon(a,g,u,o,K,N,sizeof(block_q2_K),dot_q2_K_q8_K_row_neon); }
+static inline void gemv_q3_K_fused_qkv_neon(const float* a, const uint8_t* q, const uint8_t* k, const uint8_t* v, float* oq, float* ok, float* ov, int K, int Nq, int Nk, int Nv) { fused_qkv_k_neon(a,q,k,v,oq,ok,ov,K,Nq,Nk,Nv,sizeof(block_q3_K),dot_q3_K_q8_K_row_neon); }
+static inline void gemv_q4_K_fused_qkv_neon(const float* a, const uint8_t* q, const uint8_t* k, const uint8_t* v, float* oq, float* ok, float* ov, int K, int Nq, int Nk, int Nv) { fused_qkv_k_neon(a,q,k,v,oq,ok,ov,K,Nq,Nk,Nv,sizeof(block_q4_K),dot_q4_K_q8_K_row_neon); }
+static inline void gemv_q5_K_fused_qkv_neon(const float* a, const uint8_t* q, const uint8_t* k, const uint8_t* v, float* oq, float* ok, float* ov, int K, int Nq, int Nk, int Nv) { fused_qkv_k_neon(a,q,k,v,oq,ok,ov,K,Nq,Nk,Nv,sizeof(block_q5_K),dot_q5_K_q8_K_row_neon); }
+static inline void gemv_q2_K_fused_qkv_neon(const float* a, const uint8_t* q, const uint8_t* k, const uint8_t* v, float* oq, float* ok, float* ov, int K, int Nq, int Nk, int Nv) { fused_qkv_k_neon(a,q,k,v,oq,ok,ov,K,Nq,Nk,Nv,sizeof(block_q2_K),dot_q2_K_q8_K_row_neon); }
+static inline void gemv_q4_K_attn_proj_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q4_K),dot_q4_K_q8_K_row_neon); }
+static inline void gemv_q5_K_attn_proj_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q5_K),dot_q5_K_q8_K_row_neon); }
+static inline void gemv_q6_K_attn_proj_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q6_K),dot_q6_K_q8_K_row_neon); }
+static inline void gemv_q2_K_attn_proj_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q2_K),dot_q2_K_q8_K_row_neon); }
+static inline void gemv_q3_K_attn_proj_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q3_K),dot_q3_K_q8_K_row_neon); }
+static inline void gemv_q4_K_ffn_down_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q4_K),dot_q4_K_q8_K_row_neon); }
+static inline void gemv_q5_K_ffn_down_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q5_K),dot_q5_K_q8_K_row_neon); }
+static inline void gemv_q2_K_ffn_down_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q2_K),dot_q2_K_q8_K_row_neon); }
+static inline void gemv_q3_K_ffn_down_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q3_K),dot_q3_K_q8_K_row_neon); }
+static inline void gemv_q6_K_ffn_down_residual_neon(const float* a, const uint8_t* w, const float* r, float* o, int K, int N) { fused_residual_k_neon(a,w,r,o,K,N,sizeof(block_q6_K),dot_q6_K_q8_K_row_neon); }
+
 #endif  // USE_NEON
 
 }  // namespace cpu

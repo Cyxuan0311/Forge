@@ -11,10 +11,17 @@
 
 #include "../../common/quant_helpers.h"
 #include "../../common/quant_tables.h"
+#include "scales.h"
+#include "vec.h"
 #include "forge/types.h"
 
 namespace forge {
 namespace ops {
+
+// Helper for llama.cpp-compatible scale broadcast (used by IQ2_XS/IQ2_S).
+static inline __m256i make_m128i_si256(__m128i lo, __m128i hi) {
+    return _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
 
 // ============================================================================
 // IQ2_S x Q8_K fused dot product (AVX2)
@@ -123,61 +130,125 @@ static void gemv_iq2_s_q8k_transB_avx2(const float* a, const uint8_t* w, float* 
 static inline float dot_iq2_xs_q8_K_avx2(const uint8_t* iq2xs_row,
                                          const cpu::block_q8_K* q8, int nb) {
     constexpr int QK_K = 256;
-    constexpr int IQ2_XS_BLOCK_SIZE = 74;
 
-    float acc = 0.0f;
+    // Sign expansion masks (ported from llama.cpp ggml-cpu/arch/x86/quants.c)
+    static const char block_sign_shuffle_mask_1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+    };
+    static const char block_sign_shuffle_mask_2[32] = {
+        0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+    };
+    static const uint8_t bit_selector_mask_bytes[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+    static const uint8_t k_bit_helper[32] = {
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+    };
+
+    const __m256i mone = _mm256_set1_epi8(1);
+    const __m256i bit_selector_mask = _mm256_loadu_si256((const __m256i*)bit_selector_mask_bytes);
+    const __m256i block_sign_shuffle_1 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_1);
+    const __m256i block_sign_shuffle_2 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_2);
+    const __m256i bit_helper = _mm256_loadu_si256((const __m256i*)k_bit_helper);
+    const __m256i m511 = _mm256_set1_epi16(511);
+    const __m128i m4 = _mm_set1_epi8(0xf);
+    const __m128i m1 = _mm_set1_epi8(1);
+
+    __m256 accumf = _mm256_setzero_ps();
 
     for (int bi = 0; bi < nb; ++bi) {
-        const uint8_t* block_ptr = iq2xs_row + (size_t)bi * IQ2_XS_BLOCK_SIZE;
-        float d = cpu::fp16_to_float_scalar(*reinterpret_cast<const uint16_t*>(block_ptr));
-        const uint16_t* qs = reinterpret_cast<const uint16_t*>(block_ptr + 2);
-        const uint8_t* scales = block_ptr + 2 + 64;
+        const uint8_t* block_ptr = iq2xs_row + (size_t)bi * 74;
+        const float d = cpu::fp16_to_float_scalar(*reinterpret_cast<const uint16_t*>(block_ptr)) * q8[bi].d;
+        const uint16_t* q2 = reinterpret_cast<const uint16_t*>(block_ptr + 2);
+        const int8_t* q8d = q8[bi].qs;
 
-        const cpu::block_q8_K* y = q8 + bi;
-        const float d_q8 = y->d;
-        const int8_t* q8d = y->qs;
+        // Decode 8 scales -> 16 int8 scales (2*scale+1), matching llama.cpp
+        uint64_t aux64;
+        memcpy(&aux64, block_ptr + 66, 8);
+        __m128i stmp = _mm_set1_epi64x(aux64);
+        stmp = _mm_unpacklo_epi8(_mm_and_si128(stmp, m4), _mm_and_si128(_mm_srli_epi16(stmp, 4), m4));
+        const __m128i scales = _mm_add_epi8(_mm_slli_epi16(stmp, 1), m1);
 
-        float block_acc = 0.0f;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
 
-        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
-            const float db0_f = (0.5f + (scales[ib32] & 0xf)) * 0.25f;
-            const float db1_f = (0.5f + (scales[ib32] >> 4)) * 0.25f;
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 4) {
+            const __m256i q2_data = _mm256_loadu_si256((const __m256i*)q2);
+            q2 += 16;
 
-            alignas(32) uint8_t grid_vals[32];
-            alignas(32) uint8_t sign_mask[32];
-            for (int l = 0; l < 4; ++l) {
-                const uint16_t qs_u16 = qs[4 * ib32 + l];
-                memcpy(grid_vals + l * 8, &iq2xs_grid[qs_u16 & 511], 8);
-                const uint8_t signs_byte = ksigns_iq2xs[qs_u16 >> 9];
-                for (int j = 0; j < 8; ++j)
-                    sign_mask[l * 8 + j] = (signs_byte & kmask_iq2xs[j]) ? 0xFF : 0x00;
-            }
+            // gindex[i] = qs_u16 & 511, registers hold 16 grid indices (uint16)
+            // aux_gindex trick from llama.cpp: view the 256-bit reg as 16 uint16
+            __m256i aux_gindex = _mm256_and_si256(q2_data, m511);
+            const uint16_t* gindex = reinterpret_cast<const uint16_t*>(&aux_gindex);
 
-            const __m256i grid_vec = _mm256_load_si256((const __m256i*)grid_vals);
-            const __m256i q8_vec = _mm256_loadu_si256((const __m256i*)(q8d + ib32 * 32));
-            const __m256i sign_vec = _mm256_load_si256((const __m256i*)sign_mask);
+            // Build the 4 grid vectors (each 32 bytes = 4 x 8-byte grid values)
+            const __m256i q2_1 = _mm256_set_epi64x(iq2xs_grid[gindex[3]],  iq2xs_grid[gindex[2]],
+                                                   iq2xs_grid[gindex[1]],  iq2xs_grid[gindex[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(iq2xs_grid[gindex[7]],  iq2xs_grid[gindex[6]],
+                                                   iq2xs_grid[gindex[5]],  iq2xs_grid[gindex[4]]);
+            const __m256i q2_3 = _mm256_set_epi64x(iq2xs_grid[gindex[11]], iq2xs_grid[gindex[10]],
+                                                   iq2xs_grid[gindex[9]],  iq2xs_grid[gindex[8]]);
+            const __m256i q2_4 = _mm256_set_epi64x(iq2xs_grid[gindex[15]], iq2xs_grid[gindex[14]],
+                                                   iq2xs_grid[gindex[13]], iq2xs_grid[gindex[12]]);
 
-            const __m256i zero = _mm256_setzero_si256();
-            const __m256i q8_neg = _mm256_sub_epi8(zero, q8_vec);
-            const __m256i q8_signed = _mm256_blendv_epi8(q8_vec, q8_neg, sign_vec);
+            // Sign bits: low 3 bits select ksigns_iq2xs entry, high bit via xors
+            const __m256i partial_sign_bits = _mm256_srli_epi16(q2_data, 9);
+            const __m256i partial_sign_bits_upper = _mm256_srli_epi16(q2_data, 13);
+            const __m256i partial_sign_bits_for_counting = _mm256_xor_si256(partial_sign_bits, partial_sign_bits_upper);
+            const __m256i odd_bits = _mm256_shuffle_epi8(bit_helper, partial_sign_bits_for_counting);
+            const __m256i full_sign_bits = _mm256_or_si256(partial_sign_bits, odd_bits);
 
-            const __m256i p16 = _mm256_maddubs_epi16(grid_vec, q8_signed);
-            const __m256i p32 = _mm256_madd_epi16(_mm256_set1_epi16(1), p16);
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+            const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
+            const __m256i q8_4 = _mm256_loadu_si256((const __m256i*)q8d); q8d += 32;
 
-            const __m128i lo = _mm256_extracti128_si256(p32, 0);
-            const __m128i hi = _mm256_extracti128_si256(p32, 1);
-            __m128i h = _mm_hadd_epi32(lo, hi);
-            h = _mm_hadd_epi32(h, h);
-            const int s_l01 = _mm_cvtsi128_si32(h);
-            const int s_l23 = _mm_extract_epi32(h, 1);
+            const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
+            const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
+            const __m256i full_signs_1 = make_m128i_si256(full_signs_l, full_signs_l);
+            const __m256i full_signs_2 = make_m128i_si256(full_signs_h, full_signs_h);
 
-            block_acc += (float)s_l01 * db0_f + (float)s_l23 * db1_f;
+            __m256i signs;
+            signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_1);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, _mm256_or_si256(signs, mone));
+
+            signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_2);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, _mm256_or_si256(signs, mone));
+
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_1);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_3 = _mm256_sign_epi8(q8_3, _mm256_or_si256(signs, mone));
+
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_2);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_4 = _mm256_sign_epi8(q8_4, _mm256_or_si256(signs, mone));
+
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const __m256i dot3 = _mm256_maddubs_epi16(q2_3, q8s_3);
+            const __m256i dot4 = _mm256_maddubs_epi16(q2_4, q8s_4);
+
+            const __m256i sc1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, cpu::get_scale_shuffle(ib32 + 0)));
+            const __m256i sc2 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, cpu::get_scale_shuffle(ib32 + 1)));
+            const __m256i sc3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, cpu::get_scale_shuffle(ib32 + 2)));
+            const __m256i sc4 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, cpu::get_scale_shuffle(ib32 + 3)));
+
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, sc1));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, sc2));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot3, sc3));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot4, sc4));
         }
 
-        acc += d * d_q8 * block_acc;
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
     }
 
-    return acc;
+    return 0.125f * cpu::hsum_avx2(accumf);
 }
 
 static void gemv_iq2_xs_q8k_transB_avx2(const float* a, const uint8_t* w, float* out,

@@ -916,8 +916,12 @@ static void gemv_q4_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
         const uint8_t* q4_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
 
         // Per-M accumulators (FP32 for the dot, __m128 for min contribution)
-        std::vector<__m256> acc_vec(M, _mm256_setzero_ps());
-        std::vector<__m128> acc_m_vec(M, _mm_setzero_ps());
+        __m256* acc_vec = reinterpret_cast<__m256*>(_mm_malloc(M * sizeof(__m256), 32));
+        __m128* acc_m_vec = reinterpret_cast<__m128*>(_mm_malloc(M * sizeof(__m128), 16));
+        for (int m = 0; m < M; ++m) {
+            acc_vec[m] = _mm256_setzero_ps();
+            acc_m_vec[m] = _mm_setzero_ps();
+        }
 
         for (int i = 0; i < nb; ++i) {
             const block_q4_K* x = reinterpret_cast<const block_q4_K*>(q4_row) + i;
@@ -1000,6 +1004,8 @@ static void gemv_q4_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
             acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
             out[m * N + n] = hsum_avx2(acc_vec[m]) + _mm_cvtss_f32(acc_m);
         }
+        _mm_free(acc_vec);
+        _mm_free(acc_m_vec);
     }
 }
 

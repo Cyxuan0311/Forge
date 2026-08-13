@@ -298,6 +298,183 @@ static inline void gemv_q8_0_transB_neon(const float* a, const uint8_t* w,
     }  // end M loop
 }
 
+// ---- Q4_1 GEMV: q = d * nibble + m ----
+static inline void gemv_q4_1_transB_neon(const float* a, const uint8_t* w,
+                                          float* out, int M, int K, int N) {
+    constexpr int QK = 32;
+    constexpr int BLOCK_BYTES = 20;
+    const int nb = K / QK;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        std::vector<block_q8_0_act> q8_act(nb);
+        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+                uint16_t d_bits, m_bits;
+                std::memcpy(&d_bits, blk, sizeof(d_bits));
+                std::memcpy(&m_bits, blk + 2, sizeof(m_bits));
+                float d = arm_dot::fp16_to_fp32(d_bits) * q8_act[bi].d;
+                float min = arm_dot::fp16_to_fp32(m_bits) * q8_act[bi].d;
+
+                uint8x16_t packed = vld1q_u8(blk + 4);
+                uint8x16_t lo = vandq_u8(packed, vdupq_n_u8(0x0F));
+                uint8x16_t hi = vshrq_n_u8(packed, 4);
+                uint8x16_t q_lo = vzip1q_u8(lo, hi);
+                uint8x16_t q_hi = vzip2q_u8(lo, hi);
+                int8x16_t a_lo = vld1q_s8(q8_act[bi].qs);
+                int8x16_t a_hi = vld1q_s8(q8_act[bi].qs + 16);
+
+                int32_t dot;
+#ifdef USE_DOTPROD
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vdotq_s32(acc, vreinterpretq_s8_u8(q_lo), a_lo);
+                acc = vdotq_s32(acc, vreinterpretq_s8_u8(q_hi), a_hi);
+                dot = vaddvq_s32(acc);
+#else
+                int16x8_t p0 = vmull_s8(vget_low_s8(vreinterpretq_s8_u8(q_lo)), vget_low_s8(a_lo));
+                int16x8_t p1 = vmull_s8(vget_high_s8(vreinterpretq_s8_u8(q_lo)), vget_high_s8(a_lo));
+                int16x8_t p2 = vmull_s8(vget_low_s8(vreinterpretq_s8_u8(q_hi)), vget_low_s8(a_hi));
+                int16x8_t p3 = vmull_s8(vget_high_s8(vreinterpretq_s8_u8(q_hi)), vget_high_s8(a_hi));
+                dot = vaddvq_s32(vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3))));
+#endif
+                int sum_q8 = 0;
+                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+                sum += d * dot + min * sum_q8;
+            }
+            o_row[n] = sum;
+        }
+    }
+}
+
+// ---- Q5_0 GEMV: value = 5bit - 16, 5bit = nibble | (bit5 << 4) ----
+// Q5_0 block = 22 bytes: d[2](fp16) + qh[4](bit5) + qs[16](nibbles)
+static inline void gemv_q5_0_transB_neon(const float* a, const uint8_t* w,
+                                         float* out, int M, int K, int N) {
+    constexpr int QK = 32;
+    constexpr int BLOCK_BYTES = 22;
+    const int nb = K / QK;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        std::vector<block_q8_0_act> q8_act(nb);
+        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+                uint16_t d_bits;
+                std::memcpy(&d_bits, blk, sizeof(d_bits));
+                float combined_scale = arm_dot::fp16_to_fp32(d_bits) * q8_act[bi].d;
+
+                alignas(16) int8_t vals[QK];
+                const uint8_t* qh = blk + 2;
+                const uint8_t* qs = blk + 6;
+                for (int j = 0; j < QK; ++j) {
+                    const int nib = (qs[j >> 1] >> ((j & 1) << 2)) & 0x0F;
+                    const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+                    vals[j] = (int8_t)(nib | (bit5 << 4));
+                }
+                int8x16_t w_lo = vld1q_s8(vals);
+                int8x16_t w_hi = vld1q_s8(vals + 16);
+                int8x16_t a_lo = vld1q_s8(q8_act[bi].qs);
+                int8x16_t a_hi = vld1q_s8(q8_act[bi].qs + 16);
+
+                int32_t dot;
+#ifdef USE_DOTPROD
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vdotq_s32(acc, w_lo, a_lo);
+                acc = vdotq_s32(acc, w_hi, a_hi);
+                dot = vaddvq_s32(acc);
+#else
+                int16x8_t p0 = vmull_s8(vget_low_s8(w_lo), vget_low_s8(a_lo));
+                int16x8_t p1 = vmull_s8(vget_high_s8(w_lo), vget_high_s8(a_lo));
+                int16x8_t p2 = vmull_s8(vget_low_s8(w_hi), vget_low_s8(a_hi));
+                int16x8_t p3 = vmull_s8(vget_high_s8(w_hi), vget_high_s8(a_hi));
+                int32x4_t s01 = vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
+                int32x4_t s23 = vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3));
+                dot = vaddvq_s32(vaddq_s32(s01, s23));
+#endif
+                int sum_q8 = 0;
+                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+                sum += combined_scale * (float)(dot - 16 * sum_q8);
+            }
+            o_row[n] = sum;
+        }
+    }
+}
+
+// ---- Q5_1 GEMV: value = 5bit * d + m ----
+// Q5_1 block = 24 bytes: d[2](fp16) + m[2](fp16) + qh[4](bit5) + qs[16](nibbles)
+static inline void gemv_q5_1_transB_neon(const float* a, const uint8_t* w,
+                                         float* out, int M, int K, int N) {
+    constexpr int QK = 32;
+    constexpr int BLOCK_BYTES = 24;
+    const int nb = K / QK;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        std::vector<block_q8_0_act> q8_act(nb);
+        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+                uint16_t d_bits, m_bits;
+                std::memcpy(&d_bits, blk, sizeof(d_bits));
+                std::memcpy(&m_bits, blk + 2, sizeof(m_bits));
+                float d = arm_dot::fp16_to_fp32(d_bits) * q8_act[bi].d;
+                float min = arm_dot::fp16_to_fp32(m_bits) * q8_act[bi].d;
+
+                alignas(16) int8_t vals[QK];
+                const uint8_t* qh = blk + 4;
+                const uint8_t* qs = blk + 8;
+                for (int j = 0; j < QK; ++j) {
+                    const int nib = (qs[j >> 1] >> ((j & 1) << 2)) & 0x0F;
+                    const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+                    vals[j] = (int8_t)(nib | (bit5 << 4));
+                }
+                int8x16_t w_lo = vld1q_s8(vals);
+                int8x16_t w_hi = vld1q_s8(vals + 16);
+                int8x16_t a_lo = vld1q_s8(q8_act[bi].qs);
+                int8x16_t a_hi = vld1q_s8(q8_act[bi].qs + 16);
+
+                int32_t dot;
+#ifdef USE_DOTPROD
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vdotq_s32(acc, w_lo, a_lo);
+                acc = vdotq_s32(acc, w_hi, a_hi);
+                dot = vaddvq_s32(acc);
+#else
+                int16x8_t p0 = vmull_s8(vget_low_s8(w_lo), vget_low_s8(a_lo));
+                int16x8_t p1 = vmull_s8(vget_high_s8(w_lo), vget_high_s8(a_lo));
+                int16x8_t p2 = vmull_s8(vget_low_s8(w_hi), vget_low_s8(a_hi));
+                int16x8_t p3 = vmull_s8(vget_high_s8(w_hi), vget_high_s8(a_hi));
+                int32x4_t s01 = vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
+                int32x4_t s23 = vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3));
+                dot = vaddvq_s32(vaddq_s32(s01, s23));
+#endif
+                int sum_q8 = 0;
+                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+                sum += d * (float)dot + min * (float)sum_q8;
+            }
+            o_row[n] = sum;
+        }
+    }
+}
+
 #endif // USE_NEON
 
 }  // namespace cpu

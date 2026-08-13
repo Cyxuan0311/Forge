@@ -25,59 +25,64 @@ namespace cpu {
 // ---- FP32 GEMV: out[n] = sum_k(a[k] * w[n][k]) ----
 // NR=4 row-level unrolling. Each iteration processes 4 output rows,
 // dotting a[K] with 4 rows of w concurrently via VSX vec_madd.
+// Supports both M=1 (decode) and M>1 (prefill / batched) by looping over
+// the M dimension; each output row group is written independently.
 static inline void gemv_fp32_transB_vsx(const float* a, const float* b,
                                          float* out, int M, int K, int N) {
-    // M=1 decode path only
-    const int NR = 4;
-    int n = 0;
-    for (; n + NR - 1 < N; n += NR) {
-        __vector float acc0 = vec_splats(0.0f);
-        __vector float acc1 = vec_splats(0.0f);
-        __vector float acc2 = vec_splats(0.0f);
-        __vector float acc3 = vec_splats(0.0f);
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        const int NR = 4;
+        int n = 0;
+        for (; n + NR - 1 < N; n += NR) {
+            __vector float acc0 = vec_splats(0.0f);
+            __vector float acc1 = vec_splats(0.0f);
+            __vector float acc2 = vec_splats(0.0f);
+            __vector float acc3 = vec_splats(0.0f);
 
-        int k = 0;
-        for (; k + 3 < K; k += 4) {
-            __vector float av = vec_xl(0, a + k);
-            acc0 = vec_madd(av, vec_xl(0, b + (size_t)n * K + k), acc0);
-            acc1 = vec_madd(av, vec_xl(0, b + (size_t)(n+1) * K + k), acc1);
-            acc2 = vec_madd(av, vec_xl(0, b + (size_t)(n+2) * K + k), acc2);
-            acc3 = vec_madd(av, vec_xl(0, b + (size_t)(n+3) * K + k), acc3);
+            int k = 0;
+            for (; k + 3 < K; k += 4) {
+                __vector float av = vec_xl(0, a_row + k);
+                acc0 = vec_madd(av, vec_xl(0, b + (size_t)n * K + k), acc0);
+                acc1 = vec_madd(av, vec_xl(0, b + (size_t)(n+1) * K + k), acc1);
+                acc2 = vec_madd(av, vec_xl(0, b + (size_t)(n+2) * K + k), acc2);
+                acc3 = vec_madd(av, vec_xl(0, b + (size_t)(n+3) * K + k), acc3);
+            }
+            // Scalar tail
+            float sum0 = hsum_f32x4(acc0);
+            float sum1 = hsum_f32x4(acc1);
+            float sum2 = hsum_f32x4(acc2);
+            float sum3 = hsum_f32x4(acc3);
+            for (; k < K; ++k) {
+                float ak = a_row[k];
+                sum0 += ak * b[(size_t)n * K + k];
+                sum1 += ak * b[(size_t)(n+1) * K + k];
+                sum2 += ak * b[(size_t)(n+2) * K + k];
+                sum3 += ak * b[(size_t)(n+3) * K + k];
+            }
+            o_row[n]   = sum0;
+            o_row[n+1] = sum1;
+            o_row[n+2] = sum2;
+            o_row[n+3] = sum3;
         }
-        // Scalar tail
-        float sum0 = hsum_f32x4(acc0);
-        float sum1 = hsum_f32x4(acc1);
-        float sum2 = hsum_f32x4(acc2);
-        float sum3 = hsum_f32x4(acc3);
-        for (; k < K; ++k) {
-            float ak = a[k];
-            sum0 += ak * b[(size_t)n * K + k];
-            sum1 += ak * b[(size_t)(n+1) * K + k];
-            sum2 += ak * b[(size_t)(n+2) * K + k];
-            sum3 += ak * b[(size_t)(n+3) * K + k];
+        // Remaining rows with dual-accumulator
+        for (; n < N; ++n) {
+            __vector float acc0 = vec_splats(0.0f);
+            __vector float acc1 = vec_splats(0.0f);
+            int k = 0;
+            for (; k + 7 < K; k += 8) {
+                __vector float a0 = vec_xl(0, a_row + k);
+                __vector float a1 = vec_xl(0, a_row + k + 4);
+                acc0 = vec_madd(a0, vec_xl(0, b + (size_t)n * K + k), acc0);
+                acc1 = vec_madd(a1, vec_xl(0, b + (size_t)n * K + k + 4), acc1);
+            }
+            for (; k + 3 < K; k += 4) {
+                acc0 = vec_madd(vec_xl(0, a_row + k), vec_xl(0, b + (size_t)n * K + k), acc0);
+            }
+            float sum = hsum_f32x4(acc0 + acc1);
+            for (; k < K; ++k) sum += a_row[k] * b[(size_t)n * K + k];
+            o_row[n] = sum;
         }
-        out[n]   = sum0;
-        out[n+1] = sum1;
-        out[n+2] = sum2;
-        out[n+3] = sum3;
-    }
-    // Remaining rows with dual-accumulator
-    for (; n < N; ++n) {
-        __vector float acc0 = vec_splats(0.0f);
-        __vector float acc1 = vec_splats(0.0f);
-        int k = 0;
-        for (; k + 7 < K; k += 8) {
-            __vector float a0 = vec_xl(0, a + k);
-            __vector float a1 = vec_xl(0, a + k + 4);
-            acc0 = vec_madd(a0, vec_xl(0, b + (size_t)n * K + k), acc0);
-            acc1 = vec_madd(a1, vec_xl(0, b + (size_t)n * K + k + 4), acc1);
-        }
-        for (; k + 3 < K; k += 4) {
-            acc0 = vec_madd(vec_xl(0, a + k), vec_xl(0, b + (size_t)n * K + k), acc0);
-        }
-        float sum = hsum_f32x4(acc0 + acc1);
-        for (; k < K; ++k) sum += a[k] * b[(size_t)n * K + k];
-        out[n] = sum;
     }
 }
 
@@ -102,6 +107,7 @@ static inline float gemv_fp16_to_fp32(uint16_t bits) {
 // ---- Q4_0 GEMV: quantize a once, then dot product with all weight rows ----
 // Q4_0 block = 18 bytes: d[2](fp16) + qs[16](32 nibbles).
 // K is the total activation dimension.
+// Supports both M=1 (decode) and M>1 (prefill) by looping over M.
 static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
                                          float* out, int M, int K, int N) {
     const int QK = 32;
@@ -109,9 +115,13 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
     int nb = K / QK;
     int blocks_per_row = nb;
 
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+
     // Quantize activation to Q8_0_act blocks
     std::vector<block_q8_0_act> q8_act(blocks_per_row);
-    quantize_row_q8_0_act(a, q8_act.data(), K);
+    quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     const int NR = 4;
     int n = 0;
@@ -185,7 +195,7 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
             }
             acc = acc + vec_xl(0, row_sum);
         }
-        vec_xst(acc, 0, out + n);
+        vec_xst(acc, 0, o_row + n);
     }
     // Remaining rows
     for (; n < N; ++n) {
@@ -236,12 +246,14 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
 
             sum += scale * (float)dot_i32;
         }
-        out[n] = sum;
+        o_row[n] = sum;
     }
+    }  // end M loop
 }
 
 // ---- Q8_0 GEMV: same pattern as Q4_0 but simpler (no nibble expansion) ----
 // Q8_0 block = 34 bytes: d[2](fp16) + qs[32](signed int8)
+// Supports both M=1 (decode) and M>1 (prefill) by looping over M.
 static inline void gemv_q8_0_transB_vsx(const float* a, const uint8_t* w,
                                          float* out, int M, int K, int N) {
     const int QK = 32;
@@ -249,8 +261,12 @@ static inline void gemv_q8_0_transB_vsx(const float* a, const uint8_t* w,
     int nb = K / QK;
     int blocks_per_row = nb;
 
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+
     std::vector<block_q8_0_act> q8_act(blocks_per_row);
-    quantize_row_q8_0_act(a, q8_act.data(), K);
+    quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     int n = 0;
     for (; n < N; ++n) {
@@ -282,7 +298,173 @@ static inline void gemv_q8_0_transB_vsx(const float* a, const uint8_t* w,
 
             sum += scale * (float)dot_i32;
         }
-        out[n] = sum;
+        o_row[n] = sum;
+    }
+    }  // end M loop
+}
+
+// ---- Q4_1 GEMV: q = d * nibble + m ----
+static inline void gemv_q4_1_transB_vsx(const float* a, const uint8_t* w,
+                                         float* out, int M, int K, int N) {
+    constexpr int QK = 32;
+    constexpr int BLOCK_BYTES = 20;
+    const int nb = K / QK;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        std::vector<block_q8_0_act> q8_act(nb);
+        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+                uint16_t d_bits, m_bits;
+                std::memcpy(&d_bits, blk, sizeof(d_bits));
+                std::memcpy(&m_bits, blk + 2, sizeof(m_bits));
+                float d = gemv_fp16_to_fp32(d_bits) * q8_act[bi].d;
+                float min = gemv_fp16_to_fp32(m_bits) * q8_act[bi].d;
+
+                __vector unsigned char packed = vec_xl(0, blk + 4);
+                __vector unsigned char lo = packed & vec_splats((unsigned char)0x0F);
+                __vector unsigned char hi = vec_sr(packed, vec_splats((unsigned char)4));
+                static const __vector unsigned char mz1 = {
+                     0, 16,  1, 17,  2, 18,  3, 19,
+                     4, 20,  5, 21,  6, 22,  7, 23
+                };
+                static const __vector unsigned char mz2 = {
+                     8, 24,  9, 25, 10, 26, 11, 27,
+                    12, 28, 13, 29, 14, 30, 15, 31
+                };
+                __vector signed char q_lo = (__vector signed char)vec_perm(lo, hi, mz1);
+                __vector signed char q_hi = (__vector signed char)vec_perm(lo, hi, mz2);
+                __vector signed char a_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+                __vector signed char a_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
+
+                __vector signed int zero = vec_splats((int)0);
+                __vector signed int dot_vec = vec_sum4s(vec_mule(q_lo, a_lo), zero) +
+                                              vec_sum4s(vec_mulo(q_lo, a_lo), zero) +
+                                              vec_sum4s(vec_mule(q_hi, a_hi), zero) +
+                                              vec_sum4s(vec_mulo(q_hi, a_hi), zero);
+                union { __vector signed int vi; int i[4]; } u;
+                u.vi = dot_vec;
+                int dot = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+                int sum_q8 = 0;
+                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+                sum += d * dot + min * sum_q8;
+            }
+            o_row[n] = sum;
+        }
+    }
+}
+
+// ---- Q5_0 GEMV: value = 5bit - 16, 5bit = nibble | (bit5 << 4) ----
+// Q5_0 block = 22 bytes: d[2](fp16) + qh[4](bit5) + qs[16](nibbles)
+static inline void gemv_q5_0_transB_vsx(const float* a, const uint8_t* w,
+                                        float* out, int M, int K, int N) {
+    constexpr int QK = 32;
+    constexpr int BLOCK_BYTES = 22;
+    const int nb = K / QK;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        std::vector<block_q8_0_act> q8_act(nb);
+        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+                uint16_t d_bits;
+                std::memcpy(&d_bits, blk, sizeof(d_bits));
+                float combined_scale = gemv_fp16_to_fp32(d_bits) * q8_act[bi].d;
+
+                alignas(16) signed char vals[QK];
+                const uint8_t* qh = blk + 2;
+                const uint8_t* qs = blk + 6;
+                for (int j = 0; j < QK; ++j) {
+                    const int nib = (qs[j >> 1] >> ((j & 1) << 2)) & 0x0F;
+                    const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+                    vals[j] = (signed char)(nib | (bit5 << 4));
+                }
+                __vector signed char w_lo = vec_xl(0, vals);
+                __vector signed char w_hi = vec_xl(0, vals + 16);
+                __vector signed char a_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+                __vector signed char a_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
+
+                __vector signed int zero = vec_splats((int)0);
+                __vector signed int dot_vec = vec_sum4s(vec_mule(w_lo, a_lo), zero) +
+                                              vec_sum4s(vec_mulo(w_lo, a_lo), zero) +
+                                              vec_sum4s(vec_mule(w_hi, a_hi), zero) +
+                                              vec_sum4s(vec_mulo(w_hi, a_hi), zero);
+                union { __vector signed int vi; int i[4]; } u;
+                u.vi = dot_vec;
+                int dot = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+                int sum_q8 = 0;
+                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+                sum += combined_scale * (float)(dot - 16 * sum_q8);
+            }
+            o_row[n] = sum;
+        }
+    }
+}
+
+// ---- Q5_1 GEMV: value = 5bit * d + m ----
+// Q5_1 block = 24 bytes: d[2](fp16) + m[2](fp16) + qh[4](bit5) + qs[16](nibbles)
+static inline void gemv_q5_1_transB_vsx(const float* a, const uint8_t* w,
+                                        float* out, int M, int K, int N) {
+    constexpr int QK = 32;
+    constexpr int BLOCK_BYTES = 24;
+    const int nb = K / QK;
+
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = a + (size_t)m * K;
+        float* o_row = out + (size_t)m * N;
+        std::vector<block_q8_0_act> q8_act(nb);
+        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+            for (int bi = 0; bi < nb; ++bi) {
+                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+                uint16_t d_bits, m_bits;
+                std::memcpy(&d_bits, blk, sizeof(d_bits));
+                std::memcpy(&m_bits, blk + 2, sizeof(m_bits));
+                float d = gemv_fp16_to_fp32(d_bits) * q8_act[bi].d;
+                float min = gemv_fp16_to_fp32(m_bits) * q8_act[bi].d;
+
+                alignas(16) signed char vals[QK];
+                const uint8_t* qh = blk + 4;
+                const uint8_t* qs = blk + 8;
+                for (int j = 0; j < QK; ++j) {
+                    const int nib = (qs[j >> 1] >> ((j & 1) << 2)) & 0x0F;
+                    const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+                    vals[j] = (signed char)(nib | (bit5 << 4));
+                }
+                __vector signed char w_lo = vec_xl(0, vals);
+                __vector signed char w_hi = vec_xl(0, vals + 16);
+                __vector signed char a_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+                __vector signed char a_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
+
+                __vector signed int zero = vec_splats((int)0);
+                __vector signed int dot_vec = vec_sum4s(vec_mule(w_lo, a_lo), zero) +
+                                              vec_sum4s(vec_mulo(w_lo, a_lo), zero) +
+                                              vec_sum4s(vec_mule(w_hi, a_hi), zero) +
+                                              vec_sum4s(vec_mulo(w_hi, a_hi), zero);
+                union { __vector signed int vi; int i[4]; } u;
+                u.vi = dot_vec;
+                int dot = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+                int sum_q8 = 0;
+                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+                sum += d * (float)dot + min * (float)sum_q8;
+            }
+            o_row[n] = sum;
+        }
     }
 }
 

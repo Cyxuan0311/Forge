@@ -418,10 +418,9 @@ TensorPtr matmul_transB_shared_input(const TensorPtr& input,
         }
         return out;
     }
-#elif defined(USE_NEON)
-    // NEON batched MoE path — enable the same dot_q8k fast path
+#elif defined(USE_NEON) || defined(USE_VSX)
     {
-        auto dot_fn = get_dot_q8k_fn(dt);
+        auto dot_fn = cpu::get_dot_q8k_fn(dt);
         for (int w = 1; w < n_w && dot_fn; ++w) {
             if (weights[w]->dtype() != dt ||
                 static_cast<int>(weights[w]->shape()[0]) != N ||
@@ -527,10 +526,9 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
         }
         return out;
     }
-#elif defined(USE_NEON)
-    // NEON batched MoE path — enable the same dot_q8k fast path
+#elif defined(USE_NEON) || defined(USE_VSX)
     {
-        auto dot_fn = get_dot_q8k_fn(dt);
+        auto dot_fn = cpu::get_dot_q8k_fn(dt);
         for (int p = 1; p < n_pairs && dot_fn; ++p) {
             if (weights[p]->dtype() != dt ||
                 static_cast<int>(weights[p]->shape()[0]) != N ||
@@ -742,6 +740,18 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 PERF_SCOPE("matmul_transB/q8_0_gemv_neon");
                 forge::cpu::gemv_q8_0_transB_neon(a_data, static_cast<const uint8_t*>(b->data()), o_data,
                                                   M, K, N);
+            } else if (b->dtype() == DataType::Q4_1) {
+                PERF_SCOPE("matmul_transB/q4_1_gemv_neon");
+                forge::cpu::gemv_q4_1_transB_neon(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                  M, K, N);
+            } else if (b->dtype() == DataType::Q5_0) {
+                PERF_SCOPE("matmul_transB/q5_0_gemv_neon");
+                forge::cpu::gemv_q5_0_transB_neon(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                  M, K, N);
+            } else if (b->dtype() == DataType::Q5_1) {
+                PERF_SCOPE("matmul_transB/q5_1_gemv_neon");
+                forge::cpu::gemv_q5_1_transB_neon(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                  M, K, N);
             } else if (b->dtype() == DataType::Q4_K) {
                 PERF_SCOPE("matmul_transB/q4_k_gemm_neon");
                 cpu::gemm_q4_K_neon(a_data, static_cast<const uint8_t*>(b->data()), o_data,
@@ -782,16 +792,40 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
 #elif defined(USE_VSX)
             if (b->dtype() == DataType::Q4_0) {
                 PERF_SCOPE("matmul_transB/q4_0_gemv_vsx");
-                for (int m = 0; m < M; ++m) {
-                    cpu::gemv_q4_0_transB_vsx(a_data + (size_t)m * K, static_cast<const uint8_t*>(b->data()),
-                                         o_data + (size_t)m * N, 1, K, N);
-                }
+                cpu::gemv_q4_0_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                           o_data, M, K, N);
             } else if (b->dtype() == DataType::Q8_0) {
                 PERF_SCOPE("matmul_transB/q8_0_gemv_vsx");
-                for (int m = 0; m < M; ++m) {
-                    cpu::gemv_q8_0_transB_vsx(a_data + (size_t)m * K, static_cast<const uint8_t*>(b->data()),
-                                         o_data + (size_t)m * N, 1, K, N);
-                }
+                cpu::gemv_q8_0_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                           o_data, M, K, N);
+            } else if (b->dtype() == DataType::Q4_1) {
+                PERF_SCOPE("matmul_transB/q4_1_gemv_vsx");
+                cpu::gemv_q4_1_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                           o_data, M, K, N);
+            } else if (b->dtype() == DataType::Q5_0) {
+                PERF_SCOPE("matmul_transB/q5_0_gemv_vsx");
+                cpu::gemv_q5_0_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                           o_data, M, K, N);
+            } else if (b->dtype() == DataType::Q5_1) {
+                PERF_SCOPE("matmul_transB/q5_1_gemv_vsx");
+                cpu::gemv_q5_1_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                           o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ2_S) {
+                PERF_SCOPE("matmul_transB/iq2_s_q8k_fused_gemv_vsx");
+                cpu::gemv_iq2_s_q8k_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                               o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ2_XS) {
+                PERF_SCOPE("matmul_transB/iq2_xs_q8k_fused_gemv_vsx");
+                cpu::gemv_iq2_xs_q8k_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                                o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ3_S) {
+                PERF_SCOPE("matmul_transB/iq3_s_q8k_fused_gemv_vsx");
+                cpu::gemv_iq3_s_q8k_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                               o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ4_NL) {
+                PERF_SCOPE("matmul_transB/iq4_nl_q8k_fused_gemv_vsx");
+                cpu::gemv_iq4_nl_q8k_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+                                                o_data, M, K, N);
             } else if (b->dtype() == DataType::Q4_K) {
                 PERF_SCOPE("matmul_transB/q4_k_gemm_vsx");
                 cpu::gemm_q4_K_vsx(a_data, static_cast<const uint8_t*>(b->data()), o_data, M, K, N);
@@ -913,10 +947,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
             forge::cpu::gemv_fp32_transB_neon(a_data, static_cast<const float*>(b->data()), o_data, M, K, N);
 #elif defined(USE_VSX)
             PERF_SCOPE("matmul_transB/fp32_gemv_vsx");
-            for (int m = 0; m < M; ++m) {
-                cpu::gemv_fp32_transB_vsx(a_data + (size_t)m * K, static_cast<const float*>(b->data()),
-                                     o_data + (size_t)m * N, 1, K, N);
-            }
+            cpu::gemv_fp32_transB_vsx(a_data, static_cast<const float*>(b->data()), o_data, M, K, N);
 #else
             PERF_SCOPE("matmul_transB/fp32_gemv_scalar");
             const float* b_data = static_cast<const float*>(b->data());
@@ -1054,10 +1085,27 @@ TensorPtr matmul_transB_fused_qkv_q4_0(const TensorPtr& input, const TensorPtr& 
             static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
     }
 #elif defined(USE_NEON)
-    // Fallback: separate matmul_transB calls
-    q_out = ops::matmul_transB(input, wq);
-    k_out = ops::matmul_transB(input, wk);
-    v_out = ops::matmul_transB(input, wv);
+    PERF_SCOPE("matmul_transB/fused_qkv_q4_0");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_0_transB_neon(a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+                                   static_cast<float*>(q_out->data()) + m * N_q, 1, K, N_q);
+        cpu::gemv_q4_0_transB_neon(a_data + m * K, static_cast<const uint8_t*>(wk->data()),
+                                   static_cast<float*>(k_out->data()) + m * N_k, 1, K, N_k);
+        cpu::gemv_q4_0_transB_neon(a_data + m * K, static_cast<const uint8_t*>(wv->data()),
+                                   static_cast<float*>(v_out->data()) + m * N_v, 1, K, N_v);
+    }
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_qkv_q4_0_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_0_transB_vsx(a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+                                  static_cast<float*>(q_out->data()) + m * N_q, 1, K, N_q);
+        cpu::gemv_q4_0_transB_vsx(a_data + m * K, static_cast<const uint8_t*>(wk->data()),
+                                  static_cast<float*>(k_out->data()) + m * N_k, 1, K, N_k);
+        cpu::gemv_q4_0_transB_vsx(a_data + m * K, static_cast<const uint8_t*>(wv->data()),
+                                  static_cast<float*>(v_out->data()) + m * N_v, 1, K, N_v);
+    }
 #else
     // Fallback: separate matmul_transB calls
     q_out = ops::matmul_transB(input, wq);
@@ -1119,9 +1167,21 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_0(const TensorPtr& input,
                                               r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    // Fallback: separate matmul + add
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_0_transB_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), o_data + m * N, 1, K, N);
+        for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+    }
+#elif defined(USE_VSX)
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_0_transB_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), o_data + m * N, 1, K, N);
+        for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+    }
 #else
     // Fallback: separate matmul + add
     out = ops::matmul_transB(input, weight);
@@ -1161,8 +1221,21 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_1(const TensorPtr& input,
                                                r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_1_transB_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), o_data + m * N, 1, K, N);
+        for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+    }
+#elif defined(USE_VSX)
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_1_transB_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), o_data + m * N, 1, K, N);
+        for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+    }
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1205,8 +1278,25 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
                                                 r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_0_transB_neon(a_data + m * K,
+                                   static_cast<const uint8_t*>(weight->data()),
+                                   o_data + m * N, 1, K, N);
+        for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+    }
+#elif defined(USE_VSX)
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_0_transB_vsx(a_data + m * K,
+                                  static_cast<const uint8_t*>(weight->data()),
+                                  o_data + m * N, 1, K, N);
+        for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+    }
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1247,8 +1337,23 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_k(const TensorPtr& input,
                                                 r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q4_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q4_K_ffn_down_residual_neon(a_data + m * K,
+                                              static_cast<const uint8_t*>(weight->data()),
+                                              r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q4_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q4_K_attn_proj_residual_vsx(a_data + m * K,
+                                              static_cast<const uint8_t*>(weight->data()),
+                                              r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1261,19 +1366,14 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q5_k(const TensorPtr& input,
                                                        const TensorPtr& weight,
                                                        const TensorPtr& residual) {
     if (input->ndim() != 2 || weight->ndim() != 2 || residual->ndim() != 2)
-        throw std::runtime_error(
-            "matmul_transB_fused_attn_proj_residual_q5_k expects 2D tensors");
+        throw std::runtime_error("matmul_transB_fused_attn_proj_residual_q5_k expects 2D tensors");
     if (weight->dtype() != DataType::Q5_K)
-        throw std::runtime_error(
-            "matmul_transB_fused_attn_proj_residual_q5_k requires Q5_K weights");
+        throw std::runtime_error("matmul_transB_fused_attn_proj_residual_q5_k requires Q5_K weights");
     if (input->device() != DeviceType::CPU)
-        throw std::runtime_error(
-            "matmul_transB_fused_attn_proj_residual_q5_k is CPU-only");
-
+        throw std::runtime_error("matmul_transB_fused_attn_proj_residual_q5_k is CPU-only");
     int M = static_cast<int>(input->shape()[0]);
     int K = static_cast<int>(input->shape()[1]);
     int N = static_cast<int>(weight->shape()[0]);
-
     auto out =
         std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
 
@@ -1289,8 +1389,19 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q5_k(const TensorPtr& input,
                                                 r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q5_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_attn_proj_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q5_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_attn_proj_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1331,8 +1442,17 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q6_k(const TensorPtr& input,
                                                 r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q6_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) cpu::gemv_q6_K_attn_proj_residual_neon(a_data + m*K, static_cast<const uint8_t*>(weight->data()), r_data + m*N, o_data + m*N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q6_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) cpu::gemv_q6_K_attn_proj_residual_vsx(a_data + m*K, static_cast<const uint8_t*>(weight->data()), r_data + m*N, o_data + m*N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1345,8 +1465,7 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q2_k(const TensorPtr& input,
                                                        const TensorPtr& weight,
                                                        const TensorPtr& residual) {
     if (input->ndim() != 2 || weight->ndim() != 2 || residual->ndim() != 2)
-        throw std::runtime_error(
-            "matmul_transB_fused_attn_proj_residual_q2_k expects 2D tensors");
+        throw std::runtime_error("matmul_transB_fused_attn_proj_residual_q2_k expects 2D tensors");
     if (weight->dtype() != DataType::Q2_K)
         throw std::runtime_error(
             "matmul_transB_fused_attn_proj_residual_q2_k requires Q2_K weights");
@@ -1373,8 +1492,15 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q2_k(const TensorPtr& input,
                                                 r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) cpu::gemv_q2_K_attn_proj_residual_neon(a_data + m*K, static_cast<const uint8_t*>(weight->data()), r_data + m*N, o_data + m*N, K, N);
+#elif defined(USE_VSX)
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) cpu::gemv_q2_K_attn_proj_residual_vsx(a_data + m*K, static_cast<const uint8_t*>(weight->data()), r_data + m*N, o_data + m*N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1415,8 +1541,19 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q3_k(const TensorPtr& input,
                                                 r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q3_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q3_K_attn_proj_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/attn_proj_residual_q3_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q3_K_attn_proj_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1460,9 +1597,27 @@ TensorPtr matmul_transB_fused_qkv_q4_k(const TensorPtr& input, const TensorPtr& 
             static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
     }
 #elif defined(USE_NEON)
-    q_out = ops::matmul_transB(input, wq);
-    k_out = ops::matmul_transB(input, wk);
-    v_out = ops::matmul_transB(input, wv);
+    PERF_SCOPE("matmul_transB/fused_qkv_q4_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_K_fused_qkv_neon(
+            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+            static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
+            static_cast<float*>(q_out->data()) + m * N_q,
+            static_cast<float*>(k_out->data()) + m * N_k,
+            static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+    }
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_qkv_q4_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_K_fused_qkv_vsx(
+            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+            static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
+            static_cast<float*>(q_out->data()) + m * N_q,
+            static_cast<float*>(k_out->data()) + m * N_k,
+            static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+    }
 #else
     q_out = ops::matmul_transB(input, wq);
     k_out = ops::matmul_transB(input, wk);
@@ -1511,9 +1666,20 @@ TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPt
             static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    auto gate = ops::matmul_transB(input, w_gate);
-    auto up = ops::matmul_transB(input, w_up);
-    out = ops::silu_multiply(gate, up);
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q4_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q4_K_fused_ffn_up_neon(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+                                         static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+    }
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q4_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q4_K_fused_ffn_up_vsx(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+                                        static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
 #else
     auto gate = ops::matmul_transB(input, w_gate);
     auto up = ops::matmul_transB(input, w_up);
@@ -1559,6 +1725,13 @@ TensorPtr matmul_transB_fused_ffn_up_q3_k(const TensorPtr& input, const TensorPt
             a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
             static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
     }
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q3_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q3_K_fused_ffn_up_vsx(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+                                        static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
 #else
     auto gate = ops::matmul_transB(input, w_gate);
     auto up = ops::matmul_transB(input, w_up);
@@ -1653,9 +1826,26 @@ TensorPtr matmul_transB_fused_qkv_q3_k(const TensorPtr& input, const TensorPtr& 
             static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
     }
 #elif defined(USE_NEON)
-    q_out = ops::matmul_transB(input, wq);
-    k_out = ops::matmul_transB(input, wk);
-    v_out = ops::matmul_transB(input, wv);
+    PERF_SCOPE("matmul_transB/fused_qkv_q3_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_q3_K_fused_qkv_neon(
+            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+            static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
+            static_cast<float*>(q_out->data()) + m * N_q,
+            static_cast<float*>(k_out->data()) + m * N_k,
+            static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+    }
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_qkv_q3_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q3_K_fused_qkv_vsx(
+            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+            static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
+            static_cast<float*>(q_out->data()) + m * N_q,
+            static_cast<float*>(k_out->data()) + m * N_k,
+            static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
 #else
     q_out = ops::matmul_transB(input, wq);
     k_out = ops::matmul_transB(input, wk);
@@ -1749,39 +1939,43 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q6_k(const TensorPtr& input,
     if (input->ndim() != 2 || weight->ndim() != 2 || residual->ndim() != 2)
         throw std::runtime_error("matmul_transB_fused_ffn_down_residual_q6_k expects 2D tensors");
     if (weight->dtype() != DataType::Q6_K)
-        throw std::runtime_error(
-            "matmul_transB_fused_ffn_down_residual_q6_k requires Q6_K weights");
+        throw std::runtime_error("matmul_transB_fused_ffn_down_residual_q6_k requires Q6_K weights");
     if (input->device() != DeviceType::CPU)
         throw std::runtime_error("matmul_transB_fused_ffn_down_residual_q6_k is CPU-only");
 
     int M = static_cast<int>(input->shape()[0]);
     int K = static_cast<int>(input->shape()[1]);
     int N = static_cast<int>(weight->shape()[0]);
-
-    auto out =
-        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+    auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
 
 #ifdef USE_AVX2
     PERF_SCOPE("matmul_transB/ffn_down_residual_q6_k");
     const float* a_data = static_cast<const float*>(input->data());
     const float* r_data = static_cast<const float*>(residual->data());
     float* o_data = static_cast<float*>(out->data());
-
-    for (int m = 0; m < M; ++m) {
-        cpu::gemv_q6_k_ffn_down_residual_avx2(a_data + m * K,
-                                              static_cast<const uint8_t*>(weight->data()),
-                                              r_data + m * N, o_data + m * N, K, N);
-    }
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q6_k_ffn_down_residual_avx2(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q6_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q6_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q6_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q6_K_ffn_down_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
 #endif
-
     return out;
 }
+
 
 TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
                                                      const TensorPtr& weight,
@@ -1813,8 +2007,19 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
                                                r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q4_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q4_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q4_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q4_K_ffn_down_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1853,8 +2058,19 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q5_k(const TensorPtr& input,
                                                r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q5_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q5_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_ffn_down_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1893,8 +2109,19 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q2_k(const TensorPtr& input,
                                                r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q2_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q2_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q2_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q2_K_ffn_down_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -1933,8 +2160,19 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q3_k(const TensorPtr& input,
                                                r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    out = ops::matmul_transB(input, weight);
-    out = ops::add(residual, out);
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q3_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q3_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/ffn_down_residual_q3_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q3_K_ffn_down_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);
@@ -2015,9 +2253,17 @@ TensorPtr matmul_transB_fused_ffn_up_q5_k(const TensorPtr& input, const TensorPt
             static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    auto gate = ops::matmul_transB(input, w_gate);
-    auto up = ops::matmul_transB(input, w_up);
-    out = ops::silu_multiply(gate, up);
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q5_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_fused_ffn_up_neon(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()), static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q5_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_fused_ffn_up_vsx(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()), static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
 #else
     auto gate = ops::matmul_transB(input, w_gate);
     auto up = ops::matmul_transB(input, w_up);
@@ -2054,9 +2300,17 @@ TensorPtr matmul_transB_fused_ffn_up_q2_k(const TensorPtr& input, const TensorPt
             static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
-    auto gate = ops::matmul_transB(input, w_gate);
-    auto up = ops::matmul_transB(input, w_up);
-    out = ops::silu_multiply(gate, up);
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q2_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q2_K_fused_ffn_up_neon(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()), static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_ffn_up_q2_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q2_K_fused_ffn_up_vsx(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()), static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
 #else
     auto gate = ops::matmul_transB(input, w_gate);
     auto up = ops::matmul_transB(input, w_up);
@@ -2073,9 +2327,6 @@ TensorPtr matmul_transB_fused_qkv_q5_k(const TensorPtr& input, const TensorPtr& 
     if (wq->dtype() != DataType::Q5_K || wk->dtype() != DataType::Q5_K ||
         wv->dtype() != DataType::Q5_K)
         throw std::runtime_error("matmul_transB_fused_qkv_q5_k requires Q5_K weights");
-    if (input->device() != DeviceType::CPU)
-        throw std::runtime_error("matmul_transB_fused_qkv_q5_k is CPU-only");
-
     int M = static_cast<int>(input->shape()[0]);
     int K = static_cast<int>(input->shape()[1]);
     int N_q = static_cast<int>(wq->shape()[0]);
@@ -2101,9 +2352,15 @@ TensorPtr matmul_transB_fused_qkv_q5_k(const TensorPtr& input, const TensorPtr& 
             static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
     }
 #elif defined(USE_NEON)
-    q_out = ops::matmul_transB(input, wq);
-    k_out = ops::matmul_transB(input, wk);
-    v_out = ops::matmul_transB(input, wv);
+    PERF_SCOPE("matmul_transB/fused_qkv_q5_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_fused_qkv_neon(a_data + m * K, static_cast<const uint8_t*>(wq->data()), static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()), static_cast<float*>(q_out->data()) + m * N_q, static_cast<float*>(k_out->data()) + m * N_k, static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_qkv_q5_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q5_K_fused_qkv_vsx(a_data + m * K, static_cast<const uint8_t*>(wq->data()), static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()), static_cast<float*>(q_out->data()) + m * N_q, static_cast<float*>(k_out->data()) + m * N_k, static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
 #else
     q_out = ops::matmul_transB(input, wq);
     k_out = ops::matmul_transB(input, wk);
@@ -2160,9 +2417,15 @@ TensorPtr matmul_transB_fused_qkv_q2_k(const TensorPtr& input, const TensorPtr& 
             static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
     }
 #elif defined(USE_NEON)
-    q_out = ops::matmul_transB(input, wq);
-    k_out = ops::matmul_transB(input, wk);
-    v_out = ops::matmul_transB(input, wv);
+    PERF_SCOPE("matmul_transB/fused_qkv_q2_k");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q2_K_fused_qkv_neon(a_data + m * K, static_cast<const uint8_t*>(wq->data()), static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()), static_cast<float*>(q_out->data()) + m * N_q, static_cast<float*>(k_out->data()) + m * N_k, static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+#elif defined(USE_VSX)
+    PERF_SCOPE("matmul_transB/fused_qkv_q2_k_vsx");
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m)
+        cpu::gemv_q2_K_fused_qkv_vsx(a_data + m * K, static_cast<const uint8_t*>(wq->data()), static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()), static_cast<float*>(q_out->data()) + m * N_q, static_cast<float*>(k_out->data()) + m * N_k, static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
 #else
     q_out = ops::matmul_transB(input, wq);
     k_out = ops::matmul_transB(input, wk);

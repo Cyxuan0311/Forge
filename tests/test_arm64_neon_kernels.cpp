@@ -369,6 +369,61 @@ static float ref_vec_dot_q8_0_q8_0(const uint8_t* w_row,
     return result;
 }
 
+// Scalar vec_dot_q5_0_q8_0
+// Q5_0 block = 22 bytes: d[2] fp16 + qh[4] bit5 + qs[16] nibbles
+// Q5_0 value = (5bit - 16) * d, where 5bit = nibble | (bit5 << 4)
+static float ref_vec_dot_q5_0_q8_0(const uint8_t* w_row,
+                                   const forge::cpu::block_q8_0_act* act,
+                                   int nb) {
+    float result = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        uint16_t d_bits;
+        std::memcpy(&d_bits, w_row + i * 22, 2);
+        float scale = fp16_to_f32_ref(d_bits) * act[i].d;
+        const uint8_t* qh = w_row + i * 22 + 2;
+        const uint8_t* qs = w_row + i * 22 + 6;
+        int dot = 0;
+        for (int j = 0; j < 32; ++j) {
+            int nib = (qs[j / 2] >> ((j % 2) << 2)) & 0x0F;
+            int bit5 = (qh[j / 8] >> (j % 8)) & 1;
+            int val = nib | (bit5 << 4);
+            dot += (val - 16) * (int)act[i].qs[j];
+        }
+        result += scale * (float)dot;
+    }
+    return result;
+}
+
+// Scalar vec_dot_q5_1_q8_0
+// Q5_1 block = 24 bytes: d[2] fp16 + m[2] fp16 + qh[4] bit5 + qs[16] nibbles
+// Q5_1 value = 5bit * d + m
+static float ref_vec_dot_q5_1_q8_0(const uint8_t* w_row,
+                                   const forge::cpu::block_q8_0_act* act,
+                                   int nb) {
+    float acc_d = 0.0f, acc_m = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        uint16_t d_bits, m_bits;
+        std::memcpy(&d_bits, w_row + i * 24, 2);
+        std::memcpy(&m_bits, w_row + i * 24 + 2, 2);
+        float d_scale = fp16_to_f32_ref(d_bits) * act[i].d;
+        float m_scale = fp16_to_f32_ref(m_bits) * act[i].d;
+        const uint8_t* qh = w_row + i * 24 + 4;
+        const uint8_t* qs = w_row + i * 24 + 8;
+        int dot = 0;
+        for (int j = 0; j < 32; ++j) {
+            int nib = (qs[j / 2] >> ((j % 2) << 2)) & 0x0F;
+            int bit5 = (qh[j / 8] >> (j % 8)) & 1;
+            int val = nib | (bit5 << 4);
+            dot += val * (int)act[i].qs[j];
+        }
+        int sum_act = 0;
+        for (int j = 0; j < 32; ++j) sum_act += (int)act[i].qs[j];
+        acc_d += d_scale * (float)dot;
+        acc_m += m_scale * (float)sum_act;
+    }
+    return acc_d + acc_m;
+}
+
 // Create synthetic Q8_0_act blocks from random floats
 static void make_q8_0_act(std::mt19937& rng, forge::cpu::block_q8_0_act* act, int nb) {
     for (int i = 0; i < nb; ++i) {
@@ -455,6 +510,78 @@ static void make_q8_0_blocks(std::mt19937& rng, uint8_t* w, int nb) {
     }
 }
 
+// fp16 encoding helper (defined later in file)
+static uint16_t encode_fp16(float val);
+
+// Create synthetic Q5_0 weight blocks from random floats
+static void make_q5_0_blocks(std::mt19937& rng, uint8_t* w, int nb) {
+    for (int i = 0; i < nb; ++i) {
+        float src[32];
+        fill_random(rng, src, 32, 3.0f);
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) { float v = std::fabs(src[j]); if (v > amax) amax = v; }
+        float d = amax / 16.0f;
+        float id = (amax > 0.0f) ? 1.0f / d : 0.0f;
+
+        uint8_t* blk = w + i * 22;
+        uint16_t f16 = encode_fp16(d);
+        std::memcpy(blk, &f16, 2);
+        uint8_t* qh = blk + 2;
+        uint8_t* qs = blk + 6;
+        for (int j = 0; j < 4; ++j) qh[j] = 0;
+        for (int j = 0; j < 16; ++j) qs[j] = 0;
+        for (int j = 0; j < 32; ++j) {
+            float x = src[j] * id;
+            int q = (int)((x >= 0) ? (x + 0.5f) : (x - 0.5f));
+            if (q > 15) q = 15; if (q < -16) q = -16;
+            int val = q + 16;
+            int nib = val & 0x0F;
+            int bit5 = (val >> 4) & 1;
+            int byte_idx = j / 2;
+            if (j % 2 == 0) qs[byte_idx] = (qs[byte_idx] & 0xF0) | (nib & 0x0F);
+            else qs[byte_idx] = (qs[byte_idx] & 0x0F) | (nib << 4);
+            if (bit5) qh[j / 8] |= (uint8_t)(1 << (j % 8));
+        }
+    }
+}
+
+// Create synthetic Q5_1 weight blocks from random floats
+static void make_q5_1_blocks(std::mt19937& rng, uint8_t* w, int nb) {
+    for (int i = 0; i < nb; ++i) {
+        float src[32];
+        fill_random(rng, src, 32, 3.0f);
+        float amax = 0.0f, amin = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            if (src[j] > amax) amax = src[j];
+            if (src[j] < amin) amin = src[j];
+        }
+        float d = (amax - amin) / 31.0f;
+        float m = amin;
+        float id = (d > 0.0f) ? 1.0f / d : 0.0f;
+
+        uint8_t* blk = w + i * 24;
+        uint16_t f16_d = encode_fp16(d);
+        uint16_t f16_m = encode_fp16(m);
+        std::memcpy(blk, &f16_d, 2);
+        std::memcpy(blk + 2, &f16_m, 2);
+        uint8_t* qh = blk + 4;
+        uint8_t* qs = blk + 8;
+        for (int j = 0; j < 4; ++j) qh[j] = 0;
+        for (int j = 0; j < 16; ++j) qs[j] = 0;
+        for (int j = 0; j < 32; ++j) {
+            float x = (src[j] - m) * id;
+            int qv = (int)((x >= 0) ? (x + 0.5f) : (x - 0.5f));
+            if (qv > 31) qv = 31; if (qv < 0) qv = 0;
+            int nib = qv & 0x0F;
+            int bit5 = (qv >> 4) & 1;
+            int byte_idx = j / 2;
+            if (j % 2 == 0) qs[byte_idx] = (qs[byte_idx] & 0xF0) | (nib & 0x0F);
+            else qs[byte_idx] = (qs[byte_idx] & 0x0F) | (nib << 4);
+            if (bit5) qh[j / 8] |= (uint8_t)(1 << (j % 8));
+        }
+    }
+}
+
 static void test_vec_dot_q4_0() {
     std::mt19937 rng(42);
     for (int nb : {1, 2, 4, 8, 16}) {
@@ -529,6 +656,60 @@ static void test_gemv_q4_0() {
                     w_blocks.data() + n * nb * 18, q8_act.data(), nb);
             }
             check_close_f32("gemv_q4_0_transB", out_neon.data(), out_ref.data(), N, 1e-4f);
+        }
+    }
+}
+
+static void test_gemv_q5_0() {
+    std::mt19937 rng(42);
+    for (int nb : {1, 4, 8}) {
+        int K = nb * 32;
+        for (int N : {1, 3, 5, 8}) {
+            std::vector<float> a(K);
+            fill_random(rng, a.data(), K, 3.0f);
+
+            std::vector<uint8_t> w_blocks(N * nb * 22);
+            for (int n = 0; n < N; ++n) {
+                make_q5_0_blocks(rng, w_blocks.data() + n * nb * 22, nb);
+            }
+
+            std::vector<float> out_neon(N), out_ref(N, 0.0f);
+            forge::cpu::gemv_q5_0_transB_neon(a.data(), w_blocks.data(), out_neon.data(), 1, K, N);
+
+            std::vector<forge::cpu::block_q8_0_act> q8_act(nb);
+            forge::cpu::quantize_row_q8_0_act(a.data(), q8_act.data(), K);
+            for (int n = 0; n < N; ++n) {
+                out_ref[n] = ref_vec_dot_q5_0_q8_0(
+                    w_blocks.data() + n * nb * 22, q8_act.data(), nb);
+            }
+            check_close_f32("gemv_q5_0_transB", out_neon.data(), out_ref.data(), N, 1e-4f);
+        }
+    }
+}
+
+static void test_gemv_q5_1() {
+    std::mt19937 rng(42);
+    for (int nb : {1, 4, 8}) {
+        int K = nb * 32;
+        for (int N : {1, 3, 5, 8}) {
+            std::vector<float> a(K);
+            fill_random(rng, a.data(), K, 3.0f);
+
+            std::vector<uint8_t> w_blocks(N * nb * 24);
+            for (int n = 0; n < N; ++n) {
+                make_q5_1_blocks(rng, w_blocks.data() + n * nb * 24, nb);
+            }
+
+            std::vector<float> out_neon(N), out_ref(N, 0.0f);
+            forge::cpu::gemv_q5_1_transB_neon(a.data(), w_blocks.data(), out_neon.data(), 1, K, N);
+
+            std::vector<forge::cpu::block_q8_0_act> q8_act(nb);
+            forge::cpu::quantize_row_q8_0_act(a.data(), q8_act.data(), K);
+            for (int n = 0; n < N; ++n) {
+                out_ref[n] = ref_vec_dot_q5_1_q8_0(
+                    w_blocks.data() + n * nb * 24, q8_act.data(), nb);
+            }
+            check_close_f32("gemv_q5_1_transB", out_neon.data(), out_ref.data(), N, 1e-4f);
         }
     }
 }
@@ -971,6 +1152,8 @@ int main() {
     std::printf("\n--- GEMV Kernels ---\n");
     test_gemv_fp32();
     test_gemv_q4_0();
+    test_gemv_q5_0();
+    test_gemv_q5_1();
 
     std::printf("\n--- Q3_K/Q4_K Quantized Dot & Fused Kernels ---\n");
     test_q3_k_sb_dot();

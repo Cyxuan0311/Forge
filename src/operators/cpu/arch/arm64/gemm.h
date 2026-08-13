@@ -27,6 +27,11 @@ namespace cpu {
 
 #ifdef USE_NEON
 
+static inline float dot_q2_K_q8_K_row_neon(const uint8_t*, const block_q8_K*, int);
+static inline float dot_q3_K_q8_K_row_neon(const uint8_t*, const block_q8_K*, int);
+static inline float dot_q5_K_q8_K_row_neon(const uint8_t*, const block_q8_K*, int);
+static inline float dot_q6_K_q8_K_row_neon(const uint8_t*, const block_q8_K*, int);
+
 // ============================================================================
 // Q4_K scale decoding helper — extracts 8 scale + 8 min uint6 values from
 // the packed 12-byte scales field.  Uses the same bit-twiddling as the x86
@@ -480,76 +485,32 @@ static void gemm_q6_K_neon(
     }
 }
 
-// ============================================================================
-// Q2_K GEMM fallback: dequantize + fp32 gemv
-// ============================================================================
-
-static void gemm_q2_K_neon(
-    const float* a_data,
-    const uint8_t* w_data,
-    float* o_data,
-    int M, int K, int N)
-{
-    // Dequantize weight rows to fp32, then use fp32 gemv
-    std::vector<float> w_fp32((size_t)N * K);
-    auto dequant_fn = get_dequant_row_fn(DataType::Q2_K);
-    if (!dequant_fn) {
-        // Cannot dequantize — zero output
-        std::memset(o_data, 0, (size_t)M * N * sizeof(float));
-        return;
+template <typename DotFn>
+static void gemm_k_row_dot_neon(const float* a_data, const uint8_t* w_data,
+                                float* o_data, int M, int K, int N,
+                                size_t block_bytes, DotFn dot_fn) {
+    const int nb = (K + 255) / 256;
+    std::vector<block_q8_K> q8_all((size_t)M * nb);
+    for (int m = 0; m < M; ++m)
+        quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* row = w_data + (size_t)n * nb * block_bytes;
+        for (int m = 0; m < M; ++m)
+            o_data[(size_t)m * N + n] = dot_fn(row, q8_all.data() + (size_t)m * nb, nb);
     }
-    #pragma omp parallel for schedule(dynamic)
-    for (int n = 0; n < N; ++n)
-        dequant_fn(w_data, w_fp32.data() + (size_t)n * K, K, n);
-
-    // Reuse fp32 gemv (already defined in gemv.h)
-    gemv_fp32_transB_neon(a_data, w_fp32.data(), o_data, M, K, N);
 }
 
-// ============================================================================
-// Q3_K GEMM fallback: dequantize + fp32 gemv
-// ============================================================================
-
-static void gemm_q3_K_neon(
-    const float* a_data,
-    const uint8_t* w_data,
-    float* o_data,
-    int M, int K, int N)
-{
-    std::vector<float> w_fp32((size_t)N * K);
-    auto dequant_fn = get_dequant_row_fn(DataType::Q3_K);
-    if (!dequant_fn) {
-        std::memset(o_data, 0, (size_t)M * N * sizeof(float));
-        return;
-    }
-    #pragma omp parallel for schedule(dynamic)
-    for (int n = 0; n < N; ++n)
-        dequant_fn(w_data, w_fp32.data() + (size_t)n * K, K, n);
-
-    gemv_fp32_transB_neon(a_data, w_fp32.data(), o_data, M, K, N);
+static void gemm_q2_K_neon(const float* a, const uint8_t* w, float* out, int M, int K, int N) {
+    gemm_k_row_dot_neon(a, w, out, M, K, N, sizeof(block_q2_K), dot_q2_K_q8_K_row_neon);
 }
 
-// ============================================================================
-// Q5_K GEMM fallback: dequantize + fp32 gemv
-// ============================================================================
+static void gemm_q3_K_neon(const float* a, const uint8_t* w, float* out, int M, int K, int N) {
+    gemm_k_row_dot_neon(a, w, out, M, K, N, sizeof(block_q3_K), dot_q3_K_q8_K_row_neon);
+}
 
-static void gemm_q5_K_neon(
-    const float* a_data,
-    const uint8_t* w_data,
-    float* o_data,
-    int M, int K, int N)
-{
-    std::vector<float> w_fp32((size_t)N * K);
-    auto dequant_fn = get_dequant_row_fn(DataType::Q5_K);
-    if (!dequant_fn) {
-        std::memset(o_data, 0, (size_t)M * N * sizeof(float));
-        return;
-    }
-    #pragma omp parallel for schedule(dynamic)
-    for (int n = 0; n < N; ++n)
-        dequant_fn(w_data, w_fp32.data() + (size_t)n * K, K, n);
-
-    gemv_fp32_transB_neon(a_data, w_fp32.data(), o_data, M, K, N);
+static void gemm_q5_K_neon(const float* a, const uint8_t* w, float* out, int M, int K, int N) {
+    gemm_k_row_dot_neon(a, w, out, M, K, N, sizeof(block_q5_K), dot_q5_K_q8_K_row_neon);
 }
 
 #endif // USE_NEON
