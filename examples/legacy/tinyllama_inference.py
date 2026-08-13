@@ -31,6 +31,9 @@ Interactive commands:
 import os
 import sys
 
+# Allow running from within examples/legacy/ — add examples/ to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 import chat_utils as chat_utils_mod
 from chat_utils import (
     add_common_args,

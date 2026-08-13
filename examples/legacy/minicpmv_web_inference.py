@@ -13,6 +13,10 @@ Requirements:
 
 import sys
 import os
+
+# Allow running from within examples/legacy/ — add examples/ to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 import gc
 import numpy as np
 from pathlib import Path
