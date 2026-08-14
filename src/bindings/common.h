@@ -39,6 +39,10 @@
 namespace py = pybind11;
 using namespace forge;
 
+// Set by forge.set_num_threads(); create_context() applies it to the engine
+// ContextParams (engine forward overrides the global omp thread count).
+extern int forge_global_cpu_threads;
+
 // ---- Registration helpers ----
 
 inline void ensure_engines_registered() {
@@ -522,6 +526,12 @@ public:
         ensure_engines_registered();
 
         auto ctx = std::make_unique<PyInferenceContext>(model_);
+
+        // Apply the forge.set_num_threads() value to the engine context so the
+        // engine's per-forward omp_set_num_threads() doesn't reset it to the
+        // ContextParams default (4).
+        ctx->get().params_mut().n_threads = forge_global_cpu_threads;
+        ctx->get().params_mut().n_threads_batch = forge_global_cpu_threads;
 
         // Internal feature flag: enable paged KV storage via environment variable.
         // Not exposed as a Python API parameter (Phase 3 requirement).

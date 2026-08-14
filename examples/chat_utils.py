@@ -100,6 +100,25 @@ perf = PerfTimer()
 profiling_enabled = False
 
 
+def _physical_core_count():
+    """Return the number of physical cores, or 0 when undetectable."""
+    # Linux: count unique core ids exposed by sysfs.
+    if sys.platform.startswith("linux"):
+        try:
+            import glob
+
+            core_ids = set()
+            for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
+                with open(p) as f:
+                    core_ids.add(f.read().strip())
+            if core_ids:
+                return len(core_ids)
+        except OSError:
+            pass
+    # Fall back to logical CPUs (may include hyperthreads).
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+
+
 def print_cpp_profiler_summary():
     """Print the C++ PerfProfiler summary (operator-level timing)."""
     try:
@@ -668,9 +687,11 @@ def load_model_and_tokenize(args, model_path=None):
 
     # CPU threads
     if args.device == "cpu":
-        cpu_threads = (
-            len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
-        )
+        cpu_threads = int(os.environ.get("FORGE_THREADS", "0")) if os.environ.get("FORGE_THREADS") else 0
+        if cpu_threads < 1:
+            # Default to physical cores (hyperthreading rarely helps latency-
+            # bound MoE dots); falls back to logical CPUs when undetectable.
+            cpu_threads = _physical_core_count()
         forge.set_num_threads(cpu_threads)
         print(f"CPU threads set to: {cpu_threads}")
 
