@@ -34,6 +34,7 @@
 #include "forge/logger.h"
 #include "forge/model.h"
 #include "forge/tensor.h"
+#include "forge/threads.h"
 #include "forge/tokenizer.h"
 #include "forge/types.h"
 #include "forge/vision_encoder.h"
@@ -497,6 +498,18 @@ int main(int argc, char** argv) {
     auto t4 = std::chrono::high_resolution_clock::now();
 
     InferenceContext ctx(model);
+    // CPU threads: -t/--threads wins; default "auto" probes the fused GEMV.
+    if (args.threads > 0) {
+        ctx.params_mut().n_threads = args.threads;
+        ctx.params_mut().n_threads_batch = args.threads;
+        std::cout << "CPU threads set to: " << args.threads << "\n";
+    } else if (model.device() != DeviceType::CUDA) {
+        int t = forge::detect_best_cpu_threads(cfg.hidden_dim,
+                                               cfg.intermediate_dim);
+        ctx.params_mut().n_threads = t;
+        ctx.params_mut().n_threads_batch = t;
+        std::cout << "CPU threads auto-detected: " << t << "\n";
+    }
     auto engine = EngineRegistry::instance().create(cfg.arch_type, model, ctx);
     if (!engine) {
         std::cerr << "Error: No matching engine for architecture: " << cfg.arch_type << "\n";

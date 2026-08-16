@@ -14,6 +14,7 @@
  */
 
 #include "common.h"
+#include "forge/threads.h"
 #ifdef _OPENMP
 #    include <omp.h>
 #endif
@@ -48,4 +49,22 @@ PYBIND11_MODULE(forge, m) {
             forge_global_cpu_threads = n;
         },
         py::arg("n"), "Set number of CPU threads for inference (OpenMP)");
+
+    m.def(
+        "auto_detect_threads",
+        [](int hidden, int intermediate) {
+            int n = (hidden > 0 && intermediate > 0)
+                        ? forge::detect_best_cpu_threads(hidden, intermediate)
+                        : forge::detect_best_cpu_threads();
+#ifdef _OPENMP
+            omp_set_num_threads(n);
+#endif
+            forge_global_cpu_threads = n;
+            return n;
+        },
+        py::arg("hidden") = 0, py::arg("intermediate") = 0,
+        "Probe the fused Q2_K GEMV and pick the best CPU thread count for "
+        "decode. hidden/intermediate size the synthetic probe weights to the "
+        "model (0 = Llama-8B-class defaults). Applies it for subsequent "
+        "create_context() calls.");
 }

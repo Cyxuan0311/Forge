@@ -685,15 +685,23 @@ def load_model_and_tokenize(args, model_path=None):
         f"kv_heads={cfg.num_kv_heads}, vocab={cfg.vocab_size}"
     )
 
-    # CPU threads
+    # CPU threads: --threads > FORGE_THREADS env (0/absent = auto) > runtime probe.
     if args.device == "cpu":
-        cpu_threads = int(os.environ.get("FORGE_THREADS", "0")) if os.environ.get("FORGE_THREADS") else 0
-        if cpu_threads < 1:
-            # Default to physical cores (hyperthreading rarely helps latency-
-            # bound MoE dots); falls back to logical CPUs when undetectable.
-            cpu_threads = _physical_core_count()
-        forge.set_num_threads(cpu_threads)
-        print(f"CPU threads set to: {cpu_threads}")
+        cpu_threads = 0
+        if getattr(args, "threads", None) and args.threads > 0:
+            cpu_threads = args.threads
+        elif os.environ.get("FORGE_THREADS"):
+            try:
+                cpu_threads = int(os.environ["FORGE_THREADS"])
+            except ValueError:
+                cpu_threads = 0
+        if cpu_threads > 0:
+            forge.set_num_threads(cpu_threads)
+            print(f"CPU threads set to: {cpu_threads}")
+        else:
+            cpu_threads = forge.auto_detect_threads(
+                cfg.hidden_dim, cfg.intermediate_dim)
+            print(f"CPU threads auto-detected: {cpu_threads}")
 
     # Profiling setup
     if profiling_enabled:
@@ -705,12 +713,6 @@ def load_model_and_tokenize(args, model_path=None):
         kv_cache_dtype=args.kv_cache_dtype,
         gpu_layers=args.gpu_layers,
     )
-    stats = ctx.memory_stats()
-    print(
-        f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
-        f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB"
-    )
-
     if args.device == "cuda":
         print("Warming up CUDA kernels...")
         try:
@@ -722,10 +724,18 @@ def load_model_and_tokenize(args, model_path=None):
             print("Warmup done!")
         except RuntimeError as e:
             print(f"Warmup skipped ({e})")
-        del ctx
+
+    # Read KV stats after warmup: the cache is lazily allocated on first forward,
+    # so querying before it would always report fp32 / 0 MB.
+    stats = ctx.memory_stats()
+    print(
+        f"KV Cache: dtype={stats.get('kv_cache_dtype', 'unknown')}, "
+        f"size: {stats.get('kv_cache_nbytes', 0) / 1024 / 1024:.1f} MB"
+    )
+
+    del ctx
+    if args.device == "cuda":
         gc.collect()
-    else:
-        del ctx
 
     t5 = time.time()
     if profiling_enabled:
@@ -757,7 +767,8 @@ def add_common_args(parser, gpu_layers_default=-1, temperature_default=0.7):
         help="Number of layers to place on GPU (-1 for all)",
     )
     parser.add_argument(
-        "--kv-cache-dtype", type=str, default="fp32", choices=["fp32", "q4_0"],
+        "--kv-cache-dtype", type=str, default="fp32",
+        choices=["fp32", "f16", "q8_0", "q4_0"],
         help="KV cache data type",
     )
     parser.add_argument(
@@ -775,6 +786,10 @@ def add_common_args(parser, gpu_layers_default=-1, temperature_default=0.7):
     parser.add_argument("--repeat-penalty", type=float, default=1.1, help="Repetition penalty")
     parser.add_argument("--no-stream", action="store_true", help="Disable streaming output")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--threads", type=int, default=None,
+        help="CPU threads for inference (default: auto-detect optimal)",
+    )
     parser.add_argument(
         "--profile", action="store_true",
         help="Enable performance profiling (Python + C++ PerfProfiler)",
