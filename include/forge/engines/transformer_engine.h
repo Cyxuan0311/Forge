@@ -7,7 +7,6 @@
 #include "forge/inference/layer_execution_context.h"
 #include "forge/kv_cache.h"
 #include "forge/kv_memory.h"
-#include "forge/memory_pool.h"
 #include "forge/model.h"
 
 namespace forge {
@@ -98,7 +97,6 @@ protected:
     std::unique_ptr<KVMemory> kv_memory_;
     ModelWeights weights_;
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
-    MemoryPool workspace_pool_;
     int gpu_layers_ = -1;
     std::vector<DeviceTarget> layer_devices_;  // per-layer (device_type, device_id) assignment
     bool use_graph_ = false;

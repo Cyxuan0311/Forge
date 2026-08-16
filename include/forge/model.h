@@ -240,7 +240,6 @@ struct ModelWeights {
     TensorPtr output_weight;
     TensorPtr output_bias;           // Optional output projection bias (phimoe)
     TensorPtr output_weight_fp32;  // Pre-dequantized FP32 cache for CPU output_proj
-    TensorPtr output_weight_fp16;  // Pre-dequantized FP16 cache for CUDA output_proj
     std::vector<LayerWeights> layers;
 
     // Gemma4 per-layer embedding weights

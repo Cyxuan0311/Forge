@@ -35,8 +35,7 @@ TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
       plan_(build_execution_plan(model.config().arch_type, model.config())),
       memory_(ctx.memory()),
       kv_cache_(*ctx.memory().kv()),
-      kv_memory_(std::make_unique<KVMemory>(*ctx.memory().kv(), ctx.params().kv_storage_mode)),
-      workspace_pool_(model.device()) {
+      kv_memory_(std::make_unique<KVMemory>(*ctx.memory().kv(), ctx.params().kv_storage_mode)) {
     LOG_INFO("Execution plan: " + plan_.plan_id());
     graph_runtime_.set_builder(plan_.graph_builder);
 }
@@ -703,35 +702,13 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
 #ifdef USE_CUDA
             auto dtype = output_weight->dtype();
             if (dtype == DataType::Q4_0) {
-                // Dequantize Q4_0 → FP16 once, then use cuBLAS (tensor core) for output_proj
-                if (!weights_.output_weight_fp16) {
-                    weights_.output_weight_fp16 = std::make_shared<Tensor>(
-                        DataType::FP16, output_weight->shape(), DeviceType::CUDA);
-                    cuda::launch_dequant_q4_0_matrix_fp16(
-                        output_weight->data(),
-                        weights_.output_weight_fp16->data(),
-                        N, K);
-                }
-                cuda::launch_cublas_gemm_fp16_fp32(
-                    static_cast<const float*>(cur_hidden->data()),
-                    weights_.output_weight_fp16->data(),
-                    static_cast<float*>(logits->data()),
-                    1, K, N, true);
+                cuda::launch_output_proj_q4_0(static_cast<const float*>(cur_hidden->data()),
+                                              output_weight->data(),
+                                              static_cast<float*>(logits->data()), K, N);
             } else if (dtype == DataType::Q4_K) {
-                // Dequantize Q4_K → FP16 once, then use cuBLAS (tensor core)
-                if (!weights_.output_weight_fp16) {
-                    weights_.output_weight_fp16 = std::make_shared<Tensor>(
-                        DataType::FP16, output_weight->shape(), DeviceType::CUDA);
-                    cuda::launch_dequant_q4_k_matrix_fp16(
-                        output_weight->data(),
-                        weights_.output_weight_fp16->data(),
-                        N, K);
-                }
-                cuda::launch_cublas_gemm_fp16_fp32(
-                    static_cast<const float*>(cur_hidden->data()),
-                    weights_.output_weight_fp16->data(),
-                    static_cast<float*>(logits->data()),
-                    1, K, N, true);
+                cuda::launch_output_proj_q4_k(static_cast<const float*>(cur_hidden->data()),
+                                              output_weight->data(),
+                                              static_cast<float*>(logits->data()), K, N);
             } else if (dtype == DataType::Q5_K) {
                 cuda::launch_output_proj_q5_k(static_cast<const float*>(cur_hidden->data()),
                                               output_weight->data(),
