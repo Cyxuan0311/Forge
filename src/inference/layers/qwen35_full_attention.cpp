@@ -75,7 +75,37 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
     const int q_dim = num_heads * head_dim;
 
     // Q 投影输出 [num_heads * head_dim * 2]: 每个 head 是 [Q | gate] 拼接。
-    auto q_full = ensure_cpu(ops::matmul_transB(normed, lw.attn_q()));
+    TensorPtr q_full, k, v;
+    if (lw.attn_q()->dtype() == DataType::Q4_K && lw.attn_k()->dtype() == DataType::Q4_K &&
+        lw.attn_v()->dtype() == DataType::Q4_K) {
+        // 三个投影共享同一输入: 融合为单次量化 + 单 OpenMP 区 (省 2 个 gemm 调用)。
+        // 返回拼接 [q|k|v], 按 N 切分 (M 很小, 拷贝开销可忽略)。
+        auto qkv_fused = ops::matmul_transB_fused_qkv_q4_k(normed, lw.attn_q(), lw.attn_k(),
+                                                           lw.attn_v());
+        int Nq = static_cast<int>(lw.attn_q()->shape()[0]);
+        int Nk = static_cast<int>(lw.attn_k()->shape()[0]);
+        int Nv = static_cast<int>(lw.attn_v()->shape()[0]);
+        const int row_stride = Nq + Nk + Nv;
+        const float* src = static_cast<const float*>(qkv_fused->data());
+        q_full = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, Nq},
+                                          DeviceType::CPU);
+        k = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, Nk},
+                                     DeviceType::CPU);
+        v = std::make_shared<Tensor>(DataType::FP32,
+                                     std::vector<int64_t>{seq_len, Nv},
+                                     DeviceType::CPU);
+        for (int s = 0; s < seq_len; ++s) {
+            const float* row = src + s * row_stride;
+            std::memcpy(static_cast<float*>(q_full->data()) + s * Nq, row, Nq * sizeof(float));
+            std::memcpy(static_cast<float*>(k->data()) + s * Nk, row + Nq, Nk * sizeof(float));
+            std::memcpy(static_cast<float*>(v->data()) + s * Nv, row + Nq + Nk,
+                        Nv * sizeof(float));
+        }
+    } else {
+        q_full = ensure_cpu(ops::matmul_transB(normed, lw.attn_q()));
+        k = ensure_cpu(ops::matmul_transB(normed, lw.attn_k()));
+        v = ensure_cpu(ops::matmul_transB(normed, lw.attn_v()));
+    }
 
     auto q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim},
                                       DeviceType::CPU);
@@ -95,10 +125,6 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
                         head_dim * sizeof(float));
         }
     }
-
-    // K/V 投影后拉回 CPU 做 per-head 操作 (RMSNorm + RoPE)。
-    auto k = ensure_cpu(ops::matmul_transB(normed, lw.attn_k()));
-    auto v = ensure_cpu(ops::matmul_transB(normed, lw.attn_v()));
 
     if (lw.attn_q_norm()) {
         per_head_rms_norm_cpu(static_cast<float*>(q->data()),

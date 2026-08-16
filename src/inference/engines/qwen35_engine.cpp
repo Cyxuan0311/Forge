@@ -2,8 +2,10 @@
 
 #include <stdexcept>
 
+#include "forge/inference/layers/ffn_executor.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
+#include "forge/perf_profiler.h"
 
 namespace forge {
 
@@ -70,10 +72,19 @@ TensorPtr Qwen35Engine::apply_ffn(const TensorPtr& hidden_after_attn,
         ffn_input = ops::rms_norm(hidden_after_attn, lw.post_attention_norm(), cfg.rms_norm_eps);
     }
 
-    auto gate = ops::matmul_transB(ffn_input, lw.w1());
-    auto up = ops::matmul_transB(ffn_input, lw.w3());
-    auto ffn_mid = ops::silu_multiply(gate, up);
-    auto ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
+    // Route through FfnExecutor so decode (M=1) uses the fused gate+up and
+    // down+residual kernels (single OpenMP region each, x quantized once)
+    // instead of four separate matmul/silu/add calls.
+    int seq_len = static_cast<int>(ffn_input->shape()[0]);
+    TensorPtr ffn_out;
+    {
+        PERF_SCOPE("layer/ffn");
+        ffn_out = FfnExecutor::apply(ffn_input, hidden_after_attn, cfg, lw, seq_len,
+                                     lctx.device.type);
+    }
+    if (FfnExecutor::residual_fused(cfg, lw, seq_len, lctx.device.type)) {
+        return ffn_out;
+    }
     return ops::add(hidden_after_attn, ffn_out);
 }
 

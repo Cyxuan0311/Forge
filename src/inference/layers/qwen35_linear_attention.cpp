@@ -171,10 +171,28 @@ TensorPtr Qwen35LinearAttention::apply_cpu(const TensorPtr& normed,
     const int value_dim = dims.value_dim();
 
     // 输入投影后统一拉回 CPU: 递推部分是标量循环。
-    auto qkv_mixed = ensure_cpu(ops::matmul_transB(normed, lw.attn_qkv()));
-    auto z = ensure_cpu(ops::matmul_transB(normed, lw.attn_gate()));
-    auto alpha = ensure_cpu(ops::matmul_transB(normed, lw.ssm_alpha()));
-    auto beta = ensure_cpu(ops::matmul_transB(normed, lw.ssm_beta()));
+    // 四个投影共享同一输入 (normed): 若 qkv 为 Q4_K/Q6_K 且 z/alpha/beta 为 Q4_K
+    // 则走融合内核, 一次 Q8_K 量化 + 单个 OpenMP 区完成 qkv/z/alpha/beta。
+    TensorPtr qkv_mixed, z, alpha, beta;
+    auto qkv_dt = lw.attn_qkv()->dtype();
+    bool qkv_z_ab_fused =
+        (qkv_dt == DataType::Q4_K || qkv_dt == DataType::Q6_K) &&
+        lw.attn_gate()->dtype() == DataType::Q4_K && lw.ssm_alpha()->dtype() == DataType::Q4_K &&
+        lw.ssm_beta()->dtype() == DataType::Q4_K;
+    if (qkv_z_ab_fused) {
+        auto normed_cpu = ensure_cpu(normed);
+        auto fused = ops::matmul_transB_fused_qkv_z_ab(normed_cpu, lw.attn_qkv(), lw.attn_gate(),
+                                                       lw.ssm_alpha(), lw.ssm_beta());
+        qkv_mixed = fused.qkv;
+        z = fused.z;
+        alpha = fused.alpha;
+        beta = fused.beta;
+    } else {
+        qkv_mixed = ensure_cpu(ops::matmul_transB(normed, lw.attn_qkv()));
+        z = ensure_cpu(ops::matmul_transB(normed, lw.attn_gate()));
+        alpha = ensure_cpu(ops::matmul_transB(normed, lw.ssm_alpha()));
+        beta = ensure_cpu(ops::matmul_transB(normed, lw.ssm_beta()));
+    }
 
     float* alpha_data = static_cast<float*>(alpha->data());
     float* beta_data = static_cast<float*>(beta->data());
