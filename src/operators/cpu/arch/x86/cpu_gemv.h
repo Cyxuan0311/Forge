@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include "forge/host_mem_pool.h"
 
 #ifdef USE_AVX2
 #    include <immintrin.h>
@@ -152,7 +153,7 @@ static void gemv_q4_0_transB_avx2_q8(const float* a, const uint8_t* w, float* ou
     const int blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
     const int full_blocks = K / BLOCK_SIZE;
 
-    std::vector<block_q8_0> q8_act(blocks_per_row);
+    scratch_vec<block_q8_0> q8_act(blocks_per_row);
     quantize_row_q8_0(a, q8_act.data(), K);
 
     constexpr int NR = 4;
@@ -246,7 +247,7 @@ static void gemv_q4_0_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     const int64_t blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Quantize activation once
-    std::vector<block_q8_0_act> q8_act(blocks_per_row);
+    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
     quantize_row_q8_0_act(a, q8_act.data(), K);
 
     constexpr int RM = 4;
@@ -282,7 +283,7 @@ static void gemv_q4_0_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     const int64_t blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Quantize activation once
-    std::vector<block_q8_0_act> q8_act(blocks_per_row);
+    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
     quantize_row_q8_0_act(a, q8_act.data(), K);
 
     constexpr int RM = 4;
@@ -1003,7 +1004,7 @@ static void gemv_q3_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
     const int nb = (K + QK_K - 1) / QK_K;
 
     if (M == 1) {
-        std::vector<block_q8_K> q8_buf(nb);
+        scratch_vec<block_q8_K> q8_buf(nb);
         quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1012,7 +1013,7 @@ static void gemv_q3_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
             out[n] = dot_q3_K_q8_K_avx2(q3_row, q8_buf.data(), nb);
         }
     } else {
-        std::vector<block_q8_K> q8_all(M * nb);
+        scratch_vec<block_q8_K> q8_all(M * nb);
         for (int m = 0; m < M; ++m) {
             quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
         }
@@ -1045,14 +1046,14 @@ static void gemv_q3_k_transB_batch_avx2(const float* a, const uint8_t* w, float*
     static const uint32_t kmask2 = 0x0f0f0f0f;
 
     // Quantize all M input vectors to Q8_K
-    std::vector<block_q8_K> q8_src(M * nb);
+    scratch_vec<block_q8_K> q8_src(M * nb);
     for (int m = 0; m < M; ++m) {
         quantize_row_q8_K(a + m * K, q8_src.data() + m * nb, K);
     }
 
     // Transpose Q8_K data: q8_t[i * M + m] = q8_src[m * nb + i]
     // This makes per-block access sequential for all M rows
-    std::vector<block_q8_K> q8_t(nb * M);
+    scratch_vec<block_q8_K> q8_t(nb * M);
     for (int i = 0; i < nb; ++i) {
         for (int m = 0; m < M; ++m) {
             q8_t[i * M + m] = q8_src[m * nb + i];
@@ -1061,7 +1062,8 @@ static void gemv_q3_k_transB_batch_avx2(const float* a, const uint8_t* w, float*
 
     // Pre-allocate aligned accumulators per OpenMP thread
     int max_threads = omp_get_max_threads();
-    __m256* acc_storage = static_cast<__m256*>(_mm_malloc(max_threads * M * sizeof(__m256), 32));
+    __m256* acc_storage = static_cast<__m256*>(forge::host_mem::allocate(
+        static_cast<size_t>(max_threads) * M * sizeof(__m256)));
 
 #pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n) {
@@ -1170,7 +1172,7 @@ static void gemv_q3_k_transB_batch_avx2(const float* a, const uint8_t* w, float*
             out[m * N + n] = hsum_avx2(acc[m]);
         }
     }
-    _mm_free(acc_storage);
+    forge::host_mem::deallocate(acc_storage);
 }
 
 // ---- Q3_K fused FFN Up (SiLU(gate@w1) * (up@w3)) for decode ----
@@ -1182,7 +1184,7 @@ static void gemv_q3_k_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
     constexpr int Q3_K_BLOCK_BYTES = 110;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
@@ -1221,7 +1223,7 @@ static void gemv_q3_k_fused_qk_avx2(const float* a, const uint8_t* wq, const uin
     constexpr int Q3_K_BLOCK_BYTES = 110;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
     auto dot_rows = [&](const uint8_t* w, float* out, int N) {
@@ -1252,7 +1254,7 @@ static void gemv_q3_k_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     constexpr int Q3_K_BLOCK_BYTES = 110;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
     auto dot_rows = [&](const uint8_t* w, float* out, int N) {
@@ -1372,7 +1374,7 @@ static void gemv_q6_K_transB_avx2(const float* a, const uint8_t* w, float* out, 
     const int nb = (K + QK_K - 1) / QK_K;
 
     if (M == 1) {
-        std::vector<block_q8_K> q8_buf(nb);
+        scratch_vec<block_q8_K> q8_buf(nb);
         quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1381,7 +1383,7 @@ static void gemv_q6_K_transB_avx2(const float* a, const uint8_t* w, float* out, 
             out[n] = dot_q6_K_q8_K_avx2(q6_row, q8_buf.data(), nb);
         }
     } else {
-        std::vector<block_q8_K> q8_all(M * nb);
+        scratch_vec<block_q8_K> q8_all(M * nb);
         for (int m = 0; m < M; ++m) {
             quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
         }
@@ -1409,17 +1411,23 @@ static void gemv_q6_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
     const __m256i m15 = _mm256_set1_epi8(15);
 
     // Quantize all M input vectors to Q8_K
-    std::vector<block_q8_K> q8_all(M * nb);
+    scratch_vec<block_q8_K> q8_all(M * nb);
     for (int m = 0; m < M; ++m) {
         quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
     }
+
+    // Per-thread accumulators, allocated once per call (was _mm_malloc each
+    // parallel iteration: N heap alloc/frees per GEMV).
+    const int max_threads = omp_get_max_threads();
+    __m256* acc_storage = static_cast<__m256*>(forge::host_mem::allocate(
+        static_cast<size_t>(max_threads) * M * sizeof(__m256)));
 
 #    pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n) {
         const uint8_t* q6_row = w + (size_t)n * nb * Q6_K_BLOCK_BYTES;
 
         // Per-M accumulators (use _mm_malloc for 32-byte alignment)
-        __m256* acc_vec = static_cast<__m256*>(_mm_malloc(M * sizeof(__m256), 32));
+        __m256* acc_vec = acc_storage + (size_t)omp_get_thread_num() * M;
         for (int i = 0; i < M; ++i) acc_vec[i] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
@@ -1509,8 +1517,8 @@ static void gemv_q6_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
         for (int m = 0; m < M; ++m) {
             out[m * N + n] = hsum_avx2(acc_vec[m]);
         }
-        _mm_free(acc_vec);
     }
+    forge::host_mem::deallocate(acc_storage);
 }
 
 // Q4_K Batch-GEMV (transB layout) - defined in gemv.h
@@ -1601,7 +1609,7 @@ static void gemv_q2_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
     const int nb = (K + QK_K - 1) / QK_K;
 
     if (M == 1) {
-        std::vector<block_q8_K> q8_buf(nb);
+        scratch_vec<block_q8_K> q8_buf(nb);
         quantize_row_q8_K(a, q8_buf.data(), K);
 
 #pragma omp parallel for schedule(static)
@@ -1610,7 +1618,7 @@ static void gemv_q2_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
             out[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
         }
     } else {
-        std::vector<block_q8_K> q8_all(M * nb);
+        scratch_vec<block_q8_K> q8_all(M * nb);
         for (int m = 0; m < M; ++m) {
             quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
         }
@@ -1639,14 +1647,14 @@ static void gemv_q2_k_transB_batch_avx2(const float* a, const uint8_t* w, float*
 
     // Quantize all M input vectors to Q8_K
     // Store as [m][i] layout
-    std::vector<block_q8_K> q8_src(M * nb);
+    scratch_vec<block_q8_K> q8_src(M * nb);
     for (int m = 0; m < M; ++m) {
         quantize_row_q8_K(a + m * K, q8_src.data() + m * nb, K);
     }
 
     // Transpose Q8_K data: q8_t[i * M + m] = q8_src[m * nb + i]
     // This makes per-block access sequential for all M rows
-    std::vector<block_q8_K> q8_t(nb * M);
+    scratch_vec<block_q8_K> q8_t(nb * M);
     for (int i = 0; i < nb; ++i) {
         for (int m = 0; m < M; ++m) {
             q8_t[i * M + m] = q8_src[m * nb + i];
@@ -1655,7 +1663,8 @@ static void gemv_q2_k_transB_batch_avx2(const float* a, const uint8_t* w, float*
 
     // Pre-allocate aligned accumulators per OpenMP thread
     int max_threads = omp_get_max_threads();
-    __m256* acc_storage = static_cast<__m256*>(_mm_malloc(max_threads * M * sizeof(__m256), 32));
+    __m256* acc_storage = static_cast<__m256*>(forge::host_mem::allocate(
+        static_cast<size_t>(max_threads) * M * sizeof(__m256)));
 
 #pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n) {
@@ -1742,7 +1751,7 @@ static void gemv_q2_k_transB_batch_avx2(const float* a, const uint8_t* w, float*
             out[m * N + n] = hsum_avx2(acc[m]);
         }
     }
-    _mm_free(acc_storage);
+    forge::host_mem::deallocate(acc_storage);
 }
 #endif  // USE_AVX2
 
@@ -1832,7 +1841,7 @@ static void gemv_q6_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q6_K_BLOCK_BYTES = 210;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1850,7 +1859,7 @@ static void gemv_q4_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q4_K_BLOCK_BYTES = 144;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1867,7 +1876,7 @@ static void gemv_q2_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q2_K_BLOCK_BYTES = 84;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1884,7 +1893,7 @@ static void gemv_q3_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q3_K_BLOCK_BYTES = 110;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1902,7 +1911,7 @@ static void gemv_q4_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q4_K_BLOCK_BYTES = 144;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1919,7 +1928,7 @@ static void gemv_q6_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q6_K_BLOCK_BYTES = 210;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1936,7 +1945,7 @@ static void gemv_q2_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q2_K_BLOCK_BYTES = 84;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1953,7 +1962,7 @@ static void gemv_q3_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q3_K_BLOCK_BYTES = 110;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1981,7 +1990,7 @@ static void gemv_q4_0_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     const int nb = (K + 31) / 32;
 
     if (M == 1) {
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a, q8_act.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -1993,7 +2002,7 @@ static void gemv_q4_0_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     } else {
         for (int m_start = 0; m_start < M; m_start += nrc) {
             int m_cur = (m_start + nrc <= M) ? nrc : (M - m_start);
-            std::vector<block_q8_0_act> q8_tile(m_cur * nb);
+            scratch_vec<block_q8_0_act> q8_tile(m_cur * nb);
             for (int m = 0; m < m_cur; ++m)
                 quantize_row_q8_0_act(a + (m_start + m) * K, q8_tile.data() + m * nb, K);
 
@@ -2015,7 +2024,7 @@ static void gemv_q4_1_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     const int nb = (K + 31) / 32;
 
     if (M == 1) {
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a, q8_act.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2027,7 +2036,7 @@ static void gemv_q4_1_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     } else {
         for (int m_start = 0; m_start < M; m_start += nrc) {
             int m_cur = (m_start + nrc <= M) ? nrc : (M - m_start);
-            std::vector<block_q8_0_act> q8_tile(m_cur * nb);
+            scratch_vec<block_q8_0_act> q8_tile(m_cur * nb);
             for (int m = 0; m < m_cur; ++m)
                 quantize_row_q8_0_act(a + (m_start + m) * K, q8_tile.data() + m * nb, K);
 
@@ -2050,7 +2059,7 @@ static void gemv_q8_0_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     const int nb = (K + 31) / 32;
 
     if (M == 1) {
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a, q8_act.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2062,7 +2071,7 @@ static void gemv_q8_0_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     } else {
         for (int m_start = 0; m_start < M; m_start += nrc) {
             int m_cur = (m_start + nrc <= M) ? nrc : (M - m_start);
-            std::vector<block_q8_0_act> q8_tile(m_cur * nb);
+            scratch_vec<block_q8_0_act> q8_tile(m_cur * nb);
             for (int m = 0; m < m_cur; ++m)
                 quantize_row_q8_0_act(a + (m_start + m) * K, q8_tile.data() + m * nb, K);
 
@@ -2084,7 +2093,7 @@ static void gemv_q5_0_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     const int nb = (K + 31) / 32;
 
     if (M == 1) {
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a, q8_act.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2096,7 +2105,7 @@ static void gemv_q5_0_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     } else {
         for (int m_start = 0; m_start < M; m_start += nrc) {
             int m_cur = (m_start + nrc <= M) ? nrc : (M - m_start);
-            std::vector<block_q8_0_act> q8_tile(m_cur * nb);
+            scratch_vec<block_q8_0_act> q8_tile(m_cur * nb);
             for (int m = 0; m < m_cur; ++m)
                 quantize_row_q8_0_act(a + (m_start + m) * K, q8_tile.data() + m * nb, K);
 
@@ -2118,7 +2127,7 @@ static void gemv_q5_1_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     const int nb = (K + 31) / 32;
 
     if (M == 1) {
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a, q8_act.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2130,7 +2139,7 @@ static void gemv_q5_1_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     } else {
         for (int m_start = 0; m_start < M; m_start += nrc) {
             int m_cur = (m_start + nrc <= M) ? nrc : (M - m_start);
-            std::vector<block_q8_0_act> q8_tile(m_cur * nb);
+            scratch_vec<block_q8_0_act> q8_tile(m_cur * nb);
             for (int m = 0; m < m_cur; ++m)
                 quantize_row_q8_0_act(a + (m_start + m) * K, q8_tile.data() + m * nb, K);
 
@@ -2251,7 +2260,7 @@ static void gemv_q5_K_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     const int nb = (K + QK_K - 1) / QK_K;
 
     if (M == 1) {
-        std::vector<block_q8_K> q8_buf(nb);
+        scratch_vec<block_q8_K> q8_buf(nb);
         quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2263,7 +2272,7 @@ static void gemv_q5_K_maddubs_transB_avx2(const float* a, const uint8_t* w, floa
     } else {
         for (int m_start = 0; m_start < M; m_start += nrc) {
             int m_cur = (m_start + nrc <= M) ? nrc : (M - m_start);
-            std::vector<block_q8_K> q8_tile(m_cur * nb);
+            scratch_vec<block_q8_K> q8_tile(m_cur * nb);
             for (int m = 0; m < m_cur; ++m)
                 quantize_row_q8_K(a + (m_start + m) * K, q8_tile.data() + m * nb, K);
 
@@ -2284,7 +2293,7 @@ static void gemv_q5_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q5_K_BLOCK_BYTES = 176;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2301,7 +2310,7 @@ static void gemv_q5_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     constexpr int Q5_K_BLOCK_BYTES = 176;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2320,7 +2329,7 @@ static void gemv_q5_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     constexpr int Q5_K_BLOCK_BYTES = 176;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -2349,7 +2358,7 @@ static void gemv_q2_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     constexpr int Q2_K_BLOCK_BYTES = 84;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)

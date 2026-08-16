@@ -10,6 +10,8 @@
 #include <cmath>
 #include <vector>
 
+#include "../../common/quant_helpers.h"
+
 namespace forge {
 namespace cpu {
 
@@ -101,7 +103,7 @@ static inline void gemv_q4_0_transB_neon(const float* a, const uint8_t* w,
     // Quantize activation to Q8_0_act blocks
     // Using stack for small-activation decode case (common: K <= 4096 → 128 blocks)
     // For prefill (M large), caller should use gemm path instead.
-    std::vector<block_q8_0_act> q8_act(blocks_per_row);
+    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
     quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     const int NR = 4;
@@ -250,7 +252,7 @@ static inline void gemv_q8_0_transB_neon(const float* a, const uint8_t* w,
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
 
-    std::vector<block_q8_0_act> q8_act(blocks_per_row);
+    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
     quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     int n = 0;
@@ -308,7 +310,7 @@ static inline void gemv_q4_1_transB_neon(const float* a, const uint8_t* w,
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
         for (int n = 0; n < N; ++n) {
@@ -364,7 +366,7 @@ static inline void gemv_q5_0_transB_neon(const float* a, const uint8_t* w,
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
         for (int n = 0; n < N; ++n) {
@@ -424,7 +426,7 @@ static inline void gemv_q5_1_transB_neon(const float* a, const uint8_t* w,
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
         for (int n = 0; n < N; ++n) {

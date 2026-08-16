@@ -74,7 +74,7 @@ static void gemm_q4_K_vsx(
     const int nb = (K + QK_K - 1) / QK_K;
 
     // Quantize all M activation rows to Q8_K (one-time cost)
-    std::vector<block_q8_K> q8_all((size_t)M * nb);
+    scratch_vec<block_q8_K> q8_all((size_t)M * nb);
     for (int m = 0; m < M; ++m)
         quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
@@ -270,7 +270,7 @@ static void gemm_q6_K_vsx(
     constexpr int Q6_K_BLOCK_BYTES = 210;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_all((size_t)M * nb);
+    scratch_vec<block_q8_K> q8_all((size_t)M * nb);
     for (int m = 0; m < M; ++m)
         quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
@@ -426,7 +426,7 @@ static void gemm_q2_K_vsx(
     int M, int K, int N)
 {
     // Dequantize weight rows to fp32, then use fp32 gemv
-    std::vector<float> w_fp32((size_t)N * K);
+    scratch_vec<float> w_fp32((size_t)N * K);
     auto dequant_fn = get_dequant_row_fn(DataType::Q2_K);
     if (!dequant_fn) {
         // Cannot dequantize — zero output
@@ -451,7 +451,7 @@ static void gemm_q3_K_vsx(
     float* o_data,
     int M, int K, int N)
 {
-    std::vector<float> w_fp32((size_t)N * K);
+    scratch_vec<float> w_fp32((size_t)N * K);
     auto dequant_fn = get_dequant_row_fn(DataType::Q3_K);
     if (!dequant_fn) {
         std::memset(o_data, 0, (size_t)M * N * sizeof(float));
@@ -474,7 +474,7 @@ static void gemm_q5_K_vsx(
     float* o_data,
     int M, int K, int N)
 {
-    std::vector<float> w_fp32((size_t)N * K);
+    scratch_vec<float> w_fp32((size_t)N * K);
     auto dequant_fn = get_dequant_row_fn(DataType::Q5_K);
     if (!dequant_fn) {
         std::memset(o_data, 0, (size_t)M * N * sizeof(float));

@@ -14,6 +14,8 @@
 #include <cmath>
 #include <vector>
 
+#include "../../common/quant_helpers.h"
+
 #include "vec.h"
 #include "vec_dot.h"
 
@@ -120,7 +122,7 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
         float* o_row = out + (size_t)m * N;
 
     // Quantize activation to Q8_0_act blocks
-    std::vector<block_q8_0_act> q8_act(blocks_per_row);
+    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
     quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     const int NR = 4;
@@ -265,7 +267,7 @@ static inline void gemv_q8_0_transB_vsx(const float* a, const uint8_t* w,
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
 
-    std::vector<block_q8_0_act> q8_act(blocks_per_row);
+    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
     quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
     int n = 0;
@@ -313,7 +315,7 @@ static inline void gemv_q4_1_transB_vsx(const float* a, const uint8_t* w,
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
         for (int n = 0; n < N; ++n) {
@@ -371,7 +373,7 @@ static inline void gemv_q5_0_transB_vsx(const float* a, const uint8_t* w,
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
         for (int n = 0; n < N; ++n) {
@@ -424,7 +426,7 @@ static inline void gemv_q5_1_transB_vsx(const float* a, const uint8_t* w,
     for (int m = 0; m < M; ++m) {
         const float* a_row = a + (size_t)m * K;
         float* o_row = out + (size_t)m * N;
-        std::vector<block_q8_0_act> q8_act(nb);
+        scratch_vec<block_q8_0_act> q8_act(nb);
         quantize_row_q8_0_act(a_row, q8_act.data(), K);
 
         for (int n = 0; n < N; ++n) {

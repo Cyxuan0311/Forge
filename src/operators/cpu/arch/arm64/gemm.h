@@ -81,7 +81,7 @@ static void gemm_q4_K_neon(
     const int nb = (K + QK_K - 1) / QK_K;
 
     // Quantize all M activation rows to Q8_K (one-time cost)
-    std::vector<block_q8_K> q8_all((size_t)M * nb);
+    scratch_vec<block_q8_K> q8_all((size_t)M * nb);
     for (int m = 0; m < M; ++m)
         quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
@@ -319,7 +319,7 @@ static void gemm_q6_K_neon(
     constexpr int Q6_K_BLOCK_BYTES = 210;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_all((size_t)M * nb);
+    scratch_vec<block_q8_K> q8_all((size_t)M * nb);
     for (int m = 0; m < M; ++m)
         quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
@@ -490,7 +490,7 @@ static void gemm_k_row_dot_neon(const float* a_data, const uint8_t* w_data,
                                 float* o_data, int M, int K, int N,
                                 size_t block_bytes, DotFn dot_fn) {
     const int nb = (K + 255) / 256;
-    std::vector<block_q8_K> q8_all((size_t)M * nb);
+    scratch_vec<block_q8_K> q8_all((size_t)M * nb);
     for (int m = 0; m < M; ++m)
         quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
     #pragma omp parallel for schedule(static)

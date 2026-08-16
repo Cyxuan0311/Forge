@@ -1089,7 +1089,7 @@ template <typename DotFn>
 static inline void fused_ffn_up_k_neon(const float* a, const uint8_t* gate, const uint8_t* up,
                                        float* out, int K, int N, size_t block_bytes, DotFn dot) {
     const int nb = (K + 255) / 256;
-    std::vector<block_q8_K> q8(nb);
+    scratch_vec<block_q8_K> q8(nb);
     quantize_row_q8_K(a, q8.data(), K);
     #pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n) {
@@ -1104,7 +1104,7 @@ static inline void fused_qkv_k_neon(const float* a, const uint8_t* wq, const uin
                                     const uint8_t* wv, float* oq, float* ok, float* ov,
                                     int K, int Nq, int Nk, int Nv, size_t block_bytes, DotFn dot) {
     const int nb = (K + 255) / 256;
-    std::vector<block_q8_K> q8(nb);
+    scratch_vec<block_q8_K> q8(nb);
     quantize_row_q8_K(a, q8.data(), K);
     auto run = [&](const uint8_t* w, float* o, int N) {
         #pragma omp parallel for schedule(static)
@@ -1118,7 +1118,7 @@ template <typename DotFn>
 static inline void fused_residual_k_neon(const float* a, const uint8_t* w, const float* residual,
                                          float* out, int K, int N, size_t block_bytes, DotFn dot) {
     const int nb = (K + 255) / 256;
-    std::vector<block_q8_K> q8(nb);
+    scratch_vec<block_q8_K> q8(nb);
     quantize_row_q8_K(a, q8.data(), K);
     #pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n)

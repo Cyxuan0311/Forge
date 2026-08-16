@@ -8,6 +8,7 @@
 #include "../../common/quant_helpers.h"
 #include "scales.h"
 #include "vec.h"
+#include "forge/host_mem_pool.h"
 #ifdef _OPENMP
 #    include <omp.h>
 #endif
@@ -866,7 +867,7 @@ static void gemv_q4_K_transB_avx2(const float* a, const uint8_t* w, float* out, 
     const int nb = (K + QK_K - 1) / QK_K;
 
     if (M == 1) {
-        std::vector<block_q8_K> q8_buf(nb);
+        scratch_vec<block_q8_K> q8_buf(nb);
         quantize_row_q8_K(a, q8_buf.data(), K);
 
 #    pragma omp parallel for schedule(static)
@@ -875,7 +876,7 @@ static void gemv_q4_K_transB_avx2(const float* a, const uint8_t* w, float* out, 
             out[n] = dot_q4_K_q8_K_avx2(q4_row, q8_buf.data(), nb);
         }
     } else {
-        std::vector<block_q8_K> q8_all(M * nb);
+        scratch_vec<block_q8_K> q8_all(M * nb);
         for (int m = 0; m < M; ++m) {
             quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
         }
@@ -906,18 +907,26 @@ static void gemv_q4_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
     static const uint32_t kmask3 = 0x03030303;
 
     // Quantize all M input vectors to Q8_K
-    std::vector<block_q8_K> q8_all(M * nb);
+    scratch_vec<block_q8_K> q8_all(M * nb);
     for (int m = 0; m < M; ++m) {
         quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
     }
+
+// Accumulators per OpenMP thread, allocated once per call (was per-iteration
+    // _mm_malloc inside the parallel loop: N heap alloc/frees per GEMV).
+    const int max_threads = omp_get_max_threads();
+    __m256* acc_storage = static_cast<__m256*>(forge::host_mem::allocate(
+        static_cast<size_t>(max_threads) * M * sizeof(__m256)));
+    __m128* acc_m_storage = static_cast<__m128*>(forge::host_mem::allocate(
+        static_cast<size_t>(max_threads) * M * sizeof(__m128)));
 
 #    pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n) {
         const uint8_t* q4_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
 
         // Per-M accumulators (FP32 for the dot, __m128 for min contribution)
-        __m256* acc_vec = reinterpret_cast<__m256*>(_mm_malloc(M * sizeof(__m256), 32));
-        __m128* acc_m_vec = reinterpret_cast<__m128*>(_mm_malloc(M * sizeof(__m128), 16));
+        __m256* acc_vec = acc_storage + (size_t)omp_get_thread_num() * M;
+        __m128* acc_m_vec = acc_m_storage + (size_t)omp_get_thread_num() * M;
         for (int m = 0; m < M; ++m) {
             acc_vec[m] = _mm256_setzero_ps();
             acc_m_vec[m] = _mm_setzero_ps();
@@ -1004,9 +1013,10 @@ static void gemv_q4_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
             acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
             out[m * N + n] = hsum_avx2(acc_vec[m]) + _mm_cvtss_f32(acc_m);
         }
-        _mm_free(acc_vec);
-        _mm_free(acc_m_vec);
     }
+
+    forge::host_mem::deallocate(acc_storage);
+    forge::host_mem::deallocate(acc_m_storage);
 }
 
 // Q6_K GEMV has been consolidated into cpu_gemv.h to avoid duplication with matmul.cpp.
