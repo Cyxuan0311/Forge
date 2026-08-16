@@ -696,6 +696,10 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 PERF_SCOPE("matmul_transB/iq4_nl_q8k_fused_gemv");
                 gemv_iq4_nl_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()),
                                             o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ4_XS) {
+                PERF_SCOPE("matmul_transB/iq4_xs_q8k_fused_gemv");
+                gemv_iq4_xs_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()),
+                                            o_data, M, K, N);
             } else
 #elif defined(USE_NEON)
             if (b->dtype() == DataType::Q4_0) {
@@ -1639,6 +1643,62 @@ TensorPtr matmul_transB_fused_qkv_q4_k(const TensorPtr& input, const TensorPtr& 
     return out;
 }
 
+FusedQkvZAlphaBeta matmul_transB_fused_qkv_z_ab(const TensorPtr& input,
+                                                const TensorPtr& wqkv,
+                                                const TensorPtr& wz,
+                                                const TensorPtr& walpha,
+                                                const TensorPtr& wbeta) {
+    if (input->ndim() != 2 || wqkv->ndim() != 2 || wz->ndim() != 2 || walpha->ndim() != 2 ||
+        wbeta->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_qkv_z_ab expects 2D tensors");
+    if ((wqkv->dtype() != DataType::Q4_K && wqkv->dtype() != DataType::Q6_K) ||
+        wz->dtype() != DataType::Q4_K || walpha->dtype() != DataType::Q4_K ||
+        wbeta->dtype() != DataType::Q4_K)
+        throw std::runtime_error(
+            "matmul_transB_fused_qkv_z_ab requires Q4_K/Q6_K qkv and Q4_K z/alpha/beta");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_qkv_z_ab is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N_qkv = static_cast<int>(wqkv->shape()[0]);
+    int N_z = static_cast<int>(wz->shape()[0]);
+    int N_alpha = static_cast<int>(walpha->shape()[0]);
+    int N_beta = static_cast<int>(wbeta->shape()[0]);
+
+    FusedQkvZAlphaBeta r;
+    r.qkv = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_qkv},
+                                     DeviceType::CPU);
+    r.z = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_z}, DeviceType::CPU);
+    r.alpha = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_alpha},
+                                       DeviceType::CPU);
+    r.beta = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N_beta},
+                                      DeviceType::CPU);
+
+#if defined(USE_AVX2)
+    PERF_SCOPE("matmul_transB/fused_qkv_z_ab");
+    const bool qkv_q6 = (wqkv->dtype() == DataType::Q6_K);
+    const float* a_data = static_cast<const float*>(input->data());
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_fused_qkv_z_ab_avx2(
+            a_data + m * K, static_cast<const uint8_t*>(wqkv->data()), qkv_q6,
+            static_cast<const uint8_t*>(wz->data()), static_cast<const uint8_t*>(walpha->data()),
+            static_cast<const uint8_t*>(wbeta->data()),
+            static_cast<float*>(r.qkv->data()) + m * N_qkv,
+            static_cast<float*>(r.z->data()) + m * N_z,
+            static_cast<float*>(r.alpha->data()) + m * N_alpha,
+            static_cast<float*>(r.beta->data()) + m * N_beta, K, N_qkv, N_z, N_alpha, N_beta);
+    }
+#else
+    r.qkv = ops::matmul_transB(input, wqkv);
+    r.z = ops::matmul_transB(input, wz);
+    r.alpha = ops::matmul_transB(input, walpha);
+    r.beta = ops::matmul_transB(input, wbeta);
+#endif
+
+    return r;
+}
+
 TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPtr& w_gate,
                                           const TensorPtr& w_up) {
     if (input->ndim() != 2 || w_gate->ndim() != 2 || w_up->ndim() != 2)
@@ -1680,6 +1740,41 @@ TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPt
     for (int m = 0; m < M; ++m)
         cpu::gemv_q4_K_fused_ffn_up_vsx(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
                                         static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+#else
+    auto gate = ops::matmul_transB(input, w_gate);
+    auto up = ops::matmul_transB(input, w_up);
+    out = ops::silu_multiply(gate, up);
+#endif
+
+    return out;
+}
+
+TensorPtr matmul_transB_fused_ffn_up_iq4_xs(const TensorPtr& input, const TensorPtr& w_gate,
+                                            const TensorPtr& w_up) {
+    if (input->ndim() != 2 || w_gate->ndim() != 2 || w_up->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_iq4_xs expects 2D tensors");
+    if (w_gate->dtype() != DataType::IQ4_XS || w_up->dtype() != DataType::IQ4_XS)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_iq4_xs requires IQ4_XS weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_ffn_up_iq4_xs is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N = static_cast<int>(w_gate->shape()[0]);
+
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/fused_ffn_up_iq4_xs");
+    const float* a_data = static_cast<const float*>(input->data());
+    float* o_data = static_cast<float*>(out->data());
+
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_iq4_xs_fused_ffn_up_avx2(
+            a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+            static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+    }
 #else
     auto gate = ops::matmul_transB(input, w_gate);
     auto up = ops::matmul_transB(input, w_up);
@@ -2020,6 +2115,43 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
     float* o_data = static_cast<float*>(out->data());
     for (int m = 0; m < M; ++m)
         cpu::gemv_q4_K_ffn_down_residual_vsx(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+#else
+    out = ops::matmul_transB(input, weight);
+    out = ops::add(residual, out);
+#endif
+
+    return out;
+}
+
+TensorPtr matmul_transB_fused_ffn_down_residual_iq4_xs(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual) {
+    if (input->ndim() != 2 || weight->ndim() != 2 || residual->ndim() != 2)
+        throw std::runtime_error("matmul_transB_fused_ffn_down_residual_iq4_xs expects 2D tensors");
+    if (weight->dtype() != DataType::IQ4_XS)
+        throw std::runtime_error(
+            "matmul_transB_fused_ffn_down_residual_iq4_xs requires IQ4_XS weights");
+    if (input->device() != DeviceType::CPU)
+        throw std::runtime_error("matmul_transB_fused_ffn_down_residual_iq4_xs is CPU-only");
+
+    int M = static_cast<int>(input->shape()[0]);
+    int K = static_cast<int>(input->shape()[1]);
+    int N = static_cast<int>(weight->shape()[0]);
+
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, DeviceType::CPU);
+
+#ifdef USE_AVX2
+    PERF_SCOPE("matmul_transB/ffn_down_residual_iq4_xs");
+    const float* a_data = static_cast<const float*>(input->data());
+    const float* r_data = static_cast<const float*>(residual->data());
+    float* o_data = static_cast<float*>(out->data());
+
+    for (int m = 0; m < M; ++m) {
+        cpu::gemv_iq4_xs_ffn_down_residual_avx2(a_data + m * K,
+                                                static_cast<const uint8_t*>(weight->data()),
+                                                r_data + m * N, o_data + m * N, K, N);
+    }
 #else
     out = ops::matmul_transB(input, weight);
     out = ops::add(residual, out);

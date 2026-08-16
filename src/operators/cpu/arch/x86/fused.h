@@ -5,7 +5,9 @@
 #include <cstring>
 
 #include "gemv.h"
+#include "cpu_gemv.h"
 #include "vec.h"
+#include "../../common/quant_helpers.h"
 #ifdef _OPENMP
 #    include <omp.h>
 #endif
@@ -250,7 +252,7 @@ static void gemv_q4_K_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate, c
     constexpr int Q4_K_BLOCK_BYTES = 144;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
@@ -279,7 +281,7 @@ static void gemv_q4_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     constexpr int Q4_K_BLOCK_BYTES = 144;
     const int nb = (K + QK_K - 1) / QK_K;
 
-    std::vector<block_q8_K> q8_buf(nb);
+    scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
     auto process_row = [&](const uint8_t* w_row, float* out, int N_out) {
@@ -293,6 +295,53 @@ static void gemv_q4_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     process_row(wq, out_q, N_q);
     process_row(wk, out_k, N_k);
     process_row(wv, out_v, N_v);
+}
+#endif  // USE_AVX2
+
+// ---- Fused QKV + z + alpha + beta projection for qwen35 linear attention ----
+// All four projections share the same input vector. Computed in a single OpenMP
+// region so the Q8_K activation quantization and region setup are amortized
+// once instead of four separate gemm calls.
+// qkv may be Q4_K or Q6_K; z/alpha/beta are always Q4_K.
+
+#ifdef USE_AVX2
+static void gemv_fused_qkv_z_ab_avx2(
+    const float* a, const uint8_t* w_qkv, bool qkv_q6, const uint8_t* w_z,
+    const uint8_t* w_alpha, const uint8_t* w_beta, float* out_qkv, float* out_z,
+    float* out_alpha, float* out_beta, int K, int N_qkv, int N_z, int N_alpha, int N_beta) {
+    constexpr int QK_K = 256;
+    constexpr int Q4_K_BLOCK_BYTES = 144;
+    constexpr int Q6_K_BLOCK_BYTES = 210;
+    const int nb = (K + QK_K - 1) / QK_K;
+    const size_t qkv_stride = (size_t)nb * (qkv_q6 ? Q6_K_BLOCK_BYTES : Q4_K_BLOCK_BYTES);
+    const size_t q4_stride = (size_t)nb * Q4_K_BLOCK_BYTES;
+
+    scratch_vec<block_q8_K> q8_buf(nb);
+    quantize_row_q8_K(a, q8_buf.data(), K);
+
+    const int n_qkv_z = N_qkv + N_z;
+    const int n_qkv_z_ab = n_qkv_z + N_alpha;
+    const int total = n_qkv_z_ab + N_beta;
+
+#    pragma omp parallel for schedule(static)
+    for (int n = 0; n < total; ++n) {
+        float v;
+        if (n < N_qkv) {
+            const uint8_t* row = w_qkv + (size_t)n * qkv_stride;
+            v = qkv_q6 ? dot_q6_K_q8_K_avx2(row, q8_buf.data(), nb)
+                       : dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
+            out_qkv[n] = v;
+        } else if (n < n_qkv_z) {
+            const uint8_t* row = w_z + (size_t)(n - N_qkv) * q4_stride;
+            out_z[n - N_qkv] = dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
+        } else if (n < n_qkv_z_ab) {
+            const uint8_t* row = w_alpha + (size_t)(n - n_qkv_z) * q4_stride;
+            out_alpha[n - n_qkv_z] = dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
+        } else {
+            const uint8_t* row = w_beta + (size_t)(n - n_qkv_z_ab) * q4_stride;
+            out_beta[n - n_qkv_z_ab] = dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
+        }
+    }
 }
 #endif  // USE_AVX2
 

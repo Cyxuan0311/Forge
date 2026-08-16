@@ -25,6 +25,21 @@ TensorPtr matmul_transB_fused_qkv_q4_0(const TensorPtr& input, const TensorPtr& 
 TensorPtr matmul_transB_fused_qkv_q4_k(const TensorPtr& input, const TensorPtr& wq,
                                        const TensorPtr& wk, const TensorPtr& wv);
 
+// Fused QKV + z + alpha + beta projection for qwen35 linear attention: all four
+// projections share the same input and are computed in a single OpenMP region.
+// qkv may be Q4_K or Q6_K; z/alpha/beta must be Q4_K. Returns the four outputs.
+struct FusedQkvZAlphaBeta {
+    TensorPtr qkv;
+    TensorPtr z;
+    TensorPtr alpha;
+    TensorPtr beta;
+};
+FusedQkvZAlphaBeta matmul_transB_fused_qkv_z_ab(const TensorPtr& input,
+                                                const TensorPtr& wqkv,
+                                                const TensorPtr& wz,
+                                                const TensorPtr& walpha,
+                                                const TensorPtr& wbeta);
+
 // Fused FFN gate+up: computes SiLU(gate) * up from a single input read.
 // Both weight tensors must be Q4_0 with the same K dimension and N.
 TensorPtr matmul_transB_fused_ffn_up_q4_0(const TensorPtr& input, const TensorPtr& w_gate,
@@ -81,6 +96,12 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q3_k(const TensorPtr& input,
 TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPtr& w_gate,
                                           const TensorPtr& w_up);
 
+// IQ4_XS fused FFN gate+up: reads input once, quantizes to Q8_K one time,
+// then computes gate and up dot products in parallel, producing SiLU(gate)*up.
+// Both weight tensors must be IQ4_XS with the same K and N.
+TensorPtr matmul_transB_fused_ffn_up_iq4_xs(const TensorPtr& input, const TensorPtr& w_gate,
+                                            const TensorPtr& w_up);
+
 // Q5_K fused FFN gate+up: reads input once, quantizes to Q8_K one time,
 // then computes gate and up dot products in parallel, producing SiLU(gate)*up.
 // Both weight tensors must be Q5_K with the same K and N.
@@ -130,6 +151,12 @@ TensorPtr matmul_transB_fused_qkv_q2_k(const TensorPtr& input, const TensorPtr& 
 TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
                                                      const TensorPtr& weight,
                                                      const TensorPtr& residual);
+
+// IQ4_XS fused FFN down-projection + residual: computes input @ weight + residual.
+// Weight tensor must be IQ4_XS.
+TensorPtr matmul_transB_fused_ffn_down_residual_iq4_xs(const TensorPtr& input,
+                                                       const TensorPtr& weight,
+                                                       const TensorPtr& residual);
 
 // Q6_K fused FFN down-projection + residual: computes input @ weight + residual.
 // Weight tensor must be Q6_K.

@@ -13,14 +13,15 @@ bool FfnExecutor::residual_fused(const ModelConfig& cfg, const LayerWeights& lw,
     if (cfg.ffn_type != FFNType::SiLUGated) return false;
     auto w2_dtype = lw.w2()->dtype();
     if (dev == DeviceType::CUDA && seq_len == 1) {
-        return w2_dtype == DataType::Q4_0 || w2_dtype == DataType::Q4_K ||
-               w2_dtype == DataType::Q5_K || w2_dtype == DataType::Q6_K;
+        return w2_dtype == DataType::Q3_K || w2_dtype == DataType::Q4_0 ||
+               w2_dtype == DataType::Q4_K || w2_dtype == DataType::Q5_K ||
+               w2_dtype == DataType::Q6_K;
     }
     if (dev == DeviceType::CPU && seq_len == 1) {
         return w2_dtype == DataType::Q4_0 || w2_dtype == DataType::Q4_1 ||
                w2_dtype == DataType::Q4_K || w2_dtype == DataType::Q5_K ||
                w2_dtype == DataType::Q6_K || w2_dtype == DataType::Q2_K ||
-               w2_dtype == DataType::Q3_K;
+               w2_dtype == DataType::Q3_K || w2_dtype == DataType::IQ4_XS;
     }
     return false;
 }
@@ -86,6 +87,11 @@ TensorPtr FfnExecutor::apply(const TensorPtr& x, const TensorPtr& residual, cons
                 else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
                          lw.w1()->dtype() == DataType::Q2_K && lw.w3()->dtype() == DataType::Q2_K) {
                     ffn_mid = ops::matmul_transB_fused_ffn_up_q2_k(x, lw.w1(), lw.w3());
+                }
+                // Fused CPU IQ4_XS gate+up
+                else if (dev == DeviceType::CPU && seq_len == 1 && lw.w1() && lw.w3() &&
+                         lw.w1()->dtype() == DataType::IQ4_XS && lw.w3()->dtype() == DataType::IQ4_XS) {
+                    ffn_mid = ops::matmul_transB_fused_ffn_up_iq4_xs(x, lw.w1(), lw.w3());
                 } else {
                     auto gate = ops::matmul_transB(x, lw.w1());
                     auto up = ops::matmul_transB(x, lw.w3());
@@ -117,6 +123,11 @@ TensorPtr FfnExecutor::apply(const TensorPtr& x, const TensorPtr& residual, cons
                             static_cast<float*>(ffn_out->data()), K_down, N_down);
                     } else if (w2_dtype == DataType::Q5_K) {
                         cuda::launch_ffn_down_fused_q5_k(
+                            static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
+                            static_cast<const float*>(residual->data()),
+                            static_cast<float*>(ffn_out->data()), K_down, N_down);
+                    } else if (w2_dtype == DataType::Q3_K) {
+                        cuda::launch_ffn_down_fused_q3_k(
                             static_cast<const float*>(ffn_mid->data()), lw.w2()->data(),
                             static_cast<const float*>(residual->data()),
                             static_cast<float*>(ffn_out->data()), K_down, N_down);
@@ -156,7 +167,11 @@ TensorPtr FfnExecutor::apply(const TensorPtr& x, const TensorPtr& residual, cons
                 } else if (dev == DeviceType::CPU && seq_len == 1 &&
                            lw.w2()->dtype() == DataType::Q3_K) {
                     ffn_out = ops::matmul_transB_fused_ffn_down_residual_q3_k(ffn_mid, lw.w2(),
-                                                                              residual);
+                                                                               residual);
+                } else if (dev == DeviceType::CPU && seq_len == 1 &&
+                           lw.w2()->dtype() == DataType::IQ4_XS) {
+                    ffn_out = ops::matmul_transB_fused_ffn_down_residual_iq4_xs(ffn_mid, lw.w2(),
+                                                                                residual);
                 } else {
                     ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
                 }
