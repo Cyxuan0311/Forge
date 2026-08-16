@@ -24,6 +24,7 @@ void dequantize_iq2_xxs_row(const uint8_t* q_data, float* out, int K, int row);
 void dequantize_iq4_nl_row(const uint8_t* q_data, float* out, int K, int row);
 void dequantize_iq2_xs_row(const uint8_t* q_data, float* out, int K, int row);
 void dequantize_iq3_s_row(const uint8_t* q_data, float* out, int K, int row);
+void dequantize_iq4_xs_row(const uint8_t* q_data, float* out, int K, int row);
 
 }  // namespace ops
 }  // namespace forge

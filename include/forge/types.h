@@ -25,6 +25,7 @@ enum class DataType : uint32_t {
     BF16 = 15,     // bfloat16 (converted to FP32 at load time)
     IQ2_XS = 18,   // 74 bytes/block, 256 elements/block (2.3125 bpw)
     IQ3_S = 19,    // 110 bytes/block, 256 elements/block (3.4375 bpw)
+    IQ4_XS = 20,   // 136 bytes/block, 256 elements/block (non-linear 4-bit)
 };
 
 enum class DeviceType : uint32_t {

@@ -6,12 +6,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <vector>
+#include "forge/host_mem_pool.h"
 #ifdef _OPENMP
 #    include <omp.h>
 #endif
 
 namespace forge {
 namespace cpu {
+
+// std::vector variant backed by the host memory caching pool. Hot kernels use
+// this for their per-call GEMV scratch buffers so blocks are reused (and stay
+// 64-byte aligned for SIMD) instead of churning malloc/free every token.
+template <typename T>
+using scratch_vec = std::vector<T, forge::host_mem::host_allocator<T>>;
 
 // Q8_K block structure (256 elements)
 struct block_q8_K {

@@ -23,6 +23,7 @@ void register_core_types(py::module_& m) {
         .value("IQ4_NL", DataType::IQ4_NL)
         .value("IQ2_XS", DataType::IQ2_XS)
         .value("IQ3_S", DataType::IQ3_S)
+        .value("IQ4_XS", DataType::IQ4_XS)
         .value("BF16", DataType::BF16);
 
     py::enum_<DeviceType>(m, "DeviceType")

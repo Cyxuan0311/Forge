@@ -446,6 +446,152 @@ static inline float dot_iq4_nl_q8_K_avx2(const uint8_t* iq4nl_row,
     return acc;
 }
 
+// IQ4_XS x Q8_K dot: 256-element block (136 bytes), 8 sub-blocks of 32.
+// Sub-block scale (6-bit): ls = (scales_l[g] nibble) | (scales_h 2 bits), dl = d*(ls-32).
+// Matches llama.cpp ggml_vec_dot_iq4_xs_q8_K_generic bit layout.
+static inline int dot32_iq4xs_avx2(const uint8_t* qs, const int8_t* q8d, const __m128i& kvalues,
+                                   const __m128i& m4) {
+    __m128i qs_vec = _mm_loadu_si128((const __m128i*)qs);
+    __m128i low_nibbles = _mm_and_si128(qs_vec, m4);
+    __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs_vec, 4), m4);
+
+    __m128i vals_low = _mm_shuffle_epi8(kvalues, low_nibbles);
+    __m128i vals_high = _mm_shuffle_epi8(kvalues, high_nibbles);
+
+    __m128i q8_low = _mm_loadu_si128((const __m128i*)q8d);
+    __m128i q8_high = _mm_loadu_si128((const __m128i*)(q8d + 16));
+
+    __m256i p32 = _mm256_add_epi32(_mm256_madd_epi16(_mm256_cvtepi8_epi16(vals_low),
+                                                     _mm256_cvtepi8_epi16(q8_low)),
+                                   _mm256_madd_epi16(_mm256_cvtepi8_epi16(vals_high),
+                                                     _mm256_cvtepi8_epi16(q8_high)));
+    __m128i lo128 = _mm256_extracti128_si256(p32, 0);
+    __m128i hi128 = _mm256_extracti128_si256(p32, 1);
+    __m128i h = _mm_hadd_epi32(lo128, hi128);
+    h = _mm_hadd_epi32(h, h);
+    h = _mm_hadd_epi32(h, h);
+    return _mm_cvtsi128_si32(h);
+}
+
+static inline float dot_iq4_xs_q8_K_avx2(const uint8_t* iq4xs_row,
+                                         const cpu::block_q8_K* q8, int nb) {
+    constexpr int QK_K = 256;
+    constexpr int IQ4_XS_BLOCK_SIZE = 136;
+
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m128i kvalues = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
+
+    float acc = 0.0f;
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const uint8_t* block_ptr = iq4xs_row + (size_t)bi * IQ4_XS_BLOCK_SIZE;
+        const cpu::block_q8_K* y = q8 + bi;
+        const float d = cpu::fp16_to_float_scalar(*reinterpret_cast<const uint16_t*>(block_ptr));
+        const float d_q8 = y->d;
+        uint16_t h = *reinterpret_cast<const uint16_t*>(block_ptr + 2);
+        const uint8_t* scales_l = block_ptr + 4;
+        const uint8_t* qs = block_ptr + 8;
+        const int8_t* q8d = y->qs;
+
+        float block_acc = 0.0f;
+        for (int g = 0; g < QK_K / 64; ++g) {
+            const uint8_t ls1 = static_cast<uint8_t>(scales_l[g] & 0xf) |
+                                static_cast<uint8_t>((h << 4) & 0x30);
+            const uint8_t ls2 = static_cast<uint8_t>(scales_l[g] >> 4) |
+                                static_cast<uint8_t>((h << 2) & 0x30);
+            h >>= 4;
+            const float d1 = d * static_cast<float>(ls1 - 32);
+            const float d2 = d * static_cast<float>(ls2 - 32);
+            block_acc += d1 * dot32_iq4xs_avx2(qs + g * 32, q8d + g * 64, kvalues, m4);
+            block_acc += d2 * dot32_iq4xs_avx2(qs + g * 32 + 16, q8d + g * 64 + 32, kvalues, m4);
+        }
+
+        acc += d_q8 * block_acc;
+    }
+
+    return acc;
+}
+
+static void gemv_iq4_xs_q8k_transB_avx2(const float* a, const uint8_t* w, float* out,
+                                        int M, int K, int N) {
+    constexpr int QK_K = 256;
+    constexpr int IQ4_XS_BLOCK_SIZE = 136;
+    const int nb = (K + QK_K - 1) / QK_K;
+    const size_t row_bytes = (size_t)nb * IQ4_XS_BLOCK_SIZE;
+
+    if (M == 1) {
+        std::vector<cpu::block_q8_K> q8_buf(nb);
+        cpu::quantize_row_q8_K(a, q8_buf.data(), K);
+
+#pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* row = w + (size_t)n * row_bytes;
+            out[n] = dot_iq4_xs_q8_K_avx2(row, q8_buf.data(), nb);
+        }
+    } else {
+        std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
+        for (int m = 0; m < M; ++m)
+            cpu::quantize_row_q8_K(a + m * K, q8_all.data() + (size_t)m * nb, K);
+
+#pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const uint8_t* row = w + (size_t)n * row_bytes;
+            for (int m = 0; m < M; ++m)
+                out[m * N + n] = dot_iq4_xs_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
+        }
+    }
+}
+
+}  // namespace ops
+}  // namespace forge
+
+namespace forge {
+namespace cpu {
+
+static void gemv_iq4_xs_ffn_down_residual_avx2(const float* a, const uint8_t* w,
+                                               const float* residual, float* out, int K, int N) {
+    constexpr int QK_K = 256;
+    constexpr int IQ4_XS_BLOCK_SIZE = 136;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    scratch_vec<block_q8_K> q8_buf(nb);
+    quantize_row_q8_K(a, q8_buf.data(), K);
+
+#pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* row = w + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
+        out[n] = ops::dot_iq4_xs_q8_K_avx2(row, q8_buf.data(), nb) + residual[n];
+    }
+}
+
+static void gemv_iq4_xs_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
+                                          const uint8_t* w_up, float* out, int K, int N) {
+    constexpr int QK_K = 256;
+    constexpr int IQ4_XS_BLOCK_SIZE = 136;
+    const int nb = (K + QK_K - 1) / QK_K;
+
+    scratch_vec<block_q8_K> q8_buf(nb);
+    quantize_row_q8_K(a, q8_buf.data(), K);
+
+    auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
+
+#pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* gate_row = w_gate + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
+        const uint8_t* up_row = w_up + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
+
+        float gate_val = silu(ops::dot_iq4_xs_q8_K_avx2(gate_row, q8_buf.data(), nb));
+        float up_val = ops::dot_iq4_xs_q8_K_avx2(up_row, q8_buf.data(), nb);
+        out[n] = gate_val * up_val;
+    }
+}
+
+}  // namespace cpu
+}  // namespace forge
+
+namespace forge {
+namespace ops {
+
 static void gemv_iq4_nl_q8k_transB_avx2(const float* a, const uint8_t* w, float* out,
                                         int M, int K, int N) {
     constexpr int QK_K = 256;
@@ -488,6 +634,7 @@ static inline DotQ8KFn get_dot_q8k_fn(DataType dt) {
     case DataType::IQ2_XS: return dot_iq2_xs_q8_K_avx2;
     case DataType::IQ3_S:  return dot_iq3_s_q8_K_avx2;
     case DataType::IQ4_NL: return dot_iq4_nl_q8_K_avx2;
+    case DataType::IQ4_XS: return dot_iq4_xs_q8_K_avx2;
     case DataType::IQ2_S:  return dot_iq2_s_q8_K_avx2;
     default: return nullptr;
     }

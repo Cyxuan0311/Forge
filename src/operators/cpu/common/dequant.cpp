@@ -478,6 +478,44 @@ void dequantize_iq4_nl_row(const uint8_t* q_data, float* out, int K, int row) {
     }
 }
 
+void dequantize_iq4_xs_row(const uint8_t* q_data, float* out, int K, int row) {
+    const int IQ4_XS_BLOCK_SIZE = 136;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+    const uint8_t* row_ptr = q_data + row * blocks_per_row * IQ4_XS_BLOCK_SIZE;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const uint8_t* block_ptr = row_ptr + bi * IQ4_XS_BLOCK_SIZE;
+        float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block_ptr));
+        uint16_t h = *reinterpret_cast<const uint16_t*>(block_ptr + 2);
+        const uint8_t* scales_l = block_ptr + 4;
+        const uint8_t* qs = block_ptr + 8;
+
+        float* y = out + bi * QK_K;
+        for (int ib = 0; ib < QK_K / 32; ib += 2) {
+            const uint8_t ls1 = static_cast<uint8_t>(scales_l[ib / 2] & 0xf) |
+                                static_cast<uint8_t>((h << 4) & 0x30);
+            const uint8_t ls2 = static_cast<uint8_t>(scales_l[ib / 2] >> 4) |
+                                static_cast<uint8_t>((h << 2) & 0x30);
+            h >>= 4;
+            const float d1 = d * static_cast<float>(ls1 - 32);
+            const float d2 = d * static_cast<float>(ls2 - 32);
+
+            for (int j = 0; j < 16; ++j) {
+                y[j] = d1 * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]);
+                y[j + 16] = d1 * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+            }
+            qs += 16;
+            y += 32;
+            for (int j = 0; j < 16; ++j) {
+                y[j] = d2 * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]);
+                y[j + 16] = d2 * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+            }
+            qs += 16;
+            y += 32;
+        }
+    }
+}
+
 // --- IQ2_XS / IQ3_S dequant ---
 
 void dequantize_iq2_xs_row(const uint8_t* q_data, float* out, int K, int row) {

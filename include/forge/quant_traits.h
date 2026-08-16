@@ -106,6 +106,12 @@ template <> struct QuantTraits<DataType::IQ3_S> {
     static constexpr const char* name  = "iq3_s";
 };
 
+template <> struct QuantTraits<DataType::IQ4_XS> {
+    static constexpr int block_elements = 256;
+    static constexpr int block_size    = 136;
+    static constexpr const char* name  = "iq4_xs";
+};
+
 // ---- Runtime traits table ----
 
 // Dequantize row function: dequantize one row of a quantized weight matrix.
