@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
@@ -16,6 +17,11 @@
 
 #ifdef _OPENMP
 #    include <omp.h>
+#endif
+
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#    include "forge/cuda_kernels.h"
 #endif
 
 namespace forge {
@@ -36,13 +42,16 @@ bool PhimoeEngine::init_weights() {
 // RMSNorm + bias helper
 // ----------------------------------------------------------------------------
 
+#ifdef USE_CUDA
+static TensorPtr add_bias_cuda(const TensorPtr& normed, const TensorPtr& bias);
+#endif
+
 TensorPtr PhimoeEngine::rms_norm_with_bias(const TensorPtr& x, const TensorPtr& weight,
                                            const TensorPtr& bias, float eps) {
     auto normed = ops::rms_norm(x, weight, eps);
     if (!bias) return normed;
 
-    // Add 1D bias broadcast over rows. CPU path is direct; CUDA falls back to
-    // host copy for simplicity (smoke test runs on CPU).
+    // Add 1D bias broadcast over rows. CPU path is direct; CUDA adds on device.
     int M = static_cast<int>(normed->shape()[0]);
     int N = static_cast<int>(normed->shape()[1]);
 
@@ -58,7 +67,13 @@ TensorPtr PhimoeEngine::rms_norm_with_bias(const TensorPtr& x, const TensorPtr& 
         return normed;
     }
 
-    // CUDA fallback: copy to CPU, add, copy back
+#ifdef USE_CUDA
+    if (normed->device() == DeviceType::CUDA) {
+        return add_bias_cuda(normed, bias);
+    }
+#endif
+
+    // Fallback: copy to CPU, add, copy back
     auto cpu_normed = ensure_cpu(normed);
     auto cpu_bias = ensure_cpu(bias);
     float* data = static_cast<float*>(cpu_normed->data());
@@ -71,6 +86,32 @@ TensorPtr PhimoeEngine::rms_norm_with_bias(const TensorPtr& x, const TensorPtr& 
     }
     return restore_device(cpu_normed, normed->device());
 }
+
+// CUDA branch of the same helper: broadcast the 1D bias over rows entirely on
+// device (no host copy). Bias lives on the layer device in CUDA mode; a CPU
+// bias tensor is uploaded once if it happens to be host-resident.
+#ifdef USE_CUDA
+static TensorPtr add_bias_cuda(const TensorPtr& normed, const TensorPtr& bias) {
+    int M = static_cast<int>(normed->shape()[0]);
+    int N = static_cast<int>(normed->shape()[1]);
+
+    TensorPtr bias_cuda;
+    const float* bias_data = static_cast<const float*>(bias->data());
+    if (bias->device() != DeviceType::CUDA) {
+        bias_cuda = std::make_shared<Tensor>(bias->dtype(), bias->shape(), DeviceType::CUDA);
+        bias_cuda->copy_from(*bias);
+        bias_data = static_cast<const float*>(bias_cuda->data());
+    }
+
+    auto out = std::make_shared<Tensor>(DataType::FP32, normed->shape(), DeviceType::CUDA);
+    const float* n_data = static_cast<const float*>(normed->data());
+    float* o_data = static_cast<float*>(out->data());
+    for (int m = 0; m < M; ++m) {
+        cuda::launch_add_bias(n_data + m * N, bias_data, o_data + m * N, N);
+    }
+    return out;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // MoE FFN (CPU router path, SiLU-gated, top-k, no shared expert)
@@ -252,6 +293,170 @@ TensorPtr PhimoeEngine::moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeig
     return expert_out;
 }
 
+#ifdef USE_CUDA
+// ----------------------------------------------------------------------------
+// MoE FFN, fully on GPU (decode/prefill). Reuses the device MoE router from
+// cuda_moe.cu (softmax + top-k + renormalize) and drives each active expert
+// through the per-dtype CUDA GEMV dispatch via zero-copy 2D weight views.
+// No per-layer D2H of activations and no H2D restore.
+// ----------------------------------------------------------------------------
+
+TensorPtr PhimoeEngine::moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWeights& lw,
+                                     const ModelConfig& cfg, int seq_len) {
+    const int n_expert = cfg.n_expert;
+    const int n_expert_used = cfg.n_expert_used > 0 ? cfg.n_expert_used : 1;
+    const int hidden_dim = cfg.hidden_dim;
+
+    // Non-blocking error check: cudaGetLastError is sticky, so a single final
+    // cudaDeviceSynchronize at the end of this function catches any launch error
+    // without draining the pipeline after every kernel.
+    auto check_err = [&](const char* tag) {
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess)
+            throw std::runtime_error(std::string("moe_ffn_cuda[") + tag + "]: " +
+                                     cudaGetErrorString(e));
+    };
+
+    // ---- Router logits on GPU: [seq_len, hidden] x [n_expert, hidden]^T ----
+    auto router_logits = ops::matmul_transB(ffn_normed, lw.ffn_gate_inp());
+    check_err("router_logits");
+
+    // ---- Reusable scratch (allocated once, grown if the batch grows) ----
+    const int n_ids = seq_len * n_expert_used;
+    const int n_sm = seq_len * n_expert;
+    if (!moe_router_indices_ || moe_router_indices_->numel() < n_ids) {
+        moe_router_indices_ = std::make_shared<Tensor>(
+            DataType::INT32, std::vector<int64_t>{n_ids}, DeviceType::CUDA);
+        moe_router_weights_ = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{n_ids}, DeviceType::CUDA);
+        moe_router_softmax_ = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{n_sm}, DeviceType::CUDA);
+        moe_indices_h_ = std::make_shared<Tensor>(
+            DataType::INT32, std::vector<int64_t>{n_ids}, DeviceType::CPU);
+        moe_weights_h_ = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{n_ids}, DeviceType::CPU);
+    }
+    if (!moe_expert_out_ || moe_expert_out_->numel() < (size_t)seq_len * hidden_dim) {
+        moe_expert_out_ = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, hidden_dim}, DeviceType::CUDA);
+    }
+
+    // ---- Softmax + top-k + renormalize on device (moe_router_kernel) ----
+    cuda::launch_moe_router(static_cast<const float*>(router_logits->data()),
+                            static_cast<int*>(moe_router_indices_->data()),
+                            static_cast<float*>(moe_router_weights_->data()),
+                            static_cast<float*>(moe_router_softmax_->data()), n_expert,
+                            n_expert_used, seq_len);
+    check_err("router");
+
+    const int* d_idx = static_cast<const int*>(moe_router_indices_->data());
+    const float* d_w = static_cast<const float*>(moe_router_weights_->data());
+
+    // ---- All-device grouped path (IQ2_S): no D2H, no host loop, ~4 launches ----
+    auto gate3d = lw.ffn_gate_exps();
+    auto up3d = lw.ffn_up_exps();
+    auto down3d = lw.ffn_down_exps();
+    const bool grouped_ok =
+        gate3d && up3d && down3d && gate3d->device() == DeviceType::CUDA &&
+        gate3d->dtype() == DataType::IQ2_S && up3d->dtype() == DataType::IQ2_S &&
+        down3d->dtype() == DataType::IQ2_S &&
+        std::getenv("FORGE_FORCE_MOE_FALLBACK") == nullptr;
+
+    if (grouped_ok) {
+        const int n_ff = static_cast<int>(gate3d->shape()[1]);
+        const size_t n_gated = (size_t)n_ids * n_ff;
+        if (!moe_gate_out_ || moe_gate_out_->numel() < n_gated) {
+            std::vector<int64_t> shp{seq_len * n_expert_used, n_ff};
+            moe_gate_out_ = std::make_shared<Tensor>(DataType::FP32, shp, DeviceType::CUDA);
+            moe_up_out_ = std::make_shared<Tensor>(DataType::FP32, shp, DeviceType::CUDA);
+            moe_gated_out_ = std::make_shared<Tensor>(DataType::FP32, shp, DeviceType::CUDA);
+        }
+
+        // gate/up: shared input quantized once, both projections per slot.
+        cuda::launch_moe_expert_iq2_s_gateup(
+            static_cast<const float*>(ffn_normed->data()), gate3d->data(), up3d->data(),
+            static_cast<float*>(moe_gate_out_->data()),
+            static_cast<float*>(moe_up_out_->data()), d_idx, hidden_dim, n_ff, n_expert,
+            n_expert_used, seq_len);
+        check_err("gateup");
+
+        cuda::launch_silu_multiply(static_cast<const float*>(moe_gate_out_->data()),
+                                   static_cast<const float*>(moe_up_out_->data()),
+                                   static_cast<float*>(moe_gated_out_->data()),
+                                   static_cast<int>(n_gated));
+        check_err("silu");
+
+        // down: per-token weighted accumulate in slot order (deterministic).
+        cuda::launch_moe_expert_iq2_s_down(
+            static_cast<const float*>(moe_gated_out_->data()), down3d->data(),
+            static_cast<float*>(moe_expert_out_->data()), d_idx, d_w, n_ff, hidden_dim,
+            n_expert, n_expert_used, seq_len);
+        check_err("down");
+
+        return moe_expert_out_;
+    }
+
+    // ---- Fallback: per-expert path (non-IQ2_S dtypes) ----
+    // Tiny host mirror drives expert slicing; all heavy compute stays on device.
+    moe_indices_h_->copy_from(*moe_router_indices_);
+    moe_weights_h_->copy_from(*moe_router_weights_);
+    const int* idx_data = static_cast<const int*>(moe_indices_h_->data());
+    const float* w_data = static_cast<const float*>(moe_weights_h_->data());
+
+    moe_expert_out_->zero_();
+    check_err("zero_");
+    float* out_data = static_cast<float*>(moe_expert_out_->data());
+
+    // Zero-copy expert extraction: phimoe stores the expert axis as FIRST dim
+    // (axis 0). The 2D view shares GPU storage, so matmul_transB dispatches to
+    // the CUDA GEMV/MMQ kernels (on-the-fly dequant) directly.
+    auto extract_expert_2d = [&](const TensorPtr& w3d, int expert_idx) -> TensorPtr {
+        if (!w3d) return nullptr;
+        auto& shp = w3d->shape();
+        if (shp.size() < 2) return w3d;
+        if (shp.size() == 3 && expert_idx < shp[0]) {
+            auto expert_slice = w3d->slice(0, expert_idx, expert_idx + 1);
+            return std::make_shared<Tensor>(expert_slice.view({shp[1], shp[2]}));
+        }
+        return w3d;
+    };
+
+    for (int s = 0; s < seq_len; ++s) {
+        auto token_hidden =
+            std::make_shared<Tensor>(ffn_normed->slice(0, s, s + 1).view({1, hidden_dim}));
+        for (int k = 0; k < n_expert_used; ++k) {
+            const int expert_idx = idx_data[s * n_expert_used + k];
+            const float weight = w_data[s * n_expert_used + k];
+
+            auto gate_w = extract_expert_2d(lw.ffn_gate_exps(), expert_idx);
+            auto up_w = extract_expert_2d(lw.ffn_up_exps(), expert_idx);
+            auto down_w = extract_expert_2d(lw.ffn_down_exps(), expert_idx);
+            if (!gate_w || !up_w || !down_w) continue;
+
+            auto gate = ops::matmul_transB(token_hidden, gate_w);  // [1, n_ff]
+            check_err("gate gemv");
+            auto up = ops::matmul_transB(token_hidden, up_w);      // [1, n_ff]
+            check_err("up gemv");
+            auto gated = ops::silu_multiply(gate, up);
+            check_err("silu_multiply");
+            auto down = ops::matmul_transB(gated, down_w);         // [1, hidden]
+            check_err("down gemv");
+
+            cuda::launch_scale_accumulate(static_cast<const float*>(down->data()),
+                                          out_data + s * hidden_dim, weight, hidden_dim);
+            check_err("scale_accumulate");
+
+        }
+    }
+
+    // No cudaDeviceSynchronize here: kernels stay pipelined across layers; the
+    // next op consuming expert_out is queued on the same stream, and launch
+    // errors are surfaced by the sticky check_err above. Only a single flush
+    // happens at the end of forward_request (logits read-back).
+    return moe_expert_out_;
+}
+#endif  // USE_CUDA
+
 // ----------------------------------------------------------------------------
 // forward_layer
 // ----------------------------------------------------------------------------
@@ -369,8 +574,15 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     TensorPtr ffn_out;
     {
         PERF_SCOPE("layer/moe_ffn");
-        ffn_out = moe_ffn_cpu(ffn_normed, lw, cfg, seq_len);
-        ffn_out = restore_device(ffn_out, dev);
+#ifdef USE_CUDA
+        if (dev == DeviceType::CUDA && ffn_normed->device() == DeviceType::CUDA) {
+            ffn_out = moe_ffn_cuda(ffn_normed, lw, cfg, seq_len);
+        } else
+#endif
+        {
+            ffn_out = moe_ffn_cpu(ffn_normed, lw, cfg, seq_len);
+            ffn_out = restore_device(ffn_out, dev);
+        }
     }
 
     // ---- 10. Output residual ----

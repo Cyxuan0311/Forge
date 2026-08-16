@@ -39,6 +39,25 @@ private:
     TensorPtr moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeights& lw,
                           const ModelConfig& cfg, int seq_len);
 
+#ifdef USE_CUDA
+    // MoE FFN fully on GPU: device router (softmax+top-k) + per-expert CUDA
+    // GEMV dispatch. Reused scratch buffers avoid per-layer pool allocations.
+    TensorPtr moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWeights& lw,
+                           const ModelConfig& cfg, int seq_len);
+
+    // Reused across moe_ffn_cuda invocations (device router outputs, softmax
+    // buffer, host mirror of routing, and the per-layer expert accumulator).
+    TensorPtr moe_router_indices_;
+    TensorPtr moe_router_weights_;
+    TensorPtr moe_router_softmax_;
+    TensorPtr moe_indices_h_;
+    TensorPtr moe_weights_h_;
+    TensorPtr moe_expert_out_;
+    TensorPtr moe_gate_out_;
+    TensorPtr moe_up_out_;
+    TensorPtr moe_gated_out_;
+#endif
+
     RopeExecutor rope_executor_;
     AttentionExecutor attention_executor_;
 };

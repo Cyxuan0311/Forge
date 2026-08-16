@@ -62,35 +62,31 @@ __global__ void moe_router_kernel(
     // Stage 2: top-K selection (sequential, n_expert ≤ 256, n_expert_used ≤ 8)
     int* s_indices = expert_indices + s * n_expert_used;
     float* s_weights = expert_weights + s * n_expert_used;
+    __shared__ float s_inv_topk;
 
-    if (tid < n_expert_used) {
-        int best_idx = -1;
-        float best_val = -1.0f;
-        for (int e = 0; e < n_expert; ++e) {
-            bool already = false;
-            for (int k = 0; k < tid; ++k) {
-                if (s_indices[k] == e) { already = true; break; }
+    // Single-thread sequential selection. The per-thread variant raced on
+    // s_indices[k]: thread k read indices written by threads < k without a
+    // barrier, so the same expert was often selected twice.
+    if (tid == 0) {
+        float topk_sum = 0.0f;
+        for (int k = 0; k < n_expert_used; ++k) {
+            int best = -1;
+            float bv = -1.0f;
+            for (int e = 0; e < n_expert; ++e) {
+                bool used = false;
+                for (int j = 0; j < k; ++j)
+                    if (s_indices[j] == e) { used = true; break; }
+                if (!used && s_buf[e] > bv) { bv = s_buf[e]; best = e; }
             }
-            if (!already && s_buf[e] > best_val) {
-                best_val = s_buf[e];
-                best_idx = e;
-            }
+            s_indices[k] = best;
+            s_weights[k] = bv;
+            topk_sum += bv;
         }
-        s_indices[tid] = best_idx;
-        s_weights[tid] = best_val;
+        s_inv_topk = 1.0f / (topk_sum + 1e-8f);
     }
     __syncthreads();
 
     // Stage 3: renormalize top-K weights
-    __shared__ float s_inv_topk;
-    float topk_sum = 0.0f;
-    if (tid < n_expert_used) topk_sum = s_weights[tid];
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        topk_sum += __shfl_down_sync(0xFFFFFFFF, topk_sum, offset);
-    }
-    if (tid == 0) s_inv_topk = 1.0f / (topk_sum + 1e-8f);
-    __syncthreads();
-
     if (tid < n_expert_used) s_weights[tid] *= s_inv_topk;
 }
 
