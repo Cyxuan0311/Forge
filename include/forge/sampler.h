@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "inference_batch.h"
@@ -56,10 +57,18 @@ public:
 private:
     void apply_repeat_penalty(std::vector<float>& logits) const;
     void ensure_token_history_buffer(int n);
+    // Reusable per-token scratch buffers. resize() is called with the current
+    // vocab_size so begin()/end() always span exactly the live range; capacity
+    // grows monotonically to absorb the per-token allocation churn.
+    void ensure_scratch(int vocab_size);
 
     SamplerConfig config_;
     uint64_t rng_state_ = 12345;
     std::vector<int32_t> token_history_;
+
+    std::vector<float> logits_scratch_;
+    std::vector<float> probs_scratch_;
+    std::vector<std::pair<float, int>> indexed_scratch_;
 
     void* cuda_argmax_buf_ = nullptr;
     int32_t* d_token_history_ = nullptr;

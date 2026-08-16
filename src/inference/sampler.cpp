@@ -11,11 +11,197 @@
 
 #include "cpu/simd.h"
 
+#ifdef _OPENMP
+#    include <omp.h>
+#endif
+
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
 #endif
 
 namespace forge {
+
+namespace {
+
+// Parallel wrappers around the single-threaded SIMD sampling kernels.
+// Decode logits are vocab-sized (e.g. 248K floats); the reduce/sort passes
+// are pure streaming work that scales with threads. Chunked with fixed
+// boundaries and ordered partial accumulation for run-to-run determinism.
+
+constexpr int kSamplerParallelMinN = 16384;
+
+#ifdef _OPENMP
+inline void sampler_chunk(int n, int t, int nt, int& b, int& e) {
+    b = static_cast<int>(static_cast<int64_t>(n) * t / nt);
+    e = static_cast<int>(static_cast<int64_t>(n) * (t + 1) / nt);
+}
+#endif
+
+float parallel_max_f32(const float* data, int n) {
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+    if (nt > 1 && n >= kSamplerParallelMinN) {
+        std::vector<float> partials(nt, -1e30f);
+#pragma omp parallel
+        {
+            int t = omp_get_thread_num();
+            int b, e;
+            sampler_chunk(n, t, nt, b, e);
+            partials[t] = forge::cpu::max_f32(data + b, e - b);
+        }
+        float m = partials[0];
+        for (int t = 1; t < nt; ++t) m = std::max(m, partials[t]);
+        return m;
+    }
+#endif
+    return forge::cpu::max_f32(data, n);
+}
+
+float parallel_softcap_and_max_f32(float* data, int n, float cap) {
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+    if (nt > 1 && n >= kSamplerParallelMinN) {
+        std::vector<float> partials(nt, -1e30f);
+#pragma omp parallel
+        {
+            int t = omp_get_thread_num();
+            int b, e;
+            sampler_chunk(n, t, nt, b, e);
+            partials[t] = forge::cpu::softcap_and_max_f32(data + b, e - b, cap);
+        }
+        float m = partials[0];
+        for (int t = 1; t < nt; ++t) m = std::max(m, partials[t]);
+        return m;
+    }
+#endif
+    return forge::cpu::softcap_and_max_f32(data, n, cap);
+}
+
+float parallel_exp_and_sum_f32(const float* data, float* out, int n, float max_val,
+                               float inv_temp) {
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+    if (nt > 1 && n >= kSamplerParallelMinN) {
+        std::vector<float> partials(nt, 0.0f);
+#pragma omp parallel
+        {
+            int t = omp_get_thread_num();
+            int b, e;
+            sampler_chunk(n, t, nt, b, e);
+            partials[t] = forge::cpu::exp_and_sum_f32(data + b, out + b, e - b, max_val, inv_temp);
+        }
+        float sum = 0.0f;
+        for (int t = 0; t < nt; ++t) sum += partials[t];
+        return sum;
+    }
+#endif
+    return forge::cpu::exp_and_sum_f32(data, out, n, max_val, inv_temp);
+}
+
+void parallel_scale_normalize_f32(float* data, int n, float inv) {
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+    if (nt > 1 && n >= kSamplerParallelMinN) {
+#pragma omp parallel
+        {
+            int t = omp_get_thread_num();
+            int b, e;
+            sampler_chunk(n, t, nt, b, e);
+            forge::cpu::scale_normalize_f32(data + b, e - b, inv);
+        }
+        return;
+    }
+#endif
+    forge::cpu::scale_normalize_f32(data, n, inv);
+}
+
+void parallel_build_pairs(std::vector<std::pair<float, int>>& indexed, const float* probs,
+                          int n) {
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+    if (nt > 1 && n >= kSamplerParallelMinN) {
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; ++i) indexed[i] = {probs[i], i};
+        return;
+    }
+#endif
+    for (int i = 0; i < n; ++i) indexed[i] = {probs[i], i};
+}
+
+// Chunked top-k selection + merge. Writes the global top-k (descending) into out.
+// Each chunk uses nth_element (O(N/T)) + sort of the k survivors, which is
+// asymptotically cheaper than a full partial_sort per chunk.
+void parallel_top_k_pairs(std::vector<std::pair<float, int>>& indexed,
+                          std::vector<std::pair<float, int>>& out, int n, int k) {
+    auto desc = [](const auto& a, const auto& b) { return a.first > b.first; };
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+    if (nt > 1 && n >= kSamplerParallelMinN && k < n) {
+        out.resize(static_cast<size_t>(nt) * k);
+#pragma omp parallel
+        {
+            int t = omp_get_thread_num();
+            int b, e;
+            sampler_chunk(n, t, nt, b, e);
+            int c = std::min(k, e - b);
+            std::nth_element(indexed.begin() + b, indexed.begin() + b + c, indexed.begin() + e,
+                             desc);
+            std::sort(indexed.begin() + b, indexed.begin() + b + c, desc);
+            std::copy(indexed.begin() + b, indexed.begin() + b + c,
+                      out.begin() + static_cast<size_t>(t) * k);
+        }
+        std::partial_sort(out.begin(), out.begin() + k, out.end(), desc);
+        out.resize(k);
+        return;
+    }
+#endif
+    std::nth_element(indexed.begin(), indexed.begin() + k, indexed.end(), desc);
+    std::sort(indexed.begin(), indexed.begin() + k, desc);
+    out.assign(indexed.begin(), indexed.begin() + k);
+}
+
+// Full descending merge sort (chunked std::sort + k-way merge).
+void parallel_full_sort_pairs(std::vector<std::pair<float, int>>& src,
+                              std::vector<std::pair<float, int>>& dst, int n) {
+    auto desc = [](const auto& a, const auto& b) { return a.first > b.first; };
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+    if (nt > 1 && n >= kSamplerParallelMinN) {
+        std::vector<std::pair<int, int>> ranges(nt);
+#pragma omp parallel
+        {
+            int t = omp_get_thread_num();
+            int b, e;
+            sampler_chunk(n, t, nt, b, e);
+            ranges[t] = {b, e};
+            std::sort(src.begin() + b, src.begin() + e, desc);
+        }
+        std::vector<int> pos(nt, 0);
+        for (int i = 0; i < n; ++i) {
+            int best = -1;
+            std::pair<float, int> best_pair;
+            for (int t = 0; t < nt; ++t) {
+                int b = ranges[t].first;
+                int p = pos[t];
+                if (p < ranges[t].second - b) {
+                    const auto& cand = src[b + p];
+                    if (best < 0 || cand.first > best_pair.first) {
+                        best = t;
+                        best_pair = cand;
+                    }
+                }
+            }
+            dst[i] = best_pair;
+            ++pos[best];
+        }
+        return;
+    }
+#endif
+    std::sort(src.begin(), src.end(), desc);
+    dst.assign(src.begin(), src.end());
+}
+
+}  // namespace
 
 Sampler::Sampler(const SamplerConfig& config) : config_(config) {
     rng_state_ = config.seed != 0 ? config.seed : 12345;
@@ -68,6 +254,12 @@ void Sampler::ensure_token_history_buffer(int n) {
 #endif
 }
 
+void Sampler::ensure_scratch(int vocab_size) {
+    logits_scratch_.resize(vocab_size);
+    probs_scratch_.resize(vocab_size);
+    indexed_scratch_.resize(vocab_size);
+}
+
 int Sampler::sample_greedy(const TensorPtr& logits) {
     int vocab_size = static_cast<int>(logits->numel());
     SET_PERF_CONTEXT(-1, "sampler", -1, logits->device() == DeviceType::CUDA ? "cuda" : "cpu", 1);
@@ -105,7 +297,8 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
 #endif
     }
 
-    std::vector<float> host_logits(vocab_size);
+    ensure_scratch(vocab_size);
+    std::vector<float>& host_logits = logits_scratch_;
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         PERF_SCOPE("sampler/logits_d2h");
@@ -116,6 +309,7 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
         PERF_SCOPE("sampler/logits_memcpy");
         std::memcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float));
     }
+
 
     if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
         PERF_SCOPE("sampler/repeat_penalty");
@@ -178,7 +372,8 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
     }
 
     // CPU fallback path
-    std::vector<float> host_logits(vocab_size);
+    ensure_scratch(vocab_size);
+    std::vector<float>& host_logits = logits_scratch_;
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         PERF_SCOPE("sampler/logits_d2h");
@@ -189,6 +384,7 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
         PERF_SCOPE("sampler/logits_memcpy");
         std::memcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float));
     }
+
 
     if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
         PERF_SCOPE("sampler/repeat_penalty");
@@ -201,63 +397,85 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
         bool has_softcap = (config_.logit_softcapping > 0.0f);
         if (has_softcap) {
             float cap = config_.logit_softcapping;
-            max_val = forge::cpu::softcap_and_max_f32(host_logits.data(), vocab_size, cap);
+            max_val = parallel_softcap_and_max_f32(host_logits.data(), vocab_size, cap);
         } else {
-            max_val = forge::cpu::max_f32(host_logits.data(), vocab_size);
+            max_val = parallel_max_f32(host_logits.data(), vocab_size);
         }
 
-        std::vector<float> probs(vocab_size);
+        std::vector<float>& probs = probs_scratch_;
         float inv_temp = 1.0f / temperature;
-        float sum = forge::cpu::exp_and_sum_f32(host_logits.data(), probs.data(), vocab_size, max_val, inv_temp);
+        float sum = parallel_exp_and_sum_f32(host_logits.data(), probs.data(), vocab_size, max_val,
+                                             inv_temp);
+        parallel_scale_normalize_f32(probs.data(), vocab_size, 1.0f / sum);
 
-        float inv_sum = 1.0f / sum;
-        forge::cpu::scale_normalize_f32(probs.data(), vocab_size, inv_sum);
+        // Sorted (prob, index) pairs for top_k / top_p filtering.
+        // After top_k, holds the (already normalized) top-k in descending order.
+        std::vector<std::pair<float, int>> top_sorted;
+        float inv_top = 1.0f;
 
         if (config_.top_k > 0) {
-            std::vector<std::pair<float, int>> indexed(vocab_size);
-            for (int i = 0; i < vocab_size; ++i) {
-                indexed[i] = {probs[i], i};
-            }
-            std::partial_sort(indexed.begin(), indexed.begin() + config_.top_k, indexed.end(),
-                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::vector<std::pair<float, int>>& indexed = indexed_scratch_;
+            int k = config_.top_k;
+            if (k > vocab_size) k = vocab_size;
+
+            parallel_build_pairs(indexed, probs.data(), vocab_size);
+            parallel_top_k_pairs(indexed, top_sorted, vocab_size, k);
 
             std::fill(probs.begin(), probs.end(), 0.0f);
             float top_sum = 0.0f;
-            for (int i = 0; i < config_.top_k && i < vocab_size; ++i) {
-                probs[indexed[i].second] = indexed[i].first;
-                top_sum += indexed[i].first;
+            for (int i = 0; i < k; ++i) {
+                probs[top_sorted[i].second] = top_sorted[i].first;
+                top_sum += top_sorted[i].first;
             }
-            for (int i = 0; i < vocab_size; ++i) {
-                probs[i] /= top_sum;
-            }
+            inv_top = 1.0f / top_sum;
+            parallel_scale_normalize_f32(probs.data(), vocab_size, inv_top);
         }
 
         if (config_.top_p < 1.0f) {
-            std::vector<std::pair<float, int>> indexed(vocab_size);
-            for (int i = 0; i < vocab_size; ++i) {
-                indexed[i] = {probs[i], i};
-            }
-            std::sort(indexed.begin(), indexed.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first; });
-
-            float cumsum = 0.0f;
             int cutoff = vocab_size;
-            for (int i = 0; i < vocab_size; ++i) {
-                cumsum += indexed[i].first;
-                if (cumsum > config_.top_p) {
-                    cutoff = i + 1;
-                    break;
-                }
-            }
+            std::vector<std::pair<float, int>> full_sorted;
 
-            std::fill(probs.begin(), probs.end(), 0.0f);
-            float top_p_sum = 0.0f;
-            for (int i = 0; i < cutoff; ++i) {
-                probs[indexed[i].second] = indexed[i].first;
-                top_p_sum += indexed[i].first;
-            }
-            for (int i = 0; i < vocab_size; ++i) {
-                probs[i] /= top_p_sum;
+            if (!top_sorted.empty()) {
+                // top_k was applied first: probs only has k non-zero entries and
+                // top_sorted holds them descending (pre-normalization). Reuse it,
+                // accumulating the normalized cumulative probability (cutoff <= k).
+                float acc = 0.0f;
+                int lim = static_cast<int>(top_sorted.size());
+                for (int i = 0; i < lim; ++i) {
+                    acc += top_sorted[i].first * inv_top;
+                    if (acc > config_.top_p) {
+                        cutoff = i + 1;
+                        break;
+                    }
+                }
+                std::fill(probs.begin(), probs.end(), 0.0f);
+                float top_p_sum = 0.0f;
+                for (int i = 0; i < cutoff && i < lim; ++i) {
+                    probs[top_sorted[i].second] = top_sorted[i].first;
+                    top_p_sum += top_sorted[i].first;
+                }
+                parallel_scale_normalize_f32(probs.data(), vocab_size, 1.0f / top_p_sum);
+            } else {
+                std::vector<std::pair<float, int>>& indexed = indexed_scratch_;
+                parallel_build_pairs(indexed, probs.data(), vocab_size);
+                full_sorted.resize(vocab_size);
+                parallel_full_sort_pairs(indexed, full_sorted, vocab_size);
+
+                float cumsum = 0.0f;
+                for (int i = 0; i < vocab_size; ++i) {
+                    cumsum += full_sorted[i].first;
+                    if (cumsum > config_.top_p) {
+                        cutoff = i + 1;
+                        break;
+                    }
+                }
+                std::fill(probs.begin(), probs.end(), 0.0f);
+                float top_p_sum = 0.0f;
+                for (int i = 0; i < cutoff; ++i) {
+                    probs[full_sorted[i].second] = full_sorted[i].first;
+                    top_p_sum += full_sorted[i].first;
+                }
+                parallel_scale_normalize_f32(probs.data(), vocab_size, 1.0f / top_p_sum);
             }
         }
 
