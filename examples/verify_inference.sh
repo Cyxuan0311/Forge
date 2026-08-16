@@ -70,6 +70,7 @@ TESTS=(
     "minicpmv|examples/legacy/minicpmv_cli_inference.py|MINICPMV_MODEL|"
     "qwen3vl|examples/legacy/qwen3vl_inference.py|QWEN3VL_MODEL|"
     "phimoe|examples/legacy/phi_mini_moe_inference.py|PHIMOE_MODEL|"
+    "phi4|examples/legacy/phi4_inference.py|PHI4_MODEL|"
 )
 
 usage() {
