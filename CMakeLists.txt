@@ -173,7 +173,8 @@ endif()
 add_library(
   forge_core STATIC
   src/core/tensor.cpp
-  src/core/memory_pool.cpp
+  src/core/host_mem_pool.cpp
+  src/core/cuda_mem_pool.cpp
   src/core/backend.cpp
   src/core/backend_scheduler.cpp
   src/core/op_kernels.cpp
@@ -285,6 +286,7 @@ add_library(
   src/inference/attention_mask.cpp
   src/inference/request_scheduler.cpp
   src/inference/speculative.cpp
+  src/inference/threads.cpp
   # Jinja engine (vendored from llama.cpp, MIT licensed)
   third_party/jinja/lexer.cpp
   third_party/jinja/parser.cpp

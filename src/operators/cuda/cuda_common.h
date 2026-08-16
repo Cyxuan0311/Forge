@@ -12,6 +12,12 @@ namespace cuda {
 
 // Thread-local scratch memory pool for temporary device allocations.
 // Avoids per-kernel cudaMalloc/cudaFree overhead.
+//
+// This is the single TLS-based scratch utility in the CUDA backend. Small
+// kernel-internal temporaries (cuda_gemv decode, GPU argmax) draw from it;
+// larger or multi-live scratch (e.g. the FP32 dequant in matmul_cuda.cpp)
+// goes through cuda_mem::allocate/deallocate instead, so buffers can be
+// pooled and released safely on the same stream.
 struct CudaScratchPool {
     void* ptr = nullptr;
     size_t capacity = 0;

@@ -4,6 +4,8 @@
 #include <cstring>
 
 #include "forge/backend.h"
+#include "forge/cuda_mem_pool.h"
+#include "forge/host_mem_pool.h"
 #include "forge/logger.h"
 #include "forge/memory_planner.h"
 
@@ -278,11 +280,11 @@ TensorPtr ComputeGraph::execute() {
                             void* old_data = node.output->replace_data(planned_ptr, copy_size);
                             if (old_data) {
                                 if (node.output->device() == DeviceType::CPU) {
-                                    std::free(old_data);
+                                    host_mem::deallocate(old_data);
                                 }
 #ifdef USE_CUDA
                                 else {
-                                    cudaFree(old_data);
+                                    cuda_mem::deallocate(old_data);
                                 }
 #endif
                             }

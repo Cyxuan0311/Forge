@@ -4,6 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "forge/host_mem_pool.h"
 #include "forge/logger.h"
 #include "memory_counters.h"
 
@@ -36,7 +37,7 @@ public:
     void* allocate(size_t size) override {
         auto& ctr = MemoryCounters::instance();
         ctr.cpu_malloc_count.fetch_add(1, std::memory_order_relaxed);
-        void* ptr = std::malloc(size);
+        void* ptr = host_mem::allocate(size);
         if (!ptr && size > 0) {
             LOG_ERROR("CPU malloc failed for " + std::to_string(size) + " bytes");
         }
@@ -47,7 +48,7 @@ public:
         if (ptr) {
             auto& ctr = MemoryCounters::instance();
             ctr.cpu_free_count.fetch_add(1, std::memory_order_relaxed);
-            std::free(ptr);
+            host_mem::deallocate(ptr);
         }
     }
 

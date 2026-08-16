@@ -5,7 +5,8 @@
 #include <stdexcept>
 
 #include "forge/backend.h"
-#include "forge/memory_pool.h"
+#include "forge/cuda_mem_pool.h"
+#include "forge/host_mem_pool.h"
 #include "memory_counters.h"
 
 #ifdef USE_CUDA
@@ -93,14 +94,14 @@ void Tensor::allocate() {
         return;
 
     if (device_ == DeviceType::CPU) {
-        data_ = std::malloc(nbytes_);
+        data_ = host_mem::allocate(nbytes_);
         if (!data_)
-            throw std::runtime_error("CPU malloc failed");
+            throw std::runtime_error("CPU malloc failed (host_mem_pool)");
     } else {
 #ifdef USE_CUDA
-        cudaError_t err = cudaMalloc(&data_, nbytes_);
-        if (err != cudaSuccess)
-            throw std::runtime_error("CUDA malloc failed: " + std::string(cudaGetErrorString(err)));
+        data_ = cuda_mem::allocate(nbytes_);
+        if (!data_)
+            throw std::runtime_error("CUDA malloc failed (cuda_mem_pool)");
 #else
         throw std::runtime_error("CUDA not available");
 #endif
@@ -121,10 +122,10 @@ void Tensor::allocate() {
 void Tensor::release() {
     if (owns_storage_ && data_) {
         if (device_ == DeviceType::CPU) {
-            std::free(data_);
+            host_mem::deallocate(data_);
         } else {
 #ifdef USE_CUDA
-            cudaFree(data_);
+            cuda_mem::deallocate(data_);
 #endif
         }
     }

@@ -1,4 +1,6 @@
 #include "common.h"
+#include "forge/cuda_mem_pool.h"
+#include "forge/host_mem_pool.h"
 
 void register_profiler(py::module_& m) {
     py::class_<PerfProfiler>(m, "_PerfProfiler")
@@ -73,4 +75,12 @@ void register_profiler(py::module_& m) {
     m.def("profiler_trace_to_json", []() { return PerfProfiler::instance().trace_to_json(); });
     m.def("profiler_trace_overflow", []() { return PerfProfiler::instance().trace_overflow(); });
     m.def("profiler_trace_size", []() { return PerfProfiler::instance().trace_size(); });
+    m.def("pool_cached_bytes", []() { return forge::cuda_mem::cached_bytes(); });
+    m.def("pool_alloc_count", []() { return forge::cuda_mem::alloc_count(); });
+    m.def("pool_hit_count", []() { return forge::cuda_mem::hit_count(); });
+    m.def("pool_print_stats", []() { forge::cuda_mem::print_stats(); });
+    m.def("hostpool_cached_bytes", []() { return forge::host_mem::cached_bytes(); });
+    m.def("hostpool_alloc_count", []() { return forge::host_mem::alloc_count(); });
+    m.def("hostpool_hit_count", []() { return forge::host_mem::hit_count(); });
+    m.def("hostpool_print_stats", []() { forge::host_mem::print_stats(); });
 }
