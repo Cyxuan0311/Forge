@@ -1960,14 +1960,23 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     float d = __half2float(reinterpret_cast<const __half&>(*(const uint16_t*)block_ptr));
     float d8 = __low2float(q8_blk->ds);
 
-    const int* qs = (const int*)(block_ptr + 2);
+    // IQ4_NL blocks are 18 bytes (2B half scale + 16B data), so (block_ptr + 2)
+    // is only 2-byte aligned when the block index is odd. Copy the 16 data bytes
+    // into an aligned local buffer before doing 4-byte int reads.
+    alignas(4) uint8_t tmp[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+        tmp[j] = block_ptr[2 + j];
+    const int* qs = reinterpret_cast<const int*>(tmp);
     const int* q8i = (const int*)q8_blk->qs;
 
     int sumi = 0;
     for (int j = 0; j < 4; ++j) {
+        // llama.cpp pairs v.x with q8[iqs+l] (activation [4j..4j+3]) and
+        // v.y with q8[iqs+l+4] (activation [4j+16..4j+19]).
         const int2 v = get_int_from_table_16(qs[j], c_kvalues_iq4nl);
-        sumi = forge_dp4a(v.x, q8i[2*j + 0], sumi);
-        sumi = forge_dp4a(v.y, q8i[2*j + 1], sumi);
+        sumi = forge_dp4a(v.x, q8i[j], sumi);
+        sumi = forge_dp4a(v.y, q8i[j + 4], sumi);
     }
 
     return d * d8 * (float)sumi;
@@ -2335,6 +2344,189 @@ void launch_gemv_iq2_s_q8_1_batch(const float* x, const void* q_weight, float* o
     int grid_blocks = (total_warps + warps_per_block - 1) / warps_per_block;
     gemv_iq2_s_q8_1_batch_kernel<<<grid_blocks, threads, 0, stream>>>(
         x_q8, static_cast<const uint8_t*>(q_weight), out, M, K, N);
+}
+
+// ============================================================================
+// Phimoe grouped IQ2_S MoE (slot-strided, all-device)
+// ============================================================================
+// Weight layout: axis-0 expert slabs, [n_expert, N, K] quantized IQ2_S blocks.
+//   expert e slab starts at q_w + e * N * num_blocks_row * BS
+// x is pre-quantized to Q8_1 once per token: [n_tokens, (K+31)/32] blocks.
+//
+// gateup:  out[(token*k+kk)*N + n] = x·gate_e^T (unscaled) and x·up_e^T
+// down:    out[token*N + n] += w * x·down_e^T  (deterministic slot order)
+// Each block handles one slot (gateup) or one token with all slots in order
+// (down), processing a chunk of N rows with warps. No atomics -> exact FP
+// order matches the sequential per-expert reference path.
+
+__global__ void moe_expert_iq2_s_gateup_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,   // [n_tokens, (K+31)/32]
+    const uint8_t* __restrict__ q_gate,          // [n_expert, N, K]
+    const uint8_t* __restrict__ q_up,            // [n_expert, N, K]
+    float* __restrict__ out_gate,                // [n_tokens*k, N]
+    float* __restrict__ out_up,                  // [n_tokens*k, N]
+    const int* __restrict__ expert_indices,      // [n_tokens*k]
+    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+    int rows_per_block)
+{
+    constexpr int BE = 256, BS = 82, QI = 16;
+    int num_blocks_row = (K + BE - 1) / BE;
+    int q8_blocks_row = (K + 31) / 32;
+
+    int slot = blockIdx.x;
+    int chunk = blockIdx.y;
+    int token = slot / n_expert_used;
+    int expert = expert_indices[slot];
+
+    const block_q8_1_gemv* x_row = x_q8 + (size_t)token * q8_blocks_row;
+    const uint8_t* gate_base = q_gate + (size_t)expert * N * num_blocks_row * BS;
+    const uint8_t* up_base = q_up + (size_t)expert * N * num_blocks_row * BS;
+
+    int tid = threadIdx.x;
+    int lane = tid % 32;
+    int warp_in_block = tid / 32;
+    int warps_per_block = blockDim.x / 32;
+
+    int row_start = chunk * rows_per_block;
+    int row_end = min(row_start + rows_per_block, N);
+    for (int row = row_start + warp_in_block; row < row_end; row += warps_per_block) {
+        const uint8_t* g_row = gate_base + (size_t)row * num_blocks_row * BS;
+        const uint8_t* u_row = up_base + (size_t)row * num_blocks_row * BS;
+        float sg = 0.0f, su = 0.0f;
+        int blocks_per_thread = (num_blocks_row + 31) / 32;
+        for (int b = 0; b < blocks_per_thread; ++b) {
+            int bi = b * 32 + lane;
+            if (bi >= num_blocks_row) break;
+            const block_q8_1_gemv* row_q8 = x_row + (size_t)bi * 8;
+#pragma unroll
+            for (int iqs = 0; iqs < QI; ++iqs) {
+                sg += vec_dot_iq2_s_q8_1(g_row, row_q8, bi, iqs);
+                su += vec_dot_iq2_s_q8_1(u_row, row_q8, bi, iqs);
+            }
+        }
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 16);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 8);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 4);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 2);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 1);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 16);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 8);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 4);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 2);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 1);
+        if (lane == 0) {
+            out_gate[(size_t)slot * N + row] = sg;
+            out_up[(size_t)slot * N + row] = su;
+        }
+    }
+}
+
+__global__ void moe_expert_iq2_s_down_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,   // [n_tokens*k, (K+31)/32]
+    const uint8_t* __restrict__ q_down,          // [n_expert, N, K]
+    float* __restrict__ out,                     // [n_tokens, N]
+    const int* __restrict__ expert_indices,      // [n_tokens*k]
+    const float* __restrict__ expert_weights,    // [n_tokens*k]
+    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+    int rows_per_block)
+{
+    constexpr int BE = 256, BS = 82, QI = 16;
+    int num_blocks_row = (K + BE - 1) / BE;
+    int q8_blocks_row = (K + 31) / 32;
+
+    int token = blockIdx.x;
+    int chunk = blockIdx.y;
+
+    int tid = threadIdx.x;
+    int lane = tid % 32;
+    int warp_in_block = tid / 32;
+    int warps_per_block = blockDim.x / 32;
+
+    int row_start = chunk * rows_per_block;
+    int row_end = min(row_start + rows_per_block, N);
+    float* out_token = out + (size_t)token * N;
+
+    for (int row = row_start + warp_in_block; row < row_end; row += warps_per_block) {
+        float acc = 0.0f;
+        for (int kk = 0; kk < n_expert_used; ++kk) {
+            int slot = token * n_expert_used + kk;
+            int expert = expert_indices[slot];
+            float weight = expert_weights[slot];
+            const block_q8_1_gemv* x_row = x_q8 + (size_t)slot * q8_blocks_row;
+            const uint8_t* d_row = q_down + (size_t)expert * N * num_blocks_row * BS
+                                   + (size_t)row * num_blocks_row * BS;
+            float sd = 0.0f;
+            int blocks_per_thread = (num_blocks_row + 31) / 32;
+            for (int b = 0; b < blocks_per_thread; ++b) {
+                int bi = b * 32 + lane;
+                if (bi >= num_blocks_row) break;
+                const block_q8_1_gemv* row_q8 = x_row + (size_t)bi * 8;
+#pragma unroll
+                for (int iqs = 0; iqs < QI; ++iqs) {
+                    sd += vec_dot_iq2_s_q8_1(d_row, row_q8, bi, iqs);
+                }
+            }
+            sd += __shfl_down_sync(0xFFFFFFFF, sd, 16);
+            sd += __shfl_down_sync(0xFFFFFFFF, sd, 8);
+            sd += __shfl_down_sync(0xFFFFFFFF, sd, 4);
+            sd += __shfl_down_sync(0xFFFFFFFF, sd, 2);
+            sd += __shfl_down_sync(0xFFFFFFFF, sd, 1);
+            acc += weight * sd;
+        }
+        if (lane == 0) out_token[row] = acc;
+    }
+}
+
+void launch_moe_expert_iq2_s_gateup(
+    const float* x, const void* q_gate, const void* q_up,
+    float* out_gate, float* out_up, const int* expert_indices,
+    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+    cudaStream_t stream)
+{
+    ensure_gemv_iq_tables();
+    int q8_blocks_row = (K + 31) / 32;
+    size_t q8_bytes = (size_t)n_tokens * q8_blocks_row * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+    int num_q8_blocks = n_tokens * q8_blocks_row;
+    int q8_threads = 256, q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, n_tokens * K);
+
+    int warps_per_block = 8;
+    int rows_per_block = 128;
+    int threads = warps_per_block * 32;
+    int chunks = (N + rows_per_block - 1) / rows_per_block;
+    dim3 grid(n_tokens * n_expert_used, chunks);
+    moe_expert_iq2_s_gateup_kernel<<<grid, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_gate), static_cast<const uint8_t*>(q_up),
+        out_gate, out_up, expert_indices, K, N, n_expert, n_expert_used, n_tokens,
+        rows_per_block);
+}
+
+void launch_moe_expert_iq2_s_down(
+    const float* x, const void* q_down, float* out,
+    const int* expert_indices, const float* expert_weights,
+    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+    cudaStream_t stream)
+{
+    ensure_gemv_iq_tables();
+    int q8_blocks_row = (K + 31) / 32;
+    size_t q8_bytes = (size_t)n_tokens * n_expert_used * q8_blocks_row * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+    int num_q8_blocks = n_tokens * n_expert_used * q8_blocks_row;
+    int q8_threads = 256, q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_kernel<<<q8_blocks, q8_threads, 0, stream>>>(
+        x, x_q8, n_tokens * n_expert_used * K);
+
+    int warps_per_block = 8;
+    int rows_per_block = 128;
+    int threads = warps_per_block * 32;
+    int chunks = (N + rows_per_block - 1) / rows_per_block;
+    dim3 grid(n_tokens, chunks);
+    moe_expert_iq2_s_down_kernel<<<grid, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_down), out, expert_indices, expert_weights,
+        K, N, n_expert, n_expert_used, n_tokens, rows_per_block);
 }
 
 // ============================================================================

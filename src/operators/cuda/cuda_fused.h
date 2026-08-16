@@ -39,6 +39,9 @@ void launch_ffn_down_fused_q4_k_q8_1(const float* ffn_mid, const void* q_w2,
 void launch_ffn_down_fused_q5_k(const float* ffn_mid, const void* q_w2, const float* residual,
                                 float* out, int K, int hidden_dim, cudaStream_t stream = 0);
 
+void launch_ffn_down_fused_q3_k(const float* ffn_mid, const void* q_w2, const float* residual,
+                                float* out, int K, int hidden_dim, cudaStream_t stream = 0);
+
 void launch_ffn_down_fused_q6_k(const float* ffn_mid, const void* q_w2, const float* residual,
                                 float* out, int K, int hidden_dim, cudaStream_t stream = 0);
 

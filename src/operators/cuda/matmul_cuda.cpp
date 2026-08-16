@@ -12,6 +12,7 @@
 #    include <cuda_runtime.h>
 
 #    include "forge/cuda_kernels.h"
+#    include "forge/cuda_mem_pool.h"
 #    include "forge/logger.h"
 #    include "forge/operator_elementwise.h"
 #    include "forge/operator_matmul.h"
@@ -21,30 +22,6 @@ namespace forge {
 namespace ops {
 
 namespace {
-struct CudaScratchBuffer {
-    void* ptr = nullptr;
-    size_t capacity = 0;
-
-    ~CudaScratchBuffer() {
-        if (ptr)
-            cudaFree(ptr);
-    }
-
-    void* ensure(size_t bytes) {
-        if (bytes > capacity) {
-            if (ptr)
-                cudaFree(ptr);
-            cudaMalloc(&ptr, bytes);
-            capacity = bytes;
-        }
-        return ptr;
-    }
-};
-
-CudaScratchBuffer& get_scratch() {
-    static thread_local CudaScratchBuffer buf;
-    return buf;
-}
 
 using DequantMatrixFn = void (*)(const void*, float*, int, int, cudaStream_t);
 
@@ -121,12 +98,32 @@ cuda::MmqFn device_mmq_fn(DataType dt) {
     throw std::runtime_error(msg);
 }
 
-// Dequantize B on device into the thread-local scratch buffer.
-float* dequant_b_on_device(DequantMatrixFn fn, const TensorPtr& b, int N, int K) {
+// RAII owner for a device scratch buffer drawn from the caching pool.
+// Returns the block to the pool (instead of cudaFree) when the matmul call
+// is done; kernels run ordered on the same stream, so the buffer is never
+// recycled while the async GEMV that reads it is still in flight.
+struct DeviceScratch {
+    void* ptr = nullptr;
+    ~DeviceScratch() {
+        if (ptr)
+            forge::cuda_mem::deallocate(ptr);
+    }
+    DeviceScratch() = default;
+    explicit DeviceScratch(void* p) : ptr(p) {}
+    DeviceScratch(const DeviceScratch&) = delete;
+    DeviceScratch& operator=(const DeviceScratch&) = delete;
+    DeviceScratch(DeviceScratch&& o) noexcept : ptr(o.ptr) { o.ptr = nullptr; }
+    float* as_float() { return static_cast<float*>(ptr); }
+};
+
+// Dequantize B on device into a pooled device scratch buffer.
+DeviceScratch dequant_b_on_device(DequantMatrixFn fn, const TensorPtr& b, int N, int K) {
     size_t fp32_bytes = (size_t)N * K * sizeof(float);
-    float* b_fp32 = static_cast<float*>(get_scratch().ensure(fp32_bytes));
-    fn(b->data(), b_fp32, N, K, 0);
-    return b_fp32;
+    DeviceScratch scr(forge::cuda_mem::allocate(fp32_bytes));
+    if (!scr.ptr)
+        throw std::runtime_error("cuda_mem::allocate failed in dequant_b_on_device");
+    fn(b->data(), scr.as_float(), N, K, 0);
+    return scr;
 }
 }  // namespace
 
@@ -190,8 +187,8 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
             auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
             if (!dequant_matrix)
                 capability_failure("matmul_transB", b->dtype(), M, K, N);
-            float* b_fp32 = dequant_b_on_device(dequant_matrix, b, N, K);
-            cuda::launch_cublas_sgemm(a_data, b_fp32, o_data, M, K, N, true);
+            auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
+            cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
         } else {
             cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M, K, N,
                                       true);
@@ -207,8 +204,8 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
             auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
             if (!dequant_matrix)
                 capability_failure("matmul_transB", b->dtype(), M, K, N);
-            float* b_fp32 = dequant_b_on_device(dequant_matrix, b, N, K);
-            cuda::launch_cublas_sgemm(a_data, b_fp32, o_data, M, K, N, true);
+            auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
+            cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
         } else {
             cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M, K, N,
                                       true);
@@ -219,11 +216,18 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
         if (gemv) {
             gemv(a_data, b->data(), o_data, K, N, 0);
         } else if (quantized) {
-            auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
-            if (!dequant_matrix)
-                capability_failure("matmul_transB", b->dtype(), M, K, N);
-            float* b_fp32 = dequant_b_on_device(dequant_matrix, b, N, K);
-            cuda::launch_gemv_transB(a_data, b_fp32, o_data, K, N);
+            // No dedicated M=1 kernel: fall back to the batched GEMV (on-the-fly
+            // dequant) with M=1 before dequantizing the whole weight to FP32.
+            auto gemv_batch = device_gemv_batch_fn(b->dtype());
+            if (gemv_batch) {
+                gemv_batch(a_data, b->data(), o_data, 1, K, N, 0);
+            } else {
+                auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
+                if (!dequant_matrix)
+                    capability_failure("matmul_transB", b->dtype(), M, K, N);
+                auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
+                cuda::launch_gemv_transB(a_data, b_scratch.as_float(), o_data, K, N);
+            }
         } else {
             // FP32: use cuBLAS for large N (output_proj), custom GEMV for small N
             if (N > 4096) {

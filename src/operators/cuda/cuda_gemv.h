@@ -69,6 +69,16 @@ void launch_gemv_iq2_s_q8_1(const float* x, const void* q_weight, float* out, in
 void launch_gemv_iq2_s_q8_1_batch(const float* x, const void* q_weight, float* out,
                                     int M, int K, int N, cudaStream_t stream = 0);
 
+// ---- Grouped IQ2_S MoE (phimoe): all-device slot-strided gems ----
+void launch_moe_expert_iq2_s_gateup(const float* x, const void* q_gate, const void* q_up,
+                                    float* out_gate, float* out_up,
+                                    const int* expert_indices, int K, int N, int n_expert,
+                                    int n_expert_used, int n_tokens, cudaStream_t stream);
+void launch_moe_expert_iq2_s_down(const float* x, const void* q_down, float* out,
+                                  const int* expert_indices, const float* expert_weights,
+                                  int K, int N, int n_expert, int n_expert_used,
+                                  int n_tokens, cudaStream_t stream);
+
 // ---- IQ2_XS GEMV (Q8_1 + dp4a) ----
 void launch_gemv_iq2_xs_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
                               cudaStream_t stream = 0);

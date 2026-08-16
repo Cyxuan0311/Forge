@@ -54,8 +54,8 @@ const GemvFn gemv_dispatch[20] = {
     /* BF16=15  */ nullptr,
     /* IQ2_XXS=16 */ launch_gemv_iq2_xxs_q8_1,                      // Q8_1+dp4a (Phase 5)
     /* IQ4_NL=17  */ launch_gemv_iq4_nl_q8_1,                      // Q8_1+dp4a (Phase 5)
-    /* IQ2_XS=18 */ nullptr,                       // M=1: dequant fallback is faster (low GEMV occupancy at K=4096)
-    /* IQ3_S=19  */ nullptr,                        // M=1: dequant fallback is faster (low GEMV occupancy at K=4096)
+    /* IQ2_XS=18 */ launch_gemv_iq2_xs_q8_1,                      // Q8_1+dp4a (M=1, direct quantized GEMV)
+    /* IQ3_S=19  */ launch_gemv_iq3_s_q8_1,                       // Q8_1+dp4a (M=1, direct quantized GEMV)
 };
 
 const GemvBatchFn gemv_batch_dispatch[20] = {

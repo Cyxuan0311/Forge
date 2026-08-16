@@ -516,6 +516,73 @@ void launch_dequant_q6_k_matrix(const void* q_data, float* out, int N, int K, cu
                                                               out, N, K);
 }
 
+// ---- Q6_K → FP16 Matrix Dequantization (for cached output_proj) ----
+
+__global__ void dequant_q6_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
+                                                 __half* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int Q6_K_BLOCK_SIZE = 210;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int j_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * blocks_per_row * Q6_K_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q6_K_BLOCK_SIZE;
+
+    const uint8_t* ql = block_ptr;
+    const uint8_t* qh = ql + 128;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(qh + 64);
+    uint16_t d_bits;
+    memcpy(&d_bits, sc + 16, 2);
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+    int sub = j_in_block / 128;
+    int l_full = j_in_block % 128;
+    int l = l_full % 32;
+    int is = l / 16;
+
+    const uint8_t* ql_sub = ql + sub * 64;
+    const uint8_t* qh_sub = qh + sub * 32;
+    const int8_t* sc_sub = sc + sub * 8;
+
+    int8_t q_val;
+    float scale_val;
+
+    if (l_full < 32) {
+        q_val = (int8_t)((ql_sub[l + 0] & 0xF) | (((qh_sub[l] >> 0) & 3) << 4)) - 32;
+        scale_val = static_cast<float>(sc_sub[is + 0]);
+    } else if (l_full < 64) {
+        q_val = (int8_t)((ql_sub[l + 32] & 0xF) | (((qh_sub[l] >> 2) & 3) << 4)) - 32;
+        scale_val = static_cast<float>(sc_sub[is + 2]);
+    } else if (l_full < 96) {
+        q_val = (int8_t)((ql_sub[l + 0] >> 4) | (((qh_sub[l] >> 4) & 3) << 4)) - 32;
+        scale_val = static_cast<float>(sc_sub[is + 4]);
+    } else {
+        q_val = (int8_t)((ql_sub[l + 32] >> 4) | (((qh_sub[l] >> 6) & 3) << 4)) - 32;
+        scale_val = static_cast<float>(sc_sub[is + 6]);
+    }
+
+    out[idx] = __float2half(d * scale_val * static_cast<float>(q_val));
+}
+
+void launch_dequant_q6_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                      cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q6_k_matrix_fp16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), static_cast<__half*>(out), N, K);
+}
+
 // ---- Q2_K Matrix Dequantization ----
 // Block layout: scales[16] + qs[64] + d(f16,2B) + dmin(f16,2B) = 84 bytes
 
@@ -1001,12 +1068,27 @@ void launch_cublas_sgemm(const float* A, const float* B, float* C, int M, int K,
 #endif
 }
 
-// ---- cuBLAS FP16 × FP32 → FP32 GEMM ----
-// A: [M, K] FP32, B: [N, K] FP16 (transposed), C: [M, N] FP32
+// ---- cuBLAS FP16 × FP16 → FP32 GEMM ----
+// A: [M, K] FP32 (converted to FP16 internally), B: [N, K] FP16 (transposed),
+// C: [M, N] FP32. cublasGemmEx requires Atype == Btype, so A must be converted;
+// accumulation still happens in FP32 (CUBLAS_COMPUTE_32F).
 void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M, int K, int N,
                                    bool transB, cudaStream_t stream) {
 #if FORGE_USE_CUBLAS
     cublasHandle_t handle = get_cublas_handle(stream);
+
+    // Dedicated buffer for the FP16 copy of A: the shared scratch pool is used by
+    // other decode kernels, so keep this one private to avoid aliasing.
+    static void* a_fp16 = nullptr;
+    static size_t a_fp16_capacity = 0;
+    size_t a_bytes = (size_t)M * K * sizeof(__half);
+    if (a_bytes > a_fp16_capacity) {
+        if (a_fp16)
+            cudaFree(a_fp16);
+        cudaMalloc(&a_fp16, a_bytes);
+        a_fp16_capacity = a_bytes;
+    }
+    launch_quantize_f16_matrix(A, a_fp16, M, K, stream);
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -1014,8 +1096,8 @@ void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M
     cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
 
     cublasGemmEx(handle, opB, CUBLAS_OP_N, N, M, K, &alpha,
-                 B, transB ? CUDA_R_16F : CUDA_R_16F, transB ? K : N,
-                 A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
+                 B, CUDA_R_16F, transB ? K : N,
+                 a_fp16, CUDA_R_16F, K, &beta, C, CUDA_R_32F, N,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 #else
     (void)A; (void)B; (void)C; (void)M; (void)K; (void)N; (void)transB; (void)stream;

@@ -1719,6 +1719,124 @@ void launch_ffn_down_fused_q6_k(const float* ffn_mid, const void* q_w2, const fl
         ffn_mid, static_cast<const uint8_t*>(q_w2), residual, out, K, hidden_dim);
 }
 
+// ---- FFN Down Fused Q3_K (M=1, decode) ----
+// Q3_K block layout: hmask[32] + qs[64] + scales[12] + d(f16,2B) = 110 bytes.
+// Each element j (0..255): q_lo = 2-bit from qs, h = 1-bit from hmask,
+// scale = (scales[j/16] - 32) (6-bit signed), value = d * scale * (q_lo - 4*h).
+
+template <int ROWS_PER_WARP>
+__global__ void ffn_down_fused_q3_k_tiled_kernel(const float* __restrict__ ffn_mid,
+                                                  const uint8_t* __restrict__ q_w2,
+                                                  const float* __restrict__ residual,
+                                                  float* __restrict__ out, int K, int N) {
+    const int QK_K = 256;
+    const int Q3_K_BLOCK_SIZE = 110;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    int first_row = global_warp_id * ROWS_PER_WARP;
+    if (first_row >= N)
+        return;
+
+    float sums[ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r)
+        sums[r] = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        float x_vals[8];
+        {
+            int base = bi * QK_K;
+            if (base + lane < K) x_vals[0] = ffn_mid[base + lane];
+            else x_vals[0] = 0.0f;
+            if (base + 32 + lane < K) x_vals[1] = ffn_mid[base + 32 + lane];
+            else x_vals[1] = 0.0f;
+            if (base + 64 + lane < K) x_vals[2] = ffn_mid[base + 64 + lane];
+            else x_vals[2] = 0.0f;
+            if (base + 96 + lane < K) x_vals[3] = ffn_mid[base + 96 + lane];
+            else x_vals[3] = 0.0f;
+            if (base + 128 + lane < K) x_vals[4] = ffn_mid[base + 128 + lane];
+            else x_vals[4] = 0.0f;
+            if (base + 160 + lane < K) x_vals[5] = ffn_mid[base + 160 + lane];
+            else x_vals[5] = 0.0f;
+            if (base + 192 + lane < K) x_vals[6] = ffn_mid[base + 192 + lane];
+            else x_vals[6] = 0.0f;
+            if (base + 224 + lane < K) x_vals[7] = ffn_mid[base + 224 + lane];
+            else x_vals[7] = 0.0f;
+        }
+
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            int row = first_row + r;
+            if (row >= N)
+                break;
+
+            const uint8_t* row_ptr = q_w2 + (size_t)row * blocks_per_row * Q3_K_BLOCK_SIZE;
+            const uint8_t* block_ptr = row_ptr + bi * Q3_K_BLOCK_SIZE;
+
+            const uint8_t* hmask = block_ptr;    // 32 bytes (1 bit per element)
+            const uint8_t* qs = hmask + 32;       // 64 bytes (2 bits per element)
+            const uint8_t* scales_raw = qs + 64;  // 12 bytes (16 packed 6-bit scales)
+
+            uint16_t d_bits;
+            memcpy(&d_bits, scales_raw + 12, 2);
+            float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+            int8_t scales[16];
+            q3_k_unpack_scales(scales_raw, scales);
+
+            // Each lane covers 8 elements: j = lane + 32*n (n = 0..7)
+            //   q_lo = (qs[(j/128)*32 + j%32] >> (2*((j%128)/32))) & 3
+            //        = (qs[(n>>2)*32 + lane] >> (2*(n&3))) & 3
+            //   h    = 1 - ((hmask[j%32] >> (j/32)) & 1)  (hmask is stored inverted)
+            //   is   = j/16 = lane/16 + 2n
+            const int l2 = lane & 3;    // lane%4 (unused, qs shift uses n%4)
+            const int is0 = lane >> 4;  // lane/16
+
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                int q_lo = (qs[((n >> 2) << 5) + lane] >> (2 * (n & 3))) & 3;
+                int h = 1 - ((hmask[lane] >> n) & 1);
+                int is = is0 + 2 * n;
+                float w_val = d * static_cast<float>(scales[is] - 32) *
+                              static_cast<float>(q_lo - 4 * h);
+                sums[r] += x_vals[n] * w_val;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        int row = first_row + r;
+        if (row >= N)
+            break;
+
+        float s = sums[r];
+        s += __shfl_down_sync(0xFFFFFFFF, s, 16);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 8);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 4);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 2);
+        s += __shfl_down_sync(0xFFFFFFFF, s, 1);
+
+        if (lane == 0) {
+            out[row] = s + residual[row];
+        }
+    }
+}
+
+void launch_ffn_down_fused_q3_k(const float* ffn_mid, const void* q_w2, const float* residual,
+                                float* out, int K, int hidden_dim, cudaStream_t stream) {
+    const int ROWS_PER_WARP = 4;
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int num_warps = (hidden_dim + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+    int blocks = (num_warps + warps_per_block - 1) / warps_per_block;
+    ffn_down_fused_q3_k_tiled_kernel<ROWS_PER_WARP><<<blocks, threads, 0, stream>>>(
+        ffn_mid, static_cast<const uint8_t*>(q_w2), residual, out, K, hidden_dim);
+}
+
 // ---- Output Proj Q4_0 (M=1, decode, large N) ----
 // Specialized kernel for output projection where N (vocab_size) is very large
 // (e.g., 152064). Uses multiple warps per row (Split-K) to keep GPU busy.
@@ -1877,6 +1995,82 @@ void launch_output_proj_q5_k(const float* x, const void* q_weight, float* out, i
         x, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
 }
 
+// ---- Output Proj Q6_K Cooperative (M=1, decode) ----
+// The split-K kernel gives each lane a whole 256-element super-block, so for
+// K=5120 (20 blocks/row) only 20 of 32 lanes are active and consecutive lanes
+// read 210 bytes apart, which defeats coalescing entirely. Here all 32 lanes
+// cooperate on one super-block: lane L takes offset L inside each 128-element
+// half, making the ql/qh/x reads contiguous across the warp.
+// Each warp handles one output row (vocab row).
+
+__global__ void output_proj_q6_k_cooperative_kernel(
+        const float* __restrict__ x,
+        const uint8_t* __restrict__ q_weight,
+        float* __restrict__ out,
+        int K, int N) {
+    const int QK_K = 256;
+    const int Q6_K_BLOCK_SIZE = 210;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
+
+    if (warp_id >= N)
+        return;
+
+    const uint8_t* row_ptr = q_weight + (size_t)warp_id * blocks_per_row * Q6_K_BLOCK_SIZE;
+    const int is_ = lane / 16;
+
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const uint8_t* block_ptr = row_ptr + bi * Q6_K_BLOCK_SIZE;
+        const uint8_t* ql = block_ptr;
+        const uint8_t* qh = ql + 128;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(qh + 64);
+        uint16_t d_bits;
+        memcpy(&d_bits, sc + 16, 2);
+        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+        int base = bi * QK_K;
+
+        for (int n = 0; n < QK_K; n += 128) {
+            const uint8_t* ql_cur = ql + (n >> 1);
+            const uint8_t* qh_cur = qh + (n >> 2);
+            const int8_t* sc_cur = sc + (n >> 4);
+
+            uint8_t ql0 = ql_cur[lane];
+            uint8_t ql1 = ql_cur[lane + 32];
+            uint8_t qhv = qh_cur[lane];
+
+            int q1 = (int)((ql0 & 0xF) | (((qhv >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((ql1 & 0xF) | (((qhv >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((ql0 >> 4) | (((qhv >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((ql1 >> 4) | (((qhv >> 6) & 3) << 4)) - 32;
+
+            int idx = base + n + lane;
+            if (idx + 0 < K)
+                sum += x[idx + 0] * (d * (float)sc_cur[is_ + 0] * (float)q1);
+            if (idx + 32 < K)
+                sum += x[idx + 32] * (d * (float)sc_cur[is_ + 2] * (float)q2);
+            if (idx + 64 < K)
+                sum += x[idx + 64] * (d * (float)sc_cur[is_ + 4] * (float)q3);
+            if (idx + 96 < K)
+                sum += x[idx + 96] * (d * (float)sc_cur[is_ + 6] * (float)q4);
+        }
+    }
+
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+
+    if (lane == 0) {
+        out[warp_id] = sum;
+    }
+}
+
 void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, int K, int N,
                               cudaStream_t stream) {
     constexpr int BE = CudaQuantTraits<DataType::Q6_K>::block_elements;
@@ -1885,6 +2079,17 @@ void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, i
     int warps_per_row = (num_blocks_row + 31) / 32;
     if (warps_per_row < 1) warps_per_row = 1;
     if (warps_per_row > 16) warps_per_row = 16;
+
+    // With <=32 blocks per row the split-K kernel degenerates to one lane per
+    // block (uncoalesced, most lanes idle); the cooperative kernel is far faster.
+    if (warps_per_row == 1) {
+        int warps_per_block = 8;
+        int threads = warps_per_block * 32;
+        int blocks = (N + warps_per_block - 1) / warps_per_block;
+        output_proj_q6_k_cooperative_kernel<<<blocks, threads, 0, stream>>>(
+            x, static_cast<const uint8_t*>(q_weight), out, K, N);
+        return;
+    }
 
     int warps_per_block = 8;
     int threads = warps_per_block * 32;

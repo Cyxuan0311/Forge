@@ -40,5 +40,8 @@ void launch_dequant_q4_0_matrix_fp16(const void* q_data, void* out, int N, int K
 void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K,
                                       cudaStream_t stream = 0);
 
+void launch_dequant_q6_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                      cudaStream_t stream = 0);
+
 }  // namespace cuda
 }  // namespace forge

@@ -246,6 +246,9 @@ void launch_multiply(const float* a, const float* b, float* out, int n, cudaStre
 
 void launch_scale(float* data, float s, int n, cudaStream_t stream = 0);
 
+void launch_scale_accumulate(const float* src, float* dst, float s, int n,
+                             cudaStream_t stream = 0);
+
 void launch_gelu_tanh_multiply(float* x, const float* y, int n_per, int n_layer,
                                int layer_idx, int seq_len, cudaStream_t stream = 0);
 
@@ -285,6 +288,9 @@ void launch_dequant_q4_0_matrix_fp16(const void* q_data, void* out, int N, int K
 void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K,
                                      cudaStream_t stream = 0);
 
+void launch_dequant_q6_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream = 0);
+
 void launch_dequant_q4_1_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
 
@@ -311,6 +317,9 @@ void launch_ffn_down_fused_q4_k_q8_1(const float* ffn_mid, const void* q_w2,
                                        int K, int hidden_dim, cudaStream_t stream = 0);
 
 void launch_ffn_down_fused_q5_k(const float* ffn_mid, const void* q_w2, const float* residual,
+                                float* out, int K, int hidden_dim, cudaStream_t stream = 0);
+
+void launch_ffn_down_fused_q3_k(const float* ffn_mid, const void* q_w2, const float* residual,
                                 float* out, int K, int hidden_dim, cudaStream_t stream = 0);
 
 void launch_ffn_down_fused_q6_k(const float* ffn_mid, const void* q_w2, const float* residual,
@@ -453,6 +462,23 @@ void launch_moe_expert_gemv(const float* x, const void* q_w_3d, float* out,
 // ---- GeGLU Split ----
 void launch_gelu_tanh_multiply_split(const float* gate_up, float* out, int half_dim,
                                      int n_tokens, cudaStream_t stream = 0);
+
+// ---- Grouped IQ2_S MoE (phimoe): all-device, slot-strided ----
+// gate+up: computes both projections for every (token,k) slot in one pass,
+// writing unscaled per-slot results (routing weights apply only at the down
+// projection). q_gate/q_up are [n_expert, N, K] axis-0 expert slabs.
+void launch_moe_expert_iq2_s_gateup(const float* x, const void* q_gate, const void* q_up,
+                                    float* out_gate, float* out_up,
+                                    const int* expert_indices,
+                                    int K, int N, int n_expert, int n_expert_used,
+                                    int n_tokens, cudaStream_t stream = 0);
+
+// down: weighted per-slot accumulate into per-token output (deterministic
+// slot order, no atomics). out must be pre-zeroed.
+void launch_moe_expert_iq2_s_down(const float* x, const void* q_down, float* out,
+                                  const int* expert_indices, const float* expert_weights,
+                                  int K, int N, int n_expert, int n_expert_used,
+                                  int n_tokens, cudaStream_t stream = 0);
 
 // ---- I-Quant Dequantization (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_S, IQ4_NL) ----
 

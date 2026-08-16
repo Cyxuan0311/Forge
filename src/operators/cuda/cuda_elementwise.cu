@@ -76,6 +76,19 @@ void launch_scale(float* data, float s, int n, cudaStream_t stream) {
     scale_kernel<<<blocks, threads, 0, stream>>>(data, s, n);
 }
 
+__global__ void scale_accumulate_kernel(const float* src, float* dst, float s, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] += s * src[idx];
+    }
+}
+
+void launch_scale_accumulate(const float* src, float* dst, float s, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    scale_accumulate_kernel<<<blocks, threads, 0, stream>>>(src, dst, s, n);
+}
+
 // GELU(tanh) activation + element-wise multiply with per-layer embedding slice
 // x[i] = gelu_tanh(x[i]) * y[offset + i] for each token row
 __global__ void gelu_tanh_multiply_kernel(
