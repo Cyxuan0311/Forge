@@ -715,15 +715,17 @@ def load_model_and_tokenize(args, model_path=None):
     )
     if args.device == "cuda":
         print("Warming up CUDA kernels...")
-        try:
-            if profiling_enabled:
-                perf.start("startup.warmup")
-            ctx.warmup()
-            if profiling_enabled:
-                perf.stop("startup.warmup")
-            print("Warmup done!")
-        except RuntimeError as e:
-            print(f"Warmup skipped ({e})")
+    else:
+        print("Warming up CPU kernels...")
+    try:
+        if profiling_enabled:
+            perf.start("startup.warmup")
+        ctx.warmup()
+        if profiling_enabled:
+            perf.stop("startup.warmup")
+        print("Warmup done!")
+    except RuntimeError as e:
+        print(f"Warmup skipped ({e})")
 
     # Read KV stats after warmup: the cache is lazily allocated on first forward,
     # so querying before it would always report fp32 / 0 MB.

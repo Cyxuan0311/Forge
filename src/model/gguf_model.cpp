@@ -1,6 +1,7 @@
 #include "forge/gguf_model.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -584,40 +585,37 @@ void GgufModel::prefetch_pages(int nthreads) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Kernel read-ahead hint (MADV_WILLNEED / PrefetchVirtualMemory).
-    forge_prefetch(mapped_data_, mapped_size_);
-
-    // Parallel sequential read of the file through the page cache: faults the
-    // whole model in at near-sequential storage speed (instead of the strided
-    // faulting the first forward pass would trigger), then reads straight from
-    // RAM-backed pages. The buffer is tiny; the point is to populate the cache.
+    // Warm the mmap *fault* path by touching every page through the mapping
+    // itself. On WSL2 DrvFs/9p a read()-loop (or MADV_WILLNEED) does NOT
+    // populate the page cache that mmap faults consult, so a naive read-based
+    // prefetch leaves the first forward pass cold; the fault path, however,
+    // self-warms: one cold sequential touch (page-faults at storage speed)
+    // makes subsequent faults RAM-speed.
     if (nthreads <= 0)
         nthreads = std::min(8, static_cast<int>(std::thread::hardware_concurrency()));
     if (nthreads < 1)
         nthreads = 1;
 
-    static constexpr size_t CHUNK = 1 << 20;  // 1 MiB
+    constexpr uint64_t PAGE = 4096;
 
+    std::atomic<uint64_t> checksum{0};
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(nthreads));
     for (int t = 0; t < nthreads; ++t) {
-        workers.emplace_back([this, t, nthreads]() {
-            std::vector<char> buf(CHUNK);
+        workers.emplace_back([this, t, nthreads, &checksum]() {
             const uint64_t total = static_cast<uint64_t>(mapped_size_);
             const uint64_t begin = (total * static_cast<uint64_t>(t)) / static_cast<uint64_t>(nthreads);
             const uint64_t end = (total * static_cast<uint64_t>(t + 1)) / static_cast<uint64_t>(nthreads);
-            uint64_t off = begin;
-            while (off < end) {
-                const size_t n = static_cast<size_t>(std::min<uint64_t>(CHUNK, end - off));
-                const ssize_t r = forge_read(fd_, buf.data(), n);
-                if (r <= 0)
-                    break;
-                off += static_cast<uint64_t>(r);
-            }
+            const volatile uint8_t* vp = static_cast<const volatile uint8_t*>(mapped_data_);
+            uint64_t s = 0;
+            for (uint64_t off = begin; off < end; off += PAGE)
+                s += vp[off];
+            checksum.fetch_add(s, std::memory_order_relaxed);
         });
     }
     for (auto& w : workers)
         w.join();
+    (void)checksum.load();
 
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
