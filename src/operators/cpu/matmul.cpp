@@ -619,15 +619,22 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                     } else
 #endif
                     {
-                        // Try repacked weights for better cache locality
-                        const uint8_t* repacked = get_repacked_q4_0(b->data(), K, N);
-                        if (repacked) {
-                            PERF_SCOPE("matmul_transB/q4_0_gemm_decode_repacked");
-                            cpu::gemm_q4_0_decode_repacked_f16c_avx2(a_data, repacked, o_data, K, N);
+                        // Prefer llama-style 8x8 LUT layout, then RM=4 repacked
+                        const uint8_t* repacked_8x8 = get_repacked_q4_0_8x8(b->data(), K, N);
+                        if (repacked_8x8) {
+                            PERF_SCOPE("matmul_transB/q4_0_gemm_decode_8x8");
+                            cpu::gemv_q4_0_8x8_q8_0_avx2(a_data, repacked_8x8, o_data, K, N);
                         } else {
-                            PERF_SCOPE("matmul_transB/q4_0_gemm_decode");
-                            cpu::gemm_q4_0_decode_f16c_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
-                                                              K, N);
+                            // Try repacked weights for better cache locality
+                            const uint8_t* repacked = get_repacked_q4_0(b->data(), K, N);
+                            if (repacked) {
+                                PERF_SCOPE("matmul_transB/q4_0_gemm_decode_repacked");
+                                cpu::gemm_q4_0_decode_repacked_f16c_avx2(a_data, repacked, o_data, K, N);
+                            } else {
+                                PERF_SCOPE("matmul_transB/q4_0_gemm_decode");
+                                cpu::gemm_q4_0_decode_f16c_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                                  K, N);
+                            }
                         }
                     }
                 } else {
@@ -639,9 +646,25 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                     } else
 #endif
                     {
-                        PERF_SCOPE("matmul_transB/q4_0_gemm_batch");
-                        cpu::gemm_q4_0_batch_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
-                                                    M, K, N);
+                        // Prefer llama-style 8x8 LUT layout for large batches:
+                        // each weight block is decoded once and reused across all
+                        // M rows. Small batches stay on the 4x4 tile kernel, which
+                        // keeps accumulators in registers (measured faster for M<64).
+                        if (M >= 64) {
+                            const uint8_t* repacked_8x8 = get_repacked_q4_0_8x8(b->data(), K, N);
+                            if (repacked_8x8) {
+                                PERF_SCOPE("matmul_transB/q4_0_gemm_batch_8x8");
+                                cpu::gemm_q4_0_8x8_batch_avx2(a_data, repacked_8x8, o_data, M, K, N);
+                            } else {
+                                PERF_SCOPE("matmul_transB/q4_0_gemm_batch");
+                                cpu::gemm_q4_0_batch_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                            M, K, N);
+                            }
+                        } else {
+                            PERF_SCOPE("matmul_transB/q4_0_gemm_batch");
+                            cpu::gemm_q4_0_batch_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                                        M, K, N);
+                        }
                     }
                 }
             } else if (b->dtype() == DataType::Q8_0) {
@@ -1097,7 +1120,20 @@ TensorPtr matmul_transB_fused_qkv_q4_0(const TensorPtr& input, const TensorPtr& 
     const uint8_t* repacked_k = get_repacked_q4_0(wk->data(), K, N_k);
     const uint8_t* repacked_v = get_repacked_q4_0(wv->data(), K, N_v);
 
-    if (repacked_q && repacked_k && repacked_v) {
+    // Decode prefers the llama-style 8x8 LUT layout (M==1 only).
+    const uint8_t* q8 = (M == 1) ? get_repacked_q4_0_8x8(wq->data(), K, N_q) : nullptr;
+    const uint8_t* k8 = (M == 1) ? get_repacked_q4_0_8x8(wk->data(), K, N_k) : nullptr;
+    const uint8_t* v8 = (M == 1) ? get_repacked_q4_0_8x8(wv->data(), K, N_v) : nullptr;
+
+    if (q8 && k8 && v8) {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_fused_qkv_8x8_avx2(
+                a_data + m * K, q8, k8, v8,
+                static_cast<float*>(q_out->data()) + m * N_q,
+                static_cast<float*>(k_out->data()) + m * N_k,
+                static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+        }
+    } else if (repacked_q && repacked_k && repacked_v) {
         for (int m = 0; m < M; ++m) {
             cpu::gemv_q4_0_fused_qkv_repacked_avx2(
                 a_data + m * K, repacked_q, repacked_k, repacked_v,
@@ -1192,10 +1228,19 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_0(const TensorPtr& input,
     const float* r_data = static_cast<const float*>(residual->data());
     float* o_data = static_cast<float*>(out->data());
 
-    for (int m = 0; m < M; ++m) {
-        cpu::gemv_q4_0_ffn_down_residual_avx2(a_data + m * K,
-                                              static_cast<const uint8_t*>(weight->data()),
-                                              r_data + m * N, o_data + m * N, K, N);
+    // Decode prefers the llama-style 8x8 LUT layout (M==1 only).
+    const uint8_t* w8 = (M == 1) ? get_repacked_q4_0_8x8(weight->data(), K, N) : nullptr;
+    if (w8) {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_8x8_residual_avx2(
+                a_data + m * K, w8, r_data + m * N, o_data + m * N, K, N);
+        }
+    } else {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_ffn_down_residual_avx2(a_data + m * K,
+                                                  static_cast<const uint8_t*>(weight->data()),
+                                                  r_data + m * N, o_data + m * N, K, N);
+        }
     }
 #elif defined(USE_NEON)
     const float* a_data = static_cast<const float*>(input->data());
@@ -1303,10 +1348,19 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
     const float* r_data = static_cast<const float*>(residual->data());
     float* o_data = static_cast<float*>(out->data());
 
-    for (int m = 0; m < M; ++m) {
-        cpu::gemv_q4_0_attn_proj_residual_avx2(a_data + m * K,
-                                               static_cast<const uint8_t*>(weight->data()),
-                                               r_data + m * N, o_data + m * N, K, N);
+    // Decode prefers the llama-style 8x8 LUT layout (M==1 only).
+    const uint8_t* w8 = (M == 1) ? get_repacked_q4_0_8x8(weight->data(), K, N) : nullptr;
+    if (w8) {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_8x8_residual_avx2(
+                a_data + m * K, w8, r_data + m * N, o_data + m * N, K, N);
+        }
+    } else {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_attn_proj_residual_avx2(a_data + m * K,
+                                                   static_cast<const uint8_t*>(weight->data()),
+                                                   r_data + m * N, o_data + m * N, K, N);
+        }
     }
 #elif defined(USE_NEON)
     const float* a_data = static_cast<const float*>(input->data());
@@ -2366,7 +2420,17 @@ TensorPtr matmul_transB_fused_ffn_up_q4_0(const TensorPtr& input, const TensorPt
     const uint8_t* repacked_gate = get_repacked_q4_0(w_gate->data(), K, N);
     const uint8_t* repacked_up = get_repacked_q4_0(w_up->data(), K, N);
 
-    if (repacked_gate && repacked_up) {
+    // For decode (M==1) prefer the llama-style 8x8 LUT layout: two matrices
+    // are read in lockstep so the gate+up weights stay co-prefetched.
+    const uint8_t* gate_8x8 = (M == 1) ? get_repacked_q4_0_8x8(w_gate->data(), K, N) : nullptr;
+    const uint8_t* up_8x8 = (M == 1) ? get_repacked_q4_0_8x8(w_up->data(), K, N) : nullptr;
+
+    if (gate_8x8 && up_8x8) {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_fused_ffn_up_8x8_avx2(
+                a_data + m * K, gate_8x8, up_8x8, o_data + m * N, K, N);
+        }
+    } else if (repacked_gate && repacked_up) {
         for (int m = 0; m < M; ++m) {
             cpu::gemv_q4_0_fused_ffn_up_repacked_avx2(
                 a_data + m * K, repacked_gate, repacked_up, o_data + m * N, K, N);

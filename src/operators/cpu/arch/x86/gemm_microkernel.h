@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -469,7 +470,397 @@ static inline std::pair<uint8_t*, size_t> repack_q4_0_weights(
 }
 
 // ============================================================================
-// Q4_K 8-row interleaved repack (llama.cpp block_q4_Kx8, MIT)
+// Q4_0 8-row interleaved repack (llama.cpp block_q4_0x8, MIT) + 8x8 GEMV
+// ============================================================================
+// Ported from llama.cpp (ggml/src/ggml-cpu/repack.cpp: make_block_q4_0x8 and
+// arch/x86/repack.cpp: gemv_q4_b32_8x8_q8_0_lut_avx). Interleaves 8 rows'
+// same Q4_0 block so 4 contiguous 256-bit loads fetch 8 rows' quants at once
+// (better prefetch/bandwidth than the RM=4 layout), and sign-extends nibbles
+// via a LUT. Quants are XOR'd with 0x88 during repack to convert the Q4_0
+// "nibble - 8" encoding to two's complement so the LUT maps directly.
+// Total size is unchanged (144 B per 8 rows = 8 * 18 B).
+
+struct block_q4_0x8 {
+    uint16_t d[8];    // fp16 scale per row
+    uint8_t  qs[128]; // 4-bit quants, 8 bytes per row, 8-way interleaved
+};
+static_assert(sizeof(block_q4_0x8) == 8 * 18, "block_q4_0x8 must be 144 bytes");
+
+static inline std::pair<uint8_t*, size_t> repack_q4_0_weights_8x8(
+    const uint8_t* w_data, int64_t K, int64_t N)
+{
+    constexpr int RM = 8;
+    constexpr int BLOCK_SIZE = 32;
+    constexpr int BLOCK_BYTES = 18;
+    if (N % RM != 0 || K % BLOCK_SIZE != 0)
+        return {nullptr, 0};
+    const int64_t nb = K / BLOCK_SIZE;
+    const int64_t row_stride = nb * BLOCK_BYTES;
+    const size_t total_bytes = (size_t)(N / RM) * nb * sizeof(block_q4_0x8);
+    uint8_t* repacked = new uint8_t[total_bytes];
+    block_q4_0x8* out = reinterpret_cast<block_q4_0x8*>(repacked);
+    constexpr uint8_t XOR = 0x88;
+
+    for (int64_t g = 0; g < N / RM; ++g) {
+        const uint8_t* rows[RM];
+        for (int r = 0; r < RM; ++r)
+            rows[r] = w_data + (size_t)(g * RM + r) * row_stride;
+        for (int64_t l = 0; l < nb; ++l) {
+            block_q4_0x8& dst = out[(size_t)g * nb + l];
+            for (int r = 0; r < RM; ++r) {
+                uint16_t d;
+                std::memcpy(&d, rows[r] + l * BLOCK_BYTES, 2);
+                dst.d[r] = d;
+            }
+            // Interleave 8 rows' 16 bytes of nibbles in 8-byte chunks.
+            for (int i = 0; i < 16; ++i) {
+                const int src_id = i % 8;
+                const int src_off = (i / 8) * 8;
+                const int dst_off = i * 8;
+                const uint8_t* src = rows[src_id] + l * BLOCK_BYTES + 2 + src_off;
+                for (int k = 0; k < 8; ++k)
+                    dst.qs[dst_off + k] = src[k] ^ XOR;
+            }
+        }
+    }
+    return {repacked, total_bytes};
+}
+
+// int8 x int8 dot into 8 int32 lanes, sign trick (llama mul_sum_i8 helpers)
+static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc,
+                                                   const __m256i x,
+                                                   const __m256i y) {
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(dot, _mm256_set1_epi16(1)));
+}
+
+// Load 8 fp16 scales and rearrange lanes to [d0,d4,d2,d6,d1,d5,d3,d7] to
+// match the [B0,B4,B1,B5,B2,B6,B3,B7] lane order of the 8x8 accumulator.
+static inline __m256 load_col_scale_q4_0x8_rearranged(const uint16_t* d8) {
+    const __m128i mask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
+    return _mm256_cvtph_ps(_mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)d8), mask));
+}
+
+// 8-lane int8 dot of one Q8_0 activation block against pre-decoded 8-row
+// weights (the v_* vectors from a block_q4_0x8). Returns the int32 lanes in
+// [B0,B4,B1,B5,B2,B6,B3,B7] order (callers permute via finalperm before store).
+static inline __m256i gemv_q4_0_8x8_dots_8lanes(
+    const __m256i& v_0123_0, const __m256i& v_4567_0,
+    const __m256i& v_0123_1, const __m256i& v_4567_1,
+    const __m256i& v_0123_2, const __m256i& v_4567_2,
+    const __m256i& v_0123_3, const __m256i& v_4567_3,
+    const int8_t* aqs) {
+    const __m128i a_lo = _mm_loadu_si128((const __m128i*)aqs);
+    const __m128i a_hi = _mm_loadu_si128((const __m128i*)(aqs + 16));
+    const __m256i lhs_0 = _mm256_permute2f128_si256(
+        _mm256_castsi128_si256(a_lo), _mm256_castsi128_si256(a_lo), 0);
+    const __m256i lhs_1 = _mm256_permute2f128_si256(
+        _mm256_castsi128_si256(a_hi), _mm256_castsi128_si256(a_hi), 0);
+
+    __m256i iacc = _mm256_setzero_si256();
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_0, _mm256_shuffle_epi32(v_4567_0, 177), 170), _mm256_shuffle_epi32(lhs_0, 0));
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_0, 177), v_4567_0, 170), _mm256_shuffle_epi32(lhs_0, 85));
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_1, _mm256_shuffle_epi32(v_4567_1, 177), 170), _mm256_shuffle_epi32(lhs_0, 170));
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_1, 177), v_4567_1, 170), _mm256_shuffle_epi32(lhs_0, 255));
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_2, _mm256_shuffle_epi32(v_4567_2, 177), 170), _mm256_shuffle_epi32(lhs_1, 0));
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_2, 177), v_4567_2, 170), _mm256_shuffle_epi32(lhs_1, 85));
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_3, _mm256_shuffle_epi32(v_4567_3, 177), 170), _mm256_shuffle_epi32(lhs_1, 170));
+    iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_3, 177), v_4567_3, 170), _mm256_shuffle_epi32(lhs_1, 255));
+    return iacc;
+}
+
+// Decode a block_q4_0x8 into the 8 row vectors + lane-ordered fp32 col scale.
+static inline void gemv_q4_0_8x8_decode_block(const block_q4_0x8* blk,
+                                              const __m256i& lut, const __m256i& m4b,
+                                              __m256i& v_0123_0, __m256i& v_4567_0,
+                                              __m256i& v_0123_1, __m256i& v_4567_1,
+                                              __m256i& v_0123_2, __m256i& v_4567_2,
+                                              __m256i& v_0123_3, __m256i& v_4567_3,
+                                              __m256& col_scale) {
+    const __m256i raw_0123_0 = _mm256_loadu_si256((const __m256i*)(blk->qs));
+    const __m256i raw_4567_0 = _mm256_loadu_si256((const __m256i*)(blk->qs + 32));
+    const __m256i raw_0123_1 = _mm256_loadu_si256((const __m256i*)(blk->qs + 64));
+    const __m256i raw_4567_1 = _mm256_loadu_si256((const __m256i*)(blk->qs + 96));
+
+    v_0123_0 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_0123_0, m4b));
+    v_4567_0 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_4567_0, m4b));
+    v_0123_1 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_0123_1, m4b));
+    v_4567_1 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_4567_1, m4b));
+    v_0123_2 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_0123_0, 4), m4b));
+    v_4567_2 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_4567_0, 4), m4b));
+    v_0123_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_0123_1, 4), m4b));
+    v_4567_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_4567_1, 4), m4b));
+
+    col_scale = load_col_scale_q4_0x8_rearranged(blk->d);
+}
+
+// Dot one 8-row group of block_q4_0x8 against the Q8_0 activation; returns
+// the accumulator with lanes in [B0,B4,B1,B5,B2,B6,B3,B7] order (callers
+// permute via finalperm before storing).
+static inline __m256 gemv_q4_0_8x8_dot_group(const uint8_t* w8_group,
+                                             const block_q8_0_act* q8_act, int64_t nb,
+                                             const __m256i& lut, const __m256i& m4b) {
+    const block_q4_0x8* b_ptr = reinterpret_cast<const block_q4_0x8*>(w8_group);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int64_t b = 0; b < nb; ++b) {
+        if (b + 4 < nb)
+            _mm_prefetch((const char*)(b_ptr + b + 4), _MM_HINT_T0);
+
+        __m256i v_0123_0, v_4567_0, v_0123_1, v_4567_1, v_0123_2, v_4567_2, v_0123_3, v_4567_3;
+        __m256 col_scale;
+        gemv_q4_0_8x8_decode_block(b_ptr + b, lut, m4b,
+                                   v_0123_0, v_4567_0, v_0123_1, v_4567_1,
+                                   v_0123_2, v_4567_2, v_0123_3, v_4567_3, col_scale);
+
+        const __m256 row_scale = _mm256_set1_ps(q8_act[b].d);
+        const __m256 scale = _mm256_mul_ps(col_scale, row_scale);
+
+        const __m256i iacc = gemv_q4_0_8x8_dots_8lanes(
+            v_0123_0, v_4567_0, v_0123_1, v_4567_1,
+            v_0123_2, v_4567_2, v_0123_3, v_4567_3, q8_act[b].qs);
+
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scale, acc);
+    }
+    return acc;
+}
+
+// Q4_0 8x8 batch GEMM (prefill, M > 1) on the block_q4_0x8 layout.
+// Each weight block is decoded once and reused across all M activation rows
+// (weight DRAM traffic = 1x); accumulators stay lane-ordered in a scratch
+// buffer, so no horizontal reductions are needed in the inner loop.
+static void gemm_q4_0_8x8_batch_avx2(
+    const float* a_data,     // [M, K] FP32 activation
+    const uint8_t* w_8x8,    // block_q4_0x8 repacked weights
+    float* o_data,           // [M, N] FP32 output
+    int64_t M, int64_t K, int64_t N)
+{
+    constexpr int RM = 8;
+    constexpr int BLOCK_SIZE = 32;
+    const int64_t nb = K / BLOCK_SIZE;
+    const int64_t num_groups = N / RM;
+
+    scratch_vec<block_q8_0_act> q8(M * nb);
+    for (int64_t m = 0; m < M; ++m)
+        quantize_row_q8_0_act(a_data + m * K, q8.data() + m * nb, (int)K);
+
+    const __m128i lut128 = _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8,
+                                        7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256i lut = _mm256_permute2f128_si256(
+        _mm256_castsi128_si256(lut128), _mm256_castsi128_si256(lut128), 0);
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+    const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+
+    #pragma omp parallel
+    {
+        const int64_t ith = omp_get_thread_num();
+        const int64_t nth = omp_get_num_threads();
+        const int64_t g_begin = (num_groups * ith) / nth;
+        const int64_t g_end = (num_groups * (ith + 1)) / nth;
+        alignas(32) std::vector<float> acc(M * RM);
+        for (int64_t g = g_begin; g < g_end; ++g) {
+            const block_q4_0x8* gb = reinterpret_cast<const block_q4_0x8*>(
+                w_8x8 + g * nb * sizeof(block_q4_0x8));
+            std::fill(acc.begin(), acc.end(), 0.0f);
+
+            for (int64_t b = 0; b < nb; ++b) {
+                if (b + 4 < nb)
+                    _mm_prefetch((const char*)(gb + b + 4), _MM_HINT_T0);
+
+                __m256i v_0123_0, v_4567_0, v_0123_1, v_4567_1, v_0123_2, v_4567_2, v_0123_3, v_4567_3;
+                __m256 col_scale;
+                gemv_q4_0_8x8_decode_block(gb + b, lut, m4b,
+                                           v_0123_0, v_4567_0, v_0123_1, v_4567_1,
+                                           v_0123_2, v_4567_2, v_0123_3, v_4567_3, col_scale);
+
+                for (int64_t m = 0; m < M; ++m) {
+                    const block_q8_0_act* ab = q8.data() + m * nb + b;
+                    const __m256 scale = _mm256_mul_ps(col_scale, _mm256_set1_ps(ab->d));
+                    const __m256i iacc = gemv_q4_0_8x8_dots_8lanes(
+                        v_0123_0, v_4567_0, v_0123_1, v_4567_1,
+                        v_0123_2, v_4567_2, v_0123_3, v_4567_3, ab->qs);
+                    __m256 cur = _mm256_loadu_ps(acc.data() + m * RM);
+                    _mm256_storeu_ps(acc.data() + m * RM,
+                                     _mm256_add_ps(cur, _mm256_mul_ps(_mm256_cvtepi32_ps(iacc), scale)));
+                }
+            }
+
+            for (int64_t m = 0; m < M; ++m)
+                _mm256_storeu_ps(o_data + m * N + g * RM,
+                                 _mm256_permutevar8x32_ps(
+                                     _mm256_loadu_ps(acc.data() + m * RM), finalperm));
+        }
+    }
+}
+
+// Q4_0 8x8 decode GEMV (M=1) on the block_q4_0x8 layout, Q8_0 activation.
+static void gemv_q4_0_8x8_q8_0_avx2(const float* a_data, const uint8_t* w_repacked,
+                                    float* o_data, int64_t K, int64_t N) {
+    constexpr int RM = 8;
+    constexpr int BLOCK_SIZE = 32;
+    const int64_t nb = K / BLOCK_SIZE;
+    const int64_t num_groups = N / RM;
+
+    scratch_vec<block_q8_0_act> q8_act(nb);
+    quantize_row_q8_0_act(a_data, q8_act.data(), (int)K);
+
+    const __m128i lut128 = _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8,
+                                        7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256i lut = _mm256_permute2f128_si256(
+        _mm256_castsi128_si256(lut128), _mm256_castsi128_si256(lut128), 0);
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+    const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t g = 0; g < num_groups; ++g) {
+        __m256 acc_row = gemv_q4_0_8x8_dot_group(
+            w_repacked + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
+        _mm256_storeu_ps(o_data + g * RM, _mm256_permutevar8x32_ps(acc_row, finalperm));
+    }
+}
+
+// Q4_0 8x8 decode GEMV (M=1) with elementwise residual add (used for both the
+// FFN down-projection and the attention output projection): out = a@w + r.
+static void gemv_q4_0_8x8_residual_avx2(const float* a_data, const uint8_t* w_repacked,
+                                        const float* r_data, float* o_data,
+                                        int64_t K, int64_t N) {
+    constexpr int RM = 8;
+    constexpr int BLOCK_SIZE = 32;
+    const int64_t nb = K / BLOCK_SIZE;
+    const int64_t num_groups = N / RM;
+
+    scratch_vec<block_q8_0_act> q8_act(nb);
+    quantize_row_q8_0_act(a_data, q8_act.data(), (int)K);
+
+    const __m128i lut128 = _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8,
+                                        7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256i lut = _mm256_permute2f128_si256(
+        _mm256_castsi128_si256(lut128), _mm256_castsi128_si256(lut128), 0);
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+    const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t g = 0; g < num_groups; ++g) {
+        __m256 acc_row = gemv_q4_0_8x8_dot_group(
+            w_repacked + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
+        const __m256 res = _mm256_loadu_ps(r_data + g * RM);
+        _mm256_storeu_ps(o_data + g * RM,
+                         _mm256_add_ps(_mm256_permutevar8x32_ps(acc_row, finalperm), res));
+    }
+}
+
+// Fused FFN gate+up Q4_0 8x8 decode GEMV (M=1): computes out = silu(gate)*up
+// over the same activation in a single pass over both 8x8 repacked matrices.
+static void gemv_q4_0_fused_ffn_up_8x8_avx2(const float* a_data,
+                                            const uint8_t* w_gate_8x8,
+                                            const uint8_t* w_up_8x8,
+                                            float* o_data, int64_t K, int64_t N) {
+    constexpr int RM = 8;
+    constexpr int BLOCK_SIZE = 32;
+    const int64_t nb = K / BLOCK_SIZE;
+    const int64_t num_groups = N / RM;
+
+    scratch_vec<block_q8_0_act> q8_act(nb);
+    quantize_row_q8_0_act(a_data, q8_act.data(), (int)K);
+
+    const __m128i lut128 = _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8,
+                                        7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256i lut = _mm256_permute2f128_si256(
+        _mm256_castsi128_si256(lut128), _mm256_castsi128_si256(lut128), 0);
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+    const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+
+    auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t g = 0; g < num_groups; ++g) {
+        const block_q4_0x8* gb = reinterpret_cast<const block_q4_0x8*>(
+            w_gate_8x8 + g * nb * sizeof(block_q4_0x8));
+        const block_q4_0x8* ub = reinterpret_cast<const block_q4_0x8*>(
+            w_up_8x8 + g * nb * sizeof(block_q4_0x8));
+        __m256 acc_g = _mm256_setzero_ps();
+        __m256 acc_u = _mm256_setzero_ps();
+
+        for (int64_t b = 0; b < nb; ++b) {
+            if (b + 4 < nb) {
+                _mm_prefetch((const char*)(gb + b + 4), _MM_HINT_T0);
+                _mm_prefetch((const char*)(ub + b + 4), _MM_HINT_T0);
+            }
+
+            const __m256 row_scale = _mm256_set1_ps(q8_act[b].d);
+            const __m128i a0 = _mm_loadu_si128((const __m128i*)q8_act[b].qs);
+            const __m128i a1 = _mm_loadu_si128((const __m128i*)(q8_act[b].qs + 16));
+            const __m256i lhs_0 = _mm256_permute2f128_si256(
+                _mm256_castsi128_si256(a0), _mm256_castsi128_si256(a0), 0);
+            const __m256i lhs_1 = _mm256_permute2f128_si256(
+                _mm256_castsi128_si256(a1), _mm256_castsi128_si256(a1), 0);
+
+            // ---- gate ----
+            {
+                const __m256i raw_0 = _mm256_loadu_si256((const __m256i*)(gb[b].qs));
+                const __m256i raw_1 = _mm256_loadu_si256((const __m256i*)(gb[b].qs + 32));
+                const __m256i raw_2 = _mm256_loadu_si256((const __m256i*)(gb[b].qs + 64));
+                const __m256i raw_3 = _mm256_loadu_si256((const __m256i*)(gb[b].qs + 96));
+                const __m256i v_0123_0 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_0, m4b));
+                const __m256i v_4567_0 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_1, m4b));
+                const __m256i v_0123_1 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_2, m4b));
+                const __m256i v_4567_1 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_3, m4b));
+                const __m256i v_0123_2 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_0, 4), m4b));
+                const __m256i v_4567_2 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_1, 4), m4b));
+                const __m256i v_0123_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_2, 4), m4b));
+                const __m256i v_4567_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_3, 4), m4b));
+                const __m256 scale = _mm256_mul_ps(load_col_scale_q4_0x8_rearranged(gb[b].d), row_scale);
+                __m256i iacc = _mm256_setzero_si256();
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_0, _mm256_shuffle_epi32(v_4567_0, 177), 170), _mm256_shuffle_epi32(lhs_0, 0));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_0, 177), v_4567_0, 170), _mm256_shuffle_epi32(lhs_0, 85));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_1, _mm256_shuffle_epi32(v_4567_1, 177), 170), _mm256_shuffle_epi32(lhs_0, 170));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_1, 177), v_4567_1, 170), _mm256_shuffle_epi32(lhs_0, 255));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_2, _mm256_shuffle_epi32(v_4567_2, 177), 170), _mm256_shuffle_epi32(lhs_1, 0));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_2, 177), v_4567_2, 170), _mm256_shuffle_epi32(lhs_1, 85));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_3, _mm256_shuffle_epi32(v_4567_3, 177), 170), _mm256_shuffle_epi32(lhs_1, 170));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_3, 177), v_4567_3, 170), _mm256_shuffle_epi32(lhs_1, 255));
+                acc_g = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scale, acc_g);
+            }
+
+            // ---- up ----
+            {
+                const __m256i raw_0 = _mm256_loadu_si256((const __m256i*)(ub[b].qs));
+                const __m256i raw_1 = _mm256_loadu_si256((const __m256i*)(ub[b].qs + 32));
+                const __m256i raw_2 = _mm256_loadu_si256((const __m256i*)(ub[b].qs + 64));
+                const __m256i raw_3 = _mm256_loadu_si256((const __m256i*)(ub[b].qs + 96));
+                const __m256i v_0123_0 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_0, m4b));
+                const __m256i v_4567_0 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_1, m4b));
+                const __m256i v_0123_1 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_2, m4b));
+                const __m256i v_4567_1 = _mm256_shuffle_epi8(lut, _mm256_and_si256(raw_3, m4b));
+                const __m256i v_0123_2 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_0, 4), m4b));
+                const __m256i v_4567_2 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_1, 4), m4b));
+                const __m256i v_0123_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_2, 4), m4b));
+                const __m256i v_4567_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(raw_3, 4), m4b));
+                const __m256 scale = _mm256_mul_ps(load_col_scale_q4_0x8_rearranged(ub[b].d), row_scale);
+                __m256i iacc = _mm256_setzero_si256();
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_0, _mm256_shuffle_epi32(v_4567_0, 177), 170), _mm256_shuffle_epi32(lhs_0, 0));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_0, 177), v_4567_0, 170), _mm256_shuffle_epi32(lhs_0, 85));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_1, _mm256_shuffle_epi32(v_4567_1, 177), 170), _mm256_shuffle_epi32(lhs_0, 170));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_1, 177), v_4567_1, 170), _mm256_shuffle_epi32(lhs_0, 255));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_2, _mm256_shuffle_epi32(v_4567_2, 177), 170), _mm256_shuffle_epi32(lhs_1, 0));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_2, 177), v_4567_2, 170), _mm256_shuffle_epi32(lhs_1, 85));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(v_0123_3, _mm256_shuffle_epi32(v_4567_3, 177), 170), _mm256_shuffle_epi32(lhs_1, 170));
+                iacc = mul_sum_i8_pairs_acc_int32x8(iacc, _mm256_blend_epi32(_mm256_shuffle_epi32(v_0123_3, 177), v_4567_3, 170), _mm256_shuffle_epi32(lhs_1, 255));
+                acc_u = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), scale, acc_u);
+            }
+        }
+
+        const __m256 g_row = _mm256_permutevar8x32_ps(acc_g, finalperm);
+        const __m256 u_row = _mm256_permutevar8x32_ps(acc_u, finalperm);
+        float gr[8], ur[8];
+        _mm256_storeu_ps(gr, g_row);
+        _mm256_storeu_ps(ur, u_row);
+        for (int r = 0; r < RM; ++r)
+            o_data[g * RM + r] = silu(gr[r]) * ur[r];
+    }
+}
 // ============================================================================
 // Ported from llama.cpp (ggml/src/ggml-cpu/repack.cpp: make_block_q4_Kx8 and
 // repack_q4_K_to_q4_K_8_bl). Interleaves 8 rows' same super-block so one
@@ -1424,7 +1815,6 @@ static void gemm_q6_K_avx2(
         quantize_row_q8_K(a_data + m * K, q8_all.data() + m * nb, (int)K);
 
     const int Mi = (int)M;
-
     if (M == 1) {
         // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows
         #pragma omp parallel for schedule(static)

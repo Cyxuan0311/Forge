@@ -203,6 +203,42 @@ static void gemv_q4_0_fused_qkv_repacked_avx2(const float* a, const uint8_t* wq_
     decode(wk_repacked, out_k, N_k);
     decode(wv_repacked, out_v, N_v);
 }
+
+// Same as gemv_q4_0_fused_qkv_repacked_avx2 but consumes the llama-style
+// block_q4_0x8 layout (repack_q4_0_weights_8x8). Requires N_q, N_k, N_v all
+// divisible by 8 (checked at dispatch time via get_repacked_q4_0_8x8).
+static void gemv_q4_0_fused_qkv_8x8_avx2(const float* a, const uint8_t* wq_8x8,
+                                         const uint8_t* wk_8x8, const uint8_t* wv_8x8,
+                                         float* out_q, float* out_k, float* out_v,
+                                         int64_t K, int64_t N_q, int64_t N_k, int64_t N_v) {
+    constexpr int RM = 8;
+    constexpr int BLOCK_SIZE = 32;
+    const int64_t nb = K / BLOCK_SIZE;
+
+    scratch_vec<block_q8_0_act> q8_act(nb);
+    quantize_row_q8_0_act(a, q8_act.data(), (int)K);
+
+    const __m128i lut128 = _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8,
+                                        7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256i lut = _mm256_permute2f128_si256(
+        _mm256_castsi128_si256(lut128), _mm256_castsi128_si256(lut128), 0);
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+    const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+
+    auto decode = [&](const uint8_t* w_8x8, float* out, int64_t N) {
+        const int64_t num_groups = N / RM;
+#    pragma omp parallel for schedule(static)
+        for (int64_t g = 0; g < num_groups; ++g) {
+            __m256 acc_row = forge::cpu::gemv_q4_0_8x8_dot_group(
+                w_8x8 + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
+            _mm256_storeu_ps(out + g * RM, _mm256_permutevar8x32_ps(acc_row, finalperm));
+        }
+    };
+
+    decode(wq_8x8, out_q, N_q);
+    decode(wk_8x8, out_k, N_k);
+    decode(wv_8x8, out_v, N_v);
+}
 #endif  // USE_AVX2
 
 // ---- Fused FFN gate+up projection for Q4_0 decode ----

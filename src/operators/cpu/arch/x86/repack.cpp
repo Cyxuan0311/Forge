@@ -21,6 +21,13 @@ static std::unordered_map<const void*, RepackEntry>& repack_cache() {
     return cache;
 }
 
+// Separate cache for the 8x8 Q4_0 repack so it can coexist with the RM=4
+// repack of the same tensor (fused QKV uses RM=4, fused FFN uses 8x8).
+static std::unordered_map<const void*, RepackEntry>& repack_cache_8x8() {
+    static std::unordered_map<const void*, RepackEntry> cache;
+    return cache;
+}
+
 static std::mutex& repack_mutex() {
     static std::mutex mtx;
     return mtx;
@@ -120,6 +127,37 @@ const uint8_t* get_repacked_q6_K(const void* orig_data, int64_t K, int64_t N) {
     entry.K = K;
     entry.N = N;
     entry.kind = 2;
+    cache[orig_data] = entry;
+    return entry.data;
+}
+
+const uint8_t* get_repacked_q4_0_8x8(const void* orig_data, int64_t K, int64_t N) {
+    if (N % 8 != 0 || K % 32 != 0) return nullptr;  // must fit 8x8 tile
+
+    std::lock_guard<std::mutex> lock(repack_mutex());
+    auto& cache = repack_cache_8x8();
+    auto it = cache.find(orig_data);
+    if (it != cache.end()) {
+        // Validate dimensions match
+        if (it->second.K == K && it->second.N == N) {
+            return it->second.data;
+        }
+        // Dimensions changed (shouldn't happen for same tensor, but handle it)
+        delete[] it->second.data;
+        cache.erase(it);
+    }
+
+    // Repack — forge::cpu::repack_q4_0_weights_8x8 is in gemm_microkernel.h
+    auto result = forge::cpu::repack_q4_0_weights_8x8(
+        static_cast<const uint8_t*>(orig_data), K, N);
+    if (!result.first) return nullptr;
+
+    RepackEntry entry;
+    entry.data = result.first;
+    entry.size = result.second;
+    entry.K = K;
+    entry.N = N;
+    entry.kind = 3;
     cache[orig_data] = entry;
     return entry.data;
 }
