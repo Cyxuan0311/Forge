@@ -665,9 +665,22 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 cpu::gemm_q4_K_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
                                      M, K, N);
             } else if (b->dtype() == DataType::Q6_K) {
-                PERF_SCOPE("matmul_transB/q6_k_gemm");
-                cpu::gemm_q6_K_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
-                                     M, K, N);
+                if (M == 1) {
+                    // Try repacked weights for better cache locality.
+                    const uint8_t* repacked = get_repacked_q6_K(b->data(), K, N);
+                    if (repacked) {
+                        PERF_SCOPE("matmul_transB/q6_k_gemm_8x8_repacked");
+                        cpu::gemv_q6_K_8x8_q8_K_avx2(a_data, repacked, o_data, K, N);
+                    } else {
+                        PERF_SCOPE("matmul_transB/q6_k_gemm");
+                        cpu::gemm_q6_K_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                             M, K, N);
+                    }
+                } else {
+                    PERF_SCOPE("matmul_transB/q6_k_gemm");
+                    cpu::gemm_q6_K_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
+                                         M, K, N);
+                }
             } else if (b->dtype() == DataType::Q2_K) {
                 PERF_SCOPE("matmul_transB/q2_k_gemm");
                 cpu::gemm_q2_K_avx2(a_data, static_cast<const uint8_t*>(b->data()), o_data,
@@ -1080,13 +1093,27 @@ TensorPtr matmul_transB_fused_qkv_q4_0(const TensorPtr& input, const TensorPtr& 
 #ifdef USE_AVX2
     PERF_SCOPE("matmul_transB/fused_qkv_q4_0");
     const float* a_data = static_cast<const float*>(input->data());
-    for (int m = 0; m < M; ++m) {
-        cpu::gemv_q4_0_fused_qkv_avx2(
-            a_data + m * K, static_cast<const uint8_t*>(wq->data()),
-            static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
-            static_cast<float*>(q_out->data()) + m * N_q,
-            static_cast<float*>(k_out->data()) + m * N_k,
-            static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+    const uint8_t* repacked_q = get_repacked_q4_0(wq->data(), K, N_q);
+    const uint8_t* repacked_k = get_repacked_q4_0(wk->data(), K, N_k);
+    const uint8_t* repacked_v = get_repacked_q4_0(wv->data(), K, N_v);
+
+    if (repacked_q && repacked_k && repacked_v) {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_fused_qkv_repacked_avx2(
+                a_data + m * K, repacked_q, repacked_k, repacked_v,
+                static_cast<float*>(q_out->data()) + m * N_q,
+                static_cast<float*>(k_out->data()) + m * N_k,
+                static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+        }
+    } else {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_fused_qkv_avx2(
+                a_data + m * K, static_cast<const uint8_t*>(wq->data()),
+                static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()),
+                static_cast<float*>(q_out->data()) + m * N_q,
+                static_cast<float*>(k_out->data()) + m * N_k,
+                static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+        }
     }
 #elif defined(USE_NEON)
     PERF_SCOPE("matmul_transB/fused_qkv_q4_0");
@@ -1278,8 +1305,8 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
 
     for (int m = 0; m < M; ++m) {
         cpu::gemv_q4_0_attn_proj_residual_avx2(a_data + m * K,
-                                                static_cast<const uint8_t*>(weight->data()),
-                                                r_data + m * N, o_data + m * N, K, N);
+                                               static_cast<const uint8_t*>(weight->data()),
+                                               r_data + m * N, o_data + m * N, K, N);
     }
 #elif defined(USE_NEON)
     const float* a_data = static_cast<const float*>(input->data());
@@ -2334,10 +2361,22 @@ TensorPtr matmul_transB_fused_ffn_up_q4_0(const TensorPtr& input, const TensorPt
     const float* a_data = static_cast<const float*>(input->data());
     float* o_data = static_cast<float*>(out->data());
 
-    for (int m = 0; m < M; ++m) {
-        cpu::gemv_q4_0_fused_ffn_up_avx2(
-            a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
-            static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+    // Prefer repacked weights for cache-friendly 4-row tile groups (same layout
+    // the decode path uses); fall back to the original layout when unavailable.
+    const uint8_t* repacked_gate = get_repacked_q4_0(w_gate->data(), K, N);
+    const uint8_t* repacked_up = get_repacked_q4_0(w_up->data(), K, N);
+
+    if (repacked_gate && repacked_up) {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_fused_ffn_up_repacked_avx2(
+                a_data + m * K, repacked_gate, repacked_up, o_data + m * N, K, N);
+        }
+    } else {
+        for (int m = 0; m < M; ++m) {
+            cpu::gemv_q4_0_fused_ffn_up_avx2(
+                a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+                static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+        }
     }
 #elif defined(USE_NEON)
     PERF_SCOPE("matmul_transB/fused_ffn_up_q4_0");

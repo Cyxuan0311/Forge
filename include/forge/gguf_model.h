@@ -97,6 +97,12 @@ public:
     // No-op if already locked or no mmap active. Only affects CPU-side weights.
     bool mlock_mmap();
 
+    // Warm the kernel page cache for the mapped model file (hint + parallel
+    // sequential read). Prevents the cold-start page-fault storm that otherwise
+    // hits the first forward pass when the model lives on slow storage (USB).
+    // nthreads <= 0 uses min(8, hardware_concurrency). No-op if no mmap active.
+    void prefetch_pages(int nthreads = 0);
+
 private:
     int fd_ = -1;
     void* mapped_data_ = nullptr;

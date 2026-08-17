@@ -439,6 +439,7 @@ int main(int argc, char** argv) {
         model.set_load_mode(args.load_mode);
     }
     model.set_offload_embedding(args.offload_embedding);
+    model.set_prefetch(args.prefetch);
 
     bool load_ok = model.load(args.model_path, args.n_gpu_layers);
     if (!load_ok) {

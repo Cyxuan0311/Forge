@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -69,6 +70,29 @@ std::string Model::detect_format(const std::string& path) {
     return "";
 }
 
+void Model::apply_load_post_steps() {
+    // mlock the mmap region if requested (only for GGUF models with mmap support)
+    if ((load_mode_ == "mlock" || load_mode_ == "mmap_mlock") && format_name_ == "gguf") {
+        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
+        if (gguf) {
+            gguf->mlock_mmap();
+        }
+    }
+    // Warm the kernel page cache so the first forward pass does not page-fault
+    // the whole model in from (possibly slow) storage. Defaults to on; disable
+    // via set_prefetch(false) or the FORGE_PREFETCH=0 environment variable.
+    if (prefetch_ && format_name_ == "gguf") {
+        const char* env = std::getenv("FORGE_PREFETCH");
+        if (env != nullptr && std::strcmp(env, "0") == 0) {
+            return;
+        }
+        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
+        if (gguf) {
+            gguf->prefetch_pages();
+        }
+    }
+}
+
 bool Model::load(const std::string& model_path, DeviceType device) {
     auto t_total_start = std::chrono::high_resolution_clock::now();
 
@@ -85,13 +109,7 @@ bool Model::load(const std::string& model_path, DeviceType device) {
         return false;
     }
 
-    // Apply mlock if requested (only for GGUF models with mmap support)
-    if ((load_mode_ == "mlock" || load_mode_ == "mmap_mlock") && format_name_ == "gguf") {
-        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
-        if (gguf) {
-            gguf->mlock_mmap();
-        }
-    }
+    apply_load_post_steps();
 
     if (format_name_ == "gguf") {
         config_ = parse_config_from_gguf(*loader_);
@@ -136,13 +154,7 @@ bool Model::load(const std::string& model_path, int n_gpu_layers) {
         return false;
     }
 
-    // Apply mlock if requested (only for GGUF models with mmap support)
-    if ((load_mode_ == "mlock" || load_mode_ == "mmap_mlock") && format_name_ == "gguf") {
-        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
-        if (gguf) {
-            gguf->mlock_mmap();
-        }
-    }
+    apply_load_post_steps();
 
     if (format_name_ == "gguf") {
         config_ = parse_config_from_gguf(*loader_);
@@ -246,12 +258,7 @@ bool Model::load(const std::string& model_path, const std::vector<DeviceTarget>&
     }
 
     // Apply mlock if requested
-    if ((load_mode_ == "mlock" || load_mode_ == "mmap_mlock") && format_name_ == "gguf") {
-        auto* gguf = dynamic_cast<GgufModel*>(loader_.get());
-        if (gguf) {
-            gguf->mlock_mmap();
-        }
-    }
+    apply_load_post_steps();
 
     if (format_name_ == "gguf") {
         config_ = parse_config_from_gguf(*loader_);

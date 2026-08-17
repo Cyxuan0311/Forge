@@ -543,6 +543,12 @@ public:
     void set_load_mode(const std::string& mode) { load_mode_ = mode; }
     const std::string& load_mode() const { return load_mode_; }
 
+    // When true (default), warm the model file's kernel page cache at load time
+    // (GgufModel::prefetch_pages). Eliminates the cold-start page-fault storm on
+    // the first forward pass for models on slow storage. Must be set before load.
+    void set_prefetch(bool v) { prefetch_ = v; }
+    bool prefetch() const { return prefetch_; }
+
     // When true (default), token_embedding follows the first layer's device.
     // When false, token_embedding stays on CPU during partial offload (aligns with llama.cpp).
     void set_offload_embedding(bool v) { offload_embedding_ = v; }
@@ -557,6 +563,7 @@ private:
     bool load_from_loader(ModelLoader& loader, const std::vector<DeviceTarget>& layer_devices);
     ModelConfig parse_config_from_gguf(ModelLoader& loader);
     ModelConfig parse_config_from_ninf(ModelLoader& loader);
+    void apply_load_post_steps();  // mlock / page prefetch after loader_->load()
 
     ModelConfig config_;
     WeightStore weight_store_;
@@ -572,6 +579,7 @@ private:
 
     std::string load_mode_;        // "mmap" (default), "mlock", "mmap_mlock"
     bool offload_embedding_ = true; // default: follow first layer device
+    bool prefetch_ = true;          // warm page cache at load (see set_prefetch)
 };
 
 }  // namespace forge

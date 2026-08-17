@@ -6,6 +6,8 @@
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include "../core/platform.h"
 #include "forge/logger.h"
@@ -574,6 +576,53 @@ bool GgufModel::mlock_mmap() {
     }
     LOG_INFO("mlock succeeded: " + std::to_string(mapped_size_) + " bytes pinned");
     return true;
+}
+
+void GgufModel::prefetch_pages(int nthreads) {
+    if (!mapped_data_ || mapped_size_ == 0 || fd_ < 0)
+        return;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Kernel read-ahead hint (MADV_WILLNEED / PrefetchVirtualMemory).
+    forge_prefetch(mapped_data_, mapped_size_);
+
+    // Parallel sequential read of the file through the page cache: faults the
+    // whole model in at near-sequential storage speed (instead of the strided
+    // faulting the first forward pass would trigger), then reads straight from
+    // RAM-backed pages. The buffer is tiny; the point is to populate the cache.
+    if (nthreads <= 0)
+        nthreads = std::min(8, static_cast<int>(std::thread::hardware_concurrency()));
+    if (nthreads < 1)
+        nthreads = 1;
+
+    static constexpr size_t CHUNK = 1 << 20;  // 1 MiB
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(nthreads));
+    for (int t = 0; t < nthreads; ++t) {
+        workers.emplace_back([this, t, nthreads]() {
+            std::vector<char> buf(CHUNK);
+            const uint64_t total = static_cast<uint64_t>(mapped_size_);
+            const uint64_t begin = (total * static_cast<uint64_t>(t)) / static_cast<uint64_t>(nthreads);
+            const uint64_t end = (total * static_cast<uint64_t>(t + 1)) / static_cast<uint64_t>(nthreads);
+            uint64_t off = begin;
+            while (off < end) {
+                const size_t n = static_cast<size_t>(std::min<uint64_t>(CHUNK, end - off));
+                const ssize_t r = forge_read(fd_, buf.data(), n);
+                if (r <= 0)
+                    break;
+                off += static_cast<uint64_t>(r);
+            }
+        });
+    }
+    for (auto& w : workers)
+        w.join();
+
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    LOG_INFO("prefetch: " + std::to_string(mapped_size_ / (1024 * 1024)) + " MB across " +
+             std::to_string(nthreads) + " threads in " + std::to_string((int)secs) + "s");
 }
 
 }  // namespace forge

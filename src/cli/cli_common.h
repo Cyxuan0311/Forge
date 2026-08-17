@@ -42,6 +42,7 @@ struct CliArgs {
     // Memory / load tuning
     std::string load_mode;          // "mmap" (default), "mlock", "mmap_mlock"
     bool offload_embedding = true;  // true = token_embedding follows first layer device
+    bool prefetch = true;           // warm page cache at load (--no-prefetch disables)
 
     // Sampling control
     float temperature = 0.7f;

@@ -34,8 +34,10 @@ static void print_usage(const char* prog) {
            "       --cuda-graph          Enable CUDA Graph for decode (default: off)\n"
            "\n"
            "Memory:\n"
-           "       --load-mode MODE      Memory mapping mode: mmap (default), mlock, mmap_mlock\n"
-           "       --offload-embedding    Offload token_embedding to GPU (default: on)\n"
+            "       --load-mode MODE      Memory mapping mode: mmap (default), mlock, mmap_mlock\n"
+            "       --prefetch            Warm model page cache at load (default: on)\n"
+            "       --no-prefetch         Skip load-time page prefetch\n"
+            "       --offload-embedding    Offload token_embedding to GPU (default: on)\n"
            "       --no-offload-embedding Keep token_embedding on CPU during partial offload\n"
            "\n"
            "Sampling:\n"
@@ -255,6 +257,10 @@ CliArgs parse_args(int argc, char** argv) {
             args.offload_embedding = false;
         } else if (arg == "--no-jinja") {
             args.no_jinja = true;
+        } else if (arg == "--prefetch") {
+            args.prefetch = true;
+        } else if (arg == "--no-prefetch") {
+            args.prefetch = false;
         } else if (arg == "--info") {
             args.info_only = true;
         } else if (arg == "--bench") {
