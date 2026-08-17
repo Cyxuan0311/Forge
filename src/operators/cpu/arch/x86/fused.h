@@ -461,7 +461,7 @@ static void gemv_q4_K_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate, c
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
 
-#    pragma omp parallel for schedule(static)
+#    pragma omp parallel for schedule(dynamic, 64)
     for (int n = 0; n < N; ++n) {
         const uint8_t* gate_row = w_gate + (size_t)n * nb * Q4_K_BLOCK_BYTES;
         const uint8_t* up_row = w_up + (size_t)n * nb * Q4_K_BLOCK_BYTES;
@@ -489,7 +489,7 @@ static void gemv_q4_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     quantize_row_q8_K(a, q8_buf.data(), K);
 
     auto process_row = [&](const uint8_t* w_row, float* out, int N_out) {
-#    pragma omp parallel for schedule(static)
+#    pragma omp parallel for schedule(dynamic, 64)
         for (int n = 0; n < N_out; ++n) {
             const uint8_t* q4_row = w_row + (size_t)n * nb * Q4_K_BLOCK_BYTES;
             out[n] = dot_q4_K_q8_K_avx2(q4_row, q8_buf.data(), nb);

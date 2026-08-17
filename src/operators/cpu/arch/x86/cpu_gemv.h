@@ -1844,7 +1844,7 @@ static void gemv_q6_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
+#    pragma omp parallel for schedule(dynamic, 64)
     for (int n = 0; n < N; ++n) {
         const uint8_t* w_row = w + (size_t)n * nb * Q6_K_BLOCK_BYTES;
         out[n] = dot_q6_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
@@ -1862,7 +1862,7 @@ static void gemv_q4_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
+#    pragma omp parallel for schedule(dynamic, 64)
     for (int n = 0; n < N; ++n) {
         const uint8_t* w_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
         out[n] = dot_q4_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
@@ -1914,7 +1914,7 @@ static void gemv_q4_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
+#    pragma omp parallel for schedule(dynamic, 64)
     for (int n = 0; n < N; ++n) {
         const uint8_t* w_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
         out[n] = dot_q4_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
@@ -1931,7 +1931,7 @@ static void gemv_q6_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
+#    pragma omp parallel for schedule(dynamic, 64)
     for (int n = 0; n < N; ++n) {
         const uint8_t* w_row = w + (size_t)n * nb * Q6_K_BLOCK_BYTES;
         out[n] = dot_q6_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];

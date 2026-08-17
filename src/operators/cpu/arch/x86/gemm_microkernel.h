@@ -1816,8 +1816,10 @@ static void gemm_q6_K_avx2(
 
     const int Mi = (int)M;
     if (M == 1) {
-        // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows
-        #pragma omp parallel for schedule(static)
+        // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows.
+        // Dynamic work-stealing over 16 groups (=64 rows/chunk) like llama.cpp
+        // mul_mat chunking for better DRAM streaming parallelism.
+        #pragma omp parallel for schedule(dynamic, 16)
         for (int64_t n = 0; n < N; n += 4) {
             int64_t rows = std::min(n + 4, N) - n;
             for (int64_t r = 0; r < rows; ++r) {
@@ -2003,8 +2005,10 @@ static void gemm_q4_K_avx2(
     const int Mi = (int)M;
 
     if (M == 1) {
-        // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows
-        #pragma omp parallel for schedule(static)
+        // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows.
+        // Dynamic work-stealing over 16 groups (=64 rows/chunk) like llama.cpp
+        // mul_mat chunking for better DRAM streaming parallelism.
+        #pragma omp parallel for schedule(dynamic, 16)
         for (int64_t n = 0; n < N; n += 4) {
             int64_t rows = std::min(n + 4, N) - n;
             for (int64_t r = 0; r < rows; ++r) {
