@@ -1,6 +1,6 @@
 // Runtime thread-count auto-detection for CPU inference.
 //
-// Decode is dominated by short quantized-GEMV bursts (e.g. Q2_K FFN), where
+// Decode is dominated by short quantized-GEMV bursts (e.g. Q4_0 FFN), where
 // the optimal OpenMP thread count depends on the machine's memory subsystem,
 // core topology and hyperthreading behaviour. A pure streaming-read probe
 // cannot predict decode speed (streaming reads saturate with fewer threads
@@ -40,7 +40,13 @@ namespace forge {
 
 static constexpr int kProbeRowsDefault = 14336;  // Llama-3.1-8B FFN intermediate
 static constexpr int kProbeKDefault = 4096;      // Llama-3.1-8B hidden dim
-static constexpr int kProbeReps = 12;            // bursts per candidate (median)
+static constexpr int kProbeReps = 20;            // bursts per candidate (median)
+static constexpr int kProbeRounds = 3;           // rounds per candidate
+// Prefer the full physical count when the half-count is not clearly faster
+// (>8%). Decode interleaves non-GEMV work (norms, attention, sampling, the
+// slower Q6_K output layer) that benefits from more threads, and prefill runs
+// at the same count and scales with more threads.
+static constexpr double kPreferPhysicalMargin = 0.92;
 
 static double now_seconds() {
 #ifdef _OPENMP
@@ -147,11 +153,11 @@ static double gemv_ms(int threads, TensorPtr& t_in, TensorPtr& t_gate,
     // report the median burst time per round, taking the best of two rounds to
     // tolerate a single catastrophically-thrashed round.
     double best = 1e30;
-    for (int round = 0; round < 2; ++round) {
+    for (int round = 0; round < kProbeRounds; ++round) {
         std::vector<double> bursts;
         for (int r = 0; r < kProbeReps; ++r) {
             double t0 = now_seconds();
-            auto out = ops::matmul_transB_fused_ffn_up_q2_k(t_in, t_gate, t_up);
+            auto out = ops::matmul_transB_fused_ffn_up_q4_0(t_in, t_gate, t_up);
             double dt = now_seconds() - t0;
             volatile float sink = *static_cast<const float*>(out->data());
             (void)sink;
@@ -192,50 +198,57 @@ int detect_best_cpu_threads(int hidden, int intermediate) {
     }
 #endif
 
-    // Candidate set: physical/2, physical, logical-4, logical-2. The full
-    // logical count (oversubscribed HT) is excluded: on this workload it is
-    // bimodal (fast bursts when HT lanes happen to align, ~7ms catastrophes
-    // otherwise) and real decode always loses with it.
+    // Candidate set: physical/2, physical. Oversubscribed HT counts (logical-4,
+    // logical-2) are excluded: the idle-pooled probe systematically over-ranks
+    // them (per-burst HT-ramp cost is hidden between bursts), but real decode
+    // loses badly with them — measured ~4x slower on an 8-physical P/E-hybrid
+    // machine, where 14 threads (logical-2) thrashed against 8 physical cores.
     std::vector<int> candidates;
     candidates.push_back(physical / 2);
     candidates.push_back(physical);
-    if (logical > physical) {
-        candidates.push_back(logical - 4);
-        candidates.push_back(logical - 2);
-    }
     std::sort(candidates.begin(), candidates.end());
     candidates.erase(std::unique(candidates.begin(), candidates.end()),
                      candidates.end());
     for (int& c : candidates)
         c = std::max(1, std::min(c, logical));
 
-    // Synthetic Q2_K gate+up weights (row-granular like a real FFN layer),
-    // sized to the target model's hidden/intermediate dims.
-    constexpr int QK = 256;
-    constexpr int Q2K_BLOCK = 84;
-    int nb = (hidden + QK - 1) / QK;
-    size_t mat_bytes = (size_t)intermediate * nb * Q2K_BLOCK;
+    // Synthetic Q4_0 gate+up weights (row-granular like a real FFN layer),
+    // sized to the target model's hidden/intermediate dims. Q4_0 block = 32
+    // values / 18 bytes (fp16 scale + 16 packed 4-bit quants).
+    constexpr int QK4_0 = 32;
+    constexpr int Q4_0_BLOCK = 18;
+    int nb = (hidden + QK4_0 - 1) / QK4_0;
+    size_t mat_bytes = (size_t)intermediate * nb * Q4_0_BLOCK;
     std::vector<uint8_t> gate(mat_bytes), up(mat_bytes);
     for (size_t i = 0; i < mat_bytes; ++i) {
         gate[i] = static_cast<uint8_t>(i * 31);
         up[i] = static_cast<uint8_t>(i * 17);
+    }
+    // Force sane fp16 scales so the kernel never hits denormal/NaN timing
+    // outliers (values are synthetic; only the timing matters).
+    const uint16_t d_half = 0x3800;  // 0.5f in fp16
+    for (size_t off = 0; off < mat_bytes; off += Q4_0_BLOCK) {
+        std::memcpy(&gate[off], &d_half, 2);
+        std::memcpy(&up[off], &d_half, 2);
     }
     std::vector<float> in(hidden, 0.5f);
 
     TensorPtr t_in = std::make_shared<Tensor>(Tensor::from_buffer(
         in.data(), DataType::FP32, std::vector<int64_t>{1, hidden}));
     TensorPtr t_gate = std::make_shared<Tensor>(Tensor::from_buffer(
-        gate.data(), DataType::Q2_K,
+        gate.data(), DataType::Q4_0,
         std::vector<int64_t>{(int64_t)intermediate, (int64_t)hidden}));
     TensorPtr t_up = std::make_shared<Tensor>(Tensor::from_buffer(
-        up.data(), DataType::Q2_K,
+        up.data(), DataType::Q4_0,
         std::vector<int64_t>{(int64_t)intermediate, (int64_t)hidden}));
 
     int best_threads = physical;
     double best_ms = 1e30;
     for (int c : candidates) {
         double ms = gemv_ms(c, t_in, t_gate, t_up);
-        if (ms < best_ms) {
+        // Prefer the full physical count unless the half-count is clearly
+        // faster (see kPreferPhysicalMargin above).
+        if (ms < best_ms * kPreferPhysicalMargin || best_threads < c) {
             best_ms = ms;
             best_threads = c;
         }
