@@ -121,19 +121,7 @@ static void gemm_q4_0_avx2(const float* a, const uint8_t* w, float* out, int M, 
                     float scale_f;
                     uint16_t scale_bits;
                     memcpy(&scale_bits, block, 2);
-                    uint32_t sign = (scale_bits >> 15) & 1;
-                    uint32_t exponent = (scale_bits >> 10) & 0x1F;
-                    uint32_t mantissa = scale_bits & 0x3FF;
-                    if (exponent == 0) {
-                        scale_f = mantissa == 0
-                                      ? 0.0f
-                                      : (sign ? -1 : 1) *
-                                            std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
-                    } else {
-                        scale_f = (sign ? -1 : 1) *
-                                  std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                                             static_cast<int>(exponent) - 15);
-                    }
+                    scale_f = fp16_to_float_scalar(scale_bits);
 
                     for (int j = 0; j < 16 && base + j < N; ++j) {
                         o_row[base + j] += a_val * static_cast<float>((qs[j] & 0x0F) - 8) * scale_f;

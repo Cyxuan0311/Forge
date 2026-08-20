@@ -7,6 +7,7 @@
 // to avoid redefinition issues when included from cpu_gemv.h.
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -41,18 +42,22 @@ static inline float hsum_ps256(__m256 v) {
     return _mm_cvtss_f32(sum128);
 }
 
-static inline float fp16_to_fp32(uint16_t bits) {
-    uint32_t sign = (bits >> 15) & 1;
-    uint32_t exponent = (bits >> 10) & 0x1F;
-    uint32_t mantissa = bits & 0x3FF;
-    if (exponent == 0) {
-        if (mantissa == 0) return 0.0f;
-        float v = std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
-        return sign ? -v : v;
-    }
-    float v = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                         static_cast<int>(exponent) - 15);
-    return sign ? -v : v;
+static inline float fp16_to_fp32(uint16_t h) {
+    const uint32_t w = (uint32_t)h << 16;
+    const uint32_t sign = w & 0x80000000u;
+    const uint32_t two_w = w + w;
+    const uint32_t exp_offset = 0xE0u << 23;
+    const float exp_scale = 0x1.0p-112f;
+    const float normalized_value = std::bit_cast<float>((two_w >> 4) + exp_offset) * exp_scale;
+    const uint32_t magic_mask = 126u << 23;
+    const float magic_bias = 0.5f;
+    const float denormalized_value = std::bit_cast<float>((two_w >> 17) | magic_mask) - magic_bias;
+    const uint32_t denormalized_cutoff = 1u << 27;
+    const uint32_t result =
+        sign | (two_w < denormalized_cutoff
+                    ? std::bit_cast<uint32_t>(denormalized_value)
+                    : std::bit_cast<uint32_t>(normalized_value));
+    return std::bit_cast<float>(result);
 }
 
 static inline int32_t hsum_i32(__m256i v) {

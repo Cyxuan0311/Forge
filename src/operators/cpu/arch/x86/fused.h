@@ -43,20 +43,7 @@ static void gemv_q4_0_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
                     const uint8_t* block = row + bi * BLOCK_BYTES;
                     uint16_t sb;
                     memcpy(&sb, block, 2);
-                    uint32_t sign = (sb >> 15) & 1;
-                    uint32_t exponent = (sb >> 10) & 0x1F;
-                    uint32_t mantissa = sb & 0x3FF;
-                    float scale_f;
-                    if (exponent == 0) {
-                        scale_f = mantissa == 0
-                                      ? 0.0f
-                                      : (sign ? -1 : 1) *
-                                            std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
-                    } else {
-                        scale_f = (sign ? -1 : 1) *
-                                  std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                                             static_cast<int>(exponent) - 15);
-                    }
+                    const float scale_f = fp16_to_float_scalar(sb);
                     const uint8_t* qs = block + 2;
                     for (int j = 0; j < 16 && base + j < K; ++j) {
                         float qv = static_cast<float>((qs[j] & 0x0F) - 8) * scale_f;

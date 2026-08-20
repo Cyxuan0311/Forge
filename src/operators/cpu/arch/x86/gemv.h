@@ -119,19 +119,7 @@ static void gemv_q4_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
                     const uint8_t* blk = w_row + (size_t)full_blocks * BLOCK_BYTES;
                     uint16_t _sb;
                     memcpy(&_sb, blk, 2);
-                    uint32_t _sig = (_sb >> 15) & 1;
-                    uint32_t _exp = (_sb >> 10) & 0x1F;
-                    uint32_t _man = _sb & 0x3FF;
-                    float _sf;
-                    if (_exp == 0) {
-                        _sf = _man == 0 ? 0.0f
-                                        : (_sig ? -1 : 1) *
-                                              std::ldexp(static_cast<float>(_man) / 1024.0f, -14);
-                    } else {
-                        _sf =
-                            (_sig ? -1 : 1) * std::ldexp(1.0f + static_cast<float>(_man) / 1024.0f,
-                                                         static_cast<int>(_exp) - 15);
-                    }
+                    const float _sf = fp16_to_float_scalar(_sb);
                     const uint8_t* qs = blk + 2;
                     for (int j = 0; j < 16 && base + j < K; ++j)
                         dq[base + j] = static_cast<float>((qs[j] & 0x0F) - 8) * _sf;
@@ -226,21 +214,7 @@ static void gemv_q4_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
                         const uint8_t* block = w_row + (size_t)full_blocks * BLOCK_BYTES;
                         uint16_t sb;
                         memcpy(&sb, block, 2);
-                        uint32_t sign = (sb >> 15) & 1;
-                        uint32_t exponent = (sb >> 10) & 0x1F;
-                        uint32_t mantissa = sb & 0x3FF;
-                        float scale_f;
-                        if (exponent == 0) {
-                            scale_f =
-                                mantissa == 0
-                                    ? 0.0f
-                                    : (sign ? -1 : 1) *
-                                          std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
-                        } else {
-                            scale_f = (sign ? -1 : 1) *
-                                      std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                                                 static_cast<int>(exponent) - 15);
-                        }
+                        const float scale_f = fp16_to_float_scalar(sb);
                         const uint8_t* qs = block + 2;
                         for (int j = 0; j < 16 && base + j < K; ++j) {
                             float qv = static_cast<float>((qs[j] & 0x0F) - 8) * scale_f;
@@ -439,16 +413,7 @@ static void gemv_q8_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
                     const uint8_t* block = w_row + bi * BLOCK_BYTES;
                     uint16_t _sb;
                     memcpy(&_sb, block, 2);
-                    uint32_t _sig = (_sb >> 15) & 1, _exp = (_sb >> 10) & 0x1F, _man = _sb & 0x3FF;
-                    float _sf;
-                    if (_exp == 0) {
-                        _sf = _man == 0 ? 0.0f
-                                        : (_sig ? -1 : 1) *
-                                              std::ldexp(static_cast<float>(_man) / 1024.0f, -14);
-                    } else {
-                        _sf = (_sig ? -1 : 1) *
-                              std::ldexp(1.0f + static_cast<float>(_man) / 1024.0f, (int)_exp - 15);
-                    }
+                    const float _sf = fp16_to_float_scalar(_sb);
                     const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
                     for (int j = 0; j < remaining; ++j)
                         dq[base + j] = static_cast<float>(qs[j]) * _sf;
@@ -502,21 +467,7 @@ static void gemv_q8_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
                         const uint8_t* block = w_row + bi * BLOCK_BYTES;
                         uint16_t sb;
                         memcpy(&sb, block, 2);
-                        uint32_t sign = (sb >> 15) & 1;
-                        uint32_t exponent = (sb >> 10) & 0x1F;
-                        uint32_t mantissa = sb & 0x3FF;
-                        float scale_f;
-                        if (exponent == 0) {
-                            scale_f =
-                                mantissa == 0
-                                    ? 0.0f
-                                    : (sign ? -1 : 1) *
-                                          std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
-                        } else {
-                            scale_f = (sign ? -1 : 1) *
-                                      std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
-                                                 static_cast<int>(exponent) - 15);
-                        }
+                        const float scale_f = fp16_to_float_scalar(sb);
                         const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
                         for (int j = 0; j < remaining; ++j) {
                             acc_ref = _mm256_fmadd_ps(
