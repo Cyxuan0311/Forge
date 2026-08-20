@@ -33,6 +33,7 @@
 #include "forge/kv_cache.h"
 #include "forge/logger.h"
 #include "forge/model.h"
+#include "forge/perf_profiler.h"
 #include "forge/tensor.h"
 #include "forge/threads.h"
 #include "forge/tokenizer.h"
@@ -301,6 +302,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
     }
 
     int num_decode_steps = 128;
+    forge::PerfProfiler::instance().enable();
+    forge::PerfProfiler::instance().reset();
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_decode_steps; ++i) {
         auto input_ids =
@@ -320,6 +323,8 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     double tok_per_s = num_decode_steps / (ms / 1000.0);
     printf("  Decode  %4d tokens: %7.2f ms  (%8.1f tok/s)\n", num_decode_steps, ms, tok_per_s);
+
+    forge::PerfProfiler::instance().print_summary();
 
     std::cout << "\n  Benchmark complete\n";
 }
