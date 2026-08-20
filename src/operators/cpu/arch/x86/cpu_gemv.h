@@ -14,6 +14,7 @@
 #    include <immintrin.h>
 #    include "../../common/quant_helpers.h"
 #    include "scales.h"
+#    include "thread_pool.h"
 #    include "vec_dot.h"
 #    include "gemm_microkernel.h"
 // dot_q4_K_q8_K_avx2 is defined in gemv.h (included via kernels.h)
@@ -1612,11 +1613,12 @@ static void gemv_q2_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
         scratch_vec<block_q8_K> q8_buf(nb);
         quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* q2_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
-            out[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
-        }
+        parallel_for_chunks(N, 64, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* q2_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+                out[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
+            }
+        });
     } else {
         scratch_vec<block_q8_K> q8_all(M * nb);
         for (int m = 0; m < M; ++m) {
@@ -1844,11 +1846,12 @@ static void gemv_q6_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(dynamic, 64)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q6_K_BLOCK_BYTES;
-        out[n] = dot_q6_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q6_K_BLOCK_BYTES;
+            out[n] = dot_q6_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
+        }
+    });
 }
 
 // ---- Q4_K fused FFN down + residual (decode, M=1, Q8_K activation) ----
@@ -1862,11 +1865,12 @@ static void gemv_q4_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(dynamic, 64)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
-        out[n] = dot_q4_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+            out[n] = dot_q4_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
+        }
+    });
 }
 
 // ---- Q2_K fused FFN down + residual (decode, M=1, Q8_K activation) ----
@@ -1879,11 +1883,12 @@ static void gemv_q2_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
-        out[n] = dot_q2_K_q8_K_avx2(w_row, q8_buf.data(), nb, nullptr) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+            out[n] = dot_q2_K_q8_K_avx2(w_row, q8_buf.data(), nb, nullptr) + residual[n];
+        }
+    });
 }
 
 // ---- Q3_K fused FFN down + residual (decode, M=1, Q8_K activation) ----
@@ -1896,11 +1901,12 @@ static void gemv_q3_k_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
-        out[n] = dot_q3_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
+            out[n] = dot_q3_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
+        }
+    });
 }
 
 // ---- Q4_K fused attention output projection + residual (decode, M=1, Q8_K activation) ----
@@ -1914,11 +1920,12 @@ static void gemv_q4_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(dynamic, 64)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
-        out[n] = dot_q4_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+            out[n] = dot_q4_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
+        }
+    });
 }
 
 // ---- Q6_K fused attention output projection + residual (decode, M=1, Q8_K activation) ----
@@ -1931,11 +1938,12 @@ static void gemv_q6_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(dynamic, 64)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q6_K_BLOCK_BYTES;
-        out[n] = dot_q6_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q6_K_BLOCK_BYTES;
+            out[n] = dot_q6_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
+        }
+    });
 }
 
 // ---- Q2_K fused attention output projection + residual (decode, M=1, Q8_K activation) ----
@@ -1948,11 +1956,12 @@ static void gemv_q2_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
-        out[n] = dot_q2_K_q8_K_avx2(w_row, q8_buf.data(), nb, nullptr) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+            out[n] = dot_q2_K_q8_K_avx2(w_row, q8_buf.data(), nb, nullptr) + residual[n];
+        }
+    });
 }
 
 // ---- Q3_K fused attention output projection + residual (decode, M=1, Q8_K activation) ----
@@ -1965,11 +1974,12 @@ static void gemv_q3_k_attn_proj_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* w_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
-        out[n] = dot_q3_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
-    }
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* w_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
+            out[n] = dot_q3_K_q8_K_avx2(w_row, q8_buf.data(), nb) + residual[n];
+        }
+    });
 }
 #endif  // USE_AVX2
 
@@ -2361,21 +2371,21 @@ static void gemv_q2_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N_q; ++n) {
-        const uint8_t* q2_row = wq + (size_t)n * nb * Q2_K_BLOCK_BYTES;
-        out_q[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
-    }
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N_k; ++n) {
-        const uint8_t* q2_row = wk + (size_t)n * nb * Q2_K_BLOCK_BYTES;
-        out_k[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
-    }
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N_v; ++n) {
-        const uint8_t* q2_row = wv + (size_t)n * nb * Q2_K_BLOCK_BYTES;
-        out_v[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
-    }
+    const int total = N_q + N_k + N_v;
+    parallel_for_chunks(total, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            if (n < N_q) {
+                const uint8_t* q2_row = wq + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+                out_q[n] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
+            } else if (n < N_q + N_k) {
+                const uint8_t* q2_row = wk + (size_t)(n - N_q) * nb * Q2_K_BLOCK_BYTES;
+                out_k[n - N_q] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
+            } else {
+                const uint8_t* q2_row = wv + (size_t)(n - N_q - N_k) * nb * Q2_K_BLOCK_BYTES;
+                out_v[n - N_q - N_k] = dot_q2_K_q8_K_avx2(q2_row, q8_buf.data(), nb, nullptr);
+            }
+        }
+    });
 }
 #endif  // USE_AVX2
 

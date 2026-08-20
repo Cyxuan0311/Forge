@@ -12,6 +12,7 @@
 #include "../../common/quant_helpers.h"
 #include "../../common/quant_tables.h"
 #include "scales.h"
+#include "thread_pool.h"
 #include "vec.h"
 #include "forge/types.h"
 
@@ -896,15 +897,16 @@ static void gemv_q5_k_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
 
-#pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* gate_row = w_gate + (size_t)n * nb * Q5_K_BLOCK_BYTES;
-        const uint8_t* up_row = w_up + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+    cpu::parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* gate_row = w_gate + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+            const uint8_t* up_row = w_up + (size_t)n * nb * Q5_K_BLOCK_BYTES;
 
-        float gate_val = silu(dot_q5_K_q8_K_row_avx2(gate_row, q8_buf.data(), nb));
-        float up_val = dot_q5_K_q8_K_row_avx2(up_row, q8_buf.data(), nb);
-        out[n] = gate_val * up_val;
-    }
+            float gate_val = silu(dot_q5_K_q8_K_row_avx2(gate_row, q8_buf.data(), nb));
+            float up_val = dot_q5_K_q8_K_row_avx2(up_row, q8_buf.data(), nb);
+            out[n] = gate_val * up_val;
+        }
+    });
 }
 
 static void gemv_q2_k_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
@@ -918,15 +920,16 @@ static void gemv_q2_k_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
 
-#pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* gate_row = w_gate + (size_t)n * nb * Q2_K_BLOCK_BYTES;
-        const uint8_t* up_row = w_up + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+    cpu::parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* gate_row = w_gate + (size_t)n * nb * Q2_K_BLOCK_BYTES;
+            const uint8_t* up_row = w_up + (size_t)n * nb * Q2_K_BLOCK_BYTES;
 
-        float gate_val = silu(cpu::dot_q2_K_q8_K_avx2(gate_row, q8_buf.data(), nb, nullptr));
-        float up_val = cpu::dot_q2_K_q8_K_avx2(up_row, q8_buf.data(), nb, nullptr);
-        out[n] = gate_val * up_val;
-    }
+            float gate_val = silu(cpu::dot_q2_K_q8_K_avx2(gate_row, q8_buf.data(), nb, nullptr));
+            float up_val = cpu::dot_q2_K_q8_K_avx2(up_row, q8_buf.data(), nb, nullptr);
+            out[n] = gate_val * up_val;
+        }
+    });
 }
 
 }  // namespace ops

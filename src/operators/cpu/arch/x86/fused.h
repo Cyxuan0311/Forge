@@ -6,6 +6,7 @@
 
 #include "gemv.h"
 #include "cpu_gemv.h"
+#include "thread_pool.h"
 #include "vec.h"
 #include "../../common/quant_helpers.h"
 #ifdef _OPENMP
@@ -214,12 +215,13 @@ static void gemv_q4_0_fused_qkv_8x8_avx2(const float* a, const uint8_t* wq_8x8,
 
     auto decode = [&](const uint8_t* w_8x8, float* out, int64_t N) {
         const int64_t num_groups = N / RM;
-#    pragma omp parallel for schedule(static)
-        for (int64_t g = 0; g < num_groups; ++g) {
-            __m256 acc_row = forge::cpu::gemv_q4_0_8x8_dot_group(
-                w_8x8 + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
-            _mm256_storeu_ps(out + g * RM, _mm256_permutevar8x32_ps(acc_row, finalperm));
-        }
+        parallel_for_chunks((int)num_groups, 1, [&](int g0, int g1) {
+            for (int64_t g = g0; g < g1; ++g) {
+                __m256 acc_row = forge::cpu::gemv_q4_0_8x8_dot_group(
+                    w_8x8 + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
+                _mm256_storeu_ps(out + g * RM, _mm256_permutevar8x32_ps(acc_row, finalperm));
+            }
+        });
     };
 
     decode(wq_8x8, out_q, N_q);

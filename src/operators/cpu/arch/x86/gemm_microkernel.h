@@ -18,6 +18,7 @@
 #    include <immintrin.h>
 #    include "../../common/quant_helpers.h"  // block_q8_K, block_q6_K, quantize_row_q8_K, get_scale_shuffle
 #    include "scales.h"                       // get_scale_shuffle*, decode_q4_k_scales
+#    include "thread_pool.h"
 #    include "vec_dot.h"          // block_q8_0_act, quantize_row_q8_0_act, vdot::fp16_to_fp32
 #endif
 
@@ -1819,9 +1820,9 @@ static void gemm_q6_K_avx2(
         // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows.
         // Dynamic work-stealing over 16 groups (=64 rows/chunk) like llama.cpp
         // mul_mat chunking for better DRAM streaming parallelism.
-        #pragma omp parallel for schedule(dynamic, 16)
-        for (int64_t n = 0; n < N; n += 4) {
-            int64_t rows = std::min(n + 4, N) - n;
+        parallel_for_chunks(N, 64, [&](int n0, int n1) {
+            for (int64_t n = n0; n < n1; n += 4) {
+            int64_t rows = std::min(n + 4, (int64_t)n1) - n;
             for (int64_t r = 0; r < rows; ++r) {
                 const uint8_t* q6_row = w_data + (size_t)(n + r) * nb * Q6_K_BLOCK_BYTES;
                 __m256 acc = _mm256_setzero_ps();
@@ -1880,6 +1881,7 @@ static void gemm_q6_K_avx2(
                 o_data[n + r] = vdot::hsum_ps256(acc);
             }
         }
+        });
     } else {
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
@@ -2008,9 +2010,9 @@ static void gemm_q4_K_avx2(
         // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows.
         // Dynamic work-stealing over 16 groups (=64 rows/chunk) like llama.cpp
         // mul_mat chunking for better DRAM streaming parallelism.
-        #pragma omp parallel for schedule(dynamic, 16)
-        for (int64_t n = 0; n < N; n += 4) {
-            int64_t rows = std::min(n + 4, N) - n;
+        parallel_for_chunks(N, 64, [&](int n0, int n1) {
+            for (int64_t n = n0; n < n1; n += 4) {
+            int64_t rows = std::min(n + 4, (int64_t)n1) - n;
             for (int64_t r = 0; r < rows; ++r) {
                 const uint8_t* q4_row = w_data + (size_t)(n + r) * nb * Q4_K_BLOCK_BYTES;
                 __m256 acc = _mm256_setzero_ps();
@@ -2083,6 +2085,7 @@ static void gemm_q4_K_avx2(
                 o_data[n + r] = vdot::hsum_ps256(acc) + _mm_cvtss_f32(acc_m);
             }
         }
+        });
     } else {
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
@@ -2213,10 +2216,12 @@ static void gemm_q5_K_avx2(
     const int Mi = (int)M;
 
     if (M == 1) {
-        // Decode: RM=4 row grouping
-        #pragma omp parallel for schedule(static)
-        for (int64_t n = 0; n < N; n += 4) {
-            int64_t rows = std::min(n + 4, N) - n;
+        // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows.
+        // Dynamic work-stealing over 16 groups (=64 rows/chunk) like llama.cpp
+        // mul_mat chunking for better DRAM streaming parallelism.
+        parallel_for_chunks(N, 64, [&](int n0, int n1) {
+            for (int64_t n = n0; n < n1; n += 4) {
+            int64_t rows = std::min(n + 4, (int64_t)n1) - n;
             for (int64_t r = 0; r < rows; ++r) {
                 const uint8_t* q5_row = w_data + (size_t)(n + r) * nb * Q5_K_BLOCK_BYTES;
                 __m256 acc = _mm256_setzero_ps();
@@ -2299,6 +2304,7 @@ static void gemm_q5_K_avx2(
                 o_data[n + r] = vdot::hsum_ps256(acc) + summs;
             }
         }
+        });
     } else {
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
@@ -2434,10 +2440,12 @@ static void gemm_q2_K_avx2(
     const int Mi = (int)M;
 
     if (M == 1) {
-        // Decode: RM=4 row grouping
-        #pragma omp parallel for schedule(static)
-        for (int64_t n = 0; n < N; n += 4) {
-            int64_t rows = std::min(n + 4, N) - n;
+        // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows.
+        // Dynamic work-stealing over 16 groups (=64 rows/chunk) like llama.cpp
+        // mul_mat chunking for better DRAM streaming parallelism.
+        parallel_for_chunks(N, 64, [&](int n0, int n1) {
+            for (int64_t n = n0; n < n1; n += 4) {
+            int64_t rows = std::min(n + 4, (int64_t)n1) - n;
             for (int64_t r = 0; r < rows; ++r) {
                 const uint8_t* q2_row = w_data + (size_t)(n + r) * nb * Q2_K_BLOCK_BYTES;
                 __m256 acc = _mm256_setzero_ps();
@@ -2500,6 +2508,7 @@ static void gemm_q2_K_avx2(
                 o_data[n + r] = vdot::hsum_ps256(acc);
             }
         }
+        });
     } else {
         // Prefill (M > 1): k-blocked GEMM. Weight rows stream once (i innermost
         // per row) while the M-block of q8 activations for the current k-block
@@ -2629,10 +2638,12 @@ static void gemm_q3_K_avx2(
     const int Mi = (int)M;
 
     if (M == 1) {
-        // Decode: RM=4 row grouping
-        #pragma omp parallel for schedule(static)
-        for (int64_t n = 0; n < N; n += 4) {
-            int64_t rows = std::min(n + 4, N) - n;
+        // Decode: RM=4 row grouping, Q8_K stays in L1 across 4 weight rows.
+        // Dynamic work-stealing over 16 groups (=64 rows/chunk) like llama.cpp
+        // mul_mat chunking for better DRAM streaming parallelism.
+        parallel_for_chunks(N, 64, [&](int n0, int n1) {
+            for (int64_t n = n0; n < n1; n += 4) {
+            int64_t rows = std::min(n + 4, (int64_t)n1) - n;
             for (int64_t r = 0; r < rows; ++r) {
                 const uint8_t* q3_row = w_data + (size_t)(n + r) * nb * Q3_K_BLOCK_BYTES;
                 __m256 acc = _mm256_setzero_ps();
@@ -2719,6 +2730,7 @@ static void gemm_q3_K_avx2(
                 o_data[n + r] = vdot::hsum_ps256(acc);
             }
         }
+        });
     } else {
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
