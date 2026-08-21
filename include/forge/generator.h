@@ -12,6 +12,8 @@
 
 namespace forge {
 
+class SpeculativeExecutor;
+
 struct GenerationConfig {
     int max_new_tokens = 256;
     float temperature = 1.0f;
@@ -53,6 +55,7 @@ private:
     Sampler sampler_;
     TensorPtr decode_input_gpu_;
     void* decode_token_buf_ = nullptr;
+    std::unique_ptr<SpeculativeExecutor> spec_executor_;  // null when speculation disabled
 };
 
 }  // namespace forge

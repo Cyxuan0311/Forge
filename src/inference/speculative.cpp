@@ -5,46 +5,60 @@
 
 #include "forge/logger.h"
 #include "forge/sampler.h"
+#include "forge/tensor.h"
 
 namespace forge {
 
 // =========================================================================
-// NgramDraftModel
+// SpeculativeStats
 // =========================================================================
 
-NgramDraftModel::NgramDraftModel(int ngram_n, int ngram_min)
+void SpeculativeStats::reset() { *this = SpeculativeStats{}; }
+
+double SpeculativeStats::acceptance_rate() const {
+    return n_draft_tokens > 0
+               ? static_cast<double>(n_accepted_tokens) / static_cast<double>(n_draft_tokens)
+               : 0.0;
+}
+
+double SpeculativeStats::tokens_per_step() const {
+    return n_spec_steps > 0
+               ? static_cast<double>(n_output_tokens) / static_cast<double>(n_spec_steps)
+               : 0.0;
+}
+
+// =========================================================================
+// NgramDraftProvider
+// =========================================================================
+
+NgramDraftProvider::NgramDraftProvider(int ngram_n, int ngram_min)
     : ngram_n_(ngram_n), ngram_min_(ngram_min) {}
 
-std::vector<int32_t> NgramDraftModel::draft(const std::vector<int32_t>& prefix, int n_draft) {
+void NgramDraftProvider::begin(const std::vector<int32_t>& prompt) {
+    history_ = prompt;
+}
+
+std::vector<int32_t> NgramDraftProvider::draft(int n_draft) {
     std::vector<int32_t> result;
-    if (static_cast<int>(prefix.size()) < ngram_min_ || n_draft <= 0)
-        return result;
+    const int search_len = static_cast<int>(history_.size());
+    if (search_len < ngram_min_ || n_draft <= 0) return result;
 
-    // 在 history_ + prefix 中搜索最长后缀匹配
-    // 将 prefix 中的新 token 加入临时搜索范围
-    const auto& search_space = history_.empty() ? prefix : history_;
-    int search_len = static_cast<int>(search_space.size());
-
-    // 从最长 n-gram 开始尝试匹配
+    // Longest-suffix-first matching against the confirmed history itself.
+    // A match must leave at least one continuation token available.
     for (int n = std::min(ngram_n_, search_len); n >= ngram_min_; --n) {
-        // prefix 的最后 n 个 token 作为 pattern
-        const int32_t* pattern = prefix.data() + prefix.size() - n;
+        const int32_t* pattern = history_.data() + search_len - n;
 
-        // 在 search_space 中查找 pattern 出现的所有位置
         for (int i = 0; i <= search_len - n - 1; ++i) {
             bool match = true;
             for (int k = 0; k < n; ++k) {
-                if (search_space[i + k] != pattern[k]) {
+                if (history_[i + k] != pattern[k]) {
                     match = false;
                     break;
                 }
             }
             if (match) {
-                // 找到匹配，返回匹配位置之后的 token
                 int avail = std::min(n_draft, search_len - i - n);
-                for (int j = 0; j < avail; ++j) {
-                    result.push_back(search_space[i + n + j]);
-                }
+                for (int j = 0; j < avail; ++j) result.push_back(history_[i + n + j]);
                 if (!result.empty()) return result;
             }
         }
@@ -53,51 +67,55 @@ std::vector<int32_t> NgramDraftModel::draft(const std::vector<int32_t>& prefix, 
     return result;
 }
 
-void NgramDraftModel::accept(const std::vector<int32_t>& tokens) {
+void NgramDraftProvider::accept(const std::vector<int32_t>& tokens) {
     history_.insert(history_.end(), tokens.begin(), tokens.end());
+}
+
+void NgramDraftProvider::reset() {
+    history_.clear();
 }
 
 // =========================================================================
 // verify_draft_tokens
 // =========================================================================
 
-SpeculativeConfig::VerifyResult verify_draft_tokens(
+SpecVerifyResult verify_draft_tokens(
     const float* logits_all, int vocab_size,
     const std::vector<int32_t>& draft_tokens,
     Sampler& sampler, const SpeculativeConfig& config) {
+    (void)config;  // Phase 1: branch on do_sample / p_min here
 
-    SpeculativeConfig::VerifyResult result;
-    int n_draft = static_cast<int>(draft_tokens.size());
+    SpecVerifyResult result;
+    const int n_draft = static_cast<int>(draft_tokens.size());
 
     for (int i = 0; i < n_draft; ++i) {
-        // logits_all[i] 是位置 i 的 logits（预测位置 i+1 的 token）
-        const float* pos_logits = logits_all + i * vocab_size;
+        // Row i predicts the token at position start_pos+i+1.
+        const float* pos_logits = logits_all + static_cast<size_t>(i) * vocab_size;
 
-        // 用 target model 的 logits 采样/取 argmax
-        auto logits_tensor = std::make_shared<Tensor>(DataType::FP32,
-                                                       std::vector<int64_t>{1, vocab_size},
-                                                       DeviceType::CPU);
+        auto logits_tensor =
+            std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, vocab_size},
+                                     DeviceType::CPU);
         std::memcpy(logits_tensor->data(), pos_logits, vocab_size * sizeof(float));
 
-        int32_t target_token = sampler.sample_greedy(logits_tensor);
+        const int32_t target_token = sampler.sample_greedy(logits_tensor);
 
         if (target_token == draft_tokens[i]) {
-            // 接受
             result.accepted_tokens.push_back(draft_tokens[i]);
             result.n_accepted++;
         } else {
-            // 拒绝：重采样
+            // Rejected: target's own sample takes over from here.
             result.resampled = target_token;
             return result;
         }
     }
 
-    // 所有 draft tokens 都被接受 → bonus token
+    // All drafts accepted -> sample one bonus token from the last row.
     if (n_draft > 0) {
-        const float* bonus_logits = logits_all + n_draft * vocab_size;
-        auto logits_tensor = std::make_shared<Tensor>(DataType::FP32,
-                                                       std::vector<int64_t>{1, vocab_size},
-                                                       DeviceType::CPU);
+        const float* bonus_logits =
+            logits_all + static_cast<size_t>(n_draft) * vocab_size;
+        auto logits_tensor =
+            std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, vocab_size},
+                                     DeviceType::CPU);
         std::memcpy(logits_tensor->data(), bonus_logits, vocab_size * sizeof(float));
         result.bonus = sampler.sample_greedy(logits_tensor);
     }

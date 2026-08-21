@@ -286,6 +286,7 @@ add_library(
   src/inference/attention_mask.cpp
   src/inference/request_scheduler.cpp
   src/inference/speculative.cpp
+  src/inference/speculative_executor.cpp
   src/inference/threads.cpp
   # Jinja engine (vendored from llama.cpp, MIT licensed)
   third_party/jinja/lexer.cpp

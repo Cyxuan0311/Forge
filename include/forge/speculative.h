@@ -1,68 +1,125 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace forge {
 
-class InferenceEngine;
 class Sampler;
-class KVCache;
 
-// ---- Speculative Decoding 配置 ----
+// =========================================================================
+// Speculative Decoding public types.
+//
+// Layered architecture (mirrors llama.cpp common/speculative.*):
+//   IDraftProvider      -- candidate source abstraction (n-gram / draft model / MTP ...)
+//   verify_draft_tokens -- verification algorithm (greedy fast path /
+//                          resample-consistency in Phase 1)
+//   SpeculativeExecutor -- orchestrator (draft -> verify -> KV rollback),
+//                          see forge/speculative_executor.h
+// =========================================================================
 
+// ---- Per-round verification result ----
+struct SpecVerifyResult {
+    int n_accepted = 0;                      // number of accepted draft tokens
+    std::vector<int32_t> accepted_tokens;    // accepted draft tokens
+    int32_t resampled = -1;                  // token re-sampled by target at first rejection
+    int32_t bonus = -1;                      // bonus token when all drafts accepted
+};
+
+// ---- Runtime statistics ----
+struct SpeculativeStats {
+    int64_t n_spec_steps = 0;       // speculation rounds (one draft->verify cycle each)
+    int64_t n_fallback_steps = 0;   // rounds degraded to plain decode (no candidates / forward failure)
+    int64_t n_draft_tokens = 0;     // total proposed candidate tokens
+    int64_t n_accepted_tokens = 0;  // accepted candidates (excludes resampled/bonus)
+    int64_t n_output_tokens = 0;    // tokens produced via spec path (accepted + resampled/bonus)
+
+    void reset();
+    double acceptance_rate() const;   // candidate acceptance rate [0,1]
+    double tokens_per_step() const;   // avg tokens produced per speculation round (>1 means speedup)
+};
+
+// ---- Configuration ----
 struct SpeculativeConfig {
-    int n_draft = 5;            // 每次猜想 token 数
-    float p_min = 0.0f;         // 接受阈值（0 = greedy match）
-    bool use_ngram = true;      // 启用 n-gram self-speculative
-    int ngram_n = 5;            // n-gram 匹配长度
-    int ngram_min = 2;          // 最短 n-gram 后缀匹配长度
-    bool enabled = false;       // 默认关闭，需显式启用
+    bool enabled = false;       // master switch, off by default
+    int n_draft = 5;            // max drafted tokens per round (--spec-draft)
+    int n_min = 0;              // drop the whole round if fewer candidates than this (--spec-n-min)
+    float p_min = 0.0f;         // draft confidence early-stop threshold (Phase 3 model draft)
 
-    // 验证结果
-    struct VerifyResult {
-        int n_accepted = 0;                      // 接受的 draft token 数
-        std::vector<int32_t> accepted_tokens;     // 被接受的 draft tokens
-        int32_t resampled = -1;                   // 首个拒绝位置重采样的 token（或 bonus token）
-        int32_t bonus = -1;                       // 全部接受时的 bonus token
-    };
+    // Standalone small draft model (Phase 3); takes priority over n-gram when set
+    std::string draft_model_path;
+    int draft_gpu_layers = -1;  // GPU offload layers for draft model (-1 = follow target)
+
+    // n-gram self-speculative parameters
+    bool use_ngram = true;      // enable n-gram candidate source
+    int ngram_n = 5;            // longest suffix match length
+    int ngram_min = 2;          // shortest suffix match length
 };
 
-// ---- Draft Model 抽象接口 ----
+// =========================================================================
+// IDraftProvider -- candidate source abstraction.
+//
+// Self-managed state: callers (SpeculativeExecutor) never pass token history.
+//   begin(prompt)                     once per generation start
+//   [draft(n) -> (target verify) -> accept(confirmed)]*  main loop
+//   reset()                           clear internal state
+// =========================================================================
 
-class DraftModel {
+class IDraftProvider {
 public:
-    virtual ~DraftModel() = default;
-    // 基于 prefix 生成 n_draft 个猜想 token
-    virtual std::vector<int32_t> draft(const std::vector<int32_t>& prefix, int n_draft) = 0;
-    // 将已接受的 token 追加到内部状态（如 n-gram 索引）
+    virtual ~IDraftProvider() = default;
+
+    // Called once per generation, after prompt prefill. Implementations should
+    // initialize their state from `prompt`.
+    virtual void begin(const std::vector<int32_t>& /*prompt*/) {}
+
+    // Propose at most n_draft candidate tokens; return empty if none available.
+    virtual std::vector<int32_t> draft(int n_draft) = 0;
+
+    // Called after each verification round with the tokens finally confirmed
+    // by the target (accepted + resampled/bonus).
     virtual void accept(const std::vector<int32_t>& tokens) = 0;
+
+    virtual void reset() {}
+
+    virtual const char* name() const = 0;
 };
 
-// ---- N-gram Self-Speculative Draft Model ----
-// 在已生成的 token 序列中做 n-gram 后缀匹配，返回匹配后的续写
+using DraftProviderPtr = std::unique_ptr<IDraftProvider>;
 
-class NgramDraftModel : public DraftModel {
+// ---- N-gram self-speculative draft provider ----
+// Suffix-matches against its own confirmed token history and returns the
+// continuation found at the match position.
+
+class NgramDraftProvider : public IDraftProvider {
 public:
-    explicit NgramDraftModel(int ngram_n = 5, int ngram_min = 2);
+    explicit NgramDraftProvider(int ngram_n = 5, int ngram_min = 2);
 
-    std::vector<int32_t> draft(const std::vector<int32_t>& prefix, int n_draft) override;
+    void begin(const std::vector<int32_t>& prompt) override;
+    std::vector<int32_t> draft(int n_draft) override;
     void accept(const std::vector<int32_t>& tokens) override;
+    void reset() override;
+    const char* name() const override { return "ngram"; }
 
 private:
     int ngram_n_;
     int ngram_min_;
-    std::vector<int32_t> history_;  // 所有已生成的 token 历史
+    std::vector<int32_t> history_;  // full confirmed token sequence (prompt + generated)
 };
 
-// ---- 验证函数 ----
-// 用 target model 的 logits 验证 draft tokens，返回接受数和重采样结果
-// logits_all: [n_tokens, vocab_size]，每行对应一个位置的 logits
-// draft_tokens: 待验证的 draft token 列表
-// start_pos: 第一个 draft token 对应的 KV 位置
-// kv: 用于在拒绝时回滚
+// =========================================================================
+// Verification entry.
+// logits_all: [1+n_draft, vocab_size] row-major; row i predicts the token at
+// position start_pos+i+1, i.e. row i verifies draft_tokens[i]. When all drafts
+// are accepted, the last row yields the bonus token.
+// NOTE: currently the greedy-match fast path only; Phase 1 adds
+//       resample-consistency for do_sample (aligned with llama.cpp
+//       common_sampler_sample_and_accept_n).
+// =========================================================================
 
-SpeculativeConfig::VerifyResult verify_draft_tokens(
+SpecVerifyResult verify_draft_tokens(
     const float* logits_all, int vocab_size,
     const std::vector<int32_t>& draft_tokens,
     Sampler& sampler, const SpeculativeConfig& config);
