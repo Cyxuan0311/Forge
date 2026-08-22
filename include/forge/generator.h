@@ -50,6 +50,10 @@ public:
     GenerationResult generate(const std::vector<int32_t>& prompt_tokens,
                               const GenerationConfig& config, const TokenCallback& callback);
 
+    // Speculation statistics of the underlying executor (nullptr when the
+    // speculative config is disabled).
+    const SpeculativeStats* spec_stats() const;
+
 private:
     InferenceContext& ctx_;
     Sampler sampler_;

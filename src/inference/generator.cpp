@@ -52,6 +52,10 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     return generate(prompt_tokens, config, nullptr);
 }
 
+const SpeculativeStats* Generator::spec_stats() const {
+    return spec_executor_ ? &spec_executor_->stats() : nullptr;
+}
+
 GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
                                      const GenerationConfig& config,
                                      const TokenCallback& callback) {

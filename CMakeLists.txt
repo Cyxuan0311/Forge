@@ -406,3 +406,10 @@ if(FORGE_BUILD_PYTHON)
       "$<TARGET_FILE_DIR:forge>/forge_llm.py"
     COMMENT "Copying forge_llm.py to build dir")
 endif()
+
+# ---- Tests ----
+option(FORGE_BUILD_TESTS "Build forge test executables" ON)
+if(FORGE_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

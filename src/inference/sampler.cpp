@@ -262,10 +262,10 @@ void Sampler::ensure_scratch(int vocab_size) {
 
 int Sampler::sample_greedy(const TensorPtr& logits) {
     int vocab_size = static_cast<int>(logits->numel());
-    SET_PERF_CONTEXT(-1, "sampler", -1, logits->device() == DeviceType::CUDA ? "cuda" : "cpu", 1);
 
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
+        SET_PERF_CONTEXT(-1, "sampler", -1, "cuda", 1);
         if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
             PERF_SCOPE("sampler/repeat_penalty_gpu");
             int n = static_cast<int>(token_history_.size());
@@ -297,38 +297,47 @@ int Sampler::sample_greedy(const TensorPtr& logits) {
 #endif
     }
 
+    return greedy_sample_impl(static_cast<const float*>(logits->data()), vocab_size);
+}
+
+// Shared CPU core for greedy sampling: copies `logits` into scratch, applies
+// repeat penalty, then argmax (with optional softcap).
+int Sampler::greedy_sample_impl(const float* logits, int vocab_size) {
+    SET_PERF_CONTEXT(-1, "sampler", -1, "cpu", 1);
+
     ensure_scratch(vocab_size);
     std::vector<float>& host_logits = logits_scratch_;
-    if (logits->device() == DeviceType::CUDA) {
-#ifdef USE_CUDA
-        PERF_SCOPE("sampler/logits_d2h");
-        cudaMemcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-#endif
-    } else {
+    {
         PERF_SCOPE("sampler/logits_memcpy");
-        std::memcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float));
+        std::memcpy(host_logits.data(), logits,
+                    static_cast<size_t>(vocab_size) * sizeof(float));
     }
-
 
     if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
         PERF_SCOPE("sampler/repeat_penalty");
-        apply_repeat_penalty(host_logits);
+        apply_repeat_penalty(host_logits.data(), vocab_size);
     }
 
-    {
-        PERF_SCOPE("sampler/argmax_cpu");
-        int best;
-        bool has_softcap = (config_.logit_softcapping > 0.0f);
-
-        if (has_softcap) {
-            float cap = config_.logit_softcapping;
-            best = forge::cpu::softcap_and_argmax_f32(host_logits.data(), vocab_size, cap);
-        } else {
-            best = forge::cpu::argmax_f32(host_logits.data(), vocab_size);
-        }
-        return best;
+    PERF_SCOPE("sampler/argmax_cpu");
+    if (config_.logit_softcapping > 0.0f) {
+        return forge::cpu::softcap_and_argmax_f32(host_logits.data(), vocab_size,
+                                                  config_.logit_softcapping);
     }
+    return forge::cpu::argmax_f32(host_logits.data(), vocab_size);
+}
+
+int Sampler::sample_ptr(const float* logits, int vocab_size) {
+    if (!config_.do_sample || config_.temperature <= 0.0f)
+        return sample_greedy_ptr(logits, vocab_size);
+    return sample_temperature_ptr(logits, vocab_size, config_.temperature);
+}
+
+int Sampler::sample_greedy_ptr(const float* logits, int vocab_size) {
+    return greedy_sample_impl(logits, vocab_size);
+}
+
+int Sampler::sample_temperature_ptr(const float* logits, int vocab_size, float temperature) {
+    return temperature_sample_impl(logits, vocab_size, temperature);
 }
 
 int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
@@ -371,24 +380,38 @@ int Sampler::sample_temperature(const TensorPtr& logits, float temperature) {
 #endif
     }
 
-    // CPU fallback path
-    ensure_scratch(vocab_size);
-    std::vector<float>& host_logits = logits_scratch_;
+    // CUDA with top_k/top_p: D2H once, then run the CPU chain.
     if (logits->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        PERF_SCOPE("sampler/logits_d2h");
-        cudaMemcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float),
-                   cudaMemcpyDeviceToHost);
+        ensure_scratch(vocab_size);
+        {
+            PERF_SCOPE("sampler/logits_d2h");
+            cudaMemcpy(logits_scratch_.data(), logits->data(), vocab_size * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+        }
+        return temperature_sample_impl(logits_scratch_.data(), vocab_size, temperature);
 #endif
-    } else {
-        PERF_SCOPE("sampler/logits_memcpy");
-        std::memcpy(host_logits.data(), logits->data(), vocab_size * sizeof(float));
     }
 
+    return temperature_sample_impl(static_cast<const float*>(logits->data()), vocab_size,
+                                   temperature);
+}
+
+// Shared CPU core for temperature sampling: copies `logits` into scratch,
+// applies repeat penalty + softcap, softmax(1/T), top-k and top-p filtering,
+// then multinomial sampling.
+int Sampler::temperature_sample_impl(const float* logits_in, int vocab_size, float temperature) {
+    ensure_scratch(vocab_size);
+    std::vector<float>& host_logits = logits_scratch_;
+    {
+        PERF_SCOPE("sampler/logits_memcpy");
+        std::memcpy(host_logits.data(), logits_in,
+                    static_cast<size_t>(vocab_size) * sizeof(float));
+    }
 
     if (config_.repeat_penalty != 1.0f && !token_history_.empty()) {
         PERF_SCOPE("sampler/repeat_penalty");
-        apply_repeat_penalty(host_logits);
+        apply_repeat_penalty(host_logits.data(), vocab_size);
     }
     {
         PERF_SCOPE("sampler/softmax_sample");
@@ -501,7 +524,7 @@ const SamplerConfig& Sampler::config() const {
     return config_;
 }
 
-void Sampler::apply_repeat_penalty(std::vector<float>& logits) const {
+void Sampler::apply_repeat_penalty(float* logits, int size) const {
     float penalty = config_.repeat_penalty;
     int n = static_cast<int>(token_history_.size());
     int last_n = config_.repeat_last_n;
@@ -509,7 +532,7 @@ void Sampler::apply_repeat_penalty(std::vector<float>& logits) const {
     int start = (last_n > 0 && last_n < n) ? (n - last_n) : 0;
     for (int i = start; i < n; ++i) {
         int32_t tid = token_history_[i];
-        if (tid >= 0 && tid < static_cast<int>(logits.size())) {
+        if (tid >= 0 && tid < size) {
             if (logits[tid] > 0.0f) {
                 logits[tid] /= penalty;
             } else {

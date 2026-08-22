@@ -114,9 +114,11 @@ private:
 // logits_all: [1+n_draft, vocab_size] row-major; row i predicts the token at
 // position start_pos+i+1, i.e. row i verifies draft_tokens[i]. When all drafts
 // are accepted, the last row yields the bonus token.
-// NOTE: currently the greedy-match fast path only; Phase 1 adds
-//       resample-consistency for do_sample (aligned with llama.cpp
-//       common_sampler_sample_and_accept_n).
+//
+// Resample-consistency (lossless): with do_sample=true every position runs
+// the sampler's full chain; a draft token is accepted iff it equals the
+// target's own sample, otherwise that sample becomes the continuation.
+// Output distribution == plain decode. Greedy mode uses argmax matching.
 // =========================================================================
 
 SpecVerifyResult verify_draft_tokens(

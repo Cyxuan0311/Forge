@@ -1,11 +1,8 @@
 #include "forge/speculative.h"
 
 #include <algorithm>
-#include <cstring>
 
-#include "forge/logger.h"
 #include "forge/sampler.h"
-#include "forge/tensor.h"
 
 namespace forge {
 
@@ -76,48 +73,61 @@ void NgramDraftProvider::reset() {
 }
 
 // =========================================================================
-// verify_draft_tokens
+// verify_draft_tokens -- resample-consistency verification
+//
+// Two modes, selected from the sampler's live config:
+// - Greedy (do_sample=false or temperature<=0): argmax at each position must
+//   equal the draft token.
+// - Sampling (do_sample=true): the FULL sampling chain (repeat penalty ->
+//   temperature -> top-k -> top-p -> multinomial) runs at every position and
+//   the draft token is accepted iff it equals the target's own sample. On
+//   mismatch the target sample becomes the confirmed continuation. Since
+//   every sampled token (match or not) is emitted as output, the output
+//   distribution is EXACTLY the target model's -- provably lossless, and
+//   identical to plain decode. Mirrors llama.cpp's
+//   common_sampler_sample_and_accept_n.
+//
+// Each row's sample is appended to the sampler token history immediately so
+// subsequent rows see the same repeat-penalty context as plain decode would.
 // =========================================================================
 
 SpecVerifyResult verify_draft_tokens(
     const float* logits_all, int vocab_size,
     const std::vector<int32_t>& draft_tokens,
     Sampler& sampler, const SpeculativeConfig& config) {
-    (void)config;  // Phase 1: branch on do_sample / p_min here
+    (void)config;  // p_min is a draft-side knob consumed by model draft providers
 
     SpecVerifyResult result;
     const int n_draft = static_cast<int>(draft_tokens.size());
+    const SamplerConfig& scfg = sampler.config();
+    const bool greedy_mode = (!scfg.do_sample || scfg.temperature <= 0.0f);
+
+    auto sample_row = [&](int row) -> int32_t {
+        const float* row_logits =
+            logits_all + static_cast<size_t>(row) * static_cast<size_t>(vocab_size);
+        int32_t tok = greedy_mode ? sampler.sample_greedy_ptr(row_logits, vocab_size)
+                                  : sampler.sample_temperature_ptr(row_logits, vocab_size,
+                                                                   scfg.temperature);
+        sampler.add_token_to_history(tok);
+        return tok;
+    };
 
     for (int i = 0; i < n_draft; ++i) {
         // Row i predicts the token at position start_pos+i+1.
-        const float* pos_logits = logits_all + static_cast<size_t>(i) * vocab_size;
-
-        auto logits_tensor =
-            std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, vocab_size},
-                                     DeviceType::CPU);
-        std::memcpy(logits_tensor->data(), pos_logits, vocab_size * sizeof(float));
-
-        const int32_t target_token = sampler.sample_greedy(logits_tensor);
-
-        if (target_token == draft_tokens[i]) {
+        const int32_t tok = sample_row(i);
+        if (tok == draft_tokens[i]) {
             result.accepted_tokens.push_back(draft_tokens[i]);
             result.n_accepted++;
         } else {
-            // Rejected: target's own sample takes over from here.
-            result.resampled = target_token;
+            // Rejected: the target's own sample takes over from here.
+            result.resampled = tok;
             return result;
         }
     }
 
     // All drafts accepted -> sample one bonus token from the last row.
     if (n_draft > 0) {
-        const float* bonus_logits =
-            logits_all + static_cast<size_t>(n_draft) * vocab_size;
-        auto logits_tensor =
-            std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, vocab_size},
-                                     DeviceType::CPU);
-        std::memcpy(logits_tensor->data(), bonus_logits, vocab_size * sizeof(float));
-        result.bonus = sampler.sample_greedy(logits_tensor);
+        result.bonus = sample_row(n_draft);
     }
 
     return result;
