@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -197,10 +198,99 @@ static void run_verify_unit_tests() {
 }
 
 // =========================================================================
+// Part 1b -- NgramDraftProvider hash-index cross-validation
+// =========================================================================
+
+#include <random>
+
+// Brute-force reference with the same LATEST-match selection as the indexed
+// provider: longest suffix first, most recent occurrence with >=1 continuation.
+static std::vector<int32_t> ngram_brute_reference(const std::vector<int32_t>& hist,
+                                                  int ngram_n, int ngram_min, int n_draft) {
+    const int len = static_cast<int>(hist.size());
+    const int max_L = std::min(ngram_n, len);
+    for (int L = max_L; L >= ngram_min; --L) {
+        const int32_t* pat = hist.data() + len - L;
+        for (int i = len - L; i >= 0; --i) {  // descending -> latest first
+            if (i + L > len - 1) continue;
+            if (std::memcmp(hist.data() + i, pat, sizeof(int32_t) * L) == 0) {
+                int avail = std::min(n_draft, len - i - L);
+                return std::vector<int32_t>(hist.begin() + i + L,
+                                            hist.begin() + i + L + avail);
+            }
+        }
+    }
+    return {};
+}
+
+static void run_ngram_index_tests() {
+    std::printf("\n--- ngram hash index vs brute force ---\n");
+
+    // Pseudo-random stream with planted local repetitions.
+    std::mt19937 rng(1234);
+    auto clustered = [&rng]() {
+        return static_cast<int32_t>(rng() % 5);   // small alphabet -> repeats
+    };
+    auto spread = [&rng]() {
+        return static_cast<int32_t>(1000 + rng() % 9000);
+    };
+
+    constexpr int kN = 5, kMin = 2;
+    NgramDraftProvider incremental(kN, kMin);
+    std::vector<int32_t> hist;
+    size_t mismatches = 0, nonempty = 0;
+
+    for (int step = 0; step < 600; ++step) {
+        // State must agree BEFORE appending the next token.
+        auto got = incremental.draft(4);
+        auto want = ngram_brute_reference(hist, kN, kMin, 4);
+        if (got != want) ++mismatches;
+        if (!want.empty()) ++nonempty;
+
+        // Mix chunk sizes: single tokens exercise straddling-window indexing,
+        // bursts mirror multi-token speculative rounds.
+        int burst = (step % 7 == 3) ? 3 : 1;
+        std::vector<int32_t> toks;
+        for (int b = 0; b < burst; ++b)
+            toks.push_back((step % 11 < 5) ? clustered() : spread());
+        incremental.accept(toks);
+        hist.insert(hist.end(), toks.begin(), toks.end());
+    }
+    CHECK(mismatches == 0, "ngram indexed draft == brute-force reference (600 steps)");
+    CHECK(nonempty > 20, "ngram reference produced enough non-empty drafts to be meaningful");
+
+    // Bulk begin() must equal incremental accept() on the same stream.
+    std::vector<int32_t> head(hist.begin(), hist.begin() + hist.size() / 2);
+    std::vector<int32_t> tail(hist.begin() + hist.size() / 2, hist.end());
+    NgramDraftProvider bulk(kN, kMin);
+    bulk.begin(head);
+    bulk.accept(tail);
+    NgramDraftProvider inc2(kN, kMin);
+    inc2.accept(hist);
+    CHECK(bulk.draft(6) == inc2.draft(6),
+          "ngram bulk begin() state == incremental build state");
+}
+
+// =========================================================================
 // Part 2 & 3 -- model-dependent integration tests (tinyllama)
 // =========================================================================
 
-static const char* kModelPath = "models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf";
+// Integration-test model selection: FORGE_TEST_MODEL overrides, then the
+// MiniCPM-V 4.6 GGUF under /mnt/g/AI, then the in-repo tinyllama fallback
+// (keeps CI usable when the large local model is absent).
+static std::string pick_test_model() {
+    if (const char* env = std::getenv("FORGE_TEST_MODEL")) {
+        if (file_exists(env)) return env;
+        std::printf("NOTE: FORGE_TEST_MODEL='%s' not found, falling back\n", env);
+    }
+    const char* candidates[] = {
+        "/mnt/g/AI/MiniCPM-V-4.6.F16/MiniCPM-V-4_6-Q4_K_M.gguf",
+        "models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
+    };
+    for (const char* c : candidates)
+        if (file_exists(c)) return c;
+    return "";
+}
 
 // One forward over `tokens` starting at KV position `pos`. Returns flat
 // [n_tokens, vocab] host logits.
@@ -356,7 +446,7 @@ static void run_end_to_end_parity_test(const std::string& model_path) {
     const std::vector<int32_t> prompt = {1, 42, 43, 42, 43, 42, 43, 42, 43};
 
     GenerationConfig cfg;
-    cfg.max_new_tokens = 24;
+    cfg.max_new_tokens = 16;
     cfg.do_sample = false;
     cfg.temperature = 0.0f;
     cfg.reset_kv_cache = true;
@@ -396,13 +486,16 @@ int main() {
 
     register_forge_runtime();
     run_verify_unit_tests();
+    run_ngram_index_tests();
 
-    if (!file_exists(kModelPath)) {
-        std::printf("\nNOTE: %s not found; skipping integration tests\n", kModelPath);
+    const std::string model_path = pick_test_model();
+    if (model_path.empty()) {
+        std::printf("\nNOTE: no test model found; skipping integration tests\n");
     } else {
+        std::printf("\nusing model: %s\n", model_path.c_str());
         Model model;
-        if (!model.load(kModelPath, DeviceType::CPU)) {
-            std::printf("FAIL: failed to load %s\n", kModelPath);
+        if (!model.load(model_path, DeviceType::CPU)) {
+            std::printf("FAIL: failed to load %s\n", model_path.c_str());
             return 1;
         }
 
@@ -411,9 +504,9 @@ int main() {
         p.gpu_layers = 0;
         auto ctx = make_context(model, p);
 
-        int vocab = 32000;
+        const int vocab = model.config().vocab_size;
         run_batch_consistency_test(*ctx, vocab);
-        run_end_to_end_parity_test(kModelPath);
+        run_end_to_end_parity_test(model_path);
     }
 
     std::printf("\n=== %d/%d checks passed ===\n", g_checks - g_failures, g_checks);

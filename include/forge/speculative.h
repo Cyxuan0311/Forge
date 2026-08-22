@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace forge {
@@ -92,6 +93,13 @@ using DraftProviderPtr = std::unique_ptr<IDraftProvider>;
 // ---- N-gram self-speculative draft provider ----
 // Suffix-matches against its own confirmed token history and returns the
 // continuation found at the match position.
+//
+// Maintains a hash index (n-gram key -> ascending occurrence positions) over
+// all window lengths [ngram_min_, ngram_n_] so draft() is O(match length)
+// instead of an O(len * n) scan. The index is built incrementally as tokens
+// are confirmed. Among all occurrences of a matched suffix the MOST RECENT
+// one with at least one continuation token available wins (recency beats
+// distance for prediction quality).
 
 class NgramDraftProvider : public IDraftProvider {
 public:
@@ -104,9 +112,26 @@ public:
     const char* name() const override { return "ngram"; }
 
 private:
+    // Index every window completed as the history grows from old_len to
+    // new_len (windows straddling the old boundary included).
+    void index_range(int old_len, int new_len);
+
     int ngram_n_;
     int ngram_min_;
     std::vector<int32_t> history_;  // full confirmed token sequence (prompt + generated)
+
+    struct VecHash {
+        size_t operator()(const std::vector<int32_t>& v) const {
+            size_t h = 1469598103934665603ull;  // FNV-1a 64-bit offset basis
+            for (int32_t t : v) {
+                h ^= static_cast<size_t>(static_cast<uint32_t>(t));
+                h *= 1099511628211ull;
+            }
+            return h;
+        }
+    };
+    // key -> ascending start positions of occurrences inside history_
+    std::unordered_map<std::vector<int32_t>, std::vector<int32_t>, VecHash> index_;
 };
 
 // =========================================================================

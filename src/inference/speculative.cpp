@@ -25,39 +25,53 @@ double SpeculativeStats::tokens_per_step() const {
 }
 
 // =========================================================================
-// NgramDraftProvider
+// NgramDraftProvider -- hash-indexed suffix matching
 // =========================================================================
 
 NgramDraftProvider::NgramDraftProvider(int ngram_n, int ngram_min)
     : ngram_n_(ngram_n), ngram_min_(ngram_min) {}
 
+void NgramDraftProvider::index_range(int old_len, int new_len) {
+    // Every window [s, s+L) that became complete as the history grew from
+    // old_len to new_len tokens. Windows straddling the old boundary are
+    // included: they start at s >= old_len-L+1.
+    for (int L = ngram_min_; L <= ngram_n_; ++L) {
+        const int s_begin = std::max(0, old_len - L + 1);
+        const int s_end = new_len - L;  // inclusive
+        for (int s = s_begin; s <= s_end; ++s) {
+            std::vector<int32_t> key(history_.begin() + s, history_.begin() + s + L);
+            index_[std::move(key)].push_back(s);
+        }
+    }
+}
+
 void NgramDraftProvider::begin(const std::vector<int32_t>& prompt) {
     history_ = prompt;
+    index_.clear();
+    index_range(0, static_cast<int>(history_.size()));
 }
 
 std::vector<int32_t> NgramDraftProvider::draft(int n_draft) {
     std::vector<int32_t> result;
-    const int search_len = static_cast<int>(history_.size());
-    if (search_len < ngram_min_ || n_draft <= 0) return result;
+    const int len = static_cast<int>(history_.size());
+    if (len < ngram_min_ || n_draft <= 0) return result;
 
-    // Longest-suffix-first matching against the confirmed history itself.
-    // A match must leave at least one continuation token available.
-    for (int n = std::min(ngram_n_, search_len); n >= ngram_min_; --n) {
-        const int32_t* pattern = history_.data() + search_len - n;
+    // Longest suffix first; among occurrences of a matched suffix prefer the
+    // most recent one that still has >=1 continuation token available.
+    const int max_L = std::min(ngram_n_, len);
+    for (int L = max_L; L >= ngram_min_; --L) {
+        std::vector<int32_t> key(history_.end() - L, history_.end());
+        auto it = index_.find(key);
+        if (it == index_.end()) continue;
 
-        for (int i = 0; i <= search_len - n - 1; ++i) {
-            bool match = true;
-            for (int k = 0; k < n; ++k) {
-                if (history_[i + k] != pattern[k]) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                int avail = std::min(n_draft, search_len - i - n);
-                for (int j = 0; j < avail; ++j) result.push_back(history_[i + n + j]);
-                if (!result.empty()) return result;
-            }
+        const auto& positions = it->second;
+        for (auto p = positions.rbegin(); p != positions.rend(); ++p) {
+            const int s = *p;
+            if (s + L > len - 1) continue;  // tail self-occurrence / no continuation
+            const int avail = std::min(n_draft, len - s - L);
+            result.assign(history_.begin() + s + L,
+                          history_.begin() + s + L + avail);
+            return result;
         }
     }
 
@@ -65,11 +79,15 @@ std::vector<int32_t> NgramDraftProvider::draft(int n_draft) {
 }
 
 void NgramDraftProvider::accept(const std::vector<int32_t>& tokens) {
+    if (tokens.empty()) return;
+    const int old_len = static_cast<int>(history_.size());
     history_.insert(history_.end(), tokens.begin(), tokens.end());
+    index_range(old_len, static_cast<int>(history_.size()));
 }
 
 void NgramDraftProvider::reset() {
     history_.clear();
+    index_.clear();
 }
 
 // =========================================================================
