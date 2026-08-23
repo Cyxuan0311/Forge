@@ -128,8 +128,10 @@ void register_model(py::module_& m) {
                 return self.get_model().load_vision_weights(mmproj_path, dev);
             },
             py::arg("mmproj_path"), py::arg("device") = "cpu")
-        .def("create_context", &PyModel::create_context, py::arg("kv_cache_dtype") = "fp32",
-             py::arg("gpu_layers") = -1, py::arg("offload_kqv") = true, py::return_value_policy::take_ownership)
+        .def("create_context", &PyModel::create_context,
+             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
+             py::arg("offload_kqv") = true, py::arg("speculative_config") = forge::SpeculativeConfig{},
+             py::return_value_policy::take_ownership)
         .def("generate", &PyModel::generate, py::arg("prompt_ids"), py::arg("max_new_tokens") = 256,
              py::arg("temperature") = 1.0f, py::arg("top_k") = 0, py::arg("top_p") = 1.0f,
              py::arg("repeat_penalty") = 1.0f, py::arg("do_sample") = true, py::arg("seed") = 0,

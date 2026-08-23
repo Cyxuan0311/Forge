@@ -90,12 +90,37 @@ void register_core_types(py::module_& m) {
     // ---- SpeculativeConfig ----
     py::class_<SpeculativeConfig>(m, "SpeculativeConfig")
         .def(py::init<>())
+        .def(py::init<bool, int, int, float, bool,
+                      const std::string&, int, bool, int, int>(),
+             py::arg("enabled") = false,
+             py::arg("n_draft") = 5,
+             py::arg("n_min") = 0,
+             py::arg("p_min") = 0.0f,
+             py::arg("print_stats") = false,
+             py::arg("draft_model_path") = "",
+             py::arg("draft_gpu_layers") = -1,
+             py::arg("use_ngram") = true,
+             py::arg("ngram_n") = 5,
+             py::arg("ngram_min") = 2)
+        .def_readwrite("enabled", &SpeculativeConfig::enabled)
         .def_readwrite("n_draft", &SpeculativeConfig::n_draft)
+        .def_readwrite("n_min", &SpeculativeConfig::n_min)
         .def_readwrite("p_min", &SpeculativeConfig::p_min)
+        .def_readwrite("draft_model_path", &SpeculativeConfig::draft_model_path)
+        .def_readwrite("draft_gpu_layers", &SpeculativeConfig::draft_gpu_layers)
         .def_readwrite("use_ngram", &SpeculativeConfig::use_ngram)
         .def_readwrite("ngram_n", &SpeculativeConfig::ngram_n)
-        .def_readwrite("ngram_min", &SpeculativeConfig::ngram_min)
-        .def_readwrite("enabled", &SpeculativeConfig::enabled);
+        .def_readwrite("ngram_min", &SpeculativeConfig::ngram_min);
+
+    // ---- SpeculativeStats ----
+    py::class_<SpeculativeStats>(m, "SpeculativeStats")
+        .def_readwrite("n_spec_steps", &SpeculativeStats::n_spec_steps)
+        .def_readwrite("n_fallback_steps", &SpeculativeStats::n_fallback_steps)
+        .def_readwrite("n_draft_tokens", &SpeculativeStats::n_draft_tokens)
+        .def_readwrite("n_accepted_tokens", &SpeculativeStats::n_accepted_tokens)
+        .def_readwrite("n_output_tokens", &SpeculativeStats::n_output_tokens)
+        .def("acceptance_rate", &SpeculativeStats::acceptance_rate)
+        .def("tokens_per_step", &SpeculativeStats::tokens_per_step);
 
     // ---- GenerationConfig ----
     py::class_<GenerationConfig>(m, "GenerationConfig")
@@ -120,7 +145,11 @@ void register_core_types(py::module_& m) {
         .def_readonly("num_prompt_tokens", &GenerationResult::num_prompt_tokens)
         .def_readonly("num_generated_tokens", &GenerationResult::num_generated_tokens)
         .def_readonly("finished", &GenerationResult::finished)
-        .def_readonly("finish_reason", &GenerationResult::finish_reason);
+        .def_readonly("finish_reason", &GenerationResult::finish_reason)
+        .def_property_readonly("spec_stats", [](const GenerationResult& r) -> py::object {
+            if (!r.spec_stats) return py::none();
+            return py::cast(*r.spec_stats);
+        });
 
     // ---- ContextConfig ----
     py::class_<ContextConfig>(m, "ContextConfig")

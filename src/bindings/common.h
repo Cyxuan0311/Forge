@@ -31,6 +31,7 @@
 #include "forge/perf_profiler.h"
 #include "forge/request_scheduler.h"
 #include "forge/sampler.h"
+#include "forge/speculative.h"
 #include "forge/tensor.h"
 #include "forge/tokenizer.h"
 #include "forge/vision_encoder.h"
@@ -522,7 +523,8 @@ public:
     }
 
     PyInferenceContext* create_context(const std::string& kv_cache_dtype_str, int gpu_layers,
-                                       bool offload_kqv = true) {
+                                       bool offload_kqv = true,
+                                       const forge::SpeculativeConfig& speculative_config = {}) {
         ensure_engines_registered();
 
         auto ctx = std::make_unique<PyInferenceContext>(model_);
@@ -541,6 +543,7 @@ public:
         }
 
         ctx->get().params_mut().offload_kqv = offload_kqv;
+        ctx->get().params_mut().speculative_config = speculative_config;
 
         const auto& cfg = model_.config();
         auto engine = EngineRegistry::instance().create(cfg.arch_type, model_, ctx->get());
@@ -776,10 +779,12 @@ public:
     }
 
     PyInferenceContext* create_context(const std::string& kv_cache_dtype_str = "fp32",
-                                       int gpu_layers = -1, bool offload_kqv = true) {
+                                       int gpu_layers = -1, bool offload_kqv = true,
+                                       const forge::SpeculativeConfig& speculative_config = {}) {
         auto ctx = new PyInferenceContext(model_);
 
         ctx->get().params_mut().offload_kqv = offload_kqv;
+        ctx->get().params_mut().speculative_config = speculative_config;
 
         auto engine =
             EngineRegistry::instance().create(model_.config().arch_type, model_, ctx->get());
