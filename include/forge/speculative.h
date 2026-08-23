@@ -48,6 +48,7 @@ struct SpeculativeConfig {
     int n_draft = 5;            // max drafted tokens per round (--spec-draft)
     int n_min = 0;              // drop the whole round if fewer candidates than this (--spec-n-min)
     float p_min = 0.0f;         // draft confidence early-stop threshold (Phase 3 model draft)
+    bool print_stats = false;   // CLI: print SpeculativeStats after generation (--spec-stats)
 
     // Standalone small draft model (Phase 3); takes priority over n-gram when set
     std::string draft_model_path;

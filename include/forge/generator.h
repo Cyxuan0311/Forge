@@ -35,6 +35,7 @@ struct GenerationResult {
     int num_generated_tokens = 0;
     bool finished = false;
     std::string finish_reason;
+    const SpeculativeStats* spec_stats = nullptr;  // set by Generator after generate()
 };
 
 class Generator {
