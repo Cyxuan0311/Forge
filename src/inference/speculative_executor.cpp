@@ -16,9 +16,16 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
     : ctx_(ctx), sampler_(sampler), cfg_(cfg) {
     if (!cfg_.enabled) return;
 
-    // Phase 3: when cfg_.draft_model_path is set, create a ModelDraftProvider here
-    // (takes priority over n-gram).
-    if (cfg_.use_ngram) {
+    if (!cfg_.draft_model_path.empty()) {
+        auto draft = std::make_unique<ModelDraftProvider>(cfg_, ctx_.params(),
+                                                           ctx_.model().config().vocab_size);
+        if (draft->valid()) {
+            provider_ = std::move(draft);
+        } else {
+            LOG_WARN("SpeculativeExecutor: draft model unavailable, falling back to n-gram");
+        }
+    }
+    if (!provider_ && cfg_.use_ngram) {
         provider_ = std::make_unique<NgramDraftProvider>(cfg_.ngram_n, cfg_.ngram_min);
         LOG_INFO(std::string("SpeculativeExecutor: draft provider '") + provider_->name() +
                  "' enabled, n_draft=" + std::to_string(cfg_.n_draft));
@@ -52,7 +59,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         return out;
     }
 
-    auto drafts = provider_->draft(n_draft);
+    auto drafts = provider_->draft(in.last_token, n_draft);
     if (static_cast<int>(drafts.size()) < std::max(cfg_.n_min, 1)) {
         ++stats_.n_fallback_steps;
         return out;
@@ -133,6 +140,10 @@ void SpeculativeExecutor::rollback_kv(int64_t valid_end_pos) {
     auto* engine = ctx_.engine();
     KVCache* kv = engine ? engine->kv_cache() : nullptr;
     if (kv) kv->rollback(valid_end_pos);
+}
+
+void SpeculativeExecutor::notify_confirmed(int32_t token) {
+    if (provider_) provider_->accept({token});
 }
 
 }  // namespace forge

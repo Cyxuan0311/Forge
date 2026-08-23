@@ -224,6 +224,10 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         pos += 1;
         step++;
 
+        if (spec_executor_ && spec_executor_->valid()) {
+            spec_executor_->notify_confirmed(token_id);
+        }
+
         if (callback) {
             callback(token_id, step - 1);
         }

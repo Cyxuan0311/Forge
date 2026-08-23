@@ -56,6 +56,10 @@ public:
     // generation stops early inside a speculated batch output.
     void rollback_kv(int64_t valid_end_pos);
 
+    // Notify the draft provider about a token produced by the plain fallback
+    // path, keeping a model draft context synchronized between rounds.
+    void notify_confirmed(int32_t token);
+
     const SpeculativeStats& stats() const { return stats_; }
     SpeculativeStats& stats_mut() { return stats_; }
 

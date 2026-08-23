@@ -242,7 +242,7 @@ static void run_ngram_index_tests() {
 
     for (int step = 0; step < 600; ++step) {
         // State must agree BEFORE appending the next token.
-        auto got = incremental.draft(4);
+        auto got = incremental.draft(0, 4);
         auto want = ngram_brute_reference(hist, kN, kMin, 4);
         if (got != want) ++mismatches;
         if (!want.empty()) ++nonempty;
@@ -267,7 +267,7 @@ static void run_ngram_index_tests() {
     bulk.accept(tail);
     NgramDraftProvider inc2(kN, kMin);
     inc2.accept(hist);
-    CHECK(bulk.draft(6) == inc2.draft(6),
+    CHECK(bulk.draft(0, 6) == inc2.draft(0, 6),
           "ngram bulk begin() state == incremental build state");
 }
 
@@ -481,6 +481,32 @@ static void run_end_to_end_parity_test(const std::string& model_path) {
     }
 }
 
+static void run_model_draft_smoke_test(Model& target_model, const ContextParams& target_params) {
+    const char* draft_path = std::getenv("FORGE_TEST_DRAFT_MODEL");
+    if (!draft_path || !file_exists(draft_path)) {
+        std::printf("\nNOTE: FORGE_TEST_DRAFT_MODEL not set; skipping model-draft smoke test\n");
+        return;
+    }
+
+    std::printf("\n--- standalone model-draft smoke test ---\n");
+    SpeculativeConfig spec;
+    spec.draft_model_path = draft_path;
+    spec.draft_gpu_layers = 0;
+    ModelDraftProvider provider(spec, target_params, target_model.config().vocab_size);
+    CHECK(provider.valid(), "model draft: draft model loaded and vocabulary matches");
+    if (!provider.valid()) return;
+
+    const std::vector<int32_t> prompt = {1, 42, 43, 42, 43};
+    provider.begin(prompt);
+    auto drafts = provider.draft(prompt.back(), 3);
+    CHECK(!drafts.empty(), "model draft: produced at least one candidate");
+    if (!drafts.empty()) {
+        provider.accept({drafts.front()});
+        auto next = provider.draft(drafts.front(), 2);
+        CHECK(!next.empty(), "model draft: remained usable after KV resynchronization");
+    }
+}
+
 int main() {
     std::printf("=== forge-spec-test ===\n");
 
@@ -507,6 +533,7 @@ int main() {
         const int vocab = model.config().vocab_size;
         run_batch_consistency_test(*ctx, vocab);
         run_end_to_end_parity_test(model_path);
+        run_model_draft_smoke_test(model, p);
     }
 
     std::printf("\n=== %d/%d checks passed ===\n", g_checks - g_failures, g_checks);

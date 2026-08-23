@@ -51,7 +51,8 @@ void NgramDraftProvider::begin(const std::vector<int32_t>& prompt) {
     index_range(0, static_cast<int>(history_.size()));
 }
 
-std::vector<int32_t> NgramDraftProvider::draft(int n_draft) {
+std::vector<int32_t> NgramDraftProvider::draft(int32_t last_token, int n_draft) {
+    (void)last_token;
     std::vector<int32_t> result;
     const int len = static_cast<int>(history_.size());
     if (len < ngram_min_ || n_draft <= 0) return result;

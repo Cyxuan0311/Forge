@@ -64,8 +64,13 @@ struct SpeculativeConfig {
 //
 // Self-managed state: callers (SpeculativeExecutor) never pass token history.
 //   begin(prompt)                     once per generation start
-//   [draft(n) -> (target verify) -> accept(confirmed)]*  main loop
+//   [draft(last, n) -> (target verify) -> accept(confirmed)]*   main loop
 //   reset()                           clear internal state
+//
+// `last` in draft() is the latest confirmed token (already reflected in
+// accept() calls EXCEPT the prefill-sampled first token, which arrives only
+// here). Providers that track the full history internally (n-gram) may
+// ignore it.
 // =========================================================================
 
 class IDraftProvider {
@@ -76,8 +81,9 @@ public:
     // initialize their state from `prompt`.
     virtual void begin(const std::vector<int32_t>& /*prompt*/) {}
 
-    // Propose at most n_draft candidate tokens; return empty if none available.
-    virtual std::vector<int32_t> draft(int n_draft) = 0;
+    // Propose at most n_draft candidate tokens continuing after `last_token`;
+    // return empty if none available.
+    virtual std::vector<int32_t> draft(int32_t last_token, int n_draft) = 0;
 
     // Called after each verification round with the tokens finally confirmed
     // by the target (accepted + resampled/bonus).
@@ -106,7 +112,7 @@ public:
     explicit NgramDraftProvider(int ngram_n = 5, int ngram_min = 2);
 
     void begin(const std::vector<int32_t>& prompt) override;
-    std::vector<int32_t> draft(int n_draft) override;
+    std::vector<int32_t> draft(int32_t last_token, int n_draft) override;
     void accept(const std::vector<int32_t>& tokens) override;
     void reset() override;
     const char* name() const override { return "ngram"; }
@@ -132,6 +138,38 @@ private:
     };
     // key -> ascending start positions of occurrences inside history_
     std::unordered_map<std::vector<int32_t>, std::vector<int32_t>, VecHash> index_;
+};
+
+// ---- Standalone small-model draft provider ----
+// Runs a second GGUF model in its own InferenceContext and proposes sampled
+// continuations from a top-k restricted chain (llama.cpp DRAFT_SIMPLE style).
+// The draft context keeps its own KV cache; accept() trims it back to the
+// last confirmed boundary and replays the confirmed tokens so both sides stay
+// aligned for the next round.
+
+struct ContextParams;  // defined in forge/context.h (circular-include guard)
+
+class ModelDraftProvider : public IDraftProvider {
+public:
+    // Loads the draft model described by spec.draft_model_path. `target`
+    // supplies device/threading defaults (spec.draft_gpu_layers >= 0
+    // overrides the layer offload count); target_vocab must match the draft
+    // model's vocabulary or valid() returns false.
+    ModelDraftProvider(const SpeculativeConfig& spec, const ContextParams& target,
+                       int target_vocab);
+    ~ModelDraftProvider() override;
+
+    bool valid() const;
+
+    void begin(const std::vector<int32_t>& prompt) override;
+    std::vector<int32_t> draft(int32_t last_token, int n_draft) override;
+    void accept(const std::vector<int32_t>& tokens) override;
+    void reset() override;
+    const char* name() const override { return "model"; }
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 // =========================================================================
