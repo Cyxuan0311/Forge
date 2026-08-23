@@ -34,8 +34,10 @@ Generator::Generator(InferenceContext& ctx, const SamplerConfig& sampler_cfg)
     }
 #endif
 
-    spec_executor_ = std::make_unique<SpeculativeExecutor>(
-        ctx_, sampler_, ctx_.params().speculative_config);
+    if (ctx_.params().speculative_config.enabled) {
+        spec_executor_ = std::make_unique<SpeculativeExecutor>(
+            ctx_, sampler_, ctx_.params().speculative_config);
+    }
 }
 
 Generator::~Generator() {
@@ -260,7 +262,7 @@ decode_done:
     }
 
     result.num_generated_tokens = static_cast<int>(result.token_ids.size());
-
+    result.spec_stats = spec_executor_ ? &spec_executor_->stats() : nullptr;
     return result;
 }
 
