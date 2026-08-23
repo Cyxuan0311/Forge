@@ -25,7 +25,12 @@ using namespace forge;
 GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& tokenizer,
                                    const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                    float temperature, int top_k, float top_p, float repeat_penalty,
-                                   int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id) {
+                                   int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
+                                   const SpeculativeConfig& spec_cfg) {
+    // Apply speculative config to context before generation
+    if (spec_cfg.enabled) {
+        ctx.params_mut().speculative_config = spec_cfg;
+    }
     GenerationStats stats;
     stats.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
 
@@ -149,7 +154,12 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
 GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer,
                                const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                float temperature, int top_k, float top_p, float repeat_penalty,
-                               int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id) {
+                               int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
+                               const SpeculativeConfig& spec_cfg) {
+    // Apply speculative config to context before generation
+    if (spec_cfg.enabled) {
+        ctx.params_mut().speculative_config = spec_cfg;
+    }
     GenerationConfig gen_cfg;
     gen_cfg.max_new_tokens = max_new_tokens;
     gen_cfg.temperature = temperature;
@@ -185,6 +195,13 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     stats.num_prompt_tokens = result.num_prompt_tokens;
     stats.num_generated_tokens = result.num_generated_tokens;
     stats.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    if (result.spec_stats) {
+        stats.spec.n_spec_steps = result.spec_stats->n_spec_steps;
+        stats.spec.n_fallback_steps = result.spec_stats->n_fallback_steps;
+        stats.spec.n_draft_tokens = result.spec_stats->n_draft_tokens;
+        stats.spec.n_accepted_tokens = result.spec_stats->n_accepted_tokens;
+        stats.spec.n_output_tokens = result.spec_stats->n_output_tokens;
+    }
 
     return stats;
 }

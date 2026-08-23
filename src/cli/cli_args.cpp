@@ -40,6 +40,16 @@ static void print_usage(const char* prog) {
             "       --offload-embedding    Offload token_embedding to GPU (default: on)\n"
            "       --no-offload-embedding Keep token_embedding on CPU during partial offload\n"
            "\n"
+           "Speculative Decoding:\n"
+           "       --spec                 Enable speculative decoding (n-gram, off by default)\n"
+           "       --spec-draft N         Max drafted tokens per round (default: 5)\n"
+           "       --spec-n-min N         Min candidates per round or discard (default: 0)\n"
+           "       --spec-ngram-n N       Longest suffix match length (default: 5)\n"
+           "       --spec-ngram-min N     Shortest suffix match length (default: 2)\n"
+           "       --spec-p-min FLOAT     Draft confidence early-stop threshold (default: 0.0)\n"
+           "       --spec-model PATH      Standalone small draft model path (Phase 3)\n"
+           "       --spec-stats           Print speculation stats after generation\n"
+           "\n"
            "Sampling:\n"
            "       --temp FLOAT          Sampling temperature (default: 0.7, 0=greedy)\n"
            "       --top-k N             Top-K sampling (default: 40, 0=disabled)\n"
@@ -265,6 +275,57 @@ CliArgs parse_args(int argc, char** argv) {
             args.info_only = true;
         } else if (arg == "--bench") {
             args.bench = true;
+        } else if (arg == "--spec") {
+            args.spec.enabled = true;
+            args.spec.use_ngram = true;
+        } else if (arg == "--spec-draft") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.use_ngram = true;
+            args.spec.n_draft = std::stoi(argv[i]);
+        } else if (arg == "--spec-n-min") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.use_ngram = true;
+            args.spec.n_min = std::stoi(argv[i]);
+        } else if (arg == "--spec-ngram-n") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.use_ngram = true;
+            args.spec.ngram_n = std::stoi(argv[i]);
+        } else if (arg == "--spec-ngram-min") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.use_ngram = true;
+            args.spec.ngram_min = std::stoi(argv[i]);
+        } else if (arg == "--spec-p-min") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.p_min = std::stof(argv[i]);
+        } else if (arg == "--spec-model") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.draft_model_path = argv[i];
+        } else if (arg == "--spec-stats") {
+            args.spec.print_stats = true;
         } else if (arg == "-v" || arg == "--verbose") {
             args.verbose = 2;
         } else {

@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -589,11 +590,11 @@ int main(int argc, char** argv) {
         if (args.no_stream) {
             stats = generate_batch(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                   !args.no_sample, args.seed, tokenizer.eos_token_id());
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec);
         } else {
             stats = generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                        args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                       !args.no_sample, args.seed, tokenizer.eos_token_id());
+                                       !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec);
         }
 
         std::cout << "\n\n";
@@ -603,6 +604,18 @@ int main(int argc, char** argv) {
             printf("  [%d prompt, %.1f ms, %.1f tok/s | %d generated, %.1f ms, %.1f tok/s]\n",
                    stats.num_prompt_tokens, stats.prompt_eval_ms, prompt_tok_s,
                    stats.num_generated_tokens, stats.elapsed_ms, gen_tok_s);
+        }
+
+        // Print speculative decoding stats if requested
+        if (args.spec.print_stats && args.spec.enabled && stats.spec.n_spec_steps > 0) {
+            std::cout << "\n  --- Speculative Decoding Stats ---\n";
+            std::cout << "  Spec steps:      " << stats.spec.n_spec_steps << "\n";
+            std::cout << "  Fallback steps:  " << stats.spec.n_fallback_steps << "\n";
+            std::cout << "  Draft tokens:    " << stats.spec.n_draft_tokens << "\n";
+            std::cout << "  Accepted tokens: " << stats.spec.n_accepted_tokens << "\n";
+            std::cout << std::fixed << std::setprecision(1);
+            std::cout << "  Acceptance rate: " << (stats.spec.acceptance_rate() * 100.0) << "%\n";
+            std::cout << "  Tokens/step:     " << stats.spec.tokens_per_step() << "\n";
         }
 
         return 0;

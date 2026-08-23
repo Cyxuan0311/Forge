@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "forge/chat_template.h"
+#include "forge/speculative.h"
 
 // Forward declarations
 namespace forge {
@@ -67,6 +68,9 @@ struct CliArgs {
 
     // Verbosity
     int verbose = 1;
+
+    // Speculative decoding
+    forge::SpeculativeConfig spec;
 };
 
 CliArgs parse_args(int argc, char** argv);
@@ -103,6 +107,7 @@ struct GenerationStats {
     int num_generated_tokens = 0;
     double elapsed_ms = 0;
     double prompt_eval_ms = 0;
+    forge::SpeculativeStats spec;  // speculative decoding stats (zeroed when not enabled)
 };
 
 // ============================================================================
@@ -112,12 +117,14 @@ struct GenerationStats {
 GenerationStats generate_streaming(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
                                    const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                    float temperature, int top_k, float top_p, float repeat_penalty,
-                                   int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id);
+                                   int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
+                                   const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{});
 
 GenerationStats generate_batch(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
                                const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                float temperature, int top_k, float top_p, float repeat_penalty,
-                               int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id);
+                               int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
+                               const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{});
 
 // ============================================================================
 // Interactive chat
