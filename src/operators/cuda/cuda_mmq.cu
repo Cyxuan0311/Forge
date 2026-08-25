@@ -523,18 +523,28 @@ static __device__ __forceinline__ void load_tiles_q5_K(
         const uint8_t* block_ptr = w_row + kbx0 * 176;
 
         // ql[128] at offset 48, qh[32] at offset 16
-        // Each thread loads 1 int32 from ql and combines with qh
+        // Each thread loads 1 int32 from ql and merges the matching qh bits
+        // into bit 4 of every byte (ported from llama.cpp load_tiles_q5_K):
+        // the shared-memory row then holds contiguous 5-bit values, which
+        // vec_dot_q5_K_q8_1_mmq consumes with plain dp4a.
         const int txi = lane % threads_per_row;
         const int* ql_i32 = (const int*)(block_ptr + 48);
         const int* qh_i32 = (const int*)(block_ptr + 16);
 
-        // Store lo nibbles and hi bits separately in x_qs
-        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + txi] = ql_i32[txi];
-        // Pack high bits: extract 1-bit from qh and combine with lo nibbles
-        // For 5-bit: value = (ql & 0xF) | (qh_bit << 4) for lo half
-        //            value = (ql >> 4) | (qh_bit << 4) for hi half
-        // This is handled in the vec_dot function
-        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = qh_i32[txi % 8];
+        const int ky = GEMV_QR5_K * txi;
+        const int ql = ql_i32[txi];
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = qh_i32[txi % (GEMV_QI5_K / 4)];
+        const int qh0 = ((qh >> (2 * (txi / (GEMV_QI5_K / 4)) + 0)) << 4) & 0x10101010;
+        const int qh1 = ((qh >> (2 * (txi / (GEMV_QI5_K / 4)) + 1)) << 4) & 0x10101010;
+
+        const int kq0 = ky - ky % (GEMV_QI5_K / 2) + txi % (GEMV_QI5_K / 4);
+        const int kq1 = kq0 + GEMV_QI5_K / 4;
+
+        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kq0] = ql0 | qh0;
+        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + kq1] = ql1 | qh1;
     }
 
     // Load dm (d and dmin)
