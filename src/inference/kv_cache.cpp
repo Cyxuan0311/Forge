@@ -851,9 +851,18 @@ void KVCache::reset() {
 void KVCache::rollback(int64_t to_pos) {
     for (auto& layer : layers_) {
         if (layer.logical_filled > to_pos) {
-            for (int64_t p = to_pos; p < static_cast<int64_t>(layer.cells.size()); ++p) {
-                if (p >= 0 && p < static_cast<int64_t>(layer.cells.size()) &&
-                    layer.cells[p].pos >= to_pos) {
+            // Only sweep the range that was actually written (up to the
+            // physical high-water mark). Cells above `filled` were never
+            // stamped, and every consumer either caps reads at filled()
+            // (attention masks) or re-stamps on write (update()), so
+            // scanning the full max_seq_len tail was pure waste. This makes
+            // speculative-decoding rollbacks O(rejected tokens) instead of
+            // O(max_seq_len) per layer. Keep the pos>=to_pos guard so ring
+            // buffers never clobber live wrapped cells.
+            const int64_t hi = std::min<int64_t>(layer.filled,
+                                                  static_cast<int64_t>(layer.cells.size()));
+            for (int64_t p = std::max<int64_t>(to_pos, 0); p < hi; ++p) {
+                if (layer.cells[p].pos >= to_pos) {
                     layer.cells[p].pos = -1;
                     layer.cells[p].seq_id_mask = 0;
                 }
