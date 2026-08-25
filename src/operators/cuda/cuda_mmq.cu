@@ -312,6 +312,17 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 // Weight tile loading into shared memory (dp4a layout)
 // ============================================================================
 
+// Unpack one 6-bit scale/min word for Q4_K/Q5_K (ported from llama.cpp
+// mmq-load-tiles.cuh). The 12 GGUF scale bytes, viewed as three ints, hold:
+//   int0 = sc0..sc3, int1 = m0..m3, int2 = low nibbles of sc4..7 and m4..7,
+// with each value's two high bits stored at bits 6-7 of its byte in int0/int1.
+// ksc selects which word to produce: 0 -> [sc0-3], 1 -> [sc4-7],
+// 2 -> [m0-3], 3 -> [m4-7]; every output byte holds one clean 6-bit value.
+static __device__ __forceinline__ int unpack_scales_q45_K(const int* scales, int ksc) {
+    return ((scales[(ksc % 2) + (ksc != 0)] >> (4 * (ksc & (ksc / 2)))) & 0x0F0F0F0F) |
+           ((scales[ksc / 2] >> (2 * (ksc % 2))) & 0x30303030);
+}
+
 // ---- Q3_K load tiles ----
 // Q3_K block (110 bytes): hmask[32] + qs[64] + scales[12] + d[2]
 // Shared memory layout (dp4a):
@@ -458,7 +469,10 @@ static __device__ __forceinline__ void load_tiles_q4_K(
         x_dm[i] = dm;
     }
 
-    // Load scales (12 bytes at offset 4)
+    // Load scales (12 bytes at offset 4): repack into four words per row,
+    // [sc0-3][sc4-7][m0-3][m4-7], one clean 6-bit value per byte — exactly
+    // what the compute side's sc/m indexing expects (vec_dot reads sc bytes
+    // [0..2) or [2..4) of a word and the matching mins two words away).
     constexpr int rows_per_warp = warp_size / 4;
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
@@ -466,27 +480,12 @@ static __device__ __forceinline__ void load_tiles_q4_K(
         int n = n_start + min(i, N - n_start - 1);
 
         const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 144;
-        const uint8_t* block_ptr = w_row + kbx0 * 144 + (lane % (MMQ_TILE_NE_K / 8)) / (GEMV_QI4_K / 8);
+        const uint8_t* block_ptr = w_row + kbx0 * 144;
 
         const int* scales = (const int*)(block_ptr + 4);
         const int ksc = lane % (MMQ_TILE_NE_K / 8);
 
-        // Unpack scales (same as llama.cpp's unpack_scales_q45_K)
-        int scales32 = scales[ksc / 2];
-        if (ksc & 1) {
-            scales32 = (scales32 >> 4) & 0x0F0F0F0F;
-            // Merge with high bits from next pair
-            int next = scales[ksc / 2 + 2];
-            scales32 |= (next & 0x40404040) >> 2;
-            int m32 = (next >> 4) & 0x0F0F0F0F;
-            int next2 = scales[ksc / 2 + 4];
-            m32 |= (next2 & 0x40404040) >> 2;
-            // Pack scale and min together
-            x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + ksc] = scales32 | (m32 << 16);
-        } else {
-            // Simplified: just store the raw packed scales
-            x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + ksc] = scales[ksc];
-        }
+        x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + ksc] = unpack_scales_q45_K(scales, ksc);
     }
 }
 
@@ -552,7 +551,8 @@ static __device__ __forceinline__ void load_tiles_q5_K(
         x_dm[i] = dm;
     }
 
-    // Load scales (same as Q4_K)
+    // Load scales (same 12-byte layout as Q4_K): canonical unpack into
+    // [sc0-3][sc4-7][m0-3][m4-7] words, one clean 6-bit value per byte.
     constexpr int rows_per_warp = warp_size / 4;
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
@@ -560,11 +560,11 @@ static __device__ __forceinline__ void load_tiles_q5_K(
         int n = n_start + min(i, N - n_start - 1);
 
         const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 176;
-        const uint8_t* block_ptr = w_row + kbx0 * 176 + (lane % (MMQ_TILE_NE_K / 8)) / (GEMV_QI5_K / 8);
+        const uint8_t* block_ptr = w_row + kbx0 * 176;
 
         const int* scales = (const int*)(block_ptr + 4);
         const int ksc = lane % (MMQ_TILE_NE_K / 8);
-        x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + ksc] = scales[ksc];
+        x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + ksc] = unpack_scales_q45_K(scales, ksc);
     }
 }
 
