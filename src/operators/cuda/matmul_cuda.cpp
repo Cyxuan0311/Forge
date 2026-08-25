@@ -169,16 +169,21 @@ void cuda_matmul(const TensorPtr& a, const TensorPtr& b_fp32, const TensorPtr& o
 
 void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& out, int M, int K,
                         int N) {
-    // Threshold: for M <= 32, use batched GEMV (on-the-fly dequant)
-    // to avoid dequantizing the entire weight matrix to FP32.
-    const int GEMV_THRESHOLD = 32;
-
     const float* a_data = static_cast<const float*>(a->data());
     float* o_data = static_cast<float*>(out->data());
     const bool quantized = is_quantized_type(b->dtype());
 
-    if (M > 1 && M <= GEMV_THRESHOLD) {
-        // Small batch: use batched GEMV with on-the-fly dequantization
+    if (M > 1) {
+        // Multi-row batch (prefill / speculative verification).
+        //
+        // NOTE: the MMQ tiled kernels are currently DISABLED — they produce
+        // incorrect results (K-blocking misalignment: the compute loop consumes
+        // one 128-element q8_1_mmq block per iteration while load_tiles advances
+        // the weight side by a full 256-element block, and num_k_blocks counts
+        // 256-element chunks; the weight/activation streams therefore never
+        // line up). Any M > 32 prefill hit this and silently produced garbage.
+        // Route everything through the verified batched-GEMV path until the
+        // MMQ port is repaired against a reference test.
         auto gemv_batch = device_gemv_batch_fn(b->dtype());
         if (gemv_batch) {
             gemv_batch(a_data, b->data(), o_data, M, K, N, 0);
@@ -190,25 +195,8 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
             auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
             cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
         } else {
-            cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M, K, N,
-                                      true);
-        }
-    } else if (M > 1) {
-        // Large batch: use MMQ (Phase 6) if available, else dequantize + cuBLAS
-        auto mmq = device_mmq_fn(b->dtype());
-        if (mmq) {
-            // Phase 6: quantized matrix-matrix multiplication with dp4a
-            // Skips the memory-intensive full dequantization to FP32
-            mmq(a_data, b->data(), o_data, M, K, N, 0);
-        } else if (quantized) {
-            auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
-            if (!dequant_matrix)
-                capability_failure("matmul_transB", b->dtype(), M, K, N);
-            auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
-            cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
-        } else {
-            cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M, K, N,
-                                      true);
+            cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M,
+                                      K, N, true);
         }
     } else {
         // M == 1: single GEMV — use dispatch table for supported types
@@ -260,10 +248,6 @@ void cuda_matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const Tens
 
 TensorPtr cuda_ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const TensorPtr& w3,
                             const TensorPtr& out, int M, int K, int intermediate_dim) {
-    // Threshold: for M <= 32, use batched GEMV (on-the-fly dequant) to avoid
-    // dequantizing the entire weight matrix. For larger M, cublas GEMM after
-    // dequantization is more efficient due to higher compute intensity.
-    const int GEMV_THRESHOLD = 32;
 
     auto separate_path = [&]() {
         auto gate = ops::matmul_transB(input, w1);
@@ -278,16 +262,11 @@ TensorPtr cuda_ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const T
                                                 w1->data(), w3->data(),
                                                 static_cast<float*>(out->data()), K,
                                                 intermediate_dim);
-        } else if (M <= GEMV_THRESHOLD) {
-            // Small batch prefill: batched GEMV with on-the-fly dequant
-            cuda::launch_ffn_up_fused_q4_0_batch_gemv(
-                static_cast<const float*>(input->data()), w1->data(), w3->data(),
-                static_cast<float*>(out->data()), M, K, intermediate_dim);
         } else {
-            // Large batch prefill: dequantize + cublas GEMM
-            cuda::launch_ffn_up_fused_q4_0_batch(
-                static_cast<const float*>(input->data()), w1->data(), w3->data(),
-                static_cast<float*>(out->data()), M, K, intermediate_dim);
+            // M > 1: MMQ-backed matmuls (sub-linear in M) + silu_multiply.
+            // The old fused batched-GEMV re-read every weight row per
+            // activation row, so verification batches scaled linearly with M.
+            return separate_path();
         }
     } else if (w1->dtype() == DataType::Q4_K && w3->dtype() == DataType::Q4_K) {
         if (M == 1) {
@@ -296,14 +275,9 @@ TensorPtr cuda_ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const T
                                                  w1->data(), w3->data(),
                                                  static_cast<float*>(out->data()), K,
                                                  intermediate_dim);
-        } else if (M <= GEMV_THRESHOLD) {
-            // Q4_K small batch: separate GEMV + silu_multiply
-            return separate_path();
         } else {
-            cuda::launch_ffn_up_fused_q4_k_batch(static_cast<const float*>(input->data()),
-                                                 w1->data(), w3->data(),
-                                                 static_cast<float*>(out->data()), M, K,
-                                                 intermediate_dim);
+            // M > 1: MMQ-backed matmuls (sub-linear in M) + silu_multiply
+            return separate_path();
         }
     } else if (w1->dtype() == DataType::Q5_K && w3->dtype() == DataType::Q5_K) {
         if (M == 1) {
