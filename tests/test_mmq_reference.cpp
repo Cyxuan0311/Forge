@@ -99,9 +99,33 @@ void gen_q2_k(uint8_t* p, std::mt19937& g) {          // 84 B: sc[16] qs[64] d d
 }
 
 void gen_q3_k(uint8_t* p, std::mt19937& g) {          // 110 B: hmask[32] qs[64] sc[12] d
-    fill_random(p + 0, 32, g);
-    fill_random(p + 32, 64, g);
-    fill_random(p + 96, 12, g);
+    // Component-isolation switches for debugging the residual deviation:
+    // FORGE_Q3K_ZERO_HMASK / FORGE_Q3K_CONST_SCALES / FORGE_Q3K_NIB1_QS
+    const bool z_hm = std::getenv("FORGE_Q3K_ZERO_HMASK") != nullptr;
+    const bool o_hm = std::getenv("FORGE_Q3K_ONES_HMASK") != nullptr;
+    const bool c_sc = std::getenv("FORGE_Q3K_CONST_SCALES") != nullptr;
+    const bool n_qs = std::getenv("FORGE_Q3K_NIB1_QS") != nullptr;
+    if (z_hm) {
+        std::memset(p, 0, 32);
+    } else if (o_hm) {
+        std::memset(p, 0xFF, 32);
+    } else {
+        fill_random(p + 0, 32, g);
+    }
+    if (n_qs) {
+        // only low nibble varies per byte position pattern 0..7
+        for (int i = 0; i < 64; ++i) p[32 + i] = static_cast<uint8_t>(i % 4);
+    } else {
+        fill_random(p + 32, 64, g);
+    }
+    if (c_sc) {
+        // all-zero scale bytes decode to a uniform -32 on BOTH the kernel
+        // (__vsubss4(0, 0x20202020)) and the CPU aux-shuffle path (0-32),
+        // isolating qs/hmask handling from scale handling entirely.
+        std::memset(p + 96, 0, 12);
+    } else {
+        fill_random(p + 96, 12, g);
+    }
     put_f16(p + 108, urand(g, kDMin, kDMax));
 }
 
