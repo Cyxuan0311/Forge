@@ -1,13 +1,15 @@
 #include "forge/speculative_executor.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include "forge/context.h"
 #include "forge/engine.h"
-#include "forge/inference_batch.h"
+#include "forge/inference/forward_request.h"
 #include "forge/kv_cache.h"
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
+#include "forge/tensor.h"
 
 namespace forge {
 
@@ -51,8 +53,6 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         return out;
     }
 
-    // Each round produces at least one token (resampled or bonus), so a round
-    // consumes up to n_draft + 1 from the budget.
     const int n_draft = std::min(cfg_.n_draft, in.max_tokens - 1);
     if (n_draft <= 0) {
         ++stats_.n_fallback_steps;
@@ -65,30 +65,26 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         return out;
     }
 
-    // ---- Verification batch: [last_token @ pos, d0 @ pos+1, ..., dN-1 @ pos+N] ----
-    // Row i of the returned logits verifies drafts[i-1].
-    InferenceBatch batch;
-    batch.all_logits = true;
-    InferenceBatchItem item;
-    item.seq_id = 0;
-    item.logits = true;
-    item.tokens.reserve(drafts.size() + 1);
-    item.tokens.push_back(in.last_token);
-    item.tokens.insert(item.tokens.end(), drafts.begin(), drafts.end());
-    item.start_pos = in.pos;
-    const int n_rows = static_cast<int>(item.tokens.size());
-    item.positions.resize(n_rows);
-    for (int j = 0; j < n_rows; ++j) item.positions[j] = in.pos + j;
-    batch.items.push_back(std::move(item));
+    const int n_rows = static_cast<int>(drafts.size()) + 1;
+    auto input_ids = std::make_shared<Tensor>(DataType::INT32,
+                                              std::vector<int64_t>{n_rows}, DeviceType::CPU);
+    int32_t* ids_ptr = static_cast<int32_t*>(input_ids->data());
+    ids_ptr[0] = in.last_token;
+    std::memcpy(ids_ptr + 1, drafts.data(), drafts.size() * sizeof(int32_t));
+    if (ctx_.device() == DeviceType::CUDA) {
+        input_ids->to_device(DeviceType::CUDA);
+    }
 
     TensorPtr logits_all;
     {
-        PERF_SCOPE("speculative/forward_batch");
-        logits_all = engine->forward_batch(batch);
+        PERF_SCOPE("speculative/verify_forward");
+        logits_all = engine->forward_request(
+            ForwardRequest::from_ids(input_ids, in.pos));
     }
 
-    if (!logits_all || logits_all->ndim() < 2) {
-        LOG_WARN("SpeculativeExecutor: forward_batch failed, falling back to plain decode");
+    if (!logits_all || logits_all->ndim() < 2 ||
+        logits_all->shape()[0] < n_rows) {
+        LOG_WARN("SpeculativeExecutor: verify forward failed, falling back to plain decode");
         ++stats_.n_fallback_steps;
         return out;
     }
@@ -99,10 +95,8 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     const int vocab_size = static_cast<int>(logits_all->shape()[1]);
     const float* logits_data = static_cast<const float*>(logits_all->data());
 
-    // ---- Verify ----
     auto vr = verify_draft_tokens(logits_data, vocab_size, drafts, sampler_, cfg_);
 
-    // ---- Assemble produced tokens: accepted... then resampled|bonus ----
     out.tokens.insert(out.tokens.end(), vr.accepted_tokens.begin(), vr.accepted_tokens.end());
     if (vr.resampled >= 0) {
         out.tokens.push_back(vr.resampled);
@@ -114,10 +108,6 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         return out;
     }
 
-    // ---- KV rollback on partial rejection ----
-    // Batch rows wrote KV rows [pos, pos+n_draft]; accepted rows cover
-    // [pos+1, pos+n_accepted]. On rejection, drop the rejected tail so the
-    // valid region becomes [0, pos + tokens.size()).
     const bool full_accept = (vr.n_accepted == static_cast<int>(drafts.size()));
     if (!full_accept) {
         KVCache* kv = engine->kv_cache();
@@ -126,7 +116,6 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
 
     out.speculated = true;
 
-    // ---- Stats & provider bookkeeping ----
     ++stats_.n_spec_steps;
     stats_.n_draft_tokens += static_cast<int64_t>(drafts.size());
     stats_.n_accepted_tokens += vr.n_accepted;
