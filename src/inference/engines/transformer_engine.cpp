@@ -372,10 +372,17 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                 // Copy result back into flat output
                 TensorPtr seq_cpu = seq_hidden;
                 if (seq_hidden->device() == DeviceType::CUDA && layer_dev == DeviceType::CUDA) {
-                    // Same device, direct copy
+#ifdef USE_CUDA
+                    // GPU→GPU: use cudaMemcpy instead of CPU memmove
+                    size_t bytes = seq_len * hidden_dim * sizeof(float);
+                    cudaMemcpyAsync(dst + offset * hidden_dim,
+                                     static_cast<const float*>(seq_hidden->data()),
+                                     bytes, cudaMemcpyDeviceToDevice);
+#else
                     const float* src = static_cast<const float*>(seq_hidden->data());
                     size_t bytes = seq_len * hidden_dim * sizeof(float);
                     std::memcpy(dst + offset * hidden_dim, src, bytes);
+#endif
                 } else if (seq_hidden->device() != layer_dev) {
                     seq_cpu = transfer_hidden(seq_hidden, layer_dev);
                     const float* src = static_cast<const float*>(seq_cpu->data());
@@ -670,7 +677,6 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             fflush(stderr);
             return nullptr;
         }
-
     }
 
     // Use unified weights for output norm and projection
