@@ -862,9 +862,15 @@ __global__ void mul_mat_q_kernel(
                 int k = l % MMQ_TILE_Y_K;
                 int m = m_start + j;
                 if (m < M) {
+                    // One kb iteration covers a full 256-element weight
+                    // super-block, which pairs with TWO consecutive 128-value
+                    // activation blocks: 2*kb here (elements [256kb, 256kb+128))
+                    // and 2*kb+1 in the reload below. The old `kb` indexing
+                    // advanced the activation stream at half the weight rate,
+                    // so everything past the first super-block was garbage.
                     const int* by0 = q_act_mmq +
                         (int64_t)m * num_mmq_blocks_per_row * sz +
-                        (int64_t)kb * sz;
+                        (int64_t)(2 * kb) * sz;
                     tile_y[l] = by0[k];
                 } else {
                     tile_y[l] = 0;
@@ -1126,7 +1132,7 @@ __global__ void mul_mat_q_kernel(
                 if (m < M) {
                     const int* by0 = q_act_mmq +
                         (int64_t)m * num_mmq_blocks_per_row * sz +
-                        (int64_t)kb * sz + sz;  // Second sub-block
+                        (int64_t)(2 * kb + 1) * sz;  // second 128-value chunk
                     tile_y[l] = by0[k];
                 } else {
                     tile_y[l] = 0;
