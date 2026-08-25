@@ -275,11 +275,13 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_mmq(
 // ---- Q2_K × Q8_1_mmq (D2S6 layout) ----
 // Q2_K: 2-bit packed values, half2 pre-multiplied d*scale pairs
 // Q8_1_mmq D2S6: 2 half d + 6 half partial sums
-template <int ns8>
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
     const int* __restrict__ v, const int* __restrict__ u,
     const half2* __restrict__ dm2, const float& d8, const half2* __restrict__ s8)
 {
+    (void)s8;  // exact integer path: the min term uses sum(u) computed here
+               // rather than llama.cpp's pre-quant float partial sums (D2S6),
+               // which our quantizer does not need to reproduce.
     float sumf = 0.0f;
     float sumf_d8 = 0.0f;
 #pragma unroll
@@ -287,23 +289,21 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
         const float2 dm2f0 = __half22float2(dm2[i0 / (GEMV_QI8_1 / 2) + 0]);
         const float2 dm2f1 = __half22float2(dm2[i0 / (GEMV_QI8_1 / 2) + 1]);
         int sumi_d0 = 0;
-        for (int i = i0; i < i0 + GEMV_QI8_1 / 2; ++i) sumi_d0 = forge_dp4a(v[i], u[i], sumi_d0);
-        sumf_d8 += dm2f0.x * sumi_d0;
-        int sumi_d1 = 0;
-        for (int i = i0 + GEMV_QI8_1 / 2; i < i0 + GEMV_QI8_1; ++i) sumi_d1 = forge_dp4a(v[i], u[i], sumi_d1);
-        sumf_d8 += dm2f1.x * sumi_d1;
-        if (i0 / GEMV_QI8_1 < ns8) {
-            const float2 s8f = __half22float2(s8[i0 / GEMV_QI8_1]);
-            sumf -= dm2f0.y * s8f.x;
-            sumf -= dm2f1.y * s8f.y;
-        } else {
-            int sumi_m0 = 0;
-            for (int i = i0; i < i0 + GEMV_QI8_1 / 2; ++i) sumi_m0 = forge_dp4a(0x01010101, u[i], sumi_m0);
-            sumf_d8 -= dm2f0.y * sumi_m0;
-            int sumi_m1 = 0;
-            for (int i = i0 + GEMV_QI8_1 / 2; i < i0 + GEMV_QI8_1; ++i) sumi_m1 = forge_dp4a(0x01010101, u[i], sumi_m1);
-            sumf_d8 -= dm2f1.y * sumi_m1;
+        int sumi_m0 = 0;
+        for (int i = i0; i < i0 + GEMV_QI8_1 / 2; ++i) {
+            sumi_d0 = forge_dp4a(v[i], u[i], sumi_d0);
+            sumi_m0 = forge_dp4a(0x01010101, u[i], sumi_m0);
         }
+        sumf_d8 += dm2f0.x * sumi_d0;
+        sumf_d8 -= dm2f0.y * sumi_m0;
+        int sumi_d1 = 0;
+        int sumi_m1 = 0;
+        for (int i = i0 + GEMV_QI8_1 / 2; i < i0 + GEMV_QI8_1; ++i) {
+            sumi_d1 = forge_dp4a(v[i], u[i], sumi_d1);
+            sumi_m1 = forge_dp4a(0x01010101, u[i], sumi_m1);
+        }
+        sumf_d8 += dm2f1.x * sumi_d1;
+        sumf_d8 -= dm2f1.y * sumi_m1;
     }
     return sumf + d8 * sumf_d8;
 }
@@ -337,19 +337,22 @@ static __device__ __forceinline__ void load_tiles_q3_K(
     constexpr auto txs = mmq_txs_q3_k<I>();
     int*   x_qs = x_tile;
     float* x_df = (float*)(x_qs + txs.qs);
-    int*   x_sc = (int*)(x_df + txs.dm);  // reusing dm space for float scales
+    int*   x_sc = (int*)(x_df + txs.dm);
 
     constexpr int warp_size = 32;
     const int lane = threadIdx.x;
 
-    // Load quantized values (2-bit packed into 32-bit ints)
-    // Q3_K has 4 values per byte (2 bits each), packed as 32-bit ints
-    // MMQ_TILE_NE_K = 32 K-elements per sub-tile
-    // Each Q3_K block has 256 elements = 64 bytes of qs
-    // For 32 K-elements: 8 int32 values (32*2/8 = 8)
-
-    constexpr int threads_per_row = MMQ_ITER_K / (4 * GEMV_QR3_K);  // 256/(4*4) = 16
-    constexpr int nrows = warp_size / threads_per_row;  // 32/16 = 2
+    // Ported from llama.cpp load_tiles_q3_K (dp4a path). Row stride is 110
+    // bytes, so all block reads go through byte-assembled get_int_b2 -- a
+    // plain int* dereference here is a misaligned-address fault.
+    // Layout produced:
+    //   x_qs[i*65 + k] : pre-biased 3-bit values, k = (kqsx/8)*32 + l*8 + kqsx%8
+    //   x_df[i]        : super-block scale d
+    //   x_sc[i*4+i/8+ksc]: four words of per-32-group int8 scales (bias -32
+    //                      baked in), consumed as scales[k0/4 + byte]
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * GEMV_QR3_K);  // 256/16 = 16
+    constexpr int nrows = warp_size / threads_per_row;              // 2
+    const int kqsx = lane % threads_per_row;
 
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows * nwarps) {
@@ -361,17 +364,48 @@ static __device__ __forceinline__ void load_tiles_q3_K(
         const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 110;
         const uint8_t* block_ptr = w_row + kbx0 * 110;
 
-        // Load 2-bit packed qs values
-        // Each Q3_K block has qs[64] bytes at offset 32
-        // For sub-tile of 32 K-elements, we need 8 int32s
-        const int txi = lane % threads_per_row;
-        const int* qs_i32 = (const int*)(block_ptr + 32);
-        int val = qs_i32[txi];
-        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + txi] = val;
-        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = val;  // duplicate for convenience
+        const int x_ql_0 = get_int_b2(block_ptr + 32, kqsx);
+        const int x_qh_0 =
+            get_int_b2(block_ptr, kqsx % (GEMV_QI3_K / 2)) >> (4 * (kqsx / (GEMV_QI3_K / 2)));
+
+#pragma unroll
+        for (int l = 0; l < GEMV_QR3_K; ++l) {
+            const int k = (kqsx / 8) * 32 + l * 8 + kqsx % 8;
+
+            const int x_ql_k = (x_ql_0 >> (2 * l)) & 0x03030303;
+            const int x_qh_k = ((x_qh_0 >> l) << 2) & 0x04040404;
+
+            const int x_qs_k = __vsubss4(x_ql_k | x_qh_k, 0x04040404);
+            x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k] = x_qs_k;
+        }
     }
 
-    // Load scales and d
+    // Scales: 12 packed bytes -> four int-words per row of per-group int8
+    // scales with the -32 bias applied (__vsubss4 ... 0x20202020).
+    constexpr int rows_per_warp = warp_size / 4;
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = (i0 + threadIdx.y * rows_per_warp + lane / 4) % I;
+        int n = n_start + min(i, N - n_start - 1);
+
+        const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 110;
+        const uint8_t* block_ptr = w_row + kbx0 * 110;
+
+        const int ksc = lane % 4;
+
+        const int ksc_low = ksc % (GEMV_QI3_K / 8);
+        const int shift_low = 4 * (ksc / (GEMV_QI3_K / 8));
+        const int sc_low = (get_int_b2(block_ptr + 96, ksc_low) >> shift_low) & 0x0F0F0F0F;
+
+        const int ksc_high = GEMV_QI3_K / 8;
+        const int shift_high = 2 * ksc;
+        const int sc_high = ((get_int_b2(block_ptr + 96, ksc_high) >> shift_high) << 4) & 0x30303030;
+
+        const int sc = __vsubss4(sc_low | sc_high, 0x20202020);
+        x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + ksc] = sc;
+    }
+
+    // Super-block scale d (fp16 at offset 108)
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * warp_size) {
         int i = (i0 + threadIdx.y * warp_size + lane) % I;
@@ -380,36 +414,9 @@ static __device__ __forceinline__ void load_tiles_q3_K(
         const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 110;
         const uint8_t* block_ptr = w_row + kbx0 * 110;
 
-        // d is at offset 108 (2 bytes)
         uint16_t d_bits;
         memcpy(&d_bits, block_ptr + 108, 2);
-        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
-        x_df[i] = d;
-
-        // Load scales (12 bytes at offset 96) — unpack into int8
-        // Store the unpacked scales into x_sc
-        const uint8_t* scales_raw = block_ptr + 96;
-        int8_t scales[16];
-        q3_k_unpack_scales(scales_raw, scales);
-        memcpy(&x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8], scales, 16);
-    }
-
-    // Load hmask (32 bytes at offset 0)
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps * (warp_size / 4)) {
-        int i = (i0 + threadIdx.y * (warp_size / 4) + lane / 4) % I;
-        int n = n_start + min(i, N - n_start - 1);
-
-        const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 110;
-        const uint8_t* block_ptr = w_row + kbx0 * 110;
-
-        // hmask at offset 0, 32 bytes = 8 int32
-        const int* hm_i32 = (const int*)block_ptr;
-        int hm_val = hm_i32[lane % 8];
-        // Store hmask alongside scales (reuse sc region)
-        // Actually, for the dp4a vec_dot we need hmask in a specific position
-        // Simplification: store it after the scales
-        x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + 4 + lane % 8] = hm_val;
+        x_df[i] = __half2float(reinterpret_cast<const __half&>(d_bits));
     }
 }
 
@@ -595,15 +602,16 @@ static __device__ __forceinline__ void load_tiles_q4_0(
     constexpr int warp_size = 32;
     const int lane = threadIdx.x;
 
-    // Q4_0: 32 elements per block, 18 bytes per block
-    // threads_per_row = MMQ_ITER_K / (4 * MMQ_QR4_0) = 256/(4*2) = 32
-    constexpr int threads_per_row = MMQ_ITER_K / (4 * MMQ_QR4_0);
-    constexpr int nrows = warp_size / threads_per_row;  // 32/32 = 1
-
-    // Each Q4_0 block has 16 bytes of qs = 4 int32
-    // For 32 K-elements (one Q4_0 block), we need 4 int32s of packed 4-bit values
-    // MMQ_TILE_NE_K = 32, so each row of x_qs needs 32/(4*MMQ_QR4_0) = 4 int32s
-    // But stored as I*(MMQ_TILE_NE_K + 1) = I*33 ints
+    // Ported from llama.cpp load_tiles_q4_0 (dp4a path). One kb iteration
+    // covers a 256-element window = EIGHT consecutive 18-byte q4_0 blocks,
+    // pairing with activation chunks 2*kb / 2*kb+1 like the K-types.
+    // Row stride is 18 bytes, so qs reads go through byte-assembled
+    // get_int_b2 (a plain int* load here is a misaligned-address fault).
+    // Layout produced:
+    //   x_qs[i*33 + txi]          : raw packed nibbles, txi = kbx*4 + kqsx
+    //   x_df[i*8 + i/4 + kbxd]    : one fp32 d per block (padded dm region)
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * MMQ_QR4_0);   // 32
+    constexpr int nrows = warp_size / threads_per_row;              // 1
 
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows * nwarps) {
@@ -613,37 +621,30 @@ static __device__ __forceinline__ void load_tiles_q4_0(
         if (n >= N) i = min(i, N - n_start - 1);
 
         const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 18;
-        const uint8_t* block_ptr = w_row + kbx0 * 18;
 
         const int txi = lane % threads_per_row;
-        // Each Q4_0 block covers 32 K-elements
-        // For kbx0-th 256-element block, there are 8 Q4_0 sub-blocks
-        // txi ranges 0..31, but each Q4_0 sub-block only has 4 int32 of qs
-        // So we need to index into the correct sub-block
-        const int q4_block_idx = txi / 4;  // Which Q4_0 sub-block (0..7)
-        const int q4_offset = txi % 4;     // Offset within that sub-block
-        const uint8_t* sub_block = block_ptr + q4_block_idx * 18;
-        const int* qs_i32 = (const int*)(sub_block + 2);  // qs starts after half d
-        x_qs[i * (MMQ_TILE_NE_K + 1) + txi] = qs_i32[q4_offset];
+        const int kbx = txi / MMQ_QI4_0;    // block within the window (0..7)
+        const int kqsx = txi % MMQ_QI4_0;   // int within the block's qs[16]
+
+        const uint8_t* blk = w_row + (size_t)(kbx0 * 8 + kbx) * 18 + 2;
+        x_qs[i * (MMQ_TILE_NE_K + 1) + txi] = get_int_b2(blk, kqsx);
     }
 
-    // Load scales (one float per Q4_0 block)
-    // blocks_per_tile_x_row = MMQ_TILE_NE_K / MMQ_QI4_0 = 32/4 = 8
-    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / MMQ_QI4_0;
-    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;  // 32/8 = 4
+    // One float scale per q4_0 block
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / MMQ_QI4_0;   // 8
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;   // 4
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
         int i = (i0 + threadIdx.y * rows_per_warp + lane / blocks_per_tile_x_row) % I;
         int n = n_start + min(i, N - n_start - 1);
 
         const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 18;
-        const uint8_t* block_ptr = w_row + kbx0 * 18;
 
-        const int kbxd = lane % blocks_per_tile_x_row;  // which Q4_0 block within the tile
-        const uint8_t* sub_block = block_ptr + kbxd * 18;
+        const int kbxd = lane % blocks_per_tile_x_row;
+        const uint8_t* blk = w_row + (size_t)(kbx0 * 8 + kbxd) * 18;
         uint16_t d_bits;
-        memcpy(&d_bits, sub_block, sizeof(uint16_t));
-        float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        memcpy(&d_bits, blk, sizeof(uint16_t));
+        const float d = __half2float(reinterpret_cast<const __half&>(d_bits));
         x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 + kbxd] = d;
     }
 }
@@ -754,8 +755,10 @@ static __device__ __forceinline__ void load_tiles_q2_K(
         const uint8_t* block_ptr = w_row + kbx0 * 84;
 
         const int kqsx = lane % threads_per_row;
-        // Unpack 2-bit values
-        const int x_ql_0 = get_int_b2(block_ptr + 4, kqsx);
+        // Block layout (84 B): scales[16] @0, qs[64] @16, d @80, dmin @82.
+        // Ported from llama.cpp load_tiles_q2_K: the old offsets here read
+        // qs from the scale bytes and dm from packed scales -> inf/nan.
+        const int x_ql_0 = get_int_b2(block_ptr + 16, kqsx);
         for (int l = 0; l < GEMV_QR2_K; ++l) {
             const int k = (kqsx / 8) * 32 + l * 8 + kqsx % 8;
             const int x_qs_k = (x_ql_0 >> (2 * l)) & 0x03030303;
@@ -763,8 +766,9 @@ static __device__ __forceinline__ void load_tiles_q2_K(
         }
 
         // Pre-multiply scales into half2 pairs
-        const int sc_m = block_ptr[68 + kqsx];  // scales at offset 68
-        const float2 bxi_dmf = __half22float2(*(const half2*)block_ptr);  // dm at offset 0
+        const int sc_m = block_ptr[kqsx];  // scales at offset 0
+        const float2 bxi_dmf =
+            __half22float2(*reinterpret_cast<const half2*>(block_ptr + 80));  // d,dmin @80
         const half2 x_dm_ik = make_half2(
             __float2half(bxi_dmf.x * (sc_m & 0x0F)),
             __float2half(bxi_dmf.y * (sc_m >> 4)));
@@ -1011,7 +1015,13 @@ __global__ void mul_mat_q_kernel(
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QR4_0 * VDR_Q4_0_Q8_1_MMQ) {
-                const int k0 = k01 / MMQ_QR4_0;
+                // q4_0 packs e_l | e_{l+16}<<4 per byte, so the 32-element
+                // group splits into two 16-value halves in tile_y. Gather
+                // them interleaved (ported from llama.cpp's wrapper): the
+                // dot pairs lo nibbles with u[2i], hi nibbles with u[2i+1].
+                const int kyqs =
+                    GEMV_QI8_1 * ((k01 / 2) / (GEMV_QI8_1 / 2)) + (k01 / 2) % (GEMV_QI8_1 / 2);
+                const int k0 = k01;
 #pragma unroll
                 for (int j0 = 0; j0 < J; j0 += nwarps) {
                     int j = j0 + warp;
@@ -1022,11 +1032,19 @@ __global__ void mul_mat_q_kernel(
                         int i = i0 + lane;
                         if (n_start + i >= N) continue;
 
+                        int u[2 * VDR_Q4_0_Q8_1_MMQ];
+#pragma unroll
+                        for (int l = 0; l < MMQ_QI4_0; ++l) {
+                            u[2 * l + 0] = y_qs[j * MMQ_TILE_Y_K + kyqs + l];
+                            u[2 * l + 1] = y_qs[j * MMQ_TILE_Y_K + kyqs + MMQ_QI4_0 + l];
+                        }
+
                         sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
                             vec_dot_q4_0_q8_1_mmq(
-                                &x_qs[i * (MMQ_TILE_NE_K + 1) + k0],
-                                &y_qs[j * MMQ_TILE_Y_K + k01],
-                                x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 + k0 / MMQ_QI4_0],
+                                &x_qs[i * (MMQ_TILE_NE_K + 1) + k0 / MMQ_QR4_0],
+                                u,
+                                x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 +
+                                     k0 / (MMQ_QR4_0 * MMQ_QI4_0)],
                                 &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
                     }
                 }
@@ -1092,7 +1110,7 @@ __global__ void mul_mat_q_kernel(
                         const half2* s8 = (const half2*)(y_d2s6 + j * MMQ_TILE_Y_K * 2 + (1 + k01 / GEMV_QI8_1) * 2);
 
                         sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
-                            vec_dot_q2_K_q8_1_impl_mmq<2>(
+                            vec_dot_q2_K_q8_1_impl_mmq(
                                 &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k01],
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 &x_dm[i * (MMQ_TILE_NE_K + 1) + k01 / 4],
@@ -1117,7 +1135,7 @@ __global__ void mul_mat_q_kernel(
                         const half2* s8 = (const half2*)(y_d2s6 + j * MMQ_TILE_Y_K * 2 + (1 + k01 / GEMV_QI8_1) * 2);
 
                         sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
-                            vec_dot_q2_K_q8_1_impl_mmq<1>(
+                            vec_dot_q2_K_q8_1_impl_mmq(
                                 &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k01],
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 &x_dm[i * (MMQ_TILE_NE_K + 1) + k01 / 4],
@@ -1261,7 +1279,9 @@ __global__ void mul_mat_q_kernel(
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QR4_0 * VDR_Q4_0_Q8_1_MMQ) {
-                const int k0 = (MMQ_TILE_NE_K + k01) / MMQ_QR4_0;
+                const int kyqs =
+                    GEMV_QI8_1 * ((k01 / 2) / (GEMV_QI8_1 / 2)) + (k01 / 2) % (GEMV_QI8_1 / 2);
+                const int k0 = MMQ_TILE_NE_K + k01;
 #pragma unroll
                 for (int j0 = 0; j0 < J; j0 += nwarps) {
                     int j = j0 + warp;
@@ -1272,11 +1292,19 @@ __global__ void mul_mat_q_kernel(
                         int i = i0 + lane;
                         if (n_start + i >= N) continue;
 
+                        int u[2 * VDR_Q4_0_Q8_1_MMQ];
+#pragma unroll
+                        for (int l = 0; l < MMQ_QI4_0; ++l) {
+                            u[2 * l + 0] = y_qs[j * MMQ_TILE_Y_K + kyqs + l];
+                            u[2 * l + 1] = y_qs[j * MMQ_TILE_Y_K + kyqs + MMQ_QI4_0 + l];
+                        }
+
                         sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
                             vec_dot_q4_0_q8_1_mmq(
-                                &x_qs[i * (MMQ_TILE_NE_K + 1) + k0],
-                                &y_qs[j * MMQ_TILE_Y_K + k01],
-                                x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 + k0 / MMQ_QI4_0],
+                                &x_qs[i * (MMQ_TILE_NE_K + 1) + k0 / MMQ_QR4_0],
+                                u,
+                                x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 +
+                                     k0 / (MMQ_QR4_0 * MMQ_QI4_0)],
                                 &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
                     }
                 }
@@ -1339,7 +1367,7 @@ __global__ void mul_mat_q_kernel(
                         const int k0 = MMQ_TILE_NE_K + k01;
 
                         sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
-                            vec_dot_q2_K_q8_1_impl_mmq<2>(
+                            vec_dot_q2_K_q8_1_impl_mmq(
                                 &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0],
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 &x_dm[i * (MMQ_TILE_NE_K + 1) + k0 / 4],
@@ -1365,7 +1393,7 @@ __global__ void mul_mat_q_kernel(
                         const int k0 = MMQ_TILE_NE_K + k01;
 
                         sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
-                            vec_dot_q2_K_q8_1_impl_mmq<1>(
+                            vec_dot_q2_K_q8_1_impl_mmq(
                                 &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0],
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 &x_dm[i * (MMQ_TILE_NE_K + 1) + k0 / 4],
@@ -1511,7 +1539,10 @@ void launch_mmq_q4_0(const float* x, const void* q_weight, float* out,
     constexpr int J = MMQ_J_Q4_0;
 
     int K_padded = (K + MMQ_QK8_1_MMQ - 1) / MMQ_QK8_1_MMQ * MMQ_QK8_1_MMQ;
-    int num_blocks_row = (K + 255) / 256;
+    // q4_0 rows are strided by 32-element blocks (18 B each), not by
+    // super-blocks: the row stride must count true blocks or every weight
+    // row overlaps its neighbours.
+    int num_blocks_row = (K + 31) / 32;
     int num_mmq_blocks_per_row = K_padded / MMQ_QK8_1_MMQ;
 
     // Pre-quantize activations (DS4 layout for Q4_0)

@@ -111,12 +111,13 @@ static __host__ __device__ constexpr tile_x_sizes mmq_txs_q5_k() {
                         I * (MMQ_TILE_NE_K / 8) + I / 8};
 }
 
-// Q4_0: qs = I*(MMQ_TILE_NE_K + 1), dm = I*(MMQ_TILE_NE_K/QI4_0) + I/QI4_0, sc = 0
-//   (4-bit packed values, one float scale per Q4_0 block of 32 elements)
+// Q4_0: qs = I*(MMQ_TILE_NE_K + 1), dm = I*(MMQ_TILE_NE_K/QI4_0) + I/2, sc = 0
+//   (4-bit packed values, one float scale per Q4_0 block of 32 elements;
+//    padded so index i*8 + i/4 + kbxd (max 8I - 1) never leaves the region)
 template <int I>
 static __host__ __device__ constexpr tile_x_sizes mmq_txs_q4_0() {
     return tile_x_sizes{I * (MMQ_TILE_NE_K + 1),
-                        I * (MMQ_TILE_NE_K / MMQ_QI4_0) + I / MMQ_QI4_0,
+                        I * (MMQ_TILE_NE_K / MMQ_QI4_0) + I / 2,
                         0};
 }
 
