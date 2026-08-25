@@ -174,29 +174,34 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
     const bool quantized = is_quantized_type(b->dtype());
 
     if (M > 1) {
-        // Multi-row batch (prefill / speculative verification).
+        // Multi-row batch (prefill / speculative verification): prefer the
+        // MMQ tiled kernel — weight scales/mins decode once per tile and are
+        // reused across all M rows (dp4a int8 dot), giving sub-linear cost in
+        // M. The batched-GEMV fallback re-reads every weight row once per
+        // activation row (cost proportional to M).
         //
-        // NOTE: the MMQ tiled kernels are currently DISABLED — they produce
-        // incorrect results (K-blocking misalignment: the compute loop consumes
-        // one 128-element q8_1_mmq block per iteration while load_tiles advances
-        // the weight side by a full 256-element block, and num_k_blocks counts
-        // 256-element chunks; the weight/activation streams therefore never
-        // line up). Any M > 32 prefill hit this and silently produced garbage.
-        // Route everything through the verified batched-GEMV path until the
-        // MMQ port is repaired against a reference test.
-        auto gemv_batch = device_gemv_batch_fn(b->dtype());
-        if (gemv_batch) {
-            gemv_batch(a_data, b->data(), o_data, M, K, N, 0);
-        } else if (quantized) {
-            // No batched GEMV kernel: dequantize on device, then cuBLAS
-            auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
-            if (!dequant_matrix)
-                capability_failure("matmul_transB", b->dtype(), M, K, N);
-            auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
-            cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
+        // Whitelist: dtypes whose MMQ kernels pass the reference suite
+        // (tests/test_mmq_reference.cpp). Q3_K has a known residual defect
+        // and stays on the verified batched-GEMV path.
+        auto mmq = device_mmq_fn(b->dtype());
+        const bool mmq_verified = b->dtype() != DataType::Q3_K;
+        if (mmq && mmq_verified && quantized) {
+            mmq(a_data, b->data(), o_data, M, K, N, 0);
         } else {
-            cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M,
-                                      K, N, true);
+            auto gemv_batch = device_gemv_batch_fn(b->dtype());
+            if (gemv_batch) {
+                gemv_batch(a_data, b->data(), o_data, M, K, N, 0);
+            } else if (quantized) {
+                // No batched GEMV kernel: dequantize on device, then cuBLAS
+                auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
+                if (!dequant_matrix)
+                    capability_failure("matmul_transB", b->dtype(), M, K, N);
+                auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
+                cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
+            } else {
+                cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data,
+                                          M, K, N, true);
+            }
         }
     } else {
         // M == 1: single GEMV — use dispatch table for supported types
