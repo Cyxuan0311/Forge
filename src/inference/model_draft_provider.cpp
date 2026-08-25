@@ -75,16 +75,23 @@ struct ModelDraftProvider::Impl {
     int64_t committed_len = 0;
     bool draft_active = false;
     bool valid = false;
+    // Logits predicting the token right after the confirmed prefix
+    // (last row of the most recent confirmed feed). Lets draft() propose the
+    // first candidate without re-feeding the seed token, keeping the draft
+    // KV strictly equal to the confirmed prefix.
+    std::vector<float> pending_logits;
 
     Impl(const SpeculativeConfig& spec, const ContextParams& target, int target_vocab)
         : sampler([] {
               SamplerConfig config;
-              config.do_sample = true;
-              config.temperature = 1.0f;
-              config.top_k = 10;
+              // Greedy proposals: maximise agreement with greedy/low-temperature
+              // target verification. Losslessness is guaranteed by the verify
+              // step regardless of how candidates were proposed.
+              config.do_sample = false;
+              config.temperature = 0.0f;
+              config.top_k = 0;
               config.top_p = 1.0f;
               config.repeat_penalty = 1.0f;
-              config.seed = 12345;
               return config;
           }()),
           target_params(target),
@@ -116,8 +123,11 @@ struct ModelDraftProvider::Impl {
         sampler.clear_history();
         committed_len = 0;
         draft_active = false;
+        pending_logits.clear();
     }
 
+    // Feed tokens and cache the last row's logits (prediction after the
+    // final token of the confirmed prefix).
     bool feed(const std::vector<int32_t>& tokens, int64_t start_pos) {
         if (tokens.empty()) return true;
         auto ids = std::make_shared<Tensor>(DataType::INT32,
@@ -126,7 +136,13 @@ struct ModelDraftProvider::Impl {
         std::memcpy(ids->data(), tokens.data(), tokens.size() * sizeof(int32_t));
         auto logits = ctx->engine()->forward_request(
             ForwardRequest::from_ids(ids, start_pos));
-        return logits != nullptr;
+        if (!logits || logits->ndim() < 2) return false;
+        if (logits->device() != DeviceType::CPU) logits->to_device(DeviceType::CPU);
+        const int64_t vocab = logits->shape()[1];
+        const float* last_row =
+            static_cast<const float*>(logits->data()) + (logits->shape()[0] - 1) * vocab;
+        pending_logits.assign(last_row, last_row + vocab);
+        return true;
     }
 
     TensorPtr feed_one(int32_t token, int64_t pos) {
@@ -166,29 +182,40 @@ void ModelDraftProvider::begin(const std::vector<int32_t>& prompt) {
 }
 
 std::vector<int32_t> ModelDraftProvider::draft(int32_t last_token, int n_draft) {
+    (void)last_token;  // seed logits are cached from the previous confirmed feed
     std::vector<int32_t> result;
     if (!valid() || n_draft <= 0) return result;
 
     impl_->abort_draft();
     impl_->draft_active = true;
 
-    int32_t input = last_token;
+    // Invariant: draft KV == confirmed prefix [0, committed_len), and
+    // pending_logits predicts the token at committed_len. The first candidate
+    // comes straight from those logits — the seed token is NOT re-fed (it is
+    // already the last row of the confirmed prefix).
+    constexpr int kVocabRow = 1;
+    const float* row = impl_->pending_logits.data();
     for (int i = 0; i < n_draft; ++i) {
-        auto logits = impl_->feed_one(input, impl_->committed_len + i);
-        if (!logits) {
+        if (!row) {
             impl_->abort_draft();
             return {};
         }
-
-        const float* row = static_cast<const float*>(logits->data());
-        if (impl_->p_min > 0.0f && top_probability(row, impl_->vocab_size) < impl_->p_min) {
+        if (impl_->p_min > 0.0f &&
+            top_probability(row, impl_->vocab_size) < impl_->p_min) {
             break;
         }
 
-        int32_t next = static_cast<int32_t>(
-            impl_->sampler.sample_temperature_ptr(row, impl_->vocab_size, 1.0f));
+        int32_t next =
+            static_cast<int32_t>(impl_->sampler.sample_ptr(row, impl_->vocab_size));
         result.push_back(next);
-        input = next;
+
+        // Feed the candidate to get logits for the following position.
+        auto logits = impl_->feed_one(next, impl_->committed_len + i);
+        if (!logits || logits->shape()[0] < kVocabRow) {
+            impl_->abort_draft();
+            return {};
+        }
+        row = static_cast<const float*>(logits->data());
     }
 
     if (result.empty()) impl_->abort_draft();
@@ -198,18 +225,15 @@ std::vector<int32_t> ModelDraftProvider::draft(int32_t last_token, int n_draft) 
 void ModelDraftProvider::accept(const std::vector<int32_t>& tokens) {
     if (!valid() || tokens.empty()) return;
 
-    // Keep the seed token (already decoded by draft()) and discard all
-    // speculative candidates before replaying the target-confirmed suffix.
-    const int64_t keep = impl_->draft_active ? impl_->committed_len + 1
-                                             : impl_->committed_len;
-    if (impl_->ctx->engine()->kv_cache()) impl_->ctx->engine()->kv_cache()->rollback(keep);
-    impl_->draft_active = false;
+    // Discard every speculative row so the draft KV returns to the confirmed
+    // prefix before replaying target-confirmed tokens.
+    impl_->abort_draft();
 
-    if (!impl_->feed(tokens, keep)) {
+    if (!impl_->feed(tokens, impl_->committed_len)) {
         impl_->valid = false;
         return;
     }
-    impl_->committed_len = keep + static_cast<int64_t>(tokens.size());
+    impl_->committed_len += static_cast<int64_t>(tokens.size());
 }
 
 void ModelDraftProvider::reset() {

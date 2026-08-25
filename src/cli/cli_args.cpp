@@ -48,6 +48,7 @@ static void print_usage(const char* prog) {
            "       --spec-ngram-min N     Shortest suffix match length (default: 2)\n"
            "       --spec-p-min FLOAT     Draft confidence early-stop threshold (default: 0.0)\n"
            "       --spec-model PATH      Standalone small draft model path (Phase 3)\n"
+           "       --spec-draft-ngl N     GPU layers for the draft model (default: same as -ngl)\n"
            "       --spec-stats           Print speculation stats after generation\n"
            "\n"
            "Sampling:\n"
@@ -324,6 +325,12 @@ CliArgs parse_args(int argc, char** argv) {
             }
             args.spec.enabled = true;
             args.spec.draft_model_path = argv[i];
+        } else if (arg == "--spec-draft-ngl") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.draft_gpu_layers = std::stoi(argv[i]);
         } else if (arg == "--spec-stats") {
             args.spec.print_stats = true;
         } else if (arg == "-v" || arg == "--verbose") {
