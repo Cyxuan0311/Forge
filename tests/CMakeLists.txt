@@ -64,6 +64,15 @@ add_executable(forge-spec-test test_spec_verify.cpp)
 forge_link_native(forge-spec-test)
 add_test(NAME spec-verify COMMAND forge-spec-test)
 
+# ---- CUDA MMQ kernels vs CPU-dequant golden --------------------------------
+# Requires a GPU at run time; the binary itself skips gracefully without one.
+if(CUDAToolkit_FOUND)
+  add_executable(forge-mmq-ref-test test_mmq_reference.cpp
+                                   ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
+  forge_link_native(forge-mmq-ref-test)
+  add_test(NAME mmq-ref COMMAND forge-mmq-ref-test)
+endif()
+
 # ---- Parallel GGUF scanner (inspect) --------------------------------------
 add_executable(forge-inspect-scanner-test test_inspect_scanner.cpp)
 target_include_directories(
