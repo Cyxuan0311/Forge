@@ -32,9 +32,7 @@ static void gemv_q4_0_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     const __m128i lo_mask = _mm_set1_epi8(0x0F);
     const __m128i eight = _mm_set1_epi8(8);
 
-    auto process_row = [&](const float* a_row, const uint8_t* w_row, float* out, int N_out) {
-#    pragma omp parallel for schedule(static)
-        for (int n = 0; n < N_out; ++n) {
+    auto process_row = [&](const float* a_row, const uint8_t* w_row, float* out, int n) {
             const uint8_t* row = w_row + (size_t)n * blocks_per_row * BLOCK_BYTES;
             __m256 acc = _mm256_setzero_ps();
 
@@ -89,20 +87,28 @@ static void gemv_q4_0_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
                 acc = _mm256_fmadd_ps(scale, partial, acc);
             }
             out[n] = hsum_avx2(acc);
-        }
     };
 
-    process_row(a, wq, out_q, N_q);
-    process_row(a, wk, out_k, N_k);
-    process_row(a, wv, out_v, N_v);
+    // Single work-stealing pass over all q/k/v rows (one pool barrier).
+    const int total_rows = N_q + N_k + N_v;
+    parallel_for_chunks(total_rows, 64, [&](int r0, int r1) {
+        for (int n = r0; n < r1; ++n) {
+            if (n < N_q) {
+                process_row(a, wq, out_q, n);
+            } else if (n < N_q + N_k) {
+                process_row(a, wk, out_k, n - N_q);
+            } else {
+                process_row(a, wv, out_v, n - N_q - N_k);
+            }
+        }
+    });
 }
 
 // ---- Fused QKV projection for Q4_0 decode, repacked layout ----
 // Same as gemv_q4_0_fused_qkv_avx2 but consumes the repacked weight layout
 // (repack_q4_0_weights). The activation is quantized once and shared by all
-// three matrices; each matrix is decoded with the proven repacked 4-row
-// tile-group body. Three sequential OpenMP regions keep the per-matrix N
-// independent (N_q != N_k != N_v) while reusing the same thread team.
+// three matrices; q/k/v groups run in ONE work-stealing pass over the
+// persistent pool so per-matrix N differences cost no extra fork/join.
 static void gemv_q4_0_fused_qkv_repacked_avx2(const float* a, const uint8_t* wq_repacked,
                                               const uint8_t* wk_repacked, const uint8_t* wv_repacked,
                                               float* out_q, float* out_k, float* out_v,
@@ -115,81 +121,90 @@ static void gemv_q4_0_fused_qkv_repacked_avx2(const float* a, const uint8_t* wq_
     scratch_vec<block_q8_0_act> q8_act(nb);
     quantize_row_q8_0_act(a, q8_act.data(), K);
 
-    auto decode = [&](const uint8_t* w_repacked, float* out, int N) {
-        const int64_t num_groups = (N + RM - 1) / RM;
-#    pragma omp parallel for schedule(static)
-        for (int64_t g = 0; g < num_groups; ++g) {
-            int64_t n0 = g * RM;
-            int64_t rows = std::min<int64_t>(n0 + RM, N) - n0;
+    auto decode_group = [&](const uint8_t* w_repacked, float* out, int64_t N, int64_t g) {
+        int64_t n0 = g * RM;
+        int64_t rows = std::min<int64_t>(n0 + RM, N) - n0;
 
-            __m256 acc0 = _mm256_setzero_ps();
-            __m256 acc1 = _mm256_setzero_ps();
-            __m256 acc2 = _mm256_setzero_ps();
-            __m256 acc3 = _mm256_setzero_ps();
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
 
-            const uint8_t* group_base = w_repacked + (size_t)g * nb * RM * BLOCK_BYTES;
+        const uint8_t* group_base = w_repacked + (size_t)g * nb * RM * BLOCK_BYTES;
 
-            for (int64_t l = 0; l < nb; ++l) {
-                if (l + 4 < nb) {
-                    _mm_prefetch((const char*)(group_base + (l + 4) * RM * BLOCK_BYTES), _MM_HINT_T0);
-                }
-
-                const uint8_t* block_base = group_base + l * RM * BLOCK_BYTES;
-
-                __m256i wvec0 = BlockLoader<block_q4_0_tag>::load(block_base + 0 * BLOCK_BYTES);
-                __m256i wvec1 = (rows > 1) ? BlockLoader<block_q4_0_tag>::load(block_base + 1 * BLOCK_BYTES) : _mm256_setzero_si256();
-                __m256i wvec2 = (rows > 2) ? BlockLoader<block_q4_0_tag>::load(block_base + 2 * BLOCK_BYTES) : _mm256_setzero_si256();
-                __m256i wvec3 = (rows > 3) ? BlockLoader<block_q4_0_tag>::load(block_base + 3 * BLOCK_BYTES) : _mm256_setzero_si256();
-
-                __m256i avec = BlockLoader<block_q8_0_act>::load(&q8_act[l]);
-
-                uint64_t packed_scales = 0;
-                uint16_t d0, d1, d2, d3;
-                memcpy(&d0, block_base + 0 * BLOCK_BYTES, 2);
-                memcpy(&d1, block_base + 1 * BLOCK_BYTES, 2);
-                memcpy(&d2, block_base + 2 * BLOCK_BYTES, 2);
-                memcpy(&d3, block_base + 3 * BLOCK_BYTES, 2);
-                packed_scales = (uint64_t)d0 | ((uint64_t)d1 << 16) | ((uint64_t)d2 << 32) | ((uint64_t)d3 << 48);
-
-                __m128 sw_f16 = _mm_cvtph_ps(_mm_set_epi64x(0, packed_scales));
-                float act_scale = q8_act[l].d;
-                __m128 sw_all = _mm_mul_ps(sw_f16, _mm_set1_ps(act_scale));
-
-                __m256 sc0 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0x00));
-                sc0 = _mm256_permute2f128_ps(sc0, sc0, 0x00);
-                __m256 sc1 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0x55));
-                sc1 = _mm256_permute2f128_ps(sc1, sc1, 0x00);
-                __m256 sc2 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0xAA));
-                sc2 = _mm256_permute2f128_ps(sc2, sc2, 0x00);
-                __m256 sc3 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0xFF));
-                sc3 = _mm256_permute2f128_ps(sc3, sc3, 0x00);
-
-                __m256i sa0 = _mm256_sign_epi8(wvec0, wvec0);
-                __m256i sa1 = (rows > 1) ? _mm256_sign_epi8(wvec1, wvec1) : _mm256_setzero_si256();
-                __m256i sa2 = (rows > 2) ? _mm256_sign_epi8(wvec2, wvec2) : _mm256_setzero_si256();
-                __m256i sa3 = (rows > 3) ? _mm256_sign_epi8(wvec3, wvec3) : _mm256_setzero_si256();
-
-                __m256i sb0 = _mm256_sign_epi8(avec, wvec0);
-                __m256i sb1 = (rows > 1) ? _mm256_sign_epi8(avec, wvec1) : _mm256_setzero_si256();
-                __m256i sb2 = (rows > 2) ? _mm256_sign_epi8(avec, wvec2) : _mm256_setzero_si256();
-                __m256i sb3 = (rows > 3) ? _mm256_sign_epi8(avec, wvec3) : _mm256_setzero_si256();
-
-                acc0 = _mm256_fmadd_ps(sc0, updot_avx2(sa0, sb0), acc0);
-                acc1 = _mm256_fmadd_ps(sc1, updot_avx2(sa1, sb1), acc1);
-                acc2 = _mm256_fmadd_ps(sc2, updot_avx2(sa2, sb2), acc2);
-                acc3 = _mm256_fmadd_ps(sc3, updot_avx2(sa3, sb3), acc3);
+        for (int64_t l = 0; l < nb; ++l) {
+            if (l + 4 < nb) {
+                _mm_prefetch((const char*)(group_base + (l + 4) * RM * BLOCK_BYTES), _MM_HINT_T0);
             }
 
-            out[n0 + 0] = vdot::hsum_ps256(acc0);
-            if (rows > 1) out[n0 + 1] = vdot::hsum_ps256(acc1);
-            if (rows > 2) out[n0 + 2] = vdot::hsum_ps256(acc2);
-            if (rows > 3) out[n0 + 3] = vdot::hsum_ps256(acc3);
+            const uint8_t* block_base = group_base + l * RM * BLOCK_BYTES;
+
+            __m256i wvec0 = BlockLoader<block_q4_0_tag>::load(block_base + 0 * BLOCK_BYTES);
+            __m256i wvec1 = (rows > 1) ? BlockLoader<block_q4_0_tag>::load(block_base + 1 * BLOCK_BYTES) : _mm256_setzero_si256();
+            __m256i wvec2 = (rows > 2) ? BlockLoader<block_q4_0_tag>::load(block_base + 2 * BLOCK_BYTES) : _mm256_setzero_si256();
+            __m256i wvec3 = (rows > 3) ? BlockLoader<block_q4_0_tag>::load(block_base + 3 * BLOCK_BYTES) : _mm256_setzero_si256();
+
+            __m256i avec = BlockLoader<block_q8_0_act>::load(&q8_act[l]);
+
+            uint64_t packed_scales = 0;
+            uint16_t d0, d1, d2, d3;
+            memcpy(&d0, block_base + 0 * BLOCK_BYTES, 2);
+            memcpy(&d1, block_base + 1 * BLOCK_BYTES, 2);
+            memcpy(&d2, block_base + 2 * BLOCK_BYTES, 2);
+            memcpy(&d3, block_base + 3 * BLOCK_BYTES, 2);
+            packed_scales = (uint64_t)d0 | ((uint64_t)d1 << 16) | ((uint64_t)d2 << 32) | ((uint64_t)d3 << 48);
+
+            __m128 sw_f16 = _mm_cvtph_ps(_mm_set_epi64x(0, packed_scales));
+            float act_scale = q8_act[l].d;
+            __m128 sw_all = _mm_mul_ps(sw_f16, _mm_set1_ps(act_scale));
+
+            __m256 sc0 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0x00));
+            sc0 = _mm256_permute2f128_ps(sc0, sc0, 0x00);
+            __m256 sc1 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0x55));
+            sc1 = _mm256_permute2f128_ps(sc1, sc1, 0x00);
+            __m256 sc2 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0xAA));
+            sc2 = _mm256_permute2f128_ps(sc2, sc2, 0x00);
+            __m256 sc3 = _mm256_castps128_ps256(_mm_shuffle_ps(sw_all, sw_all, 0xFF));
+            sc3 = _mm256_permute2f128_ps(sc3, sc3, 0x00);
+
+            __m256i sa0 = _mm256_sign_epi8(wvec0, wvec0);
+            __m256i sa1 = (rows > 1) ? _mm256_sign_epi8(wvec1, wvec1) : _mm256_setzero_si256();
+            __m256i sa2 = (rows > 2) ? _mm256_sign_epi8(wvec2, wvec2) : _mm256_setzero_si256();
+            __m256i sa3 = (rows > 3) ? _mm256_sign_epi8(wvec3, wvec3) : _mm256_setzero_si256();
+
+            __m256i sb0 = _mm256_sign_epi8(avec, wvec0);
+            __m256i sb1 = (rows > 1) ? _mm256_sign_epi8(avec, wvec1) : _mm256_setzero_si256();
+            __m256i sb2 = (rows > 2) ? _mm256_sign_epi8(avec, wvec2) : _mm256_setzero_si256();
+            __m256i sb3 = (rows > 3) ? _mm256_sign_epi8(avec, wvec3) : _mm256_setzero_si256();
+
+            acc0 = _mm256_fmadd_ps(sc0, updot_avx2(sa0, sb0), acc0);
+            acc1 = _mm256_fmadd_ps(sc1, updot_avx2(sa1, sb1), acc1);
+            acc2 = _mm256_fmadd_ps(sc2, updot_avx2(sa2, sb2), acc2);
+            acc3 = _mm256_fmadd_ps(sc3, updot_avx2(sa3, sb3), acc3);
         }
+
+        out[n0 + 0] = vdot::hsum_ps256(acc0);
+        if (rows > 1) out[n0 + 1] = vdot::hsum_ps256(acc1);
+        if (rows > 2) out[n0 + 2] = vdot::hsum_ps256(acc2);
+        if (rows > 3) out[n0 + 3] = vdot::hsum_ps256(acc3);
     };
 
-    decode(wq_repacked, out_q, N_q);
-    decode(wk_repacked, out_k, N_k);
-    decode(wv_repacked, out_v, N_v);
+    // Single work-stealing pass across q/k/v (one pool barrier; stragglers on
+    // one matrix steal from another's tail instead of idling).
+    const int64_t gq = (N_q + RM - 1) / RM;
+    const int64_t gk = (N_k + RM - 1) / RM;
+    const int64_t gv = (N_v + RM - 1) / RM;
+    parallel_for_chunks((int)(gq + gk + gv), 1, [&](int g0, int g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            if (g < gq) {
+                decode_group(wq_repacked, out_q, N_q, g);
+            } else if (g < gq + gk) {
+                decode_group(wk_repacked, out_k, N_k, g - gq);
+            } else {
+                decode_group(wv_repacked, out_v, N_v, g - gq - gk);
+            }
+        }
+    });
 }
 
 // Same as gemv_q4_0_fused_qkv_repacked_avx2 but consumes the llama-style
@@ -223,10 +238,30 @@ static void gemv_q4_0_fused_qkv_8x8_avx2(const float* a, const uint8_t* wq_8x8,
             }
         });
     };
-
-    decode(wq_8x8, out_q, N_q);
-    decode(wk_8x8, out_k, N_k);
-    decode(wv_8x8, out_v, N_v);
+    // Single work-stealing pass across q/k/v: one pool barrier instead of
+    // three fork/joins, and late threads steal across matrix boundaries so a
+    // straggler on the q tail no longer idles workers during k/v.
+    const int64_t gq = N_q / RM;
+    const int64_t gk = N_k / RM;
+    const int64_t gv = N_v / RM;
+    parallel_for_chunks((int)(gq + gk + gv), 1, [&](int g0, int g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            const uint8_t* w;
+            float* out;
+            int64_t local;
+            if (g < gq) {
+                w = wq_8x8; out = out_q; local = g;
+            } else if (g < gq + gk) {
+                w = wk_8x8; out = out_k; local = g - gq;
+            } else {
+                w = wv_8x8; out = out_v; local = g - gq - gk;
+            }
+            __m256 acc_row = forge::cpu::gemv_q4_0_8x8_dot_group(
+                w + local * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
+            _mm256_storeu_ps(out + local * RM,
+                             _mm256_permutevar8x32_ps(acc_row, finalperm));
+        }
+    });
 }
 #endif  // USE_AVX2
 
@@ -450,15 +485,16 @@ static void gemv_q4_K_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate, c
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
 
-#    pragma omp parallel for schedule(dynamic, 64)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* gate_row = w_gate + (size_t)n * nb * Q4_K_BLOCK_BYTES;
-        const uint8_t* up_row = w_up + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+    parallel_for_chunks(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* gate_row = w_gate + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+            const uint8_t* up_row = w_up + (size_t)n * nb * Q4_K_BLOCK_BYTES;
 
-        float gate_val = silu(dot_q4_K_q8_K_avx2(gate_row, q8_buf.data(), nb));
-        float up_val = dot_q4_K_q8_K_avx2(up_row, q8_buf.data(), nb);
-        out[n] = gate_val * up_val;
-    }
+            float gate_val = silu(dot_q4_K_q8_K_avx2(gate_row, q8_buf.data(), nb));
+            float up_val = dot_q4_K_q8_K_avx2(up_row, q8_buf.data(), nb);
+            out[n] = gate_val * up_val;
+        }
+    });
 }
 #endif  // USE_AVX2
 
@@ -478,11 +514,12 @@ static void gemv_q4_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
     quantize_row_q8_K(a, q8_buf.data(), K);
 
     auto process_row = [&](const uint8_t* w_row, float* out, int N_out) {
-#    pragma omp parallel for schedule(dynamic, 64)
-        for (int n = 0; n < N_out; ++n) {
-            const uint8_t* q4_row = w_row + (size_t)n * nb * Q4_K_BLOCK_BYTES;
-            out[n] = dot_q4_K_q8_K_avx2(q4_row, q8_buf.data(), nb);
-        }
+        parallel_for_chunks(N_out, 64, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* q4_row = w_row + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+                out[n] = dot_q4_K_q8_K_avx2(q4_row, q8_buf.data(), nb);
+            }
+        });
     };
 
     process_row(wq, out_q, N_q);
@@ -516,8 +553,8 @@ static void gemv_fused_qkv_z_ab_avx2(
     const int n_qkv_z_ab = n_qkv_z + N_alpha;
     const int total = n_qkv_z_ab + N_beta;
 
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < total; ++n) {
+    parallel_for_chunks(total, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
         float v;
         if (n < N_qkv) {
             const uint8_t* row = w_qkv + (size_t)n * qkv_stride;
@@ -534,7 +571,8 @@ static void gemv_fused_qkv_z_ab_avx2(
             const uint8_t* row = w_beta + (size_t)(n - n_qkv_z_ab) * q4_stride;
             out_beta[n - n_qkv_z_ab] = dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
         }
-    }
+        }
+    });
 }
 #endif  // USE_AVX2
 

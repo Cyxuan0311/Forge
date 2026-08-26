@@ -1276,8 +1276,9 @@ static void gemv_q6_K_8x8_q8_K_avx2(
     const block_q6_Kx8* b_ptr_start = reinterpret_cast<const block_q6_Kx8*>(w_repacked);
     const block_q8_K*   a_ptr       = q8_buf.data();
 
-#    pragma omp parallel for schedule(static)
-    for (int64_t x = 0; x < N / ncols_interleaved; x++) {
+// Single work-stealing pass over column groups via the persistent pool
+    // (replaces an OMP static fork/join; chunk = 4 groups = 32 rows).
+    auto process_col_group = [&](int64_t x) {
         const block_q6_Kx8* b_ptr = b_ptr_start + (x * nb);
 
         __m256 acc_row = _mm256_setzero_ps();
@@ -1447,7 +1448,14 @@ static void gemv_q6_K_8x8_q8_K_avx2(
         }
 
         _mm256_storeu_ps(o_data + x * ncols_interleaved, acc_row);
-    }
+    };
+
+    const int64_t num_col_groups = N / ncols_interleaved;
+    parallel_for_chunks((int)num_col_groups, 4, [&](int64_t x0, int64_t x1) {
+        for (int64_t x = x0; x < x1; ++x) {
+            process_col_group(x);
+        }
+    });
 }
 
 // ============================================================================

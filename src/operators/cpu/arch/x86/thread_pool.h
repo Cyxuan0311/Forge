@@ -11,8 +11,9 @@
 //
 // This pool mirrors llama.cpp's ggml threadpool:
 //   - persistent worker threads (no per-kernel fork/join)
-//   - each worker pinned to its own physical core (E-cores preferred on
-//     P/E-hybrid CPUs by pinning to the last `nth` allowed CPUs)
+//   - no CPU pinning by default (FORGE_PIN_THREADS=first|last opts in); the
+//     OS scheduler places threads, which keeps hybrid P/E parts and VMs
+//     (WSL2) from being locked onto slow efficiency cores
 //   - ggml mul_mat chunk distribution: thread i starts at chunk i, then grabs
 //     chunks via an atomic fetch_add so late work-stealing keeps DRAM streams
 //     parallel.
@@ -31,6 +32,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <condition_variable>
@@ -181,7 +184,20 @@ private:
     }
 
     void pin_to_core(int ith) {
+        // Hard pinning is opt-in via FORGE_PIN_THREADS=first|last.
+        //
+        // Default is NO pinning (llama.cpp behaviour): leave placement to the
+        // OS scheduler. Rationale: on P/E hybrids the previous "last nth
+        // allowed CPUs" heuristic parked every worker on efficiency cores
+        // (measured ~40% slower per core on an i5-13500H), and inside VMs
+        // (WSL2) Linux CPU ids do not reliably map to physical topology, so a
+        // fixed mask can fight the host scheduler instead of helping it.
 #if defined(__linux__)
+        const char* mode = std::getenv("FORGE_PIN_THREADS");
+        if (!mode || !*mode) {
+            return;
+        }
+        const bool prefer_last = (std::strcmp(mode, "last") == 0);
         cpu_set_t allowed;
         CPU_ZERO(&allowed);
         if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
@@ -196,18 +212,28 @@ private:
         if (cpus.empty()) {
             return;
         }
-        // Pin to the last `nth_` allowed CPUs (E-cores on P/E-hybrid machines)
-        // so 8 threads run on 8 separate physical cores.
+        // first: the leading `nth_` allowed CPUs (performance cores when the
+        // OS enumerates them first); last: the trailing `nth_` CPUs.
         const int n = static_cast<int>(cpus.size());
-        const int target = n >= nth_ ? n - nth_ + ith : ith % n;
+        int target;
+        if (prefer_last) {
+            target = n >= nth_ ? n - nth_ + ith : ith % n;
+        } else {
+            target = n >= nth_ ? ith : ith % n;
+        }
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(cpus[target], &set);
         pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #elif defined(_WIN32)
-        // Best effort: pin to the last nth processors of the current group.
+        const char* mode = std::getenv("FORGE_PIN_THREADS");
+        if (!mode || !*mode) {
+            return;
+        }
+        const bool prefer_last = (std::strcmp(mode, "last") == 0);
         const int n = static_cast<int>(std::thread::hardware_concurrency());
-        const int target = n >= nth_ ? n - nth_ + ith : ith;
+        const int target =
+            n >= nth_ ? (prefer_last ? n - nth_ + ith : ith) : ith;
         SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << target);
 #else
         (void)ith;
