@@ -194,8 +194,17 @@ bool run_case(const DtypeSpec& spec, int M, int K, int N, std::mt19937& rng,
 
     std::vector<float> a(static_cast<size_t>(M) * K);
     {
-        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (auto& v : a) v = dist(rng);
+        // FORGE_MMQ_CONST_ACT=1: uniform activations collapse per-32 amax
+        // blocks to a single scale, isolating activation-side indexing bugs
+        // from weight-side decode bugs.
+        if (std::getenv("FORGE_MMQ_CONST_ACT")) {
+            for (int m = 0; m < M; ++m)
+                for (int k = 0; k < K; ++k)
+                    a[m * K + k] = 0.5f;
+        } else {
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (auto& v : a) v = dist(rng);
+        }
     }
 
     // Golden: CPU dequant + double-precision GEMM --------------------------
@@ -305,14 +314,11 @@ int main() {
     if (const char* s = std::getenv("FORGE_MMQ_SEED")) seed = static_cast<unsigned>(std::atoi(s));
     std::mt19937 rng(seed);
 
-    // Dtypes with known residual defects, excluded from production dispatch
-    // (see matmul_cuda.cpp whitelist). Their failures are reported but do not
-    // fail the suite unless FORGE_MMQ_STRICT=1.
+    // FORGE_MMQ_STRICT=1 currently changes nothing (no known-issue dtypes),
+    // kept as a hook for future waivers.
     const bool strict = std::getenv("FORGE_MMQ_STRICT") != nullptr;
-    auto known_issue = [](const char* name) {
-        return std::strcmp(name, "Q3_K") == 0;  // moderate systematic deviation,
-                                              // root cause under investigation
-    };
+    auto known_issue = [](const char*) { return false; };
+    (void)strict;
 
     for (const auto& spec : kSpecs) {
         int dtype_fails = 0;

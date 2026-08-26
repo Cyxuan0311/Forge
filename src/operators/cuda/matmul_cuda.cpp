@@ -183,9 +183,9 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
         // Whitelist: dtypes whose MMQ kernels pass the reference suite
         // (tests/test_mmq_reference.cpp). Q3_K has a known residual defect
         // and stays on the verified batched-GEMV path.
+        // All six quantized dtypes now pass tests/test_mmq_reference.cpp.
         auto mmq = device_mmq_fn(b->dtype());
-        const bool mmq_verified = b->dtype() != DataType::Q3_K;
-        if (mmq && mmq_verified && quantized) {
+        if (mmq && quantized) {
             mmq(a_data, b->data(), o_data, M, K, N, 0);
         } else {
             auto gemv_batch = device_gemv_batch_fn(b->dtype());

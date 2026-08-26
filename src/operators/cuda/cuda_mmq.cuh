@@ -175,8 +175,10 @@ static constexpr int mmq_tile_x_bytes_q2_k() {
 // inner dp4a call.  Must match llama.cpp definitions.
 // ============================================================================
 
-// Q3_K × Q8_1 MMQ: VDR = 8 (process 8 sub-groups of 4 K-elements)
-#define VDR_Q3_K_Q8_1_MMQ  8
+// Q3_K × Q8_1 MMQ: VDR = 2 (one q8_1_mmq block of 32 activations per dot;
+// must match llama.cpp so each call spans exactly ONE activation scale --
+// a value of 8 smeared four different per-32-block d's into one multiplier)
+#define VDR_Q3_K_Q8_1_MMQ  2
 
 // Q4_K × Q8_1 MMQ: VDR = 8
 #define VDR_Q4_K_Q8_1_MMQ  8

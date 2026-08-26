@@ -380,29 +380,42 @@ static __device__ __forceinline__ void load_tiles_q3_K(
         }
     }
 
-    // Scales: 12 packed bytes -> four int-words per row of per-group int8
-    // scales with the -32 bias applied (__vsubss4 ... 0x20202020).
-    constexpr int rows_per_warp = warp_size / 4;
+    // Scales: 12 packed GGUF bytes -> 16 signed 6-bit values via the SAME
+    // aux-shuffle as dequantize_row_q3_K / forge::ops::dequantize_q3_k_row.
+    // (The previously ported nibble-unpack dropped the weight-4 bit plane,
+    // biasing every scale by -4 and skewing all outputs.)
+    {
+        const int lane0 = 0;
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
-        int i = (i0 + threadIdx.y * rows_per_warp + lane / 4) % I;
-        int n = n_start + min(i, N - n_start - 1);
+        for (int i0 = 0; i0 < I; i0 += nwarps) {
+            const int i = (i0 + threadIdx.y) % I;
+            if (lane != lane0) continue;
+            const int n = n_start + min(i, N - n_start - 1);
 
-        const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 110;
-        const uint8_t* block_ptr = w_row + kbx0 * 110;
+            const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 110;
 
-        const int ksc = lane % 4;
-
-        const int ksc_low = ksc % (GEMV_QI3_K / 8);
-        const int shift_low = 4 * (ksc / (GEMV_QI3_K / 8));
-        const int sc_low = (get_int_b2(block_ptr + 96, ksc_low) >> shift_low) & 0x0F0F0F0F;
-
-        const int ksc_high = GEMV_QI3_K / 8;
-        const int shift_high = 2 * ksc;
-        const int sc_high = ((get_int_b2(block_ptr + 96, ksc_high) >> shift_high) << 4) & 0x30303030;
-
-        const int sc = __vsubss4(sc_low | sc_high, 0x20202020);
-        x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + ksc] = sc;
+            uint32_t aux[4] = {0u, 0u, 0u, 0u};
+            const uint8_t* sc_src = w_row + kbx0 * 110 + 96;
+#pragma unroll
+            for (int b = 0; b < 12; ++b) {
+                reinterpret_cast<uint8_t*>(aux)[b] = sc_src[b];
+            }
+            const uint32_t tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 4) & 0x03030303u) << 4);
+            aux[3] = ((aux[1] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 6) & 0x03030303u) << 4);
+            aux[0] = (aux[0] & 0x0F0F0F0Fu) | (((tmp >> 0) & 0x03030303u) << 4);
+            aux[1] = (aux[1] & 0x0F0F0F0Fu) | (((tmp >> 2) & 0x03030303u) << 4);
+            uint8_t* s8 = reinterpret_cast<uint8_t*>(aux);
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                s8[b] = static_cast<uint8_t>(s8[b] - 32);
+            }
+            int* dst = x_sc + i * (MMQ_TILE_NE_K / 8) + i / 8;
+            dst[0] = static_cast<int>(aux[0]);
+            dst[1] = static_cast<int>(aux[1]);
+            dst[2] = static_cast<int>(aux[2]);
+            dst[3] = static_cast<int>(aux[3]);
+        }
     }
 
     // Super-block scale d (fp16 at offset 108)
@@ -920,7 +933,8 @@ __global__ void mul_mat_q_kernel(
                         int i = i0 + lane;
                         if (n_start + i >= N) continue;
 
-                        const int8_t* scales = (const int8_t*)(x_sc + i * (MMQ_TILE_NE_K / 8) + i / 8) + k0 / 4;
+                        const int8_t* scales_p = (const int8_t*)(x_sc + i * (MMQ_TILE_NE_K / 8) + i / 8) + k0 / 4;
+            const int8_t* scales = scales_p;
 
                         sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
                             vec_dot_q3_K_q8_1_mmq(
