@@ -404,6 +404,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
             auto output_norm = weights_.output_norm;
             hidden = ops::rms_norm(hidden, output_norm, cfg.rms_norm_eps);
         }
+        last_hidden_ = hidden;  // forward_batch (prefill) hidden exposure
 
         auto output_weight = weights_.output_weight;
         if (!output_weight && cfg.tie_embeddings) {
@@ -563,24 +564,28 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         }
     }
 
-    LOG_INFO("KV cache init: layers=" + std::to_string(cfg.num_layers) + ", kv_heads=" +
+    // Reserve one extra KV layer per MTP nextn block: the draft module reuses
+    // engine attention at layer index cfg.num_layers.
+    const int kv_num_layers = cfg.num_layers + std::max(0, cfg.n_nextn_layers);
+
+    LOG_INFO("KV cache init: layers=" + std::to_string(kv_num_layers) + ", kv_heads=" +
              std::to_string(cfg.num_kv_heads) + ", head_dim=" + std::to_string(cfg.head_dim) +
              ", max_seq_len=" + std::to_string(kv_max_seq) +
              ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU"));
-    size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
+    size_t kv_bytes = (size_t)kv_num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
                       cfg.head_dim * sizeof(float);
     LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024 * 1024)) + " MB");
 
     // Allocate KV cache on the primary device
     // For paged mode, KVCache is still initialized (for transitional compatibility)
     // but PagedKVStorage is the primary storage backend.
-    kv_cache_.init_quantized(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq, kv_dev,
+    kv_cache_.init_quantized(kv_num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq, kv_dev,
                              kv_cache_dtype_);
 
     // Phase 6: set per-layer memory policies from arch config.
     // SlidingWindow layers use ring buffer eviction; Full layers grow linearly.
     if (cfg.n_swa > 0) {
-        std::vector<KVLayerPolicy> policies(cfg.num_layers, KVLayerPolicy::Full);
+        std::vector<KVLayerPolicy> policies(kv_num_layers, KVLayerPolicy::Full);
         bool has_swa_layers = false;
         for (int i = 0; i < cfg.num_layers; ++i) {
             if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1) {
@@ -612,7 +617,7 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         kv_config.type_v = kv_cache_dtype_;
         // Phase 6: set layer policies before init so SWA pools are sized correctly
         if (cfg.n_swa > 0) {
-            std::vector<KVLayerPolicy> policies(cfg.num_layers, KVLayerPolicy::Full);
+            std::vector<KVLayerPolicy> policies(kv_num_layers, KVLayerPolicy::Full);
             for (int i = 0; i < cfg.num_layers; ++i) {
                 if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1)
                     policies[i] = KVLayerPolicy::SlidingWindow;
@@ -685,6 +690,9 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
         PERF_SCOPE("forward/output_norm");
         cur_hidden = ops::rms_norm(cur_hidden, output_norm, cfg.rms_norm_eps);
     }
+    // Post-final-norm hidden (LM-head input feature), stashed for the MTP
+    // draft module. One [M, H] tensor per forward is cheap.
+    last_hidden_ = cur_hidden;
 
     auto output_weight = weights_.output_weight;
     if (!output_weight && cfg.tie_embeddings) {

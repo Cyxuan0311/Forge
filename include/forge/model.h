@@ -23,6 +23,9 @@ struct ModelConfig {
     int hidden_dim = 0;
     int intermediate_dim = 0;
     int num_layers = 0;
+    // DeepSeek-MTP style trailing nextn layers (blk.N.nextn.*). Excluded from
+    // num_layers (trunk) and loaded separately under "mtp.*" keys.
+    int n_nextn_layers = 0;
     int num_heads = 0;
     int num_kv_heads = 0;
     int head_dim = 0;

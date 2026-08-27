@@ -653,6 +653,66 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
             }
         }
 
+        // DeepSeek-MTP style nextn block(s): load the trailing blk.{N}.*
+        // decoder weights (standard names) plus nextn.{eh_proj,enorm,hnorm,..}
+        // under "mtp.*" keys so an MTP draft module can consume them. The
+        // trunk loop above deliberately skipped these layers.
+        if (config_.n_nextn_layers > 0) {
+            const int trunk = config_.num_layers;
+            for (int j = 0; j < config_.n_nextn_layers; ++j) {
+                const int b = trunk + j;
+                const std::string blk = "blk." + std::to_string(b);
+                // Canonical trunk-style keys ("layers.64.*") so the registered
+                // per-layer weight init can build a LayerWeights for the MTP
+                // decoder exactly like a trunk layer.
+                const std::string base = "layers." + std::to_string(b);
+                // `trunk` is the first nextn index and is intentionally one
+                // past layer_devices.size(); use the last real trunk device.
+                DeviceType dev = layer_devices.empty() ? first_layer_dev : layer_devices.back();
+
+                auto set_if = [&](const std::string& canonical,
+                                  const std::string& gguf_name) {
+                    auto t = load_tensor(gguf_name, dev);
+                    if (t)
+                        weight_store_.set(canonical, t);
+                };
+
+                // Decoder layer (same field set as the qwen35 trunk branch).
+                set_if(base + ".attn_norm", blk + ".attn_norm.weight");
+                set_if(base + ".attn_q", blk + ".attn_q.weight");
+                set_if(base + ".attn_k", blk + ".attn_k.weight");
+                set_if(base + ".attn_v", blk + ".attn_v.weight");
+                set_if(base + ".attn_output", blk + ".attn_output.weight");
+                set_if(base + ".attn_gate", blk + ".attn_gate.weight");
+                set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
+                set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
+                set_if(base + ".post_attention_norm",
+                       blk + ".post_attention_norm.weight");
+                set_if(base + ".ssm_norm", blk + ".ssm_norm.weight");
+                set_if(base + ".ssm_a", blk + ".ssm_a");
+                set_if(base + ".ssm_dt", blk + ".ssm_dt.bias");
+                set_if(base + ".ssm_conv1d", blk + ".ssm_conv1d.weight");
+                set_if(base + ".ssm_alpha", blk + ".ssm_alpha.weight");
+                set_if(base + ".ssm_beta", blk + ".ssm_beta.weight");
+                set_if(base + ".ssm_out", blk + ".ssm_out.weight");
+                set_if(base + ".gate_proj", blk + ".ffn_gate.weight");
+                set_if(base + ".down_proj", blk + ".ffn_down.weight");
+                set_if(base + ".up_proj", blk + ".ffn_up.weight");
+
+                // MTP glue tensors.
+                set_if("mtp.eh_proj", blk + ".nextn.eh_proj.weight");
+                set_if("mtp.enorm", blk + ".nextn.enorm.weight");
+                set_if("mtp.hnorm", blk + ".nextn.hnorm.weight");
+                // Optional explicit copies; engines fall back to the shared
+                // trunk output/embedding when absent.
+                set_if("mtp.embed_tokens", blk + ".nextn.embed_tokens.weight");
+                set_if("mtp.shared_head_head", blk + ".nextn.shared_head_head.weight");
+                set_if("mtp.shared_head_norm", blk + ".nextn.shared_head_norm.weight");
+
+                LOG_INFO("Loaded MTP nextn layer " + std::to_string(j) + " from " + blk);
+            }
+        }
+
         // Vision / Multimodal weights (mmproj)
         // Auto-scan all tensors with v.* or mm.* prefixes
         // Vision weights stay on CPU (loaded separately via load_vision_weights)

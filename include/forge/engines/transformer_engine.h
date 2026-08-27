@@ -28,6 +28,12 @@ public:
 
     KVCache* kv_cache() override { return &kv_cache_; }
     const KVCache* kv_cache() const override { return &kv_cache_; }
+
+    TensorPtr take_last_hidden() override {
+        auto h = last_hidden_;
+        last_hidden_ = nullptr;
+        return h;
+    }
     KVCache& kv_cache_ref() { return kv_cache_; }
     const KVCache& kv_cache_ref() const { return kv_cache_; }
 
@@ -94,6 +100,7 @@ protected:
     // Memory 由 InferenceContext 持有, engine 只引用。
     InferenceMemory& memory_;
     KVCache& kv_cache_;
+    TensorPtr last_hidden_;  // post-final-norm hidden from last forward_request
     std::unique_ptr<KVMemory> kv_memory_;
     ModelWeights weights_;
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;

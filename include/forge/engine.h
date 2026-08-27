@@ -38,6 +38,11 @@ public:
         (void)start_pos;
         throw std::runtime_error("forward_from_hidden not implemented for this engine");
     }
+    // Post-final-norm hidden state from the most recent forward_request
+    // (DeepSeek-MTP style draft input). Returns nullptr when the engine does
+    // not expose it or the last forward went through a path that cannot.
+    virtual TensorPtr take_last_hidden() { return nullptr; }
+
     virtual std::string name() const = 0;
     virtual void reset() {}
     virtual void set_gpu_layers(int layers) { (void)layers; }

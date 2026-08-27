@@ -42,6 +42,7 @@ static void print_usage(const char* prog) {
            "\n"
            "Speculative Decoding:\n"
            "       --spec                 Enable speculative decoding (n-gram, off by default)\n"
+           "       --spec-mtp             Use bundled qwen35 DeepSeek-MTP head\n"
            "       --spec-draft N         Max drafted tokens per round (default: 5)\n"
            "       --spec-n-min N         Min candidates per round or discard (default: 0)\n"
            "       --spec-ngram-n N       Longest suffix match length (default: 5)\n"
@@ -279,6 +280,9 @@ CliArgs parse_args(int argc, char** argv) {
         } else if (arg == "--spec") {
             args.spec.enabled = true;
             args.spec.use_ngram = true;
+        } else if (arg == "--spec-mtp") {
+            args.spec.enabled = true;
+            args.spec.use_mtp = true;
         } else if (arg == "--spec-draft") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";

@@ -6,6 +6,7 @@
 #include "forge/context.h"
 #include "forge/engine.h"
 #include "forge/inference/forward_request.h"
+#include "forge/mtp_draft_provider.h"
 #include "forge/kv_cache.h"
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
@@ -18,7 +19,15 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
     : ctx_(ctx), sampler_(sampler), cfg_(cfg) {
     if (!cfg_.enabled) return;
 
-    if (!cfg_.draft_model_path.empty()) {
+    if (cfg_.use_mtp) {
+        auto mtp = std::make_unique<MtpDraftProvider>(ctx_, cfg_.p_min);
+        if (mtp->valid()) {
+            provider_ = std::move(mtp);
+        } else {
+            LOG_WARN("SpeculativeExecutor: MTP provider unavailable, falling back");
+        }
+    }
+    if (!provider_ && !cfg_.draft_model_path.empty()) {
         auto draft = std::make_unique<ModelDraftProvider>(cfg_, ctx_.params(),
                                                            ctx_.model().config().vocab_size);
         if (draft->valid()) {

@@ -186,6 +186,18 @@ ModelConfig parse_qwen35_config(ModelLoader& loader, const std::string& arch) {
     auto cfg = parse_common_gguf_config(loader, arch);
     cfg.tie_embeddings = true;
     cfg.use_ssm = true;
+    // DeepSeek-MTP style trailing nextn block(s): blk.{N}.* carries a full
+    // decoder layer plus nextn.{eh_proj,enorm,hnorm,...}. Exclude from trunk.
+    cfg.n_nextn_layers =
+        static_cast<int>(loader.get_metadata_int(arch + ".nextn_predict_layers", 0));
+    if (cfg.n_nextn_layers > 0 && cfg.num_layers > cfg.n_nextn_layers) {
+        LOG_INFO("qwen35: " + std::to_string(cfg.n_nextn_layers) +
+                 " nextn MTP layer(s) present; trunk layers = " +
+                 std::to_string(cfg.num_layers - cfg.n_nextn_layers));
+        cfg.num_layers -= cfg.n_nextn_layers;
+    } else {
+        cfg.n_nextn_layers = 0;
+    }
     cfg.ssm_group_count =
         static_cast<int>(loader.get_metadata_int(arch + ".ssm.group_count", 0));
     cfg.ssm_time_step_rank =

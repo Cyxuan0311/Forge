@@ -55,6 +55,7 @@ struct SpeculativeConfig {
     int draft_gpu_layers = -1;  // GPU offload layers for draft model (-1 = follow target)
 
     // n-gram self-speculative parameters
+    bool use_mtp = false;       // DeepSeek-MTP style nextn draft head (qwen35)
     bool use_ngram = true;      // enable n-gram candidate source
     int ngram_n = 5;            // longest suffix match length
     int ngram_min = 2;          // shortest suffix match length
