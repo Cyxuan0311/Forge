@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -57,8 +58,16 @@ struct SpeculativeConfig {
     // n-gram self-speculative parameters
     bool use_mtp = false;       // DeepSeek-MTP style nextn draft head (qwen35)
     bool use_ngram = true;      // enable n-gram candidate source
+    bool no_ngram = false;      // --no-ngram: disable ngram fallback (used with --spec-ngram-mod to isolate mod)
     int ngram_n = 5;            // longest suffix match length
     int ngram_min = 2;          // shortest suffix match length
+
+    // n-gram-mod global hash pool (llama.cpp ngram-mod style)
+    bool use_ngram_mod = false;     // enable global hash-pool ngram-mod
+    int ngram_mod_n = 24;           // hash key length (llama n_match)
+    int ngram_mod_n_min = 1;        // min draft tokens to keep when mod truncates (lowered from 48)
+    int ngram_mod_n_max = 64;       // max draft tokens to pull from mod pool
+    size_t ngram_mod_pool_size = 4 * 1024 * 1024; // entries, ~16 MB
 };
 
 // =========================================================================
@@ -94,6 +103,10 @@ public:
     virtual void reset() {}
 
     virtual const char* name() const = 0;
+
+    // Whether this provider tracks global history and should receive
+    // accept() even when it was not the drafter (e.g. n-gram pools).
+    virtual bool is_global() const { return false; }
 };
 
 using DraftProviderPtr = std::unique_ptr<IDraftProvider>;
@@ -118,8 +131,11 @@ public:
     void accept(const std::vector<int32_t>& tokens) override;
     void reset() override;
     const char* name() const override { return "ngram"; }
+    bool is_global() const override { return true; }
 
 private:
+    // Rolling FNV-1a hash for a token window [ptr, ptr+len).
+    static uint64_t hash_window(const int32_t* ptr, int len);
     // Index every window completed as the history grows from old_len to
     // new_len (windows straddling the old boundary included).
     void index_range(int old_len, int new_len);
@@ -128,18 +144,47 @@ private:
     int ngram_min_;
     std::vector<int32_t> history_;  // full confirmed token sequence (prompt + generated)
 
-    struct VecHash {
-        size_t operator()(const std::vector<int32_t>& v) const {
-            size_t h = 1469598103934665603ull;  // FNV-1a 64-bit offset basis
-            for (int32_t t : v) {
-                h ^= static_cast<size_t>(static_cast<uint32_t>(t));
-                h *= 1099511628211ull;
-            }
-            return h;
-        }
+    // key hash -> ascending start positions of occurrences inside history_
+    std::unordered_map<uint64_t, std::vector<int32_t>> index_;
+};
+
+// ---- Global hash-pool n-gram provider (llama.cpp ngram-mod style) ----
+// Constant-memory O(1) lookup via a shared 4M-entry table. The pool is
+// process-global so concurrent sequences benefit from shared history
+// (cross-request prefix reuse for code/reasoning workloads).
+class NgramModProvider : public IDraftProvider {
+public:
+    explicit NgramModProvider(int n_match = 24, int n_min = 48, int n_max = 64,
+                              size_t pool_size = 4 * 1024 * 1024);
+    void begin(const std::vector<int32_t>& prompt) override;
+    std::vector<int32_t> draft(int32_t last_token, int n_draft) override;
+    void accept(const std::vector<int32_t>& tokens) override;
+    void reset() override;
+    const char* name() const override { return "ngram-mod"; }
+    bool is_global() const override { return true; }
+
+private:
+    // LCG hash matching llama.cpp common_ngram_mod::idx
+    static uint64_t lcg_hash(const int32_t* tokens, int n);
+
+    int n_match_;
+    int n_min_;
+    int n_max_;
+    std::vector<int32_t> history_;
+
+    // Per-provider bookkeeping for lazy indexing and reset heuristics
+    int i_last_ = 0;              // next history position to index into pool
+    int n_draft_last_ = 0;
+    int n_low_streak_ = 0;        // consecutive low-accept rounds
+
+    // ---- Global shared pool (singleton) ----
+    struct SharedPool {
+        std::vector<int32_t> table;
+        size_t used = 0;
+        std::mutex mutex;
     };
-    // key -> ascending start positions of occurrences inside history_
-    std::unordered_map<std::vector<int32_t>, std::vector<int32_t>, VecHash> index_;
+    static SharedPool& shared_pool();
+    static size_t pool_size_;
 };
 
 // ---- Standalone small-model draft provider ----

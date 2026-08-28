@@ -40,17 +40,22 @@ static void print_usage(const char* prog) {
             "       --offload-embedding    Offload token_embedding to GPU (default: on)\n"
            "       --no-offload-embedding Keep token_embedding on CPU during partial offload\n"
            "\n"
-           "Speculative Decoding:\n"
-           "       --spec                 Enable speculative decoding (n-gram, off by default)\n"
-           "       --spec-mtp             Use bundled qwen35 DeepSeek-MTP head\n"
-           "       --spec-draft N         Max drafted tokens per round (default: 5)\n"
-           "       --spec-n-min N         Min candidates per round or discard (default: 0)\n"
-           "       --spec-ngram-n N       Longest suffix match length (default: 5)\n"
-           "       --spec-ngram-min N     Shortest suffix match length (default: 2)\n"
-           "       --spec-p-min FLOAT     Draft confidence early-stop threshold (default: 0.0)\n"
-           "       --spec-model PATH      Standalone small draft model path (Phase 3)\n"
-           "       --spec-draft-ngl N     GPU layers for the draft model (default: same as -ngl)\n"
-           "       --spec-stats           Print speculation stats after generation\n"
+            "Speculative Decoding:\n"
+            "       --spec                 Enable speculative decoding (n-gram, off by default)\n"
+            "       --spec-mtp             Use bundled qwen35 DeepSeek-MTP head\n"
+            "       --spec-draft N         Max drafted tokens per round (default: 5)\n"
+            "       --spec-n-min N         Min candidates per round or discard (default: 0)\n"
+            "       --spec-ngram-n N       Longest suffix match length (default: 5)\n"
+            "       --spec-ngram-min N     Shortest suffix match length (default: 2)\n"
+            "       --spec-ngram-mod       Enable global hash-pool ngram-mod (llama.cpp style)\n"
+            "       --spec-ngram-mod-n N   Hash key length for ngram-mod (default: 24)\n"
+            "       --spec-ngram-mod-min N Min draft for ngram-mod to keep (default: 1)\n"
+            "       --spec-ngram-mod-max N Max draft for ngram-mod (default: 64)\n"
+            "       --no-ngram            Disable the plain n-gram fallback (use only with --spec-ngram-mod to isolate mod)\n"
+            "       --spec-p-min FLOAT     Draft confidence early-stop threshold (default: 0.0)\n"
+            "       --spec-model PATH      Standalone small draft model path (Phase 3)\n"
+            "       --spec-draft-ngl N     GPU layers for the draft model (default: same as -ngl)\n"
+            "       --spec-stats           Print speculation stats after generation\n"
            "\n"
            "Sampling:\n"
            "       --temp FLOAT          Sampling temperature (default: 0.7, 0=greedy)\n"
@@ -335,6 +340,37 @@ CliArgs parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             args.spec.draft_gpu_layers = std::stoi(argv[i]);
+        } else if (arg == "--spec-ngram-mod") {
+            args.spec.enabled = true;
+            args.spec.use_ngram_mod = true;
+        } else if (arg == "--no-ngram") {
+            args.spec.enabled = true;
+            args.spec.no_ngram = true;
+            args.spec.use_ngram = false;
+        } else if (arg == "--spec-ngram-mod-n") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.use_ngram_mod = true;
+            args.spec.ngram_mod_n = std::stoi(argv[i]);
+        } else if (arg == "--spec-ngram-mod-min") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.use_ngram_mod = true;
+            args.spec.ngram_mod_n_min = std::stoi(argv[i]);
+        } else if (arg == "--spec-ngram-mod-max") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.use_ngram_mod = true;
+            args.spec.ngram_mod_n_max = std::stoi(argv[i]);
         } else if (arg == "--spec-stats") {
             args.spec.print_stats = true;
         } else if (arg == "-v" || arg == "--verbose") {

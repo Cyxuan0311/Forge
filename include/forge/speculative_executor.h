@@ -44,7 +44,8 @@ public:
     ~SpeculativeExecutor();
 
     // Whether a draft provider is available and usable.
-    bool valid() const { return provider_ != nullptr; }
+    bool valid() const { return !providers_.empty() || provider_ != nullptr; }
+    bool has_providers() const { return !providers_.empty(); }
 
     // Call once per generation after prompt prefill. Resets stats and provider state.
     void begin_generation(const std::vector<int32_t>& prompt);
@@ -67,8 +68,15 @@ private:
     InferenceContext& ctx_;
     Sampler& sampler_;
     SpeculativeConfig cfg_;
-    DraftProviderPtr provider_;
+    std::vector<DraftProviderPtr> providers_;
+    DraftProviderPtr provider_; // legacy single-provider accessor (points to primary)
+    int last_drafter_idx_ = -1;
     SpeculativeStats stats_;
+
+    // Adaptive draft control: n_draft is scaled by recent acceptance rate so a
+    // low-acceptance round does not force the full (costly) forward over 5 rows.
+    int adaptive_draft_ = 0;       // current effective n_draft (0 = uninitialized)
+    double accept_ewma_ = -1.0;     // EWMA acceptance rate over recent rounds
 };
 
 }  // namespace forge
