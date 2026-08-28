@@ -410,7 +410,9 @@ if(FORGE_BUILD_PYTHON)
 endif()
 
 # ---- Tests ----
-option(FORGE_BUILD_TESTS "Build forge test executables" ON)
+# Master switch for the test suite. Default OFF: the test executables (and the
+# cross-architecture QEMU targets) are only built when explicitly requested.
+option(FORGE_BUILD_TESTS "Build forge test executables" OFF)
 if(FORGE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

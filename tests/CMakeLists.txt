@@ -1,29 +1,36 @@
 # Forge test suite.
 #
-# Layout:
-#   - Native test/bench executables are regular CMake targets linked against
-#     the forge libraries built by the parent project.
-#   - Architecture-specific kernel tests (ARM64 NEON, PPC64 VSX) cannot run on
-#     this host, so they are cross-compiled with <triple>-linux-gnu-g++ and run
-#     under QEMU (both registered with CTest via CMAKE_CROSSCOMPILING_EMULATOR-
-#     style wrappers). They are enabled only when the toolchain AND the qemu
-#     binary are found.
+# Responsibilities of THIS file:
+#   * Compile the C++ test/bench sources under tests/ and register them with
+#     CTest.
+#   * Cross-compile architecture-specific kernel tests (ARM64 NEON, PPC64 VSX)
+#     and run them under QEMU so they verify on x86 CI hosts.
+#
+# Responsibilities of the PARENT (top-level) CMakeLists.txt:
+#   * Own the master on/off switch: option(FORGE_BUILD_TESTS ...) -- default OFF.
+#   * Call enable_testing() and add_subdirectory(tests) only when enabled.
+# This file assumes it is only ever included when FORGE_BUILD_TESTS is ON.
 #
 # Run everything with CTest:
-#   cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
+#   cmake -B build -DFORGE_BUILD_TESTS=ON && cmake --build build -j
+#   ctest --test-dir build --output-on-failure
 #
-# Benchmarks are long-running; keep them out of the default ctest run by
-# configuring with -DFORGE_BUILD_BENCHMARKS=OFF.
+# Benchmarks are long-running and gated by a separate switch
+# (FORGE_BUILD_BENCHMARKS, default OFF) so they stay out of the default run.
 
-option(FORGE_BUILD_BENCHMARKS "Build the micro-benchmark executables" ON)
+option(FORGE_BUILD_BENCHMARKS "Build the micro-benchmark executables" OFF)
 
+# Libraries shared by the native (host-compiled) test executables.
 set(FORGE_TEST_LIBS forge_infer forge_model forge_ops forge_core
                     forge_tokenizer)
 
-# Common helper: link a native test like forge-cli (libs + optional CUDA/OpenMP).
-# Libraries are wrapped in --start-group/--no-whole-group (GNU ld): the arch
-# registration objects inside forge_model reference engine classes defined in
-# forge_infer and vice versa, so plain left-to-right scanning can fail.
+# -----------------------------------------------------------------------------
+# Helper: link a native test like a regular executable (libs + optional
+# CUDA/OpenMP). Libraries are wrapped in --start-group/--no-whole-group (GNU ld)
+# because the arch-registration objects inside forge_model reference engine
+# classes defined in forge_infer and vice versa, so plain left-to-right
+# scanning can fail to resolve symbols.
+# -----------------------------------------------------------------------------
 function(forge_link_native target)
   target_include_directories(
     ${target}
@@ -51,32 +58,22 @@ function(forge_link_native target)
   endif()
 endfunction()
 
-# =========================================================================
-# Native tests
-# =========================================================================
+# -----------------------------------------------------------------------------
+# Native unit tests (compiled on the host).
+#
+# New host tests are added by listing their .cpp here. Cross-architecture
+# sources (test_arm64_*, test_ppc64_*, tests/arch/**) MUST NOT be listed here
+# -- they are handled by the QEMU cross section below.
+# -----------------------------------------------------------------------------
 
-# ---- Speculative decoding (Phase 1) --------------------------------------
-#  1. verify_draft_tokens branch coverage (greedy + resample-consistency)
-#  2. forward_batch multi-token logits vs sequential single-token forwards
-#  3. End-to-end greedy parity: Generator output identical with spec on/off
-# Tests 2 and 3 need models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf and are
-# skipped with a notice when the file is missing.
+# Speculative decoding (Phase 1): draft-token verification, batched forward
+# parity, and greedy end-to-end parity. Needs tinyllama gguf; skipped gracefully
+# when the fixture is absent.
 add_executable(forge-spec-test test_spec_verify.cpp)
 forge_link_native(forge-spec-test)
 add_test(NAME spec-verify COMMAND forge-spec-test)
 
-# ---- CUDA MMQ kernels vs CPU-dequant golden --------------------------------
-# Requires a GPU at run time; the binary itself skips gracefully without one.
-if(CUDAToolkit_FOUND)
-  add_executable(
-    forge-mmq-ref-test
-    test_mmq_reference.cpp
-    ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
-  forge_link_native(forge-mmq-ref-test)
-  add_test(NAME mmq-ref COMMAND forge-mmq-ref-test)
-endif()
-
-# ---- Parallel GGUF scanner (inspect) --------------------------------------
+# Parallel GGUF scanner (inspect).
 add_executable(forge-inspect-scanner-test test_inspect_scanner.cpp)
 target_include_directories(
   forge-inspect-scanner-test
@@ -99,7 +96,7 @@ if(CUDAToolkit_FOUND)
 endif()
 add_test(NAME inspect-scanner COMMAND forge-inspect-scanner-test)
 
-# ---- Generic scalar fallback kernels (standalone, no libs) ----------------
+# Generic scalar fallback kernels (standalone, no libs).
 add_executable(forge-generic-kernels-test test_generic_scalar_kernels.cpp)
 target_compile_definitions(forge-generic-kernels-test
                            PRIVATE FORGE_ARCH_GENERIC)
@@ -108,10 +105,33 @@ target_include_directories(
                                      ${PROJECT_SOURCE_DIR}/src/operators)
 add_test(NAME generic-kernels COMMAND forge-generic-kernels-test)
 
-# =========================================================================
-# Quantized dot-kernel comparisons (x86 AVX2 hosts only)
-# =========================================================================
+# Q3_K MMQ decode bisect -- a host-only mechanical debugging tool (not a
+# normal ctest assertion suite). Built on demand, not registered with CTest.
+add_executable(
+  forge-q3k-decode-bisect
+  q3k_decode_bisect.cpp
+  ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp
+  ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/quant_tables.cpp)
+target_include_directories(
+  forge-q3k-decode-bisect PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                  ${PROJECT_SOURCE_DIR}/src)
 
+# -----------------------------------------------------------------------------
+# CUDA MMQ kernels vs CPU-dequant golden (built only when CUDA is present).
+# The binary skips gracefully at runtime when no GPU is available.
+# -----------------------------------------------------------------------------
+if(CUDAToolkit_FOUND)
+  add_executable(
+    forge-mmq-ref-test
+    test_mmq_reference.cpp
+    ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
+  forge_link_native(forge-mmq-ref-test)
+  add_test(NAME mmq-ref COMMAND forge-mmq-ref-test)
+endif()
+
+# -----------------------------------------------------------------------------
+# Quantized dot-kernel comparisons (x86 AVX2 hosts only).
+# -----------------------------------------------------------------------------
 if(FORGE_CPU_HAS_AVX2)
   foreach(iq_test IN ITEMS iq2xs iq23s)
     add_executable(
@@ -131,17 +151,35 @@ else()
   message(STATUS "tests: skipping IQ2XS/IQ23S compare tests (no AVX2 host)")
 endif()
 
-# =========================================================================
-# Cross-architecture kernel tests (QEMU)
-# =========================================================================
+# -----------------------------------------------------------------------------
+# Cross-architecture kernel tests (cross-compile + QEMU).
+#
+# These sources use NEON/VSX intrinsics and cannot be compiled by the host
+# compiler, so each is cross-built with <triple>-linux-gnu-g++ and executed
+# under QEMU via CTest. A test is registered only when BOTH the cross compiler
+# and its qemu emulator are found; otherwise it is silently skipped.
+#
+# Included here:
+#   * tests/test_arm64_neon_kernels.cpp, tests/test_ppc64_vsx_kernels.cpp
+#     (top-level historical locations)
+#   * every *.cpp under tests/arch/arm64/ and tests/arch/ppc64/ (auto-discovered)
+# -----------------------------------------------------------------------------
 
-# Helper: locate cross gcc + qemu emulator pair and register a ctest entry.
+# Helper: locate a cross gcc + qemu emulator pair and register a ctest entry.
 #   name        test label prefix
-#   src         test source
+#   src         test source (relative to PROJECT_SOURCE_DIR)
 #   triple_gcc  cross compiler binary name
-#   qemu_bin    qemu binary names tried in order
+#   qemu_candidates  qemu binary names tried in order
 #   cflags      arch-specific compile flags
-function(forge_add_cross_test name src triple_gcc qemu_candidates cflags)
+#   inc_dirs    extra -I include directories (relative to PROJECT_SOURCE_DIR)
+function(
+  forge_add_cross_test
+  name
+  src
+  triple_gcc
+  qemu_candidates
+  cflags
+  inc_dirs)
   find_program(${name}_GCC ${triple_gcc})
   set(qemu_found "")
   foreach(q IN LISTS qemu_candidates)
@@ -162,11 +200,16 @@ function(forge_add_cross_test name src triple_gcc qemu_candidates cflags)
   file(MAKE_DIRECTORY ${out_dir})
   set(out_bin ${out_dir}/${name})
 
+  set(inc_args "")
+  foreach(d IN LISTS inc_dirs)
+    list(APPEND inc_args -I${PROJECT_SOURCE_DIR}/${d})
+  endforeach()
+
   add_custom_command(
     OUTPUT ${out_bin}
     COMMAND
       ${${name}_GCC} -std=c++17 -O2 -static ${cflags} -I${PROJECT_SOURCE_DIR}
-      -I${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/${src}
+      -I${PROJECT_SOURCE_DIR}/include ${inc_args} ${PROJECT_SOURCE_DIR}/${src}
       ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp -o ${out_bin}
     DEPENDS ${PROJECT_SOURCE_DIR}/${src}
             ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp
@@ -184,21 +227,44 @@ function(forge_add_cross_test name src triple_gcc qemu_candidates cflags)
   message(STATUS "tests: ${name} -> ${triple_gcc} + ${qemu_found}")
 endfunction()
 
+# Top-level historical cross tests.
 forge_add_cross_test(
   neon-arm64-kernels tests/test_arm64_neon_kernels.cpp aarch64-linux-gnu-g++
-  "qemu-aarch64-static;qemu-aarch64" "-DUSE_NEON;-march=armv8.2-a+dotprod")
+  "qemu-aarch64-static;qemu-aarch64" "-DUSE_NEON;-march=armv8.2-a+dotprod" "")
 
 forge_add_cross_test(
   vsx-ppc64-kernels tests/test_ppc64_vsx_kernels.cpp powerpc64le-linux-gnu-g++
-  "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8")
+  "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8" "")
 
-# =========================================================================
-# Micro-benchmarks (not registered with ctest; run manually)
-# =========================================================================
+# Auto-discover every *.cpp under tests/arch/<arch>/ and cross-build it with
+# the matching toolchain + include path.
+file(GLOB ARM64_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/arch/arm64/*.cpp")
+foreach(src IN LISTS ARM64_SOURCES)
+  get_filename_component(stem ${src} NAME_WE)
+  forge_add_cross_test(
+    arm64-${stem} tests/arch/arm64/${stem}.cpp aarch64-linux-gnu-g++
+    "qemu-aarch64-static;qemu-aarch64" "-DUSE_NEON;-march=armv8.2-a+dotprod"
+    "src/operators/cpu/arch/arm64")
+endforeach()
 
+file(GLOB PPC64_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/arch/ppc64/*.cpp")
+foreach(src IN LISTS PPC64_SOURCES)
+  get_filename_component(stem ${src} NAME_WE)
+  forge_add_cross_test(
+    ppc64-${stem} tests/arch/ppc64/${stem}.cpp powerpc64le-linux-gnu-g++
+    "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8"
+    "src/operators/cpu/arch/ppc64")
+endforeach()
+
+# -----------------------------------------------------------------------------
+# Micro-benchmarks (gated by FORGE_BUILD_BENCHMARKS, default OFF; not
+# registered with CTest -- run the binaries manually).
+# -----------------------------------------------------------------------------
 if(FORGE_BUILD_BENCHMARKS)
   foreach(bench IN ITEMS ffn_q2k moe_multigemv moe_real output_proj_q6k
-                         prefill_gemm)
+                         prefill_gemm cpu_decode)
     add_executable(forge-bench-${bench} bench_${bench}.cpp)
     forge_link_native(forge-bench-${bench})
   endforeach()
