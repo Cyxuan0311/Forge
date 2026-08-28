@@ -17,8 +17,8 @@
 
 option(FORGE_BUILD_BENCHMARKS "Build the micro-benchmark executables" ON)
 
-set(FORGE_TEST_LIBS
-    forge_infer forge_model forge_ops forge_core forge_tokenizer)
+set(FORGE_TEST_LIBS forge_infer forge_model forge_ops forge_core
+                    forge_tokenizer)
 
 # Common helper: link a native test like forge-cli (libs + optional CUDA/OpenMP).
 # Libraries are wrapped in --start-group/--no-whole-group (GNU ld): the arch
@@ -40,13 +40,14 @@ function(forge_link_native target)
     set(group_close "-Wl,--end-group")
   endif()
   target_link_libraries(
-    ${target} PRIVATE ${group_open} ${FORGE_TEST_LIBS} ${group_close}
-                      $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
-                      $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+    ${target}
+    PRIVATE ${group_open} ${FORGE_TEST_LIBS} ${group_close}
+            $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
+            $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
   if(CUDAToolkit_FOUND)
     target_compile_definitions(${target} PRIVATE USE_CUDA)
-    target_link_libraries(${target} PRIVATE CUDA::cudart
-                                            $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
+    target_link_libraries(
+      ${target} PRIVATE CUDA::cudart $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
   endif()
 endfunction()
 
@@ -67,8 +68,10 @@ add_test(NAME spec-verify COMMAND forge-spec-test)
 # ---- CUDA MMQ kernels vs CPU-dequant golden --------------------------------
 # Requires a GPU at run time; the binary itself skips gracefully without one.
 if(CUDAToolkit_FOUND)
-  add_executable(forge-mmq-ref-test test_mmq_reference.cpp
-                                   ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
+  add_executable(
+    forge-mmq-ref-test
+    test_mmq_reference.cpp
+    ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
   forge_link_native(forge-mmq-ref-test)
   add_test(NAME mmq-ref COMMAND forge-mmq-ref-test)
 endif()
@@ -76,9 +79,9 @@ endif()
 # ---- Parallel GGUF scanner (inspect) --------------------------------------
 add_executable(forge-inspect-scanner-test test_inspect_scanner.cpp)
 target_include_directories(
-  forge-inspect-scanner-test PRIVATE ${PROJECT_SOURCE_DIR}/include
-                                     ${PROJECT_SOURCE_DIR}/src
-                                     ${CUDAToolkit_INCLUDE_DIRS})
+  forge-inspect-scanner-test
+  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src
+          ${CUDAToolkit_INCLUDE_DIRS})
 if(APPLE)
   set(group_open "")
   set(group_close "")
@@ -98,7 +101,8 @@ add_test(NAME inspect-scanner COMMAND forge-inspect-scanner-test)
 
 # ---- Generic scalar fallback kernels (standalone, no libs) ----------------
 add_executable(forge-generic-kernels-test test_generic_scalar_kernels.cpp)
-target_compile_definitions(forge-generic-kernels-test PRIVATE FORGE_ARCH_GENERIC)
+target_compile_definitions(forge-generic-kernels-test
+                           PRIVATE FORGE_ARCH_GENERIC)
 target_include_directories(
   forge-generic-kernels-test PRIVATE ${PROJECT_SOURCE_DIR}
                                      ${PROJECT_SOURCE_DIR}/src/operators)
@@ -110,9 +114,12 @@ add_test(NAME generic-kernels COMMAND forge-generic-kernels-test)
 
 if(FORGE_CPU_HAS_AVX2)
   foreach(iq_test IN ITEMS iq2xs iq23s)
-    add_executable(forge-${iq_test}-compare-test test_${iq_test}_compare.cpp
-                                                 ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/quant_tables.cpp)
-    target_link_libraries(forge-${iq_test}-compare-test PRIVATE forge_cpu_features)
+    add_executable(
+      forge-${iq_test}-compare-test
+      test_${iq_test}_compare.cpp
+      ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/quant_tables.cpp)
+    target_link_libraries(forge-${iq_test}-compare-test
+                          PRIVATE forge_cpu_features)
     target_include_directories(
       forge-${iq_test}-compare-test
       PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include
@@ -157,11 +164,12 @@ function(forge_add_cross_test name src triple_gcc qemu_candidates cflags)
 
   add_custom_command(
     OUTPUT ${out_bin}
-    COMMAND ${${name}_GCC} -std=c++17 -O2 -static ${cflags} -I${PROJECT_SOURCE_DIR}
-            -I${PROJECT_SOURCE_DIR}/include
-            ${PROJECT_SOURCE_DIR}/${src}
-            ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp -o ${out_bin}
-    DEPENDS ${PROJECT_SOURCE_DIR}/${src} ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp
+    COMMAND
+      ${${name}_GCC} -std=c++17 -O2 -static ${cflags} -I${PROJECT_SOURCE_DIR}
+      -I${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/${src}
+      ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp -o ${out_bin}
+    DEPENDS ${PROJECT_SOURCE_DIR}/${src}
+            ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp
     COMMENT "Cross-building ${name} (${triple_gcc})"
     VERBATIM)
   # Build the cross binary as part of the default `cmake --build build`.
@@ -169,8 +177,7 @@ function(forge_add_cross_test name src triple_gcc qemu_candidates cflags)
 
   # ctest wrapper script so `ctest` transparently runs under qemu.
   set(runner ${out_dir}/${name}.sh)
-  file(WRITE ${runner}
-       "#!/bin/sh\nexec ${qemu_found} ${out_bin}\n")
+  file(WRITE ${runner} "#!/bin/sh\nexec ${qemu_found} ${out_bin}\n")
   execute_process(COMMAND chmod +x ${runner})
 
   add_test(NAME ${name} COMMAND ${runner})
@@ -178,21 +185,20 @@ function(forge_add_cross_test name src triple_gcc qemu_candidates cflags)
 endfunction()
 
 forge_add_cross_test(
-  neon-arm64-kernels tests/test_arm64_neon_kernels.cpp
-  aarch64-linux-gnu-g++ "qemu-aarch64-static;qemu-aarch64"
-  "-DUSE_NEON;-march=armv8.2-a+dotprod")
+  neon-arm64-kernels tests/test_arm64_neon_kernels.cpp aarch64-linux-gnu-g++
+  "qemu-aarch64-static;qemu-aarch64" "-DUSE_NEON;-march=armv8.2-a+dotprod")
 
 forge_add_cross_test(
-  vsx-ppc64-kernels tests/test_ppc64_vsx_kernels.cpp
-  powerpc64le-linux-gnu-g++ "qemu-ppc64le-static;qemu-ppc64le"
-  "-DUSE_VSX;-mcpu=power8")
+  vsx-ppc64-kernels tests/test_ppc64_vsx_kernels.cpp powerpc64le-linux-gnu-g++
+  "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8")
 
 # =========================================================================
 # Micro-benchmarks (not registered with ctest; run manually)
 # =========================================================================
 
 if(FORGE_BUILD_BENCHMARKS)
-  foreach(bench IN ITEMS ffn_q2k moe_multigemv moe_real output_proj_q6k prefill_gemm)
+  foreach(bench IN ITEMS ffn_q2k moe_multigemv moe_real output_proj_q6k
+                         prefill_gemm)
     add_executable(forge-bench-${bench} bench_${bench}.cpp)
     forge_link_native(forge-bench-${bench})
   endforeach()
