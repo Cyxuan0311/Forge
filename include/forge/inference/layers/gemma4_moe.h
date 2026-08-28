@@ -12,9 +12,14 @@
 
 namespace forge {
 
+class TransformerEngine;  // MoE expert-activation hook (P0+); see transformer_engine.h
+
 class Gemma4Moe {
 public:
-    static TensorPtr apply(const TensorPtr& attn_residual, const LayerExecutionContext& lctx);
+    // engine may be null; when provided, the router's top-k experts are reported
+    // via engine->sync_experts_resident() so later phases can page experts.
+    static TensorPtr apply(const TensorPtr& attn_residual, const LayerExecutionContext& lctx,
+                           TransformerEngine* engine = nullptr);
 };
 
 }  // namespace forge

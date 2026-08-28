@@ -118,7 +118,7 @@ static TensorPtr add_bias_cuda(const TensorPtr& normed, const TensorPtr& bias) {
 // ----------------------------------------------------------------------------
 
 TensorPtr PhimoeEngine::moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeights& lw,
-                                    const ModelConfig& cfg, int seq_len) {
+                                    const ModelConfig& cfg, int seq_len, int layer_idx) {
     const int n_expert = cfg.n_expert;
     const int n_expert_used = cfg.n_expert_used > 0 ? cfg.n_expert_used : 1;
     const int hidden_dim = cfg.hidden_dim;
@@ -197,6 +197,13 @@ TensorPtr PhimoeEngine::moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeig
         float topk_sum = 0.0f;
         for (int k = 0; k < n_expert_used; ++k) {
             topk_sum += probs[indices[k]];
+        }
+
+        // Phase P0 hook: report routed (top-k) experts for this token so later
+        // phases can page them onto the device. P0: empty sync_experts_resident.
+        {
+            std::vector<int> active(indices.begin(), indices.begin() + n_expert_used);
+            sync_experts_resident(layer_idx, active);
         }
 
         // Extract token hidden as [1, hidden_dim]
@@ -302,7 +309,7 @@ TensorPtr PhimoeEngine::moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeig
 // ----------------------------------------------------------------------------
 
 TensorPtr PhimoeEngine::moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWeights& lw,
-                                     const ModelConfig& cfg, int seq_len) {
+                                     const ModelConfig& cfg, int seq_len, int layer_idx) {
     const int n_expert = cfg.n_expert;
     const int n_expert_used = cfg.n_expert_used > 0 ? cfg.n_expert_used : 1;
     const int hidden_dim = cfg.hidden_dim;
@@ -424,6 +431,14 @@ TensorPtr PhimoeEngine::moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWei
     for (int s = 0; s < seq_len; ++s) {
         auto token_hidden =
             std::make_shared<Tensor>(ffn_normed->slice(0, s, s + 1).view({1, hidden_dim}));
+
+        // Phase P0 hook: report routed (top-k) experts for this token. The host
+        // mirror idx_data already holds the router decisions (no extra D2H).
+        // P0: empty sync_experts_resident.
+        std::vector<int> active(idx_data + s * n_expert_used,
+                                idx_data + (s + 1) * n_expert_used);
+        sync_experts_resident(layer_idx, active);
+
         for (int k = 0; k < n_expert_used; ++k) {
             const int expert_idx = idx_data[s * n_expert_used + k];
             const float weight = w_data[s * n_expert_used + k];
@@ -576,11 +591,11 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
         PERF_SCOPE("layer/moe_ffn");
 #ifdef USE_CUDA
         if (dev == DeviceType::CUDA && ffn_normed->device() == DeviceType::CUDA) {
-            ffn_out = moe_ffn_cuda(ffn_normed, lw, cfg, seq_len);
+            ffn_out = moe_ffn_cuda(ffn_normed, lw, cfg, seq_len, lctx.layer_idx);
         } else
 #endif
         {
-            ffn_out = moe_ffn_cpu(ffn_normed, lw, cfg, seq_len);
+            ffn_out = moe_ffn_cpu(ffn_normed, lw, cfg, seq_len, lctx.layer_idx);
             ffn_out = restore_device(ffn_out, dev);
         }
     }

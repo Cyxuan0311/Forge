@@ -37,13 +37,13 @@ private:
 
     // MoE FFN (CPU router path). SiLU-gated, top-k, no shared expert.
     TensorPtr moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeights& lw,
-                          const ModelConfig& cfg, int seq_len);
+                          const ModelConfig& cfg, int seq_len, int layer_idx);
 
 #ifdef USE_CUDA
     // MoE FFN fully on GPU: device router (softmax+top-k) + per-expert CUDA
     // GEMV dispatch. Reused scratch buffers avoid per-layer pool allocations.
     TensorPtr moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWeights& lw,
-                           const ModelConfig& cfg, int seq_len);
+                           const ModelConfig& cfg, int seq_len, int layer_idx);
 
     // Reused across moe_ffn_cuda invocations (device router outputs, softmax
     // buffer, host mirror of routing, and the per-layer expert accumulator).

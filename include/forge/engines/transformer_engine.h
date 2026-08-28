@@ -24,6 +24,27 @@ public:
     void set_gpu_layers(int gpu_layers, const std::vector<int>& gpu_layers_per_dev);
     int gpu_layers() const override { return gpu_layers_; }
     void set_kv_cache_dtype(KVCacheDType dtype) { kv_cache_dtype_ = dtype; }
+
+    // ---- Expert-level placement (MoE partial-activation, Phase P0+) ----
+    // P0 brings the per-expert physical-location mapping into view and exposes
+    // a sync hook; it does NOT change weight movement or computation. Later
+    // phases (ExpertPageCache) use expert_device() to page experts in/out.
+    //
+    // Assign which experts of a MoE layer live on the GPU. Default (never
+    // called) = every expert inherits the layer's device (current behavior).
+    void set_expert_placement(int layer, const std::vector<int>& gpu_experts,
+                              int n_expert);
+    // Where a specific (layer, expert) currently resides. Falls back to the
+    // layer device when no explicit placement was configured.
+    DeviceTarget expert_device(int layer, int expert) const;
+    bool has_expert_placement() const { return !expert_devices_.empty(); }
+
+    // MoE expert-activation hook. Called by MoE operators right after the
+    // router picks the top-k experts for a token, before any expert GEMV runs.
+    // P0: empty default (no movement). Phase P1 overrides this to page the
+    // active experts onto the device and evict cold ones (ExpertPageCache).
+    virtual void sync_experts_resident(int layer,
+                                       const std::vector<int>& active_experts) const;
     KVCacheDType kv_cache_dtype() const { return kv_cache_dtype_; }
 
     KVCache* kv_cache() override { return &kv_cache_; }
@@ -106,6 +127,9 @@ protected:
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
     int gpu_layers_ = -1;
     std::vector<DeviceTarget> layer_devices_;  // per-layer (device_type, device_id) assignment
+    // Per-(layer, expert) device assignment for MoE partial activation.
+    // Empty until set_expert_placement() is called for at least one layer.
+    std::vector<std::vector<DeviceTarget>> expert_devices_;
     bool use_graph_ = false;
     // graph 的构建/缓存/执行全部由 GraphRuntime 负责, builder 来自 ExecutionPlan。
     GraphRuntime graph_runtime_;

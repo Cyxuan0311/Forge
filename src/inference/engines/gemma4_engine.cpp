@@ -210,7 +210,7 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden,
     // ---- FFN ----
     TensorPtr ffn_out;
     if (lw.ffn_gate_inp()) {
-        ffn_out = Gemma4Moe::apply(attn_residual, lctx);
+        ffn_out = Gemma4Moe::apply(attn_residual, lctx, this);
     } else {
         // Standard GeGLU FFN
         PERF_SCOPE("layer/ffn");

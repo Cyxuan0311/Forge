@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "forge/cuda_kernels.h"
+#include "forge/engines/transformer_engine.h"
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
@@ -88,7 +89,8 @@ void moe_gemv(DataType dt, const float* x, const void* w, float* out, const int*
 
 }  // namespace
 
-TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionContext& lctx) {
+TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionContext& lctx,
+                             TransformerEngine* engine) {
     PERF_SCOPE("layer/moe");
     const auto& cfg = lctx.config;
     const auto& lw = lctx.weights;
@@ -198,6 +200,15 @@ TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionC
             moe_gemv(lw.ffn_down_exps()->dtype(), static_cast<const float*>(gated->data()),
                      lw.ffn_down_exps()->data(), static_cast<float*>(expert_out->data()), d_indices,
                      d_weights, N_gate, cfg.hidden_dim, n_expert, n_expert_used, seq_len);
+
+            // Phase P0 hook (CUDA): router decisions live on device; mirror the
+            // top-k indices to host and report them. P0: empty sync_experts_resident.
+            if (engine) {
+                auto idx_h = ensure_cpu(indices_tensor);
+                const int* id = static_cast<const int*>(idx_h->data());
+                std::vector<int> active(id, id + seq_len * n_expert_used);
+                engine->sync_experts_resident(lctx.layer_idx, active);
+            }
         }
 #endif
     } else {
@@ -230,6 +241,15 @@ TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionC
             float topk_sum = 0.0f;
             for (int k = 0; k < n_expert_used; ++k) {
                 topk_sum += probs[indices[k]];
+            }
+
+            // Phase P0 hook: report the routed (top-k) experts for this token so
+            // later phases can page them onto the device. P0: no-op when engine
+            // is null or sync_experts_resident() is the default empty impl.
+            if (engine && n_expert_used > 0) {
+                std::vector<int> active(indices.begin(),
+                                         indices.begin() + n_expert_used);
+                engine->sync_experts_resident(lctx.layer_idx, active);
             }
 
             expert_out = ensure_cpu(expert_out);

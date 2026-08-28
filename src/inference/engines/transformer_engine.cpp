@@ -92,6 +92,20 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
         }
     }
 
+    // Phase P0: expose per-(layer, expert) placement. MoE layers get an
+    // [n_expert] device vector seeded from the layer device; set_expert_placement()
+    // can later override individual experts. Default = inherits layer device,
+    // so current behavior is unchanged.
+    if (!expert_devices_.empty()) expert_devices_.clear();
+    expert_devices_.resize(num_layers);
+    for (int i = 0; i < num_layers; ++i) {
+        auto gate_exps = weights_.layers[i].ffn_gate_exps();
+        if (gate_exps && gate_exps->shape().size() == 3) {
+            const int n_expert = static_cast<int>(gate_exps->shape()[2]);
+            if (n_expert > 0) expert_devices_[i].assign(n_expert, layer_devices_[i]);
+        }
+    }
+
     // Validation mode: weights are already placed during loading.
     DeviceType first_dev = layer_device(0);
     auto token_emb = model_.weights().get("token_embedding");
@@ -163,6 +177,43 @@ DeviceTarget TransformerEngine::layer_device_target(int layer_idx) const {
     if (layer_idx < gpu_layers_)
         return DeviceTarget::cuda(0);
     return DeviceTarget::cpu();
+}
+
+// ---- Expert-level placement (MoE partial activation) ----
+
+void TransformerEngine::set_expert_placement(int layer, const std::vector<int>& gpu_experts,
+                                              int n_expert) {
+    if (layer < 0 || layer >= static_cast<int>(weights_.layers.size()))
+        return;
+    if (expert_devices_.size() < weights_.layers.size())
+        expert_devices_.resize(weights_.layers.size());
+    auto& vec = expert_devices_[layer];
+    vec.assign(n_expert, layer_device_target(
+                              layer));  // default: inherit layer device
+    for (int e : gpu_experts) {
+        if (e >= 0 && e < n_expert) vec[e] = DeviceTarget::cuda(0);
+    }
+    LOG_INFO("set_expert_placement: layer " + std::to_string(layer) + " -> " +
+             std::to_string(gpu_experts.size()) + "/" + std::to_string(n_expert) +
+             " experts on GPU");
+}
+
+DeviceTarget TransformerEngine::expert_device(int layer, int expert) const {
+    if (layer >= 0 && layer < static_cast<int>(expert_devices_.size())) {
+        const auto& vec = expert_devices_[layer];
+        if (expert >= 0 && expert < static_cast<int>(vec.size()))
+            return vec[expert];
+    }
+    return layer_device_target(layer);  // fallback: whole-layer device
+}
+
+void TransformerEngine::sync_experts_resident(int layer,
+                                              const std::vector<int>& active_experts) const {
+    // P0: no movement. This hook is invoked by MoE operators after the router
+    // selects top-k experts, so later phases can page them in/out here.
+    // Kept empty to preserve current compute/memory behavior.
+    (void)layer;
+    (void)active_experts;
 }
 
 TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceTarget target) const {
