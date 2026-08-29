@@ -30,7 +30,7 @@ static void print_usage(const char* prog) {
            "  -nkvo,--no-kv-offload        Keep KV cache on CPU (for long context + small VRAM)\n"
            "  -t,  --threads N           CPU threads (default: auto)\n"
            "  -b,  --batch-size N        Prompt processing batch size (default: 512)\n"
-           "       --kv-cache-dtype TYPE KV cache dtype: fp32, q4_0 (default: fp32)\n"
+           "       --kv-cache-dtype TYPE KV cache dtype: fp32, f16, q8_0, q4_0 (default: fp32)\n"
            "       --cuda-graph          Enable CUDA Graph for decode (default: off)\n"
            "\n"
            "Memory:\n"
@@ -196,7 +196,8 @@ CliArgs parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             args.kv_cache_dtype = argv[i];
-            if (args.kv_cache_dtype != "fp32" && args.kv_cache_dtype != "q4_0") {
+            if (args.kv_cache_dtype != "fp32" && args.kv_cache_dtype != "f16" &&
+                args.kv_cache_dtype != "q8_0" && args.kv_cache_dtype != "q4_0") {
                 std::cerr << "Error: Unsupported KV cache dtype: " << args.kv_cache_dtype << "\n";
                 std::exit(1);
             }

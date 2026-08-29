@@ -1442,6 +1442,18 @@ TensorPtr KVCache::get_key_filled(int layer) const {
         float* dst = static_cast<float*>(out->data());
         const float* src = static_cast<const float*>(store.tensor->data());
         int seg1_len = window_size_ - cursor;
+#ifdef USE_CUDA
+        if (store.device == DeviceType::CUDA) {
+            // D2D reorder — plain memcpy would fault on device pointers.
+            if (seg1_len > 0)
+                cudaMemcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float),
+                           cudaMemcpyDeviceToDevice);
+            if (cursor > 0)
+                cudaMemcpy(dst + seg1_len * kvd, src, cursor * kvd * sizeof(float),
+                           cudaMemcpyDeviceToDevice);
+            return out;
+        }
+#endif
         if (seg1_len > 0)
             std::memcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float));
         if (cursor > 0)
@@ -1476,6 +1488,18 @@ TensorPtr KVCache::get_value_filled(int layer) const {
         float* dst = static_cast<float*>(out->data());
         const float* src = static_cast<const float*>(store.tensor->data());
         int seg1_len = window_size_ - cursor;
+#ifdef USE_CUDA
+        if (store.device == DeviceType::CUDA) {
+            // D2D reorder — plain memcpy would fault on device pointers.
+            if (seg1_len > 0)
+                cudaMemcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float),
+                           cudaMemcpyDeviceToDevice);
+            if (cursor > 0)
+                cudaMemcpy(dst + seg1_len * kvd, src, cursor * kvd * sizeof(float),
+                           cudaMemcpyDeviceToDevice);
+            return out;
+        }
+#endif
         if (seg1_len > 0)
             std::memcpy(dst, src + cursor * kvd, seg1_len * kvd * sizeof(float));
         if (cursor > 0)

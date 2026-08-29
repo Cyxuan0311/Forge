@@ -459,6 +459,7 @@ int main(int argc, char** argv) {
               << ", hidden=" << cfg.hidden_dim << ", heads=" << cfg.num_heads << " [" << model_ms
               << " ms]\n";
 
+
     // ---- Model info only ----
     if (args.info_only) {
         print_model_info(model, tokenizer);
@@ -530,7 +531,11 @@ int main(int argc, char** argv) {
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
     if (tfm_eng) {
         KVCacheDType kv_dtype = KVCacheDType::FP32;
-        if (args.kv_cache_dtype == "q4_0")
+        if (args.kv_cache_dtype == "f16")
+            kv_dtype = KVCacheDType::F16;
+        else if (args.kv_cache_dtype == "q8_0")
+            kv_dtype = KVCacheDType::Q8_0;
+        else if (args.kv_cache_dtype == "q4_0")
             kv_dtype = KVCacheDType::Q4_0;
         tfm_eng->set_kv_cache_dtype(kv_dtype);
         if (!args.gpu_layers_per_dev.empty()) {
@@ -569,8 +574,14 @@ int main(int argc, char** argv) {
     ctx.init_kv_cache();
     if (tfm_eng) {
         const KVCache* cache = tfm_eng->kv_cache();
-        std::cout << "KV Cache: dtype="
-                  << (cache->kv_dtype() == KVCacheDType::Q4_0 ? "q4_0" : "fp32")
+        const char* kv_dtype_name = "fp32";
+        switch (cache->kv_dtype()) {
+        case KVCacheDType::F16:  kv_dtype_name = "f16";  break;
+        case KVCacheDType::Q8_0: kv_dtype_name = "q8_0"; break;
+        case KVCacheDType::Q4_0: kv_dtype_name = "q4_0"; break;
+        default: break;
+        }
+        std::cout << "KV Cache: dtype=" << kv_dtype_name
                   << ", size=" << format_bytes(cache->nbytes())
                   << ", max_seq=" << cache->max_seq_len() << "\n";
     }
