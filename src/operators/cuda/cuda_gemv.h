@@ -57,6 +57,12 @@ void launch_gemv_iq4_nl_q8_1(const float* x, const void* q_weight, float* out, i
 void launch_gemv_iq4_nl_q8_1_batch(const float* x, const void* q_weight, float* out,
                                      int M, int K, int N, cudaStream_t stream = 0);
 
+// ---- IQ4_XS GEMV (Q8_1 + dp4a, llama.cpp block layout: 136B/256elem) ----
+void launch_gemv_iq4_xs_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                               cudaStream_t stream = 0);
+void launch_gemv_iq4_xs_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                     int M, int K, int N, cudaStream_t stream = 0);
+
 // ---- IQ2_XXS GEMV (Q8_1 + dp4a, Phase 5) ----
 void launch_gemv_iq2_xxs_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
                                 cudaStream_t stream = 0);
@@ -146,8 +152,8 @@ void launch_ffn_up_fused_q2k_q2k(const float* x, const void* q_gate, const void*
 using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
 using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const GemvFn gemv_dispatch[20];
-extern const GemvBatchFn gemv_batch_dispatch[20];
+extern const GemvFn gemv_dispatch[21];
+extern const GemvBatchFn gemv_batch_dispatch[21];
 
 }  // namespace cuda
 }  // namespace forge

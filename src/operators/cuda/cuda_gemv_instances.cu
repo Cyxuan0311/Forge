@@ -35,7 +35,7 @@ INST_GEMV(DataType::Q6_K)
 // Indexed by DataType enum value. nullptr for unsupported types.
 // ============================================================================
 
-const GemvFn gemv_dispatch[20] = {
+const GemvFn gemv_dispatch[21] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_gemv_q4_0_q8_1,                          // Q8_1+dp4a
@@ -56,9 +56,10 @@ const GemvFn gemv_dispatch[20] = {
     /* IQ4_NL=17  */ launch_gemv_iq4_nl_q8_1,                      // Q8_1+dp4a (Phase 5)
     /* IQ2_XS=18 */ launch_gemv_iq2_xs_q8_1,                      // Q8_1+dp4a (M=1, direct quantized GEMV)
     /* IQ3_S=19  */ launch_gemv_iq3_s_q8_1,                       // Q8_1+dp4a (M=1, direct quantized GEMV)
+    /* IQ4_XS=20 */ launch_gemv_iq4_xs_q8_1,                      // Q8_1+dp4a (136B/256elem block)
 };
 
-const GemvBatchFn gemv_batch_dispatch[20] = {
+const GemvBatchFn gemv_batch_dispatch[21] = {
     /* FP32=0  */ nullptr,
     /* FP16=1  */ nullptr,
     /* Q4_0=2  */ launch_gemv_q4_0_q8_1_batch,                          // Q8_1+dp4a (Phase 5)
@@ -79,6 +80,7 @@ const GemvBatchFn gemv_batch_dispatch[20] = {
     /* IQ4_NL=17  */ launch_gemv_iq4_nl_q8_1_batch,                    // Q8_1+dp4a (Phase 5)
     /* IQ2_XS=18 */ launch_gemv_iq2_xs_q8_1_batch,                   // Q8_1+dp4a
     /* IQ3_S=19  */ launch_gemv_iq3_s_q8_1_batch,                    // Q8_1+dp4a
+    /* IQ4_XS=20 */ launch_gemv_iq4_xs_q8_1_batch,                  // Q8_1+dp4a (136B/256elem block)
 };
 
 }  // namespace cuda
