@@ -253,6 +253,7 @@ add_library(
   src/inference/execution_plan.cpp
   src/inference/chat_template.cpp
   src/inference/engines/transformer_engine.cpp
+  src/inference/engines/expert_page_cache.cpp
   src/inference/engines/deepseek_engine.cpp
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/gemma4_engine.cpp

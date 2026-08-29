@@ -71,6 +71,10 @@ struct CliArgs {
 
     // Speculative decoding
     forge::SpeculativeConfig spec;
+
+    // MoE expert router statistics / partial-activation paging
+    bool expert_stats = false;   // print per-expert activation distribution after generation
+    bool expert_paging = false;  // enable per-expert weight movement (ExpertPageCache)
 };
 
 CliArgs parse_args(int argc, char** argv);

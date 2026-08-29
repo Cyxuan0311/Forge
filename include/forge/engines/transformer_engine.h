@@ -2,6 +2,7 @@
 
 #include "forge/context.h"
 #include "forge/engine.h"
+#include "forge/engines/expert_page_cache.h"
 #include "forge/inference/execution_plan.h"
 #include "forge/inference/graph/graph_runtime.h"
 #include "forge/inference/layer_execution_context.h"
@@ -41,10 +42,17 @@ public:
 
     // MoE expert-activation hook. Called by MoE operators right after the
     // router picks the top-k experts for a token, before any expert GEMV runs.
-    // P0: empty default (no movement). Phase P1 overrides this to page the
-    // active experts onto the device and evict cold ones (ExpertPageCache).
+    // P1: records the routed experts in ExpertPageCache (and, when paging is
+    // enabled, moves each per-expert weight view onto its target device).
     virtual void sync_experts_resident(int layer,
                                        const std::vector<int>& active_experts) const;
+
+    // Enable per-expert movement (ExpertPageCache::record_active paging_enabled).
+    // Off by default: P1 only collects router statistics, behavior unchanged.
+    void set_expert_paging(bool on) { expert_paging_enabled_ = on; }
+    bool expert_paging_enabled() const { return expert_paging_enabled_; }
+    // Print the accumulated router-distribution report (--expert-stats).
+    std::string expert_stats_report() const { return expert_page_cache_.format_report(); }
     KVCacheDType kv_cache_dtype() const { return kv_cache_dtype_; }
 
     KVCache* kv_cache() override { return &kv_cache_; }
@@ -130,6 +138,11 @@ protected:
     // Per-(layer, expert) device assignment for MoE partial activation.
     // Empty until set_expert_placement() is called for at least one layer.
     std::vector<std::vector<DeviceTarget>> expert_devices_;
+
+    // Phase P1: per-expert residency + router stats for partial activation.
+    mutable ExpertPageCache expert_page_cache_;
+    bool expert_paging_enabled_ = false;
+    mutable int64_t expert_step_ = 0;  // generation step counter for LRU
     bool use_graph_ = false;
     // graph 的构建/缓存/执行全部由 GraphRuntime 负责, builder 来自 ExecutionPlan。
     GraphRuntime graph_runtime_;

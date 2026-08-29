@@ -157,6 +157,25 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
     for (auto d : layer_devices_) if (d.is_cuda()) ++num_cuda;
     LOG_INFO("CPU offload configured: gpu_layers=" + std::to_string(gpu_layers) + "/" +
              std::to_string(num_layers) + ", CUDA layers=" + std::to_string(num_cuda));
+
+    // Phase P1: size the ExpertPageCache for router statistics. MoE layers have
+    // 3D expert tensors; dense layers contribute 0 experts and are skipped.
+    // The authoritative expert count comes from ModelConfig (tensor expert dim
+    // varies by architecture: dim 0 for PhiMoE, dim 2 for Gemma4), so infer the
+    // per-layer count from cfg.n_expert rather than the tensor shape directly.
+    {
+        const ModelConfig& mcfg = model_.config();
+        const int cfg_n_expert = mcfg.n_expert > 0 ? mcfg.n_expert : 0;
+        std::vector<int> experts_per_layer(num_layers, 0);
+        for (int i = 0; i < num_layers; ++i) {
+            auto ge = weights_.layers[i].ffn_gate_exps();
+            auto geu = weights_.layers[i].ffn_gate_up_exps();
+            const bool is_moe =
+                (ge && ge->shape().size() == 3) || (geu && geu->shape().size() == 3);
+            if (is_moe) experts_per_layer[i] = cfg_n_expert;
+        }
+        expert_page_cache_.resize(num_layers, experts_per_layer);
+    }
 }
 
 DeviceType TransformerEngine::layer_device(int layer_idx) const {
@@ -209,11 +228,34 @@ DeviceTarget TransformerEngine::expert_device(int layer, int expert) const {
 
 void TransformerEngine::sync_experts_resident(int layer,
                                               const std::vector<int>& active_experts) const {
-    // P0: no movement. This hook is invoked by MoE operators after the router
-    // selects top-k experts, so later phases can page them in/out here.
-    // Kept empty to preserve current compute/memory behavior.
-    (void)layer;
-    (void)active_experts;
+    // P1: record the routed experts (and optionally page them). Paging is off
+    // by default, so this is a cheap stats-only no-op for compute/memory.
+    if (active_experts.empty()) return;
+    if (layer < 0 || layer >= static_cast<int>(weights_.layers.size())) return;
+    const auto& lw = weights_.layers[layer];
+    // Gather the 3D expert tensors. Architectures differ: PhiMoE exposes
+    // separate ffn_gate/up/down_exps; Gemma4 exposes a combined ffn_gate_up_exps
+    // plus ffn_down_exps. Collect whichever exist so has_moe is detected for all.
+    std::vector<TensorPtr> expert_views;
+    expert_views.push_back(lw.ffn_gate_exps());
+    expert_views.push_back(lw.ffn_up_exps());
+    expert_views.push_back(lw.ffn_down_exps());
+    expert_views.push_back(lw.ffn_gate_up_exps());
+    const bool has_moe =
+        std::any_of(expert_views.begin(), expert_views.end(),
+                    [](const TensorPtr& t) { return t && t->shape().size() == 3; });
+    if (!has_moe) return;
+    // Drop any null entries before handing to the cache.
+    expert_views.erase(
+        std::remove_if(expert_views.begin(), expert_views.end(),
+                       [](const TensorPtr& t) { return !t; }),
+        expert_views.end());
+    if (expert_views.empty()) return;
+
+    const DeviceTarget target = layer_device_target(layer);
+    const int64_t step = ++expert_step_;  // mutable, LRU ordering
+    expert_page_cache_.record_active(layer, active_experts, step,
+                                     expert_paging_enabled_, expert_views, target);
 }
 
 TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceTarget target) const {

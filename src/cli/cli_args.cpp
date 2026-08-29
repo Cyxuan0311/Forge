@@ -56,6 +56,8 @@ static void print_usage(const char* prog) {
             "       --spec-model PATH      Standalone small draft model path (Phase 3)\n"
             "       --spec-draft-ngl N     GPU layers for the draft model (default: same as -ngl)\n"
             "       --spec-stats           Print speculation stats after generation\n"
+            "       --expert-stats         Print MoE expert router-distribution after generation\n"
+            "       --expert-paging        Enable per-expert weight movement (partial activation)\n"
            "\n"
            "Sampling:\n"
            "       --temp FLOAT          Sampling temperature (default: 0.7, 0=greedy)\n"
@@ -373,6 +375,11 @@ CliArgs parse_args(int argc, char** argv) {
             args.spec.ngram_mod_n_max = std::stoi(argv[i]);
         } else if (arg == "--spec-stats") {
             args.spec.print_stats = true;
+        } else if (arg == "--expert-stats") {
+            args.expert_stats = true;
+        } else if (arg == "--expert-paging") {
+            args.expert_paging = true;
+            args.expert_stats = true;  // paging implies stats visibility
         } else if (arg == "-v" || arg == "--verbose") {
             args.verbose = 2;
         } else {

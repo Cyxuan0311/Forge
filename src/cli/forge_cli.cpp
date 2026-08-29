@@ -543,6 +543,9 @@ int main(int argc, char** argv) {
             tfm_eng->set_use_graph(true);
             tfm_eng->set_cuda_graph_enabled(true);
         }
+        if (args.expert_stats || args.expert_paging) {
+            tfm_eng->set_expert_paging(args.expert_paging);
+        }
     }
     ctx.set_engine(std::move(engine));
 
@@ -616,6 +619,12 @@ int main(int argc, char** argv) {
             std::cout << std::fixed << std::setprecision(1);
             std::cout << "  Acceptance rate: " << (stats.spec.acceptance_rate() * 100.0) << "%\n";
             std::cout << "  Tokens/step:     " << stats.spec.tokens_per_step() << "\n";
+        }
+
+        // Print MoE expert router-distribution stats if requested
+        if (args.expert_stats && tfm_eng) {
+            std::cout << "\n  --- MoE Expert Router Stats ---\n";
+            std::cout << tfm_eng->expert_stats_report();
         }
 
         return 0;
