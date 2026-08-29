@@ -100,3 +100,5 @@ operator_develop.md
 /build_arm64_qemu
 /build_ppc64_qemu
 cpu_arch_split_plan.md
+# CUDA-enabled build tree
+build-cuda/

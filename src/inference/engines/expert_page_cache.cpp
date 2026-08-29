@@ -146,6 +146,7 @@ bool ExpertPageCache::ensure_resident_locked(int layer, int expert, DeviceTarget
         materialize_locked(layer, expert, src3d_[layer], slots_, expert_dim_);
     }
     p.last_used_step = step;
+    cur_step_ = step;
     if (!p.materialized) return false;
 
     if (p.current == target) {
@@ -251,6 +252,8 @@ int ExpertPageCache::evict_to_budget_locked() {
     for (const auto& c : cands) {
         if (cur <= budget_bytes_) break;
         auto& p = info_[c.layer][c.expert];
+        // Never evict an expert the in-flight step just made resident.
+        if (p.last_used_step >= cur_step_) continue;
         for (auto& w : p.w) {
             if (w && w->device() != DeviceType::CPU) w->to_device(DeviceType::CPU);
         }

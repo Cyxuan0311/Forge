@@ -544,6 +544,18 @@ int main(int argc, char** argv) {
         }
         if (args.expert_stats || args.expert_paging) {
             tfm_eng->set_expert_paging(args.expert_paging);
+            if (args.expert_paging) {
+                std::cerr
+                    << "Warning: --expert-paging is EXPERIMENTAL and currently only pays off when\n"
+                       "         the MoE expert weights do NOT fit in VRAM. If the model already\n"
+                       "         fits, paging adds host<->device transfer cost and is SLOWER, and\n"
+                       "         VRAM does not shrink because freed expert blocks stay in the CUDA\n"
+                       "         pool. Measured (RTX 4050 6GB, Phi-mini-MoE 2.75GB, -ngl 99):\n"
+                       "           baseline            20.5 tok/s, 4245 MiB\n"
+                       "           paging budget 1GB   10.5 tok/s, 5816 MiB\n"
+                       "         Output stays correct in both cases. Use only for MoE models that\n"
+                       "         exceed VRAM, and prefer --expert-stats alone for router analysis.\n";
+            }
             if (args.expert_budget_mb > 0) {
                 tfm_eng->set_expert_budget_bytes(
                     static_cast<int64_t>(args.expert_budget_mb) * 1024 * 1024);

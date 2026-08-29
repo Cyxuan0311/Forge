@@ -127,13 +127,23 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
         DeviceType expected_type = layer_devices_[i].type;
         auto& lw = weights_.layers[i];
         for (auto& [name, tensor] : lw.weights) {
-            if (tensor && tensor->device() != expected_type) {
-                LOG_WARN("set_gpu_layers: layer " + std::to_string(i) + " weight '" + name +
-                          "' is on device " + std::to_string(static_cast<int>(tensor->device())) +
-                          " but expected " + std::to_string(static_cast<int>(expected_type)) +
-                          ". Moving to target device (legacy loading path).");
-                tensor->to_device(expected_type);
-            }
+            if (!tensor || tensor->device() == expected_type) continue;
+            // P2: with expert paging enabled, deliberately keep the monolithic
+            // 3D expert tensors on the host. Only individually paged experts are
+            // uploaded (by ensure_resident), so expert VRAM tracks the routed
+            // working set instead of the whole expert pool. Without this the 3D
+            // tensor would occupy VRAM in full and paging could never save any.
+            const bool is_expert_3d =
+                tensor->shape().size() == 3 &&
+                (name == "ffn_gate_exps" || name == "ffn_up_exps" ||
+                 name == "ffn_down_exps" || name == "ffn_gate_up_exps");
+            if (expert_paging_enabled_ && is_expert_3d) continue;
+
+            LOG_WARN("set_gpu_layers: layer " + std::to_string(i) + " weight '" + name +
+                     "' is on device " + std::to_string(static_cast<int>(tensor->device())) +
+                     " but expected " + std::to_string(static_cast<int>(expected_type)) +
+                     ". Moving to target device (legacy loading path).");
+            tensor->to_device(expected_type);
         }
     }
 

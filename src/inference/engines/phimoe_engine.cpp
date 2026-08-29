@@ -384,10 +384,14 @@ TensorPtr PhimoeEngine::moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWei
     auto gate3d = lw.ffn_gate_exps();
     auto up3d = lw.ffn_up_exps();
     auto down3d = lw.ffn_down_exps();
+    // The grouped kernel indexes the monolithic 3D tensor directly, so it cannot
+    // consume paged per-expert weights. When paging is on we must take the
+    // per-expert fallback path (which does) — otherwise paging would only pay
+    // transfer cost while the compute still reads the whole 3D tensor.
     const bool grouped_ok =
         gate3d && up3d && down3d && gate3d->device() == DeviceType::CUDA &&
         gate3d->dtype() == DataType::IQ2_S && up3d->dtype() == DataType::IQ2_S &&
-        down3d->dtype() == DataType::IQ2_S &&
+        down3d->dtype() == DataType::IQ2_S && !expert_paging_enabled() &&
         std::getenv("FORGE_FORCE_MOE_FALLBACK") == nullptr;
 
     if (grouped_ok) {
@@ -438,7 +442,16 @@ TensorPtr PhimoeEngine::moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWei
     // Zero-copy expert extraction: phimoe stores the expert axis as FIRST dim
     // (axis 0). The 2D view shares GPU storage, so matmul_transB dispatches to
     // the CUDA GEMV/MMQ kernels (on-the-fly dequant) directly.
-    auto extract_expert_2d = [&](const TensorPtr& w3d, int expert_idx) -> TensorPtr {
+    auto extract_expert_2d = [&](const TensorPtr& w3d, int expert_idx,
+                                 ExpertSlot slot) -> TensorPtr {
+        // P2: prefer the paged per-expert weights. Only use them when they are
+        // actually resident on the compute device; an evicted (CPU) expert would
+        // make the CUDA GEMV see a host tensor, so fall back to the 3D slice
+        // (which stays fully on device) in that case.
+        if (expert_paging_enabled()) {
+            auto paged = expert_weight(layer_idx, expert_idx, slot);
+            if (paged && paged->device() == DeviceType::CUDA) return paged;
+        }
         if (!w3d) return nullptr;
         auto& shp = w3d->shape();
         if (shp.size() < 2) return w3d;
@@ -464,9 +477,9 @@ TensorPtr PhimoeEngine::moe_ffn_cuda(const TensorPtr& ffn_normed, const LayerWei
             const int expert_idx = idx_data[s * n_expert_used + k];
             const float weight = w_data[s * n_expert_used + k];
 
-            auto gate_w = extract_expert_2d(lw.ffn_gate_exps(), expert_idx);
-            auto up_w = extract_expert_2d(lw.ffn_up_exps(), expert_idx);
-            auto down_w = extract_expert_2d(lw.ffn_down_exps(), expert_idx);
+            auto gate_w = extract_expert_2d(lw.ffn_gate_exps(), expert_idx, ExpertSlot::Gate);
+            auto up_w = extract_expert_2d(lw.ffn_up_exps(), expert_idx, ExpertSlot::Up);
+            auto down_w = extract_expert_2d(lw.ffn_down_exps(), expert_idx, ExpertSlot::Down);
             if (!gate_w || !up_w || !down_w) continue;
 
             auto gate = ops::matmul_transB(token_hidden, gate_w);  // [1, n_ff]

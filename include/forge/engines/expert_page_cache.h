@@ -141,6 +141,10 @@ private:
     int expert_dim_ = 0;                         // axis indexing experts
     int64_t budget_bytes_ = 0;
     int64_t hits_ = 0, misses_ = 0, evictions_ = 0;
+    // Step of the residency pass currently in flight. Experts touched at this
+    // step are protected from eviction, so an expert that was just paged in is
+    // never immediately paged back out before the compute consumes it.
+    int64_t cur_step_ = 0;
     mutable std::mutex mu_;
 };
 
