@@ -58,6 +58,7 @@ static void print_usage(const char* prog) {
             "       --spec-stats           Print speculation stats after generation\n"
             "       --expert-stats         Print MoE expert router-distribution after generation\n"
             "       --expert-paging        Enable per-expert weight movement (partial activation)\n"
+           "       --expert-budget-mb MB  VRAM budget for resident experts, MB (0 = unbounded)\n"
            "\n"
            "Sampling:\n"
            "       --temp FLOAT          Sampling temperature (default: 0.7, 0=greedy)\n"
@@ -380,6 +381,12 @@ CliArgs parse_args(int argc, char** argv) {
         } else if (arg == "--expert-paging") {
             args.expert_paging = true;
             args.expert_stats = true;  // paging implies stats visibility
+        } else if (arg == "--expert-budget-mb") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.expert_budget_mb = std::stoi(argv[i]);
         } else if (arg == "-v" || arg == "--verbose") {
             args.verbose = 2;
         } else {

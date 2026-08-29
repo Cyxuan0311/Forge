@@ -75,6 +75,7 @@ struct CliArgs {
     // MoE expert router statistics / partial-activation paging
     bool expert_stats = false;   // print per-expert activation distribution after generation
     bool expert_paging = false;  // enable per-expert weight movement (ExpertPageCache)
+    int expert_budget_mb = 0;    // VRAM budget for resident experts, MB (0 = unbounded)
 };
 
 CliArgs parse_args(int argc, char** argv);

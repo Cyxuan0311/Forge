@@ -53,6 +53,22 @@ public:
     bool expert_paging_enabled() const { return expert_paging_enabled_; }
     // Print the accumulated router-distribution report (--expert-stats).
     std::string expert_stats_report() const { return expert_page_cache_.format_report(); }
+
+    // ---- P2: per-expert residency control ------------------------------------
+    // VRAM budget for resident (non-CPU) experts. 0 = unbounded.
+    void set_expert_budget_bytes(int64_t b) { expert_page_cache_.set_budget_bytes(b); }
+    int64_t expert_budget_bytes() const { return expert_page_cache_.budget_bytes(); }
+    int64_t expert_resident_bytes() const { return expert_page_cache_.resident_bytes(); }
+
+    // Per-expert weight lookup for compute paths. Returns nullptr when paging is
+    // off or the expert has not been materialised yet, so callers fall back to
+    // slicing the monolithic 3D tensor (keeps the non-paging path unchanged).
+    TensorPtr expert_weight(int layer, int expert, ExpertSlot slot) const {
+        return expert_page_cache_.expert_weight(layer, expert, slot);
+    }
+    bool expert_materialized(int layer, int expert) const {
+        return expert_page_cache_.is_materialized(layer, expert);
+    }
     KVCacheDType kv_cache_dtype() const { return kv_cache_dtype_; }
 
     KVCache* kv_cache() override { return &kv_cache_; }
@@ -138,6 +154,11 @@ protected:
     // Per-(layer, expert) device assignment for MoE partial activation.
     // Empty until set_expert_placement() is called for at least one layer.
     std::vector<std::vector<DeviceTarget>> expert_devices_;
+
+    // Build the (src3d, slots, expert_dim) triple describing a layer's expert
+    // weights, used for lazy materialisation. Returns false if not a MoE layer.
+    bool expert_source(int layer, std::vector<TensorPtr>& src3d,
+                       std::vector<ExpertSlot>& slots, int& expert_dim) const;
 
     // Phase P1: per-expert residency + router stats for partial activation.
     mutable ExpertPageCache expert_page_cache_;

@@ -22,7 +22,6 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
-#include <vector>
 
 #include "cli_common.h"
 
@@ -545,6 +544,10 @@ int main(int argc, char** argv) {
         }
         if (args.expert_stats || args.expert_paging) {
             tfm_eng->set_expert_paging(args.expert_paging);
+            if (args.expert_budget_mb > 0) {
+                tfm_eng->set_expert_budget_bytes(
+                    static_cast<int64_t>(args.expert_budget_mb) * 1024 * 1024);
+            }
         }
     }
     ctx.set_engine(std::move(engine));

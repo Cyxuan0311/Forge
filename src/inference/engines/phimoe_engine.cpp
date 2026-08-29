@@ -142,7 +142,17 @@ TensorPtr PhimoeEngine::moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeig
     // gate_exps=[n_expert, n_ff, hidden], down_exps=[n_expert, hidden, n_ff].
     // After slicing axis 0 and viewing as 2D, the result is [rows, cols] which
     // matches matmul_transB's [N, K] convention.
-    auto extract_expert_2d = [&](const TensorPtr& w3d, int expert_idx) -> TensorPtr {
+    auto extract_expert_2d = [&](const TensorPtr& w3d, int expert_idx,
+                                 ExpertSlot slot) -> TensorPtr {
+        // P2: when per-expert paging is on, ExpertPageCache owns an independent
+        // 2D copy of each materialised expert. Prefer it over slicing the
+        // monolithic 3D tensor so the compute path consumes the paged weights.
+        // A nullptr result just falls through to the 3D slice (e.g. expert not
+        // materialised yet), so paging can never change results.
+        if (expert_paging_enabled()) {
+            auto paged = expert_weight(layer_idx, expert_idx, slot);
+            if (paged) return paged;
+        }
         if (!w3d) return nullptr;
         auto& shp = w3d->shape();
         if (shp.size() < 2) return w3d;
@@ -158,15 +168,24 @@ TensorPtr PhimoeEngine::moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeig
     // stable key. Without this cache, each decode step re-transfers ~7.5MB/layer
     // of expert weights from GPU to CPU (48960 transfers over 255 decode steps).
     static thread_local std::unordered_map<uintptr_t, TensorPtr> expert_w_cache;
-    auto get_cpu_expert_weight = [&](const TensorPtr& w3d, int expert_idx) -> TensorPtr {
+    auto get_cpu_expert_weight = [&](const TensorPtr& w3d, int expert_idx,
+                                     ExpertSlot slot) -> TensorPtr {
+        // P2: paged weights are independent tensors already; only make sure they
+        // sit on CPU for this path (no-op when the layer device is CPU).
+        if (expert_paging_enabled()) {
+            auto paged = expert_weight(layer_idx, expert_idx, slot);
+            if (paged) {
+                return paged->device() == DeviceType::CPU ? paged : ensure_cpu(paged);
+            }
+        }
         if (!w3d) return nullptr;
         if (w3d->device() == DeviceType::CPU)
-            return extract_expert_2d(w3d, expert_idx);
+            return extract_expert_2d(w3d, expert_idx, slot);
         auto key = reinterpret_cast<uintptr_t>(w3d->data()) ^ static_cast<uintptr_t>(expert_idx);
         auto it = expert_w_cache.find(key);
         if (it != expert_w_cache.end())
             return it->second;
-        auto cpu_copy = ensure_cpu(extract_expert_2d(w3d, expert_idx));
+        auto cpu_copy = ensure_cpu(extract_expert_2d(w3d, expert_idx, slot));
         expert_w_cache[key] = cpu_copy;
         return cpu_copy;
     };
@@ -224,9 +243,11 @@ TensorPtr PhimoeEngine::moe_ffn_cpu(const TensorPtr& ffn_normed, const LayerWeig
         bool all_valid = true;
         for (int k = 0; k < n_expert_used; ++k) {
             int expert_idx = indices[k];
-            gate_w_k[k] = get_cpu_expert_weight(lw.ffn_gate_exps(), expert_idx);
-            up_w_k[k] = get_cpu_expert_weight(lw.ffn_up_exps(), expert_idx);
-            down_w_k[k] = get_cpu_expert_weight(lw.ffn_down_exps(), expert_idx);
+            gate_w_k[k] =
+                get_cpu_expert_weight(lw.ffn_gate_exps(), expert_idx, ExpertSlot::Gate);
+            up_w_k[k] = get_cpu_expert_weight(lw.ffn_up_exps(), expert_idx, ExpertSlot::Up);
+            down_w_k[k] =
+                get_cpu_expert_weight(lw.ffn_down_exps(), expert_idx, ExpertSlot::Down);
             route_w[k] = probs[expert_idx] / topk_sum;
             if (!gate_w_k[k] || !up_w_k[k] || !down_w_k[k]) {
                 all_valid = false;

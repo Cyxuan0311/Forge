@@ -226,36 +226,63 @@ DeviceTarget TransformerEngine::expert_device(int layer, int expert) const {
     return layer_device_target(layer);  // fallback: whole-layer device
 }
 
+bool TransformerEngine::expert_source(int layer, std::vector<TensorPtr>& src3d,
+                                      std::vector<ExpertSlot>& slots,
+                                      int& expert_dim) const {
+    if (layer < 0 || layer >= static_cast<int>(weights_.layers.size())) return false;
+    const auto& lw = weights_.layers[layer];
+
+    // Architectures differ: PhiMoE exposes separate ffn_gate/up/down_exps;
+    // Gemma4 exposes a combined ffn_gate_up_exps plus ffn_down_exps. Collect
+    // whichever 3D expert tensors exist, tagging each with its slot.
+    src3d.clear();
+    slots.clear();
+    auto add = [&](const TensorPtr& t, ExpertSlot s) {
+        if (t && t->shape().size() == 3) {
+            src3d.push_back(t);
+            slots.push_back(s);
+        }
+    };
+    add(lw.ffn_gate_exps(), ExpertSlot::Gate);
+    add(lw.ffn_up_exps(), ExpertSlot::Up);
+    add(lw.ffn_down_exps(), ExpertSlot::Down);
+    add(lw.ffn_gate_up_exps(), ExpertSlot::GateUp);
+    if (src3d.empty()) return false;
+
+    // Which axis indexes experts? Match against the configured expert count; the
+    // axis differs by architecture (PhiMoE: 0, Gemma4: 2). If it cannot be
+    // determined we refuse rather than guess, and paging stays off for this
+    // model (the non-paging path keeps working unchanged).
+    const int n_expert = model_.config().n_expert;
+    if (n_expert <= 0) return false;
+    const auto& s = src3d[0]->shape();
+    expert_dim = -1;
+    for (int d = 0; d < 3; ++d) {
+        if (s[d] == n_expert) {
+            expert_dim = d;
+            break;
+        }
+    }
+    return expert_dim >= 0;
+}
+
 void TransformerEngine::sync_experts_resident(int layer,
                                               const std::vector<int>& active_experts) const {
-    // P1: record the routed experts (and optionally page them). Paging is off
-    // by default, so this is a cheap stats-only no-op for compute/memory.
+    // P2: record the routed experts and, when paging is enabled, materialise +
+    // move each one onto the layer's device. Paging is off by default, in which
+    // case this only accumulates router statistics and touches no weight.
     if (active_experts.empty()) return;
-    if (layer < 0 || layer >= static_cast<int>(weights_.layers.size())) return;
-    const auto& lw = weights_.layers[layer];
-    // Gather the 3D expert tensors. Architectures differ: PhiMoE exposes
-    // separate ffn_gate/up/down_exps; Gemma4 exposes a combined ffn_gate_up_exps
-    // plus ffn_down_exps. Collect whichever exist so has_moe is detected for all.
-    std::vector<TensorPtr> expert_views;
-    expert_views.push_back(lw.ffn_gate_exps());
-    expert_views.push_back(lw.ffn_up_exps());
-    expert_views.push_back(lw.ffn_down_exps());
-    expert_views.push_back(lw.ffn_gate_up_exps());
-    const bool has_moe =
-        std::any_of(expert_views.begin(), expert_views.end(),
-                    [](const TensorPtr& t) { return t && t->shape().size() == 3; });
-    if (!has_moe) return;
-    // Drop any null entries before handing to the cache.
-    expert_views.erase(
-        std::remove_if(expert_views.begin(), expert_views.end(),
-                       [](const TensorPtr& t) { return !t; }),
-        expert_views.end());
-    if (expert_views.empty()) return;
+
+    std::vector<TensorPtr> src3d;
+    std::vector<ExpertSlot> slots;
+    int expert_dim = 0;
+    if (!expert_source(layer, src3d, slots, expert_dim)) return;
 
     const DeviceTarget target = layer_device_target(layer);
     const int64_t step = ++expert_step_;  // mutable, LRU ordering
     expert_page_cache_.record_active(layer, active_experts, step,
-                                     expert_paging_enabled_, expert_views, target);
+                                     expert_paging_enabled_, src3d, slots,
+                                     expert_dim, target);
 }
 
 TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceTarget target) const {
