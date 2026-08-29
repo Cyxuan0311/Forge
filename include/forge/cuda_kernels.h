@@ -114,8 +114,8 @@ void launch_gemv_q4_0_transB_dual(const float* x, const void* q_weight1, int N1,
 using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
 using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const GemvFn gemv_dispatch[20];
-extern const GemvBatchFn gemv_batch_dispatch[20];
+extern const GemvFn gemv_dispatch[21];
+extern const GemvBatchFn gemv_batch_dispatch[21];
 
 // ---- Phase 6: MMQ (Matrix-Matrix Quantized) ----
 // For large M (>32), replaces dequantize-to-FP32 + cuBLAS with dp4a.
@@ -176,9 +176,16 @@ void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3
 void launch_ffn_up_fused_q4_k_q8_1(const float* x, const void* q_w1, const void* q_w3,
                                      float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
 
+void launch_ffn_up_fused_iq4_xs_q8_1(const float* x, const void* q_w1, const void* q_w3,
+                                      float* out, int K, int intermediate_dim, cudaStream_t stream = 0);
+
 void launch_ffn_up_fused_q4_k_geglu(const float* x, const void* q_w1, const void* q_w3,
                                      float* out, int K, int intermediate_dim,
                                      cudaStream_t stream = 0);
+
+void launch_ffn_up_fused_q4_k_geglu_q8_1(const float* x, const void* q_w1, const void* q_w3,
+                                          float* out, int K, int intermediate_dim,
+                                          cudaStream_t stream = 0);
 
 void launch_ffn_up_fused_q3k_q4k(const float* x, const void* q_gate, const void* q_up,
                                    float* out, int K, int intermediate_dim, cudaStream_t stream = 0);

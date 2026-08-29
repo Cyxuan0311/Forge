@@ -5,6 +5,12 @@
 #include "cuda_gemv_tmpl.cuh"
 
 namespace forge {
+namespace ops {
+extern const int8_t kvalues_iq4nl[16];
+}
+}  // namespace forge
+
+namespace forge {
 namespace cuda {
 
 // ---- FFN Up Fused Q4_0 (shared memory, M=1, decode) ----
@@ -920,6 +926,128 @@ __global__ void ffn_up_fused_q4_k_q8_1_kernel(
     }
 }
 
+// ============================================================================
+// FFN Up Fused IQ4_XS (Q8_1 pre-quantization + dp4a, M=1, decode)
+// Block layout (llama.cpp compatible): 136B / 256 elem, 8 sub-blocks of 32,
+// kvalues_iq4nl table lookup. One warp per output row, computes gate+up+SiLU.
+// ============================================================================
+
+static __constant__ int8_t c_kvalues_iq4xs_fused[16];
+static bool iq4xs_fused_tables_uploaded = false;
+static void ensure_iq4xs_fused_tables() {
+    if (iq4xs_fused_tables_uploaded) return;
+    cudaMemcpyToSymbol(c_kvalues_iq4xs_fused, forge::ops::kvalues_iq4nl, sizeof(int8_t) * 16);
+    iq4xs_fused_tables_uploaded = true;
+}
+
+static __device__ __forceinline__ int2 iq4xs_table16(const int& q4, const int8_t* table) {
+    const uint32_t* table32 = (const uint32_t*)table;
+    uint32_t tmp[2];
+    const uint32_t sel = (0x32103210 | ((q4 & 0x88888888) >> 1));
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
+        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
+        tmp[i] = __byte_perm(low, high, sel >> shift);
+    }
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_fused(
+    const uint8_t* __restrict__ block_ptr, const block_q8_1_fused* __restrict__ q8_base)
+{
+    float d = __half2float(reinterpret_cast<const __half&>(*(const uint16_t*)block_ptr));
+    uint16_t h = *(const uint16_t*)(block_ptr + 2);
+    const uint8_t* scales_l = block_ptr + 4;
+    const uint8_t* qs = block_ptr + 8;
+
+    float acc = 0.0f;
+    for (int g = 0; g < 8; ++g) {
+        int hidx = 2 * g - (g & 1);
+        int hbits = (h >> hidx) & 0x3;
+        uint8_t ls_byte = scales_l[g / 2];
+        int ls_low = (g & 1) ? (ls_byte >> 4) : (ls_byte & 0xf);
+        int ls6 = ls_low | (hbits << 4);
+        float d_s = d * (float)(ls6 - 32);
+
+        const int* qs_g = (const int*)(qs + (size_t)g * 16);
+        const block_q8_1_fused* q8b = q8_base + g;
+        const int* q8i = (const int*)q8b->qs;
+        float d8 = __low2float(q8b->ds);
+
+        int dot = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = iq4xs_table16(qs_g[j], c_kvalues_iq4xs_fused);
+            dot = forge_dp4a(v.x, q8i[j], dot);
+            dot = forge_dp4a(v.y, q8i[j + 4], dot);
+        }
+        acc += d_s * d8 * (float)dot;
+    }
+    return acc;
+}
+
+__global__ void ffn_up_fused_iq4_xs_q8_1_kernel(
+    const block_q8_1_fused* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_w1, const uint8_t* __restrict__ q_w3,
+    float* __restrict__ out, int K, int N)
+{
+    constexpr int BS = 136, BE = 256;
+    int num_blocks_row = (K + BE - 1) / BE;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (warp_id >= N) return;
+    const uint8_t* w1_row = q_w1 + (size_t)warp_id * num_blocks_row * BS;
+    const uint8_t* w3_row = q_w3 + (size_t)warp_id * num_blocks_row * BS;
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    int blocks_per_thread = (num_blocks_row + 31) / 32;
+    for (int b = 0; b < blocks_per_thread; ++b) {
+        int bi = b * 32 + lane;
+        if (bi >= num_blocks_row) break;
+        const block_q8_1_fused* row_q8 = x_q8 + (size_t)bi * 8;
+        gate_sum += vec_dot_iq4_xs_q8_1_fused(w1_row + (size_t)bi * BS, row_q8);
+        up_sum   += vec_dot_iq4_xs_q8_1_fused(w3_row + (size_t)bi * BS, row_q8);
+    }
+
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 16);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 8);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 4);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 2);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 1);
+
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 16);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 8);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 4);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 2);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 1);
+
+    if (lane == 0) {
+        float silu_gate = gate_sum / (1.0f + __expf(-gate_sum));
+        out[warp_id] = silu_gate * up_sum;
+    }
+}
+
+void launch_ffn_up_fused_iq4_xs_q8_1(const float* x, const void* q_w1, const void* q_w3,
+                                      float* out, int K, int intermediate_dim, cudaStream_t stream) {
+    ensure_iq4xs_fused_tables();
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_fused);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_fused*>(q8_buf);
+
+    int q8_threads = 256, q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_fused_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, K);
+
+    int warps_per_block = 8, threads = warps_per_block * 32;
+    int grid_blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
+    ffn_up_fused_iq4_xs_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3),
+        out, K, intermediate_dim);
+}
+
 void launch_ffn_up_fused_q4_k_q8_1(const float* x, const void* q_w1, const void* q_w3,
                                      float* out, int K, int intermediate_dim, cudaStream_t stream) {
     // Step 1: Quantize x to Q8_1 format
@@ -937,6 +1065,91 @@ void launch_ffn_up_fused_q4_k_q8_1(const float* x, const void* q_w1, const void*
     int threads = warps_per_block * 32;
     int grid_blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
     ffn_up_fused_q4_k_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3),
+        out, K, intermediate_dim);
+}
+
+// ============================================================================
+// FFN Up Fused Q4_K (Q8_1 pre-quantization + dp4a, M=1, decode) with GELU(tanh)
+// Identical to ffn_up_fused_q4_k_q8_1_kernel but applies GELU(tanh) instead of
+// SiLU — used by Gemma4's GeGLU FFN. Quantizes x to Q8_1 once, then dp4a dot.
+// ============================================================================
+
+__global__ void ffn_up_fused_q4_k_geglu_q8_1_kernel(
+    const block_q8_1_fused* __restrict__ x_q8,
+    const uint8_t* __restrict__ q_w1,
+    const uint8_t* __restrict__ q_w3,
+    float* __restrict__ out, int K, int N)
+{
+    int num_blocks_row = (K + FUSED_Q4K_BE - 1) / FUSED_Q4K_BE;
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+
+    if (warp_id >= N) return;
+
+    const uint8_t* w1_row = q_w1 + (size_t)warp_id * num_blocks_row * FUSED_Q4K_BS;
+    const uint8_t* w3_row = q_w3 + (size_t)warp_id * num_blocks_row * FUSED_Q4K_BS;
+
+    const int q8_stride_per_q4k = FUSED_QR4_K * FUSED_QI4_K / FUSED_QI8_1;  // = 8
+
+    // Distribute (block, iqs) dot tasks across all 32 lanes instead of letting
+    // each lane own a whole Q4_K block. For small K (Gemma4 K=1536 → 6 blocks)
+    // the block-per-lane mapping left 26/32 lanes idle; this keeps every lane
+    // busy and is also faster for larger K.
+    const int tasks_per_block = FUSED_QI4_K / 2;  // iqs step is 2
+    const int total_tasks = num_blocks_row * tasks_per_block;
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (int t = lane; t < total_tasks; t += 32) {
+        int bi = t / tasks_per_block;
+        int iqs = (t % tasks_per_block) * 2;
+        const block_q8_1_fused* row_q8 = x_q8 + (size_t)bi * q8_stride_per_q4k;
+        gate_sum += vec_dot_q4_k_q8_1_fused(w1_row, row_q8, bi, iqs);
+        up_sum += vec_dot_q4_k_q8_1_fused(w3_row, row_q8, bi, iqs);
+    }
+
+    // Warp reduce
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 16);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 8);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 4);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 2);
+    gate_sum += __shfl_down_sync(0xFFFFFFFF, gate_sum, 1);
+
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 16);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 8);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 4);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 2);
+    up_sum += __shfl_down_sync(0xFFFFFFFF, up_sum, 1);
+
+    if (lane == 0) {
+        // GELU(tanh) activation (Gemma4 GeGLU) instead of SiLU
+        float x_tmp = gate_sum;
+        float tanh_in = 0.7978845608f * (x_tmp + 0.044715f * x_tmp * x_tmp * x_tmp);
+        float gelu_gate = 0.5f * x_tmp * (1.0f + tanhf(tanh_in));
+        out[warp_id] = gelu_gate * up_sum;
+    }
+}
+
+void launch_ffn_up_fused_q4_k_geglu_q8_1(const float* x, const void* q_w1, const void* q_w3,
+                                          float* out, int K, int intermediate_dim,
+                                          cudaStream_t stream) {
+    // Step 1: Quantize x to Q8_1 format (shared by gate and up)
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)num_q8_blocks * sizeof(block_q8_1_fused);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_fused*>(q8_buf);
+
+    int q8_threads = 256;
+    int q8_blocks = (num_q8_blocks + q8_threads - 1) / q8_threads;
+    quantize_q8_1_fused_kernel<<<q8_blocks, q8_threads, 0, stream>>>(x, x_q8, K);
+
+    // Step 2: Launch fused gate+up+GELU(tanh) kernel
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int grid_blocks = (intermediate_dim + warps_per_block - 1) / warps_per_block;
+    ffn_up_fused_q4_k_geglu_q8_1_kernel<<<grid_blocks, threads, 0, stream>>>(
         x_q8, static_cast<const uint8_t*>(q_w1), static_cast<const uint8_t*>(q_w3),
         out, K, intermediate_dim);
 }

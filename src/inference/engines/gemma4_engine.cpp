@@ -230,9 +230,9 @@ TensorPtr Gemma4Engine::forward_layer(const TensorPtr& hidden,
             auto gated = std::make_shared<Tensor>(DataType::FP32,
                                                   std::vector<int64_t>{seq_len, N},
                                                   DeviceType::CUDA);
-            cuda::launch_ffn_up_fused_q4_k_geglu(static_cast<const float*>(ffn_normed->data()),
-                                                 w1_tensor->data(), w3_tensor->data(),
-                                                 static_cast<float*>(gated->data()), K, N);
+            cuda::launch_ffn_up_fused_q4_k_geglu_q8_1(static_cast<const float*>(ffn_normed->data()),
+                                                      w1_tensor->data(), w3_tensor->data(),
+                                                      static_cast<float*>(gated->data()), K, N);
             ffn_out = ops::matmul_transB(gated, lw.w2());
         } else
 #endif

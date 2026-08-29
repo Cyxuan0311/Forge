@@ -67,14 +67,14 @@ DequantMatrixFn device_dequant_matrix_fn(DataType dt) {
 
 cuda::GemvFn device_gemv_fn(DataType dt) {
     int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 20)
+    if (idx < 0 || idx >= 21)
         return nullptr;
     return cuda::gemv_dispatch[idx];
 }
 
 cuda::GemvBatchFn device_gemv_batch_fn(DataType dt) {
     int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 20)
+    if (idx < 0 || idx >= 21)
         return nullptr;
     return cuda::gemv_batch_dispatch[idx];
 }
@@ -289,6 +289,16 @@ TensorPtr cuda_ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const T
             cuda::launch_ffn_up_fused_q5_k(static_cast<const float*>(input->data()), w1->data(),
                                            w3->data(), static_cast<float*>(out->data()), K,
                                            intermediate_dim);
+        } else {
+            return separate_path();
+        }
+    } else if (w1->dtype() == DataType::IQ4_XS && w3->dtype() == DataType::IQ4_XS) {
+        if (M == 1) {
+            // Decode: IQ4_XS gate + up fused with shared Q8_1 quantization
+            cuda::launch_ffn_up_fused_iq4_xs_q8_1(static_cast<const float*>(input->data()),
+                                                 w1->data(), w3->data(),
+                                                 static_cast<float*>(out->data()), K,
+                                                 intermediate_dim);
         } else {
             return separate_path();
         }
