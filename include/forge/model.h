@@ -94,6 +94,14 @@ struct ModelConfig {
     int rope_dim_count = 0;             // RoPE dimension count for full-attention layers
     int rope_dim_count_swa = 0;         // RoPE dimension count for SWA layers
     std::vector<int32_t> suppress_tokens; // tokens to suppress during generation (set to -INF in logits)
+
+    // ---- DFlash / DSPark standalone draft model (speculative decoding) ----
+    // The drafter is a lightweight transformer that shares the target model's
+    // token embedding and lm_head; its encoder consumes target hidden states.
+    std::vector<int32_t> target_layers;   // target layer indices feeding the draft encoder
+    int target_hidden_size = 0;           // hidden size of the paired target model
+    int n_embd_inp_enc = 0;               // encoder input width = |target_layers| * hidden_dim
+    int parallel_drafting_token_id = -1;  // MASK/noise token of the parallel query block
 };
 
 class WeightStore {

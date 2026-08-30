@@ -22,6 +22,7 @@
 #include "forge/engines/generic_engine.h"
 #include "forge/engines/phimoe_engine.h"
 #include "forge/engines/qwen35_engine.h"
+#include "forge/logger.h"
 #include "forge/model.h"
 
 namespace forge {
@@ -205,5 +206,24 @@ static ConfigParserAutoRegister     _cfg_qwen35("qwen35", parse_qwen35_config);
 static WeightInitAutoRegister       _winit_qwen35("qwen35", init_qwen35_layer_weights);
 static ArchCapabilityAutoRegister   _cap_qwen35("qwen35",
     ArchCapability{.use_ssm = true, .use_mrope = true});
+
+// ============================================================================
+// DFlash / DSPark (standalone lightweight drafter for speculative decoding)
+// ============================================================================
+// The draft engine lands in Phase 2. This creator returns nullptr with an
+// explicit warning so Phase 0/1 can load, parse and inspect the GGUF
+// (metadata + tensors) without being able to execute it.
+
+static EngineAutoRegister           _eng_dflash("dflash",
+    [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        (void)m; (void)c;
+        LOG_WARN("dflash: draft engine not implemented yet (Phase 2); "
+                 "the model can be inspected but not executed");
+        return nullptr;
+    });
+static ConfigParserAutoRegister     _cfg_dflash("dflash", parse_dflash_config);
+static WeightInitAutoRegister       _winit_dflash("dflash", init_gqa_layer_weights);
+static ArchCapabilityAutoRegister   _cap_dflash("dflash",
+    ArchCapability{.use_gqa = true, .use_qk_norm = true});
 
 }  // namespace forge

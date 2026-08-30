@@ -88,6 +88,33 @@ ModelConfig parse_llama_config(ModelLoader& loader, const std::string& arch) {
     return cfg;
 }
 
+// DFlash / DSPark: lightweight standalone drafter for speculative decoding.
+// Decoder layers are plain GQA transformer blocks; the target model's token
+// embedding and lm_head are shared, and the encoder fuses hidden states taken
+// from the target layers listed in <arch>.target_layers.
+ModelConfig parse_dflash_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    cfg.ffn_type = FFNType::SiLUGated;
+    cfg.rope_type = RopeType::Standard;  // Qwen-style RoPE (no NeoX interleave)
+    cfg.use_qk_norm = true;              // dflash carries attn_q_norm / attn_k_norm
+
+    cfg.target_layers = loader.get_metadata_int_array(arch + ".target_layers", {});
+    cfg.target_hidden_size =
+        static_cast<int>(loader.get_metadata_int(arch + ".target_hidden_size", 0));
+    cfg.parallel_drafting_token_id =
+        static_cast<int>(loader.get_metadata_int(arch + ".parallel_drafting_token_id", -1));
+
+    // Encoder input width = concatenated target features, one per extracted
+    // layer (mirrors llama.cpp: n_embd_inp_enc = target_layers.size() * n_embd).
+    if (!cfg.target_layers.empty()) {
+        cfg.n_embd_inp_enc = static_cast<int>(cfg.target_layers.size()) * cfg.hidden_dim;
+    } else {
+        LOG_WARN("dflash: metadata '" + arch +
+                 ".target_layers' missing; draft encoder input cannot be sized");
+    }
+    return cfg;
+}
+
 ModelConfig parse_mistral_config(ModelLoader& loader, const std::string& arch) {
     auto cfg = parse_common_gguf_config(loader, arch);
     cfg.use_neox_rope = true;
