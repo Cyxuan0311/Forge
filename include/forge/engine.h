@@ -43,6 +43,16 @@ public:
     // not expose it or the last forward went through a path that cannot.
     virtual TensorPtr take_last_hidden() { return nullptr; }
 
+    // Capture hidden states of selected layers from the most recent forward,
+    // concatenated into a single [seq, Σhidden] feature (DFlash/DSPark draft
+    // input: multi-layer target features). Engines without support return
+    // false / nullptr; the default implementation captures nothing.
+    virtual bool captures_layer_hiddens() const { return false; }
+    virtual TensorPtr take_layer_hiddens(const std::vector<int>& layers) {
+        (void)layers;
+        return nullptr;
+    }
+
     virtual std::string name() const = 0;
     virtual void reset() {}
     virtual void set_gpu_layers(int layers) { (void)layers; }
