@@ -79,6 +79,14 @@ public:
         last_hidden_ = nullptr;
         return h;
     }
+
+    // DFlash/DSPark: retain every layer's hidden state from the last forward so
+    // the draft engine can pull concatenated multi-layer target features.
+    bool captures_layer_hiddens() const override { return capture_layer_hiddens_; }
+    // Opt-in: a draft provider flips this on so forward_layers stashes per-layer
+    // hiddens. Off by default so normal generation has zero overhead / uses graphs.
+    void set_capture_layer_hiddens(bool on) { capture_layer_hiddens_ = on; }
+    TensorPtr take_layer_hiddens(const std::vector<int>& layers) override;
     KVCache& kv_cache_ref() { return kv_cache_; }
     const KVCache& kv_cache_ref() const { return kv_cache_; }
 
@@ -146,6 +154,8 @@ protected:
     InferenceMemory& memory_;
     KVCache& kv_cache_;
     TensorPtr last_hidden_;  // post-final-norm hidden from last forward_request
+    std::vector<TensorPtr> layer_hiddens_;  // per-layer hidden [seq,H] from the last forward (when capturing)
+    bool capture_layer_hiddens_ = false;    // opt-in flag flipped on by a draft provider
     std::unique_ptr<KVMemory> kv_memory_;
     ModelWeights weights_;
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;

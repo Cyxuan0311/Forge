@@ -45,8 +45,53 @@ void TransformerEngine::reset() {
     if (kv_memory_) {
         kv_memory_->storage().reset();
     }
+    layer_hiddens_.clear();
     set_kv_cache_initialized(false);
     graph_runtime_.invalidate();
+}
+
+TensorPtr TransformerEngine::take_layer_hiddens(const std::vector<int>& layers) {
+    if (layer_hiddens_.empty()) {
+        return nullptr;
+    }
+    // Gather the requested layers, copying each to CPU so we can concatenate
+    // them row-wise on the host. copy_from() is a synchronous d2h copy for
+    // CUDA->CPU, so the source tensors are left untouched.
+    std::vector<TensorPtr> selected;
+    selected.reserve(layers.size());
+    for (int li : layers) {
+        if (li < 0 || li >= static_cast<int>(layer_hiddens_.size()) || !layer_hiddens_[li]) {
+            LOG_WARN("take_layer_hiddens: layer " + std::to_string(li) + " unavailable");
+            continue;
+        }
+        const TensorPtr& t = layer_hiddens_[li];
+        auto cpu = std::make_shared<Tensor>(t->dtype(), t->shape(), DeviceType::CPU);
+        cpu->copy_from(*t);
+        selected.push_back(std::move(cpu));
+    }
+    if (selected.empty()) {
+        return nullptr;
+    }
+    const int64_t seq = selected[0]->shape()[0];
+    int64_t total_hidden = 0;
+    for (auto& t : selected) {
+        total_hidden += t->shape()[1];
+    }
+    auto out = std::make_shared<Tensor>(selected[0]->dtype(),
+                                        std::vector<int64_t>{seq, total_hidden}, DeviceType::CPU);
+    const size_t elem = out->nbytes() / out->numel();  // bytes per element
+    uint8_t* dst = static_cast<uint8_t*>(out->data());
+    int64_t col = 0;
+    for (auto& t : selected) {
+        const uint8_t* src = static_cast<const uint8_t*>(t->data());
+        const int64_t H = t->shape()[1];
+        const size_t row_bytes = static_cast<size_t>(H) * elem;
+        for (int64_t r = 0; r < seq; ++r) {
+            std::memcpy(dst + (r * total_hidden + col) * elem, src + r * row_bytes, row_bytes);
+        }
+        col += H;
+    }
+    return out;
 }
 
 void TransformerEngine::set_gpu_layers(int gpu_layers) {
@@ -777,13 +822,20 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     const int seq_len = req.n_tokens;
     const int64_t start_pos = req.start_pos;
 
+    // DFlash/DSPark: when capturing per-layer hiddens, drop the graph path (it
+    // packs the whole forward into one kernel) and reset the cache so only this
+    // forward's layers are retained.
+    if (captures_layer_hiddens()) {
+        layer_hiddens_.clear();
+    }
+    const bool use_graph = use_graph_ && !captures_layer_hiddens();
+
     // Graph 执行。builder 由 ExecutionPlan 在构造时决定, 执行期不再按架构名查表。
     // 不支持 graph 的架构直接退回 imperative, 不使用 placeholder builder。
-    if (use_graph_) {
+    if (use_graph) {
         if (!graph_runtime_.has_builder()) {
             LOG_WARN("Graph execution not supported by plan " + plan_.plan_id() +
                      ", falling back to imperative mode");
-            use_graph_ = false;
         } else {
             auto key = GraphKey::from_request(req, plan_.plan_id(), gpu_layers_, hidden->device());
             return graph_runtime_.run(hidden, req, key, model_.config(), weights_, kv_cache_,
@@ -806,6 +858,9 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             PERF_SCOPE_FMT("forward/layer_%d", layer);
             SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu", req.n_tokens);
             cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
+        }
+        if (captures_layer_hiddens()) {
+            layer_hiddens_.push_back(cur_hidden);
         }
         if (!cur_hidden) {
             fprintf(stderr, "[FATAL] Layer %d returned NULL!\n", layer);
