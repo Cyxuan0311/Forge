@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 #include "cli_common.h"
@@ -55,6 +56,10 @@ static void print_usage(const char* prog) {
             "       --spec-p-min FLOAT     Draft confidence early-stop threshold (default: 0.0)\n"
             "       --spec-model PATH      Standalone small draft model path (Phase 3)\n"
             "       --spec-draft-ngl N     GPU layers for the draft model (default: same as -ngl)\n"
+            "       --spec-draft-arch NAME Draft model architecture: dflash | dspark\n"
+            "       --spec-draft-target-layers LIST  Target layer indices feeding the draft encoder, e.g. \"2,5,8\"\n"
+            "       --spec-draft-mask-id N MASK token id for the DFlash query block (default: from GGUF)\n"
+            "       --spec-draft-n N       Speculative tokens proposed per round (default: 5)\n"
             "       --spec-stats           Print speculation stats after generation\n"
             "       --expert-stats         Print MoE expert router-distribution after generation\n"
             "       --expert-paging        Enable per-expert weight movement (partial activation)\n"
@@ -344,6 +349,60 @@ CliArgs parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             args.spec.draft_gpu_layers = std::stoi(argv[i]);
+        } else if (arg == "--spec-draft-arch") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            const std::string arch = argv[i];
+            if (arch != "dflash" && arch != "dspark") {
+                std::cerr << "Error: --spec-draft-arch must be 'dflash' or 'dspark'\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.draft_arch = arch;
+        } else if (arg == "--spec-draft-target-layers") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.draft_target_layers.clear();
+            const std::string list = argv[i];
+            size_t start = 0;
+            while (true) {
+                const size_t comma = list.find(',', start);
+                const std::string piece =
+                    list.substr(start, comma == std::string::npos ? std::string::npos
+                                                                  : comma - start);
+                if (!piece.empty()) {
+                    try {
+                        args.spec.draft_target_layers.push_back(std::stoi(piece));
+                    } catch (const std::exception&) {
+                        std::cerr << "Error: --spec-draft-target-layers expects "
+                                     "comma-separated layer indices\n";
+                        std::exit(1);
+                    }
+                }
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+            if (args.spec.draft_target_layers.empty()) {
+                std::cerr << "Error: --spec-draft-target-layers is empty\n";
+                std::exit(1);
+            }
+        } else if (arg == "--spec-draft-mask-id") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.draft_mask_token_id = std::stoi(argv[i]);
+        } else if (arg == "--spec-draft-n") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.draft_n_spec = std::stoi(argv[i]);
         } else if (arg == "--spec-ngram-mod") {
             args.spec.enabled = true;
             args.spec.use_ngram_mod = true;

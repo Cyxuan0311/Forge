@@ -55,6 +55,12 @@ struct SpeculativeConfig {
     std::string draft_model_path;
     int draft_gpu_layers = -1;  // GPU offload layers for draft model (-1 = follow target)
 
+    // ---- DFlash / DSPark draft models (Phase 0 skeleton, engine in Phase 2) ----
+    std::string draft_arch;                // "" (off) / "dflash" / "dspark"
+    std::vector<int> draft_target_layers;  // override for the encoder's target layers
+    int draft_mask_token_id = -1;          // MASK token for the query block (<0 = read from GGUF)
+    int draft_n_spec = 5;                  // speculative tokens proposed per round
+
     // n-gram self-speculative parameters
     bool use_mtp = false;       // DeepSeek-MTP style nextn draft head (qwen35)
     bool use_ngram = true;      // enable n-gram candidate source
