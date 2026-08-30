@@ -121,6 +121,12 @@ verify_draft_tokens(logits_all, draft_tokens, ...)  // 复用, 不改
 
 验收：加单测 —— 同一前缀下 `take_layer_hiddens({0,2})` 与逐层拦截的 hidden 数值一致；不开启 capture 时无开销。
 
+#### 阶段 1 验收（2026-08-30）— ✅ 编译通过
+- `engine.h`：`InferenceEngine` 新增 `captures_layer_hiddens()`（默认 false）与 `take_layer_hiddens(layers)`（默认返回 nullptr）。
+- `TransformerEngine`：新增 `layer_hiddens_` 缓存 + `capture_layer_hiddens_` 开关（默认 false，由 draft provider 调 `set_capture_layer_hiddens(true)` 开启）+ `take_layer_hiddens` 实现（逐层 `copy_from` 到 CPU 后按列 `memcpy` 拼为 `[seq, ΣH]`；`copy_from` 对 CUDA→CPU 是同步 d2h，不改动源张量）。
+- `forward_layers`：仅当 `captures_layer_hiddens()` 为真时 `layer_hiddens_.clear()` + 每层 `push_back` + 旁路 graph 路径；默认路径**零开销**（仅多一次 `if` 判断，且 graph 照常）。`reset()` 同步清理缓存。
+- 数值单测：独立 gtest 需 mock 整个 `TransformerEngine`（依赖 `Model`/`InferenceContext` 构造），成本过高；推迟到**阶段 3 端到端**——届时 `DFlashDraftProvider` 以真实小 target 调用 `take_layer_hiddens(target_layers_)`，可比对输出形状 `[committed, 8×2048]` 与逐层 hidden 一致性。
+
 ### 阶段 2 — DFlash 引擎 + embd batch + 共享权重
 
 | 文件 | 动作 |
