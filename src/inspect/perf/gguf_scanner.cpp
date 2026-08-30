@@ -137,8 +137,11 @@ size_t kv_skip(const uint8_t* data, size_t size, size_t off, uint32_t vtype) {
         case 4: case 5: case 6: return 4;                       // u32/i32/f32
         case 10: case 11: case 12: return 8;                    // u64/i64/f64
         case 8: {                                               // string
+            if (avail < 8)
+                return 0;
             const uint64_t len = peek_u64(off);
-            return 8 + (len > avail - 8 ? avail - 8 : len);
+            const uint64_t room = avail - 8;
+            return 8 + (len > room ? room : len);
         }
         case 9: {                                               // array
             if (avail < 12)
@@ -153,9 +156,23 @@ size_t kv_skip(const uint8_t* data, size_t size, size_t off, uint32_t vtype) {
                     total += 8 + peek_u64(p + total);
                 return (p - off) + total;
             }
-            size_t elem = (arr_type <= 1) ? 1 : (arr_type <= 3) ? 2
-                          : (arr_type <= 6) ? 4 : (arr_type <= 12) ? 8
-                                                                   : 4;
+            if (arr_type == 9) {                                // array of arrays
+                size_t cur = p;
+                for (uint64_t i = 0; i < n; ++i) {
+                    const size_t adv = kv_skip(data, size, cur, 9);
+                    if (adv == 0)
+                        return (size > off) ? (size - off) : 0;
+                    cur += adv;
+                }
+                return cur - off;
+            }
+            // Fixed-width elements. bool (7) is 1 byte, NOT 8 — treating it as
+            // 8 desynchronised the walk and made later keys decode as garbage.
+            const size_t elem = (arr_type <= 1 || arr_type == 7) ? 1
+                                : (arr_type <= 3)               ? 2
+                                : (arr_type <= 6)               ? 4
+                                : (arr_type <= 12)              ? 8
+                                                                : 4;
             uint64_t count = n;
             if (count > (avail - 12) / elem)
                 count = (avail - 12) / elem;
