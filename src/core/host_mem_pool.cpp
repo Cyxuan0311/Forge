@@ -6,6 +6,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#if defined(_MSC_VER)
+#include <malloc.h>
+#endif
 
 namespace forge {
 namespace host_mem {
@@ -16,6 +19,25 @@ namespace {
 // std::aligned_alloc also requires size to be a multiple of alignment, which
 // align_up() guarantees.
 constexpr size_t kAlignment = 64;
+
+// MSVC's <cstdlib> does not provide std::aligned_alloc (C11 aligned_alloc is
+// unimplemented there), so fall back to _aligned_malloc/_aligned_free. Note the
+// argument order differs: _aligned_malloc(size, alignment).
+void* raw_aligned_alloc(size_t alignment, size_t size) {
+#if defined(_MSC_VER)
+    return _aligned_malloc(size, alignment);
+#else
+    return std::aligned_alloc(alignment, size);
+#endif
+}
+
+void raw_aligned_free(void* ptr) {
+#if defined(_MSC_VER)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
 
 // Cap on bytes retained in the cache. System RAM is cheap; keep it generous so
 // the per-op working set never thrashes, but bounded so a growing allocation
@@ -72,11 +94,11 @@ void* allocate(size_t bytes) {
         }
     }
 
-    void* ptr = std::aligned_alloc(kAlignment, aligned);
+    void* ptr = raw_aligned_alloc(kAlignment, aligned);
     if (!ptr) {
         // Allocation failed (or unsupported): drop the cache and retry once.
         clear_cache();
-        ptr = std::aligned_alloc(kAlignment, aligned);
+        ptr = raw_aligned_alloc(kAlignment, aligned);
     }
     if (!ptr) {
         std::fprintf(stderr, "[host_mem_pool] aligned_alloc(%zu) failed\n", aligned);
@@ -105,7 +127,7 @@ void deallocate(void* ptr) {
 
     if (aligned > kMaxCachedBlockBytes || p.cached + aligned > kMaxCachedBytes) {
         // Block too large or cache full: release straight to the OS.
-        std::free(ptr);
+        raw_aligned_free(ptr);
         p.sizes.erase(sit);
         return;
     }
@@ -119,7 +141,7 @@ void clear_cache() {
     std::lock_guard<std::mutex> lock(p.mutex);
     for (auto& [aligned, blocks] : p.free_list) {
         for (void* ptr : blocks) {
-            std::free(ptr);
+            raw_aligned_free(ptr);
             p.sizes.erase(ptr);
         }
         blocks.clear();
