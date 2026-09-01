@@ -24,6 +24,10 @@
 #endif
 
 #if defined(_WIN32)
+// windows.h defines min/max macros that break std::min/std::max below.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
 #    include <windows.h>
 #else
 #    include <dirent.h>
