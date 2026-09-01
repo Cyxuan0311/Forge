@@ -566,6 +566,14 @@ public:
                                        const forge::SpeculativeConfig& speculative_config = {}) {
         ensure_engines_registered();
 
+        // A model loaded on CPU stays on CPU by default: create_context()'s
+        // gpu_layers=-1 ("auto") would otherwise try to offload every layer to
+        // CUDA, which fails on builds/systems without a usable GPU. An explicit
+        // non-negative value always wins.
+        if (gpu_layers < 0 && model_.device() == DeviceType::CPU) {
+            gpu_layers = 0;
+        }
+
         auto ctx = std::make_unique<PyInferenceContext>(model_);
 
         // Apply the forge.set_num_threads() value to the engine context so the
@@ -856,6 +864,12 @@ public:
                                        const std::string& kv_cache_precision_str = "auto",
                                        bool offload_kqv = true,
                                        const forge::SpeculativeConfig& speculative_config = {}) {
+        // Same CPU-model default as PyModel::create_context: gpu_layers=-1
+        // ("auto") offloads everything to CUDA; a CPU-loaded model stays CPU.
+        if (gpu_layers < 0 && model_.device() == DeviceType::CPU) {
+            gpu_layers = 0;
+        }
+
         auto ctx = new PyInferenceContext(model_);
 
         ctx->get().params_mut().offload_kqv = offload_kqv;
