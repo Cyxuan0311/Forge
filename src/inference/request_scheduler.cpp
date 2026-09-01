@@ -1,11 +1,13 @@
 #include "forge/request_scheduler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
 #include "forge/engine.h"
+#include "forge/engines/transformer_engine.h"
 #include "forge/kv_cache.h"
 #include "forge/kv_memory.h"
 #include "forge/logger.h"
@@ -50,7 +52,7 @@ bool RequestScheduler::try_prefix_cache(GenerateRequest& req) {
 
         // Verify the cached seq_id still has cells in the KV cache
         if (cached.seq_id >= 0 && memory->storage().seq_filled(0, cached.seq_id) >=
-            static_cast<int>(cached.tokens.size())) {
+                                      static_cast<int>(cached.tokens.size())) {
             // Cache hit: zero-copy share prefix via seq_share
             memory->seq_share(cached.seq_id, req.request_id, 0,
                               static_cast<int64_t>(cached.tokens.size()));
@@ -115,9 +117,8 @@ void RequestScheduler::preserve_prefix_cache(int seq_id, int prompt_len) {
 
             // Update cache entry to point to the new persistent seq_id
             cached.seq_id = new_seq_id;
-            LOG_DEBUG("Prefix cache PRESERVED: old_seq=" + std::to_string(seq_id) +
-                      " → new_seq=" + std::to_string(new_seq_id) +
-                      " prefix_len=" + std::to_string(prompt_len));
+            LOG_DEBUG("Prefix cache PRESERVED: old_seq=" + std::to_string(seq_id) + " → new_seq=" +
+                      std::to_string(new_seq_id) + " prefix_len=" + std::to_string(prompt_len));
             break;
         }
     }
@@ -134,8 +135,7 @@ bool RequestScheduler::try_prefix_cache_paged(GenerateRequest& req) {
     if (!memory || !memory->is_paged())
         return false;
 
-    int prefix_len = prefix_cache_.try_lookup(
-        req.prompt_tokens, req.request_id, memory->storage());
+    int prefix_len = prefix_cache_.try_lookup(req.prompt_tokens, req.request_id, memory->storage());
 
     if (prefix_len > 0) {
         req.prefix_len = prefix_len;
@@ -169,8 +169,7 @@ void RequestScheduler::finish_request_paged(GenerateRequest& req) {
         // Request owns a new prefix: register it in the page-level cache.
         // register_prefix transfers prefix page ownership to a cache seq_id
         // and removes them from the request's page table.
-        prefix_cache_.register_prefix(
-            req.prompt_tokens, req.request_id, memory->storage());
+        prefix_cache_.register_prefix(req.prompt_tokens, req.request_id, memory->storage());
     }
 
     // Evict LRU entries to keep cache bounded
@@ -192,6 +191,13 @@ RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seq
 
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, ctx_);
     if (engine) {
+        // Match the engine's layer placement to the model's device. Without this
+        // the engine's default gpu_layers_ = -1 maps every layer to CUDA while
+        // the weights still live on CPU (CPU-loaded model), and the first
+        // forward hangs on mixed-device ops (norm with a CPU weight pointer).
+        if (auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get())) {
+            tfm_eng->set_gpu_layers(ctx_.params().device == DeviceType::CUDA ? -1 : 0);
+        }
         ctx_.set_engine(std::move(engine));
     }
 }
@@ -243,7 +249,15 @@ int RequestScheduler::submit(const std::vector<int32_t>& prompt_tokens, int max_
 bool RequestScheduler::step() {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Roadmap 1.3: step latency is the metric a long prefill used to blow up.
+    const auto step_start = std::chrono::steady_clock::now();
+
     schedule();
+
+    // Roadmap 1.1: under KV memory pressure, evict low-value active sequences'
+    // pages to the host pool before building the batch. Evicted sequences sit
+    // out this step; their pages are brought back before their next forward.
+    const std::vector<int> suspended = try_swap_out();
 
     if (active_ids_.empty())
         return false;
@@ -257,6 +271,22 @@ bool RequestScheduler::step() {
     // Build InferenceBatch from active requests
     InferenceBatch batch;
     std::vector<int> batch_rid;  // maps batch item index → request ID
+    // Roadmap 1.3: per-item flag telling the sampling loop whether this item
+    // produced logits. Intermediate prefill chunks do not, so they must not be
+    // sampled (the engine zero-fills their logits row).
+    std::vector<char> sample_flags;
+    int step_prefill_tokens = 0;
+    int step_decode_tokens = 0;
+
+    // Effective prefill chunk size: <0 disables chunking (legacy whole-prompt
+    // behaviour), 0 follows n_ubatch, >0 is an explicit override.
+    const int configured_chunk = prefill_chunk_size_;
+    const bool chunking_enabled = configured_chunk >= 0;
+    int chunk = configured_chunk;
+    if (chunk == 0)
+        chunk = ctx_.params().n_ubatch;
+    if (chunk <= 0)
+        chunk = 256;
 
     for (int rid : active_ids_) {
         auto it = requests_.find(rid);
@@ -267,49 +297,78 @@ bool RequestScheduler::step() {
         if (req.status != RequestStatus::Prefilling && req.status != RequestStatus::Decoding)
             continue;
 
+        // Roadmap 1.1: sequences whose pages were just swapped out skip this
+        // step — fetching them back would defeat the purpose of the eviction.
+        if (std::find(suspended.begin(), suspended.end(), rid) != suspended.end())
+            continue;
+
+        // Bring any previously-evicted pages of this sequence back onto the
+        // device before the forward pass reads them.
+        if (memory && memory->is_paged())
+            memory->storage().bring_back_seq(rid);
+
         InferenceBatchItem item;
         item.seq_id = rid;
         item.logits = true;
 
         if (req.status == RequestStatus::Prefilling) {
-            // Check prefix cache for this request
-            if (!req.from_cache) {
+            // Prefix cache lookup happens once, on the first chunk.
+            if (req.prefill_done == 0 && !req.from_cache) {
                 if (paged_mode_)
                     try_prefix_cache_paged(req);
                 else
                     try_prefix_cache(req);
             }
 
-            if (req.from_cache && req.prefix_len > 0) {
-                // Cache hit: only process tokens after the cached prefix
-                int suffix_start = req.prefix_len;
-                int suffix_len = static_cast<int>(req.prompt_tokens.size()) - suffix_start;
-                if (suffix_len > 0) {
-                    item.tokens.assign(req.prompt_tokens.begin() + suffix_start,
-                                       req.prompt_tokens.end());
-                } else {
-                    // Entire prompt is cached — need at least one token for sampling
-                    // Use the last token of the prefix
-                    item.tokens = {req.prompt_tokens.back()};
-                    suffix_start = static_cast<int>(req.prompt_tokens.size()) - 1;
-                    suffix_len = 1;
-                }
-                item.start_pos = suffix_start;
-                item.positions.resize(item.tokens.size());
-                for (size_t j = 0; j < item.tokens.size(); j++)
-                    item.positions[j] = static_cast<int64_t>(suffix_start + j);
-            } else {
-                // Cache miss: process full prompt
-                item.tokens = req.prompt_tokens;
-                item.start_pos = 0;
-                item.positions.resize(req.prompt_tokens.size());
-                for (size_t j = 0; j < req.prompt_tokens.size(); j++)
-                    item.positions[j] = static_cast<int64_t>(j);
+            const int prompt_len = static_cast<int>(req.prompt_tokens.size());
+            if (prompt_len <= 0) {
+                // Nothing to prefill; drop the request from this step.
+                req.status = RequestStatus::Failed;
+                req.finish_reason = "empty_prompt";
+                release_seq_kv(rid);
+                continue;
             }
+
+            // Tokens already covered by a prefix-cache hit need no forward pass.
+            int begin = req.prefill_done;
+            if (req.from_cache && req.prefix_len > begin)
+                begin = req.prefix_len;
+            if (begin > prompt_len)
+                begin = prompt_len;
+
+            int len = prompt_len - begin;
+            if (chunking_enabled)
+                len = std::min(len, chunk);
+
+            if (len <= 0) {
+                // Every token is already covered by the cached prefix — still
+                // need one token to sample the first output.
+                begin = prompt_len - 1;
+                len = 1;
+            }
+
+            const bool last_chunk = (begin + len >= prompt_len);
+
+            item.tokens.assign(req.prompt_tokens.begin() + begin,
+                               req.prompt_tokens.begin() + begin + len);
+            item.start_pos = begin;
+            item.positions.resize(len);
+            for (int j = 0; j < len; j++)
+                item.positions[j] = static_cast<int64_t>(begin + j);
+
+            // Only the final chunk yields a token; intermediate chunks just
+            // advance the prompt cursor.
+            item.logits = last_chunk;
+            sample_flags.push_back(last_chunk ? 1 : 0);
+            step_prefill_tokens += len;
+            prefill_chunks_issued_++;
         } else {  // Decoding
             item.tokens = {req.output_tokens.back()};
             item.start_pos = req.current_pos;
             item.positions = {req.current_pos};
+            item.logits = true;
+            sample_flags.push_back(1);
+            step_decode_tokens += 1;
         }
 
         batch.items.push_back(std::move(item));
@@ -343,7 +402,8 @@ bool RequestScheduler::step() {
     // Bring logits to CPU if needed (already on CPU from forward_batch, but just in case)
     TensorPtr logits_cpu = logits_batch;
     if (logits_batch && logits_batch->device() == DeviceType::CUDA) {
-        logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits_batch->shape(), DeviceType::CPU);
+        logits_cpu =
+            std::make_shared<Tensor>(DataType::FP32, logits_batch->shape(), DeviceType::CPU);
         logits_cpu->copy_from(*logits_batch);
     }
 
@@ -355,14 +415,25 @@ bool RequestScheduler::step() {
 
         auto& req = it->second;
 
+        // Roadmap 1.3: every chunk advanced the prompt cursor, including the
+        // intermediate ones that carry no logits.
+        if (req.status == RequestStatus::Prefilling)
+            req.prefill_done += static_cast<int>(batch.items[i].tokens.size());
+
+        // Intermediate prefill chunks produced no logits (the engine zero-fills
+        // their row), so they must not be sampled — they just stay active.
+        if (!sample_flags[i]) {
+            still_active.push_back(rid);
+            continue;
+        }
+
         // Extract this sequence's logits from batch result [n_seq, vocab_size]
         TensorPtr seq_logits;
         if (logits_cpu && logits_cpu->ndim() >= 2 &&
             static_cast<int>(logits_cpu->shape()[0]) == batch.size()) {
             int vocab_size = static_cast<int>(logits_cpu->shape()[1]);
-            seq_logits = std::make_shared<Tensor>(DataType::FP32,
-                                                   std::vector<int64_t>{1, vocab_size},
-                                                   DeviceType::CPU);
+            seq_logits = std::make_shared<Tensor>(
+                DataType::FP32, std::vector<int64_t>{1, vocab_size}, DeviceType::CPU);
             const float* src = static_cast<const float*>(logits_cpu->data()) + i * vocab_size;
             std::memcpy(seq_logits->data(), src, vocab_size * sizeof(float));
         } else if (logits_cpu) {
@@ -381,8 +452,8 @@ bool RequestScheduler::step() {
 
         // Sample with per-request config
         sampler_.set_config(req.sampler_config);
-        int64_t sample_pos = batch.items[i].start_pos +
-                             static_cast<int64_t>(batch.items[i].tokens.size()) - 1;
+        int64_t sample_pos =
+            batch.items[i].start_pos + static_cast<int64_t>(batch.items[i].tokens.size()) - 1;
         int token_id = sampler_.sample(seq_logits, sample_pos);
 
         // Update request state
@@ -448,6 +519,24 @@ bool RequestScheduler::step() {
     }
 
     active_ids_ = std::move(still_active);
+
+    // Roadmap 1.3: publish this step's interleaving metrics. A step that ran
+    // both prefill and decode work proves decode was not starved.
+    last_step_prefill_tokens_ = step_prefill_tokens;
+    last_step_decode_tokens_ = step_decode_tokens;
+    if (step_prefill_tokens > 0 && step_decode_tokens > 0)
+        interleaved_steps_++;
+
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_start)
+            .count();
+    if (elapsed_ms > max_step_latency_ms_)
+        max_step_latency_ms_ = elapsed_ms;
+
+    // Roadmap 1.1: bring_back happens mid-step (before the forward pass), so
+    // refresh the swap counters after the step completes.
+    update_swap_stats();
+
     return true;
 }
 
@@ -482,8 +571,6 @@ void RequestScheduler::schedule() {
         LOG_DEBUG("RequestScheduler: scheduled request " + std::to_string(rid));
     }
 }
-
-
 
 std::vector<GenerateRequest> RequestScheduler::get_finished() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -525,6 +612,109 @@ bool RequestScheduler::has_pending() const {
     return !active_ids_.empty() || !waiting_queue_.empty();
 }
 
+// =========================================================================
+// Roadmap 1.1: KV host offload (swap)
+// =========================================================================
+
+std::vector<int> RequestScheduler::try_swap_out() {
+    std::vector<int> suspended;
+
+    auto* engine = ctx_.engine();
+    if (!engine)
+        return suspended;
+    KVMemory* memory = engine->kv_memory();
+    if (!memory || !memory->is_paged())
+        return suspended;
+    auto& storage = memory->storage();
+
+    const int total_pages = storage.total_page_capacity();
+    if (total_pages <= 0)
+        return suspended;
+
+    // Keep at least `kv_swap_watermark_` of the page capacity free on the
+    // device. Watermark <= 0 disables proactive swap-out.
+    const int min_free = static_cast<int>(kv_swap_watermark_ * total_pages);
+    if (min_free <= 0)
+        return suspended;
+
+    // Evicting a page releases its device storage, so the "free" measure that
+    // matters is the device footprint (referenced, non-evicted pages) against
+    // total capacity.
+    const int in_use = storage.num_device_pages_in_use();
+    if (total_pages - in_use >= min_free)
+        return suspended;
+
+    // Victims are the active requests holding the fewest pages (cheapest to
+    // move). They keep their KV state on the host pool and resume next step.
+    std::vector<int> candidates;
+    for (int rid : active_ids_) {
+        auto it = requests_.find(rid);
+        if (it == requests_.end())
+            continue;
+        const auto& req = it->second;
+        if (req.status != RequestStatus::Prefilling && req.status != RequestStatus::Decoding)
+            continue;
+        candidates.push_back(rid);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [&](int a, int b) { return storage.seq_num_pages(a) < storage.seq_num_pages(b); });
+
+    for (int rid : candidates) {
+        if (total_pages - storage.num_device_pages_in_use() >= min_free)
+            break;
+        if (storage.offload_seq(rid)) {
+            suspended.push_back(rid);
+            swap_events_++;
+            LOG_DEBUG("RequestScheduler: swapped out request " + std::to_string(rid));
+        }
+    }
+
+    update_swap_stats();
+    return suspended;
+}
+
+void RequestScheduler::update_swap_stats() {
+    auto* engine = ctx_.engine();
+    if (!engine)
+        return;
+    KVMemory* memory = engine->kv_memory();
+    if (!memory || !memory->is_paged())
+        return;
+    auto& storage = memory->storage();
+    num_offloaded_pages_ = storage.num_offloaded_pages();
+    num_brought_back_pages_ = storage.num_brought_back_pages();
+}
+
+int RequestScheduler::num_free_pages() const {
+    const auto* engine = ctx_.engine();
+    if (!engine)
+        return 0;
+    const KVMemory* memory = engine->kv_memory();
+    if (!memory || !memory->is_paged())
+        return 0;
+    return memory->storage().num_free_pages();
+}
+
+int RequestScheduler::num_total_pages() const {
+    const auto* engine = ctx_.engine();
+    if (!engine)
+        return 0;
+    const KVMemory* memory = engine->kv_memory();
+    if (!memory || !memory->is_paged())
+        return 0;
+    return memory->storage().total_page_capacity();
+}
+
+size_t RequestScheduler::host_pool_bytes() const {
+    const auto* engine = ctx_.engine();
+    if (!engine)
+        return 0;
+    const KVMemory* memory = engine->kv_memory();
+    if (!memory || !memory->is_paged())
+        return 0;
+    return memory->storage().host_pool_bytes();
+}
+
 void RequestScheduler::abort(int request_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -557,6 +747,18 @@ void RequestScheduler::reset() {
     prefix_cache_.clear();
     prefix_cache_hits_ = 0;
     prefix_cache_misses_ = 0;
+
+    // Roadmap 1.3: clear the interleaving metrics too.
+    last_step_prefill_tokens_ = 0;
+    last_step_decode_tokens_ = 0;
+    max_step_latency_ms_ = 0.0;
+    interleaved_steps_ = 0;
+    prefill_chunks_issued_ = 0;
+
+    // Roadmap 1.1: clear the swap counters.
+    swap_events_ = 0;
+    num_offloaded_pages_ = 0;
+    num_brought_back_pages_ = 0;
 }
 
 }  // namespace forge

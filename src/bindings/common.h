@@ -1,17 +1,17 @@
 #pragma once
 // Shared header for Forge Python bindings modules.
 
-#include <cstdlib>
-#include <memory>
-#include <string>
-
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "../core/platform.h"
+#include <cstdlib>
+#include <memory>
+#include <string>
+
 #include "../core/memory_counters.h"
+#include "../core/platform.h"
 #include "forge/arch_registry.h"
 #include "forge/backend.h"
 #include "forge/compute_graph.h"
@@ -27,7 +27,6 @@
 #include "forge/model_loader.h"
 #include "forge/ninf_model.h"
 #include "forge/operators.h"
-#include "forge/paged_kv_cache.h"
 #include "forge/perf_profiler.h"
 #include "forge/request_scheduler.h"
 #include "forge/sampler.h"
@@ -118,11 +117,33 @@ inline py::array_t<float> tensor_to_numpy(const TensorPtr& tensor) {
 
 // Parse KV cache dtype string. Supports: fp32, f16, q8_0, q4_0, q4_k
 inline KVCacheDType parse_kv_dtype(const std::string& s) {
-    if (s == "f16")  return KVCacheDType::F16;
-    if (s == "q8_0") return KVCacheDType::Q8_0;
-    if (s == "q4_0") return KVCacheDType::Q4_0;
-    if (s == "q4_k") return KVCacheDType::Q4_K;
+    if (s == "f16")
+        return KVCacheDType::F16;
+    if (s == "q8_0")
+        return KVCacheDType::Q8_0;
+    if (s == "q4_0")
+        return KVCacheDType::Q4_0;
+    if (s == "q4_k")
+        return KVCacheDType::Q4_K;
+    if (s == "fp8_e4m3")
+        return KVCacheDType::FP8_E4M3;
+    if (s == "fp8_e5m2")
+        return KVCacheDType::FP8_E5M2;
     return KVCacheDType::FP32;  // default
+}
+
+// Resolve the effective KV-cache dtype: a non-AUTO precision profile overrides
+// the explicit `dtype_str`. Throws on an unknown precision value.
+inline std::string resolve_kv_dtype(const std::string& dtype_str,
+                                    const std::string& precision_str) {
+    if (precision_str.empty() || precision_str == "auto")
+        return dtype_str;
+    KVCachePrecision p = KVCachePrecision::AUTO;
+    if (!parse_kv_cache_precision(precision_str, p))
+        throw std::invalid_argument("Unknown kv_cache_precision: " + precision_str);
+    if (const char* d = kv_cache_precision_to_dtype(p))
+        return d;
+    return dtype_str;
 }
 
 // ---- Wrapper classes ----
@@ -193,8 +214,7 @@ public:
         }
     }
 
-    void generate_stream(const std::vector<int32_t>& tokens,
-                         const GenerationConfig& config,
+    void generate_stream(const std::vector<int32_t>& tokens, const GenerationConfig& config,
                          py::object callback) {
         SamplerConfig sampler_cfg;
         sampler_cfg.temperature = config.temperature;
@@ -228,12 +248,10 @@ public:
         return generate(tokens, config);
     }
 
-    void generate_stream_kv(const std::vector<int32_t>& tokens,
-                            const GenerationConfig& config,
+    void generate_stream_kv(const std::vector<int32_t>& tokens, const GenerationConfig& config,
                             py::object callback) {
         return generate_stream(tokens, config, std::move(callback));
     }
-
 
     py::array_t<float> forward(py::array_t<int32_t, py::array::c_style> input_ids,
                                int start_pos = 0) {
@@ -260,9 +278,9 @@ public:
         return tensor_to_numpy(logits);
     }
 
-    int32_t forward_sample(py::array_t<int32_t, py::array::c_style> input_ids,
-                           int start_pos, float temperature, int top_k, float top_p,
-                           float repeat_penalty, const std::vector<int32_t>& token_history) {
+    int32_t forward_sample(py::array_t<int32_t, py::array::c_style> input_ids, int start_pos,
+                           float temperature, int top_k, float top_p, float repeat_penalty,
+                           const std::vector<int32_t>& token_history) {
         auto buf = input_ids.request();
         if (buf.ndim != 1)
             throw std::runtime_error("input_ids must be 1D");
@@ -270,9 +288,8 @@ public:
         int seq_len = static_cast<int>(buf.shape[0]);
         DeviceType dev = ctx_.device();
 
-        auto ids_tensor = std::make_shared<Tensor>(DataType::INT32,
-                                                    std::vector<int64_t>{seq_len},
-                                                    DeviceType::CPU);
+        auto ids_tensor = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{seq_len},
+                                                   DeviceType::CPU);
         std::memcpy(ids_tensor->data(), buf.ptr, seq_len * sizeof(int32_t));
 
         if (dev == DeviceType::CUDA) {
@@ -369,17 +386,27 @@ public:
         stats["kv_cache_active_bytes"] = static_cast<int64_t>(cache->active_bytes());
         stats["kv_cache_free_slots"] = cache->num_free_slots();
         stats["kv_cache_filled"] = cache->filled(0);  // layer 0 representative
-        stats["kv_cache_page_size"] = 0;  // contiguous mode: no pages
+        stats["kv_cache_page_size"] = 0;              // contiguous mode: no pages
         stats["kv_cache_free_pages"] = 0;
         // Report per-K/V types
         auto dtype_str = [](KVCacheDType dt) -> const char* {
             switch (dt) {
-            case KVCacheDType::FP32: return "fp32";
-            case KVCacheDType::F16:  return "f16";
-            case KVCacheDType::Q8_0: return "q8_0";
-            case KVCacheDType::Q4_0: return "q4_0";
-            case KVCacheDType::Q4_K: return "q4_k";
-            default: return "unknown";
+            case KVCacheDType::FP32:
+                return "fp32";
+            case KVCacheDType::F16:
+                return "f16";
+            case KVCacheDType::Q8_0:
+                return "q8_0";
+            case KVCacheDType::Q4_0:
+                return "q4_0";
+            case KVCacheDType::Q4_K:
+                return "q4_k";
+            case KVCacheDType::FP8_E4M3:
+                return "fp8_e4m3";
+            case KVCacheDType::FP8_E5M2:
+                return "fp8_e5m2";
+            default:
+                return "unknown";
             }
         };
         stats["kv_cache_dtype"] = dtype_str(cache->kv_dtype());
@@ -401,41 +428,51 @@ public:
 
     bool seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1) {
         auto* engine = ctx_.engine();
-        if (!engine) return false;
+        if (!engine)
+            return false;
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
-        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        if (!tfm_eng || !tfm_eng->kv_memory())
+            return false;
         return tfm_eng->kv_memory()->seq_share(src_seq, dst_seq, p0, p1);
     }
 
     bool seq_remove(int seq_id, int64_t p0, int64_t p1) {
         auto* engine = ctx_.engine();
-        if (!engine) return false;
+        if (!engine)
+            return false;
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
-        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        if (!tfm_eng || !tfm_eng->kv_memory())
+            return false;
         return tfm_eng->kv_memory()->seq_remove(seq_id, p0, p1);
     }
 
     bool seq_keep(int seq_id) {
         auto* engine = ctx_.engine();
-        if (!engine) return false;
+        if (!engine)
+            return false;
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
-        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        if (!tfm_eng || !tfm_eng->kv_memory())
+            return false;
         return tfm_eng->kv_memory()->seq_keep(seq_id);
     }
 
     void seq_release(int seq_id) {
         auto* engine = ctx_.engine();
-        if (!engine) return;
+        if (!engine)
+            return;
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine);
-        if (!tfm_eng || !tfm_eng->kv_memory()) return;
+        if (!tfm_eng || !tfm_eng->kv_memory())
+            return;
         tfm_eng->kv_memory()->release(seq_id);
     }
 
     bool is_paged() const {
         auto* engine = ctx_.engine();
-        if (!engine) return false;
+        if (!engine)
+            return false;
         auto* tfm_eng = dynamic_cast<const TransformerEngine*>(engine);
-        if (!tfm_eng || !tfm_eng->kv_memory()) return false;
+        if (!tfm_eng || !tfm_eng->kv_memory())
+            return false;
         return tfm_eng->kv_memory()->is_paged();
     }
 
@@ -451,8 +488,8 @@ public:
               int num_layers, int num_heads, int num_kv_heads, int head_dim, float rope_theta,
               float rms_norm_eps, int max_seq_len, const std::string& arch_type,
               const std::string& norm_type_str, const std::string& activation_str,
-              bool tie_embeddings, const std::string& device_str,
-              int n_swa = 0, const std::vector<int>& swa_layers = {}) {
+              bool tie_embeddings, const std::string& device_str, int n_swa = 0,
+              const std::vector<int>& swa_layers = {}) {
         ensure_loaders_registered();
         ensure_engines_registered();
         ModelConfig cfg;
@@ -469,7 +506,8 @@ public:
         cfg.arch_type = arch_type;
         cfg.tie_embeddings = tie_embeddings;
         cfg.n_swa = n_swa;
-        if (!swa_layers.empty()) cfg.swa_layers = swa_layers;
+        if (!swa_layers.empty())
+            cfg.swa_layers = swa_layers;
 
         if (norm_type_str == "layernorm") {
             cfg.norm_type = NormType::LayerNorm;
@@ -523,6 +561,7 @@ public:
     }
 
     PyInferenceContext* create_context(const std::string& kv_cache_dtype_str, int gpu_layers,
+                                       const std::string& kv_cache_precision_str = "auto",
                                        bool offload_kqv = true,
                                        const forge::SpeculativeConfig& speculative_config = {}) {
         ensure_engines_registered();
@@ -553,7 +592,8 @@ public:
 
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
         if (tfm_eng) {
-            tfm_eng->set_kv_cache_dtype(parse_kv_dtype(kv_cache_dtype_str));
+            tfm_eng->set_kv_cache_dtype(
+                parse_kv_dtype(resolve_kv_dtype(kv_cache_dtype_str, kv_cache_precision_str)));
             tfm_eng->set_gpu_layers(gpu_layers);
         }
 
@@ -594,25 +634,25 @@ public:
     /// The default context preserves KV cache across generate() calls.
     /// Phase 2: FORGE_DISABLE_CONTEXT_REUSE=1 disables caching (rollback to old path).
     PyInferenceContext* ensure_default_context(const std::string& kv_cache_dtype_str = "fp32",
-                                                int gpu_layers = -1) {
+                                               int gpu_layers = -1,
+                                               const std::string& kv_cache_precision_str = "auto") {
         // Phase 2 rollback: disable context reuse via env var
         const char* disable_reuse = std::getenv("FORGE_DISABLE_CONTEXT_REUSE");
         if (disable_reuse && std::string(disable_reuse) == "1") {
-            default_ctx_.reset(create_context(kv_cache_dtype_str, gpu_layers));
+            default_ctx_.reset(
+                create_context(kv_cache_dtype_str, gpu_layers, kv_cache_precision_str));
             return default_ctx_.get();
         }
         if (default_ctx_) {
             // Already created; the dtype/layers are locked to the first call's values.
             return default_ctx_.get();
         }
-        default_ctx_.reset(create_context(kv_cache_dtype_str, gpu_layers));
+        default_ctx_.reset(create_context(kv_cache_dtype_str, gpu_layers, kv_cache_precision_str));
         return default_ctx_.get();
     }
 
     /// Phase 1: release the default context (explicit reset).
-    void release_default_context() {
-        default_ctx_.reset();
-    }
+    void release_default_context() { default_ctx_.reset(); }
 
     /// Access the default context (may be nullptr if never created).
     PyInferenceContext* default_context() const { return default_ctx_.get(); }
@@ -629,8 +669,8 @@ public:
     // scheduler holds a C++ Model& reference to it.
     PyRequestScheduler(py::object model, int block_size = 16, int max_num_seqs = 4)
         : model_ref_(std::move(model)),
-          scheduler_(init_scheduler(model_ref_.cast<PyModel&>().get_model(), block_size,
-                                    max_num_seqs)) {}
+          scheduler_(
+              init_scheduler(model_ref_.cast<PyModel&>().get_model(), block_size, max_num_seqs)) {}
 
     static RequestScheduler init_scheduler(Model& model, int block_size, int max_num_seqs) {
         ensure_engines_registered();
@@ -653,6 +693,14 @@ public:
         return result;
     }
 
+    py::list get_all_requests() {
+        auto all = scheduler_.get_all_requests();
+        py::list result;
+        for (auto& req : all)
+            result.append(req);
+        return result;
+    }
+
     int num_active() const { return scheduler_.num_active(); }
     int num_waiting() const { return scheduler_.num_waiting(); }
     bool has_pending() const { return scheduler_.has_pending(); }
@@ -666,9 +714,11 @@ public:
     py::dict memory_stats() const {
         py::dict stats;
         auto* engine = scheduler_.context().engine();
-        if (!engine) return stats;
+        if (!engine)
+            return stats;
         auto* tfm_eng = dynamic_cast<const TransformerEngine*>(engine);
-        if (!tfm_eng) return stats;
+        if (!tfm_eng)
+            return stats;
 
         auto* mem = tfm_eng->kv_memory();
         auto* cache = tfm_eng->kv_cache();
@@ -684,7 +734,8 @@ public:
             // Phase 6: per-layer pool max_pages (SWA layers should be smaller)
             auto pool_sizes = storage.layer_pool_max_pages();
             py::list pool_list;
-            for (int s : pool_sizes) pool_list.append(s);
+            for (int s : pool_sizes)
+                pool_list.append(s);
             stats["layer_pool_max_pages"] = pool_list;
         } else {
             stats["kv_cache_nbytes"] = static_cast<int64_t>(cache->nbytes());
@@ -710,8 +761,7 @@ public:
                       const GenerationConfig& gen_cfg = GenerationConfig{},
                       const SamplerConfig& sampler_cfg = SamplerConfig{}) {
         py::list result;
-        scheduler_.submit(prompt_tokens, gen_cfg.max_new_tokens,
-                          gen_cfg.eos_token_id, sampler_cfg);
+        scheduler_.submit(prompt_tokens, gen_cfg.max_new_tokens, gen_cfg.eos_token_id, sampler_cfg);
         while (scheduler_.has_pending()) {
             scheduler_.step();
             auto finished = scheduler_.get_finished();
@@ -731,8 +781,31 @@ public:
     int n_threads_batch() const { return scheduler_.context().params().n_threads_batch; }
     void set_n_threads_batch(int v) { scheduler_.context().params_mut().n_threads_batch = v; }
 
+    // Roadmap 1.3: chunked prefill knobs and interleaving metrics.
+    // prefill_chunk_size < 0 disables chunking (legacy whole-prompt step),
+    // 0 follows n_ubatch, > 0 is an explicit token cap per request per step.
+    int prefill_chunk_size() const { return scheduler_.prefill_chunk_size(); }
+    void set_prefill_chunk_size(int v) { scheduler_.set_prefill_chunk_size(v); }
+
+    int last_step_prefill_tokens() const { return scheduler_.last_step_prefill_tokens(); }
+    int last_step_decode_tokens() const { return scheduler_.last_step_decode_tokens(); }
+    double last_step_decode_ratio() const { return scheduler_.last_step_decode_ratio(); }
+    double max_step_latency_ms() const { return scheduler_.max_step_latency_ms(); }
+    int interleaved_steps() const { return scheduler_.interleaved_steps(); }
+    int prefill_chunks_issued() const { return scheduler_.prefill_chunks_issued(); }
+
+    // Roadmap 1.1: KV host offload (swap) knobs and metrics.
+    float kv_swap_watermark() const { return scheduler_.kv_swap_watermark(); }
+    void set_kv_swap_watermark(float w) { scheduler_.set_kv_swap_watermark(w); }
+    int swap_events() const { return scheduler_.swap_events(); }
+    int num_offloaded_pages() const { return scheduler_.num_offloaded_pages(); }
+    int num_brought_back_pages() const { return scheduler_.num_brought_back_pages(); }
+    int num_free_pages() const { return scheduler_.num_free_pages(); }
+    int num_total_pages() const { return scheduler_.num_total_pages(); }
+    size_t host_pool_bytes() const { return scheduler_.host_pool_bytes(); }
+
 private:
-    py::object model_ref_;    // keeps PyModel alive (prevents GC of Model&)
+    py::object model_ref_;  // keeps PyModel alive (prevents GC of Model&)
     RequestScheduler scheduler_;
 };
 
@@ -779,7 +852,9 @@ public:
     }
 
     PyInferenceContext* create_context(const std::string& kv_cache_dtype_str = "fp32",
-                                       int gpu_layers = -1, bool offload_kqv = true,
+                                       int gpu_layers = -1,
+                                       const std::string& kv_cache_precision_str = "auto",
+                                       bool offload_kqv = true,
                                        const forge::SpeculativeConfig& speculative_config = {}) {
         auto ctx = new PyInferenceContext(model_);
 
@@ -795,7 +870,8 @@ public:
 
         auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
         if (tfm_eng) {
-            tfm_eng->set_kv_cache_dtype(parse_kv_dtype(kv_cache_dtype_str));
+            tfm_eng->set_kv_cache_dtype(
+                parse_kv_dtype(resolve_kv_dtype(kv_cache_dtype_str, kv_cache_precision_str)));
             tfm_eng->set_gpu_layers(gpu_layers);
         }
 

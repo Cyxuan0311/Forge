@@ -24,12 +24,12 @@ namespace forge {
 // =========================================================================
 
 struct KVReadView {
-    TensorPtr key;                 // FP32 key tensor for attention
-    TensorPtr value;               // FP32 value tensor for attention
-    std::vector<int32_t> slots;    // physical slot indices (unused in contiguous mode)
-    int n_tokens = 0;              // number of tokens in this view
-    int kv_len = 0;                // total KV length for attention
-    bool contiguous = true;        // true if slots are contiguous (no stitching needed)
+    TensorPtr key;               // FP32 key tensor for attention
+    TensorPtr value;             // FP32 value tensor for attention
+    std::vector<int32_t> slots;  // physical slot indices (unused in contiguous mode)
+    int n_tokens = 0;            // number of tokens in this view
+    int kv_len = 0;              // total KV length for attention
+    bool contiguous = true;      // true if slots are contiguous (no stitching needed)
 };
 
 // =========================================================================
@@ -39,8 +39,8 @@ struct KVReadView {
 struct KVSlotInfo {
     int seq_id = -1;
     int64_t pos_begin = 0;
-    std::vector<int32_t> slots;    // assigned physical slots
-    bool contiguous = false;       // true if slots are a single contiguous range
+    std::vector<int32_t> slots;  // assigned physical slots
+    bool contiguous = false;     // true if slots are a single contiguous range
 };
 
 // =========================================================================
@@ -81,8 +81,8 @@ public:
     // Initialize paged storage (called by engine during init_kv_cache).
     // No-op for contiguous mode.
     bool init_storage(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
-                      DeviceType device, const KVCacheTypeConfig& kv_config,
-                      int page_size, int max_num_seqs);
+                      DeviceType device, const KVCacheTypeConfig& kv_config, int page_size,
+                      int max_num_seqs);
 
     // Phase 6: set per-layer policies (must be called before init_storage for
     // paged mode to size SWA pools correctly).
@@ -103,6 +103,9 @@ public:
     }
     bool release_sequence(int seq_id);
 
+    // Roadmap 2.2: defragment the underlying contiguous KV cache (no-op for paged).
+    void defrag();
+
     // ---- Prefix cache ----
     // Returns the hash of the given tokens for prefix cache lookup.
     // The caller (RequestScheduler) uses this to manage its own prefix cache.
@@ -118,7 +121,10 @@ public:
     // Prefix cache tracking (updated by scheduler, read by memory_stats)
     int prefix_hits() const { return prefix_hits_; }
     int prefix_tokens() const { return prefix_tokens_; }
-    void record_prefix_hit(int tokens) { prefix_hits_++; prefix_tokens_ += tokens; }
+    void record_prefix_hit(int tokens) {
+        prefix_hits_++;
+        prefix_tokens_ += tokens;
+    }
 
 private:
     KVCache& cache_;

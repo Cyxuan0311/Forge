@@ -234,3 +234,70 @@ class TestPrefixCacheContiguousMode:
         finally:
             if old is not None:
                 os.environ["FORGE_KV_STORAGE_MODE"] = old
+
+
+class TestRadixTreeNestedSharing:
+    """Roadmap 2.1 — radix tree shares an arbitrary nested common prefix
+    (not just each prompt's full prefix)."""
+
+    # 32-token shared prefix X (2 pages @ page_size=16; also 8 pages @ 4).
+    X = list(range(1, 33))
+    Y = list(range(33, 65))
+    Z = list(range(65, 97))  # max 96 < vocab 100
+    W = list(range(40, 72))
+
+    def _fresh(self, model_path, model_config):
+        m = forge.Model()
+        m.load(model_path, arch_type="llama", **model_config)
+        return forge.RequestScheduler(m, block_size=4, max_num_seqs=4)
+
+    def test_nested_prefix_reuse(self, scheduler, greedy_cfg, model_path, model_config):
+        """A=X+Y, B=X+Z: B must hit and reuse the shared X prefix (not A's whole prefix)."""
+        A = self.X + self.Y
+        B = self.X + self.Z
+        scheduler.submit(A, max_new_tokens=2, sampler_config=greedy_cfg)
+        _run_scheduler(scheduler)
+
+        hits0 = scheduler.prefix_cache_hits
+        scheduler.submit(B, max_new_tokens=2, sampler_config=greedy_cfg)
+        finished = _run_scheduler(scheduler)
+        assert len(finished) == 1
+        assert scheduler.prefix_cache_hits > hits0  # B hit the shared X prefix
+
+        # KV correctness: reusing X's KV must yield the same greedy output as a
+        # from-scratch computation of B.
+        ref = self._fresh(model_path, model_config)
+        ref.submit(B, max_new_tokens=2, sampler_config=greedy_cfg)
+        ref_finished = _run_scheduler(ref)
+        assert finished[0].output_tokens == ref_finished[0].output_tokens
+
+    def test_three_way_nested_sharing(self, scheduler, greedy_cfg, model_path, model_config):
+        """Three prompts sharing X: after the first divergence splits the tree,
+        the third reuses the existing X node directly (no recompute)."""
+        A = self.X + self.Y
+        B = self.X + self.Z
+        C = self.X + self.W
+        scheduler.submit(A, max_new_tokens=2, sampler_config=greedy_cfg)
+        _run_scheduler(scheduler)
+        scheduler.submit(B, max_new_tokens=2, sampler_config=greedy_cfg)
+        _run_scheduler(scheduler)
+
+        hits0 = scheduler.prefix_cache_hits
+        scheduler.submit(C, max_new_tokens=2, sampler_config=greedy_cfg)
+        finished = _run_scheduler(scheduler)
+        assert len(finished) == 1
+        assert scheduler.prefix_cache_hits > hits0
+
+        ref = self._fresh(model_path, model_config)
+        ref.submit(C, max_new_tokens=2, sampler_config=greedy_cfg)
+        assert finished[0].output_tokens == _run_scheduler(ref)[0].output_tokens
+
+    def test_multiturn_shared_system_prefix(self, scheduler, greedy_cfg):
+        """Multi-turn: each turn reuses the shared system prefix via the radix tree."""
+        rounds = [self.X + self.Y, self.X + self.Z, self.X + self.W]
+        hits0 = scheduler.prefix_cache_hits
+        for p in rounds:
+            scheduler.submit(p, max_new_tokens=2, sampler_config=greedy_cfg)
+            _run_scheduler(scheduler)
+        # The first turn misses; the other two reuse the shared X prefix.
+        assert scheduler.prefix_cache_hits - hits0 >= 2

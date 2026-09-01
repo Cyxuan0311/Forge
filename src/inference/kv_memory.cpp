@@ -22,16 +22,17 @@ KVMemory::KVMemory(KVCache& cache, KVStorageMode mode) : cache_(cache) {
 }
 
 bool KVMemory::init_storage(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
-                             DeviceType device, const KVCacheTypeConfig& kv_config,
-                             int page_size, int max_num_seqs) {
-    return storage_->init(num_layers, kv_dims, max_seq_len, device, kv_config,
-                          page_size, max_num_seqs);
+                            DeviceType device, const KVCacheTypeConfig& kv_config, int page_size,
+                            int max_num_seqs) {
+    return storage_->init(num_layers, kv_dims, max_seq_len, device, kv_config, page_size,
+                          max_num_seqs);
 }
 
 void KVMemory::set_layer_policies(const std::vector<KVLayerPolicy>& policies, int swa_window) {
     if (storage_->is_paged()) {
         auto* paged = dynamic_cast<PagedKVStorage*>(storage_.get());
-        if (paged) paged->set_layer_policies(policies, swa_window);
+        if (paged)
+            paged->set_layer_policies(policies, swa_window);
     }
 }
 
@@ -64,6 +65,10 @@ void KVMemory::release(int seq_id) {
 bool KVMemory::release_sequence(int seq_id) {
     release(seq_id);
     return true;
+}
+
+void KVMemory::defrag() {
+    storage_->defrag();
 }
 
 // FNV-1a 64-bit hash (same as RequestScheduler's hash_prompt)

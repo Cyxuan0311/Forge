@@ -4,10 +4,11 @@
 #include <cstring>
 
 #include "forge/cuda_kernels.h"
+#include "forge/kv_sizing.h"
 #include "forge/logger.h"
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 namespace forge {
@@ -19,15 +20,15 @@ namespace forge {
 ContiguousKVStorage::ContiguousKVStorage(KVCache& cache) : cache_(cache) {}
 
 bool ContiguousKVStorage::init(int /*num_layers*/, const std::vector<int>& /*kv_dims*/,
-                                int /*max_seq_len*/, DeviceType /*device*/,
-                                const KVCacheTypeConfig& /*kv_config*/,
-                                int /*page_size*/, int /*max_num_seqs*/) {
+                               int /*max_seq_len*/, DeviceType /*device*/,
+                               const KVCacheTypeConfig& /*kv_config*/, int /*page_size*/,
+                               int /*max_num_seqs*/) {
     // Contiguous mode: KVCache is already initialized by the engine.
     return true;
 }
 
-bool ContiguousKVStorage::write_kv(int layer, int64_t pos, int seq_len,
-                                   const float* k_data, const float* v_data) {
+bool ContiguousKVStorage::write_kv(int layer, int64_t pos, int seq_len, const float* k_data,
+                                   const float* v_data) {
     // Contiguous mode delegates directly to KVCache::update.
     // The caller must ensure the K/V tensors are on the correct device.
     (void)k_data;
@@ -70,12 +71,21 @@ bool ContiguousKVStorage::seq_remove(int seq_id, int64_t p0, int64_t p1) {
         return false;
     }
     cache_.seq_rm(seq_id, p0, p1);
+    defrag_if_needed();  // Roadmap 2.2: compact holes left by the removal
     return true;
 }
 
+void ContiguousKVStorage::defrag() {
+    cache_.defrag();
+}
+
+void ContiguousKVStorage::defrag_if_needed() {
+    cache_.defrag_if_needed();
+}
+
 bool ContiguousKVStorage::seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1) {
-    if (src_seq < 0 || src_seq >= cache_.max_seqs() ||
-        dst_seq < 0 || dst_seq >= cache_.max_seqs()) {
+    if (src_seq < 0 || src_seq >= cache_.max_seqs() || dst_seq < 0 ||
+        dst_seq >= cache_.max_seqs()) {
         LOG_ERROR("ContiguousKVStorage::seq_share: invalid seq_id src=" + std::to_string(src_seq) +
                   " dst=" + std::to_string(dst_seq));
         return false;
@@ -95,6 +105,7 @@ bool ContiguousKVStorage::seq_keep(int seq_id) {
 
 void ContiguousKVStorage::release(int seq_id) {
     cache_.seq_rm(seq_id, 0, cache_.max_seq_len());
+    defrag_if_needed();  // Roadmap 2.2: compact after a sequence exits
 }
 
 int ContiguousKVStorage::max_seq_len() const {
@@ -137,8 +148,8 @@ PagedKVStorage::~PagedKVStorage() {
 }
 
 bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
-                          DeviceType device, const KVCacheTypeConfig& kv_config,
-                          int page_size, int max_num_seqs) {
+                          DeviceType device, const KVCacheTypeConfig& kv_config, int page_size,
+                          int max_num_seqs) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     num_layers_ = num_layers;
@@ -147,32 +158,77 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     device_ = device;
     kv_config_ = kv_config;
     page_size_ = page_size > 0 ? page_size : 16;
-    max_num_seqs_ = max_num_seqs > 0 ? max_num_seqs : 32;
+
+    // ---- Roadmap 1.2: auto-capacity from the device memory budget ----
+    // max_num_seqs <= 0 means "auto": derive both the concurrency limit and the
+    // per-layer page count from the free device memory. A positive value is an
+    // explicit override and keeps the historical behaviour exactly.
+    int auto_max_pages = 0;
+    if (max_num_seqs > 0) {
+        max_num_seqs_ = max_num_seqs;
+    } else {
+        KVSizingParams sp;
+        sp.num_layers = num_layers;
+        sp.kv_dims = kv_dims;
+        sp.max_seq_len = max_seq_len;
+        sp.page_size = page_size_;
+        sp.device = device;
+        sp.type_k = kv_config.type_k;
+        sp.type_v = kv_config.type_v;
+        sp.policies.resize(num_layers);
+        for (int l = 0; l < num_layers; ++l) {
+            sp.policies[l] = (l < static_cast<int>(layer_pools_.size())) ? layer_pools_[l].policy
+                                                                         : KVLayerPolicy::Full;
+            if (sp.policies[l] == KVLayerPolicy::SlidingWindow)
+                sp.swa_window = std::max(sp.swa_window, layer_pools_[l].window_size);
+        }
+
+        const KVSizingResult sizing = auto_size_kv_for_device(sp);
+        if (sizing.auto_sized) {
+            max_num_seqs_ = sizing.max_num_seqs;
+            auto_max_pages = sizing.max_pages_per_layer;
+            LOG_INFO("PagedKVStorage auto-sizing: per_seq=" +
+                     std::to_string(sizing.per_seq_bytes / (1024 * 1024)) +
+                     " MB, budget=" + std::to_string(sizing.budget_bytes / (1024 * 1024)) +
+                     " MB -> max_seqs=" + std::to_string(max_num_seqs_) +
+                     ", max_pages=" + std::to_string(auto_max_pages));
+        } else {
+            // No usable memory information (CPU backend or query failed).
+            max_num_seqs_ = 32;
+        }
+    }
 
     // Phase 6: per-layer pool sizing.
     // If layer_pools_ was pre-configured via set_layer_policies(), use those sizes.
     // Otherwise, default all layers to Full with uniform max_pages.
     if (layer_pools_.empty()) {
         layer_pools_.assign(num_layers_, LayerPoolInfo{});
-        for (auto& p : layer_pools_) p.policy = KVLayerPolicy::Full;
+        for (auto& p : layer_pools_)
+            p.policy = KVLayerPolicy::Full;
     } else if ((int)layer_pools_.size() < num_layers_) {
         layer_pools_.resize(num_layers_, LayerPoolInfo{});
     }
     int theoretical_max = (max_num_seqs_ * max_seq_len_ + page_size_ - 1) / page_size_;
+    // Historical ceiling for the explicit-override path. It exists so a manual
+    // max_num_seqs cannot accidentally request an unbounded page pool. The
+    // auto-sized path already bounds pages by the device memory budget, so it
+    // uses its own derived cap instead.
     const int MAX_PAGES_CAP = 256;
+    const int page_cap = auto_max_pages > 0 ? auto_max_pages : MAX_PAGES_CAP;
     for (int l = 0; l < num_layers_; ++l) {
         auto& pool = layer_pools_[l];
         if (pool.policy == KVLayerPolicy::SlidingWindow && pool.window_size > 0) {
             int swa_pages = (pool.window_size + page_size_ - 1) / page_size_;
             // SWA needs a few extra pages for the wrap-around cursor
-            pool.max_pages = std::min(swa_pages + 1, MAX_PAGES_CAP);
+            pool.max_pages = std::min(swa_pages + 1, page_cap);
         } else {
-            pool.max_pages = std::min(theoretical_max, MAX_PAGES_CAP);
+            pool.max_pages = std::min(theoretical_max, page_cap);
         }
     }
     // max_pages_ = max across layers (for backward-compat in some log messages)
     max_pages_ = 0;
-    for (const auto& p : layer_pools_) max_pages_ = std::max(max_pages_, p.max_pages);
+    for (const auto& p : layer_pools_)
+        max_pages_ = std::max(max_pages_, p.max_pages);
 
     // Allocate page pools per layer
     layer_pages_.resize(num_layers_);
@@ -213,10 +269,15 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     if (device_ == DeviceType::CUDA) {
         // Free any existing device arrays (re-init case) before reallocating.
         for (int l = 0; l < (int)d_key_page_ptrs_.size(); ++l)
-            if (d_key_page_ptrs_[l]) cudaFree(d_key_page_ptrs_[l]);
+            if (d_key_page_ptrs_[l])
+                cudaFree(d_key_page_ptrs_[l]);
         for (int l = 0; l < (int)d_value_page_ptrs_.size(); ++l)
-            if (d_value_page_ptrs_[l]) cudaFree(d_value_page_ptrs_[l]);
-        if (d_seq_page_ids_) { cudaFree(d_seq_page_ids_); d_seq_page_ids_ = nullptr; }
+            if (d_value_page_ptrs_[l])
+                cudaFree(d_value_page_ptrs_[l]);
+        if (d_seq_page_ids_) {
+            cudaFree(d_seq_page_ids_);
+            d_seq_page_ids_ = nullptr;
+        }
         d_seq_page_ids_cap_ = 0;
 
         d_key_page_ptrs_host_.assign(num_layers_, {});
@@ -229,18 +290,16 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
             d_value_page_ptrs_host_[l].resize(lmax);
             for (int p = 0; p < lmax; ++p) {
                 auto& page = layer_pages_[l][p];
-                d_key_page_ptrs_host_[l][p] =
-                    (kv_config_.type_k == KVCacheDType::FP32)
-                        ? static_cast<void*>(page.key.fp32_data())
-                        : page.key.d_q_data();
-                d_value_page_ptrs_host_[l][p] =
-                    (kv_config_.type_v == KVCacheDType::FP32)
-                        ? static_cast<void*>(page.value.fp32_data())
-                        : page.value.d_q_data();
+                d_key_page_ptrs_host_[l][p] = (kv_config_.type_k == KVCacheDType::FP32)
+                                                  ? static_cast<void*>(page.key.fp32_data())
+                                                  : page.key.d_q_data();
+                d_value_page_ptrs_host_[l][p] = (kv_config_.type_v == KVCacheDType::FP32)
+                                                    ? static_cast<void*>(page.value.fp32_data())
+                                                    : page.value.d_q_data();
             }
             cudaMalloc(&d_key_page_ptrs_[l], lmax * sizeof(void*));
-            cudaMemcpy(d_key_page_ptrs_[l], d_key_page_ptrs_host_[l].data(),
-                       lmax * sizeof(void*), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_key_page_ptrs_[l], d_key_page_ptrs_host_[l].data(), lmax * sizeof(void*),
+                       cudaMemcpyHostToDevice);
             cudaMalloc(&d_value_page_ptrs_[l], lmax * sizeof(void*));
             cudaMemcpy(d_value_page_ptrs_[l], d_value_page_ptrs_host_[l].data(),
                        lmax * sizeof(void*), cudaMemcpyHostToDevice);
@@ -248,16 +307,16 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     }
 #endif
 
-    LOG_INFO("PagedKVStorage init: layers=" + std::to_string(num_layers_) +
-             ", page_size=" + std::to_string(page_size_) +
-             ", max_pages=" + std::to_string(max_pages_) +
+    LOG_INFO("PagedKVStorage init: layers=" + std::to_string(num_layers_) + ", page_size=" +
+             std::to_string(page_size_) + ", max_pages=" + std::to_string(max_pages_) +
              ", max_seqs=" + std::to_string(max_num_seqs_) +
              ", dev=" + (device_ == DeviceType::CUDA ? "CUDA" : "CPU"));
     return true;
 }
 
 int PagedKVStorage::alloc_page(int layer) {
-    if (layer < 0 || layer >= (int)layer_pools_.size()) return -1;
+    if (layer < 0 || layer >= (int)layer_pools_.size())
+        return -1;
     auto& pool = layer_pools_[layer];
     if (pool.free_page_ids.empty()) {
         LOG_WARN("PagedKVStorage: page pool exhausted for layer " + std::to_string(layer));
@@ -272,22 +331,35 @@ int PagedKVStorage::alloc_page(int layer) {
 }
 
 void PagedKVStorage::free_page(int layer, int page_id) {
-    if (layer < 0 || layer >= (int)layer_pools_.size()) return;
-    if (page_id < 0 || page_id >= (int)layer_pages_[layer].size()) return;
+    if (layer < 0 || layer >= (int)layer_pools_.size())
+        return;
+    if (page_id < 0 || page_id >= (int)layer_pages_[layer].size())
+        return;
     auto& pool = layer_pools_[layer];
-    if (pool.free_page_set.count(page_id)) return;  // prevent double-enqueue
+    if (pool.free_page_set.count(page_id))
+        return;  // prevent double-enqueue
+    auto& page = layer_pages_[layer][page_id];
+    // Roadmap 1.1: a freed page gives up any host copy it still holds. An
+    // evicted page's data lives in the swap pool; a restored page keeps its
+    // host copy so a later re-eviction is cheap — but once the page is freed
+    // for good, that copy must not leak. drop() is a no-op for pages that were
+    // never offloaded.
+    swapper_.drop(layer, page_id);
+    page.evicted = false;
     pool.free_page_ids.push_back(page_id);
     pool.free_page_set.insert(page_id);
-    layer_pages_[layer][page_id].ref_count = 0;
-    layer_pages_[layer][page_id].filled = 0;
+    page.ref_count = 0;
+    page.filled = 0;
 }
 
 int PagedKVStorage::layer_max_pages(int layer) const {
-    if (layer < 0 || layer >= (int)layer_pools_.size()) return max_pages_;
+    if (layer < 0 || layer >= (int)layer_pools_.size())
+        return max_pages_;
     return layer_pools_[layer].max_pages;
 }
 
-void PagedKVStorage::set_layer_policies(const std::vector<KVLayerPolicy>& policies, int swa_window) {
+void PagedKVStorage::set_layer_policies(const std::vector<KVLayerPolicy>& policies,
+                                        int swa_window) {
     layer_pools_.assign(num_layers_ > 0 ? num_layers_ : (int)policies.size(), LayerPoolInfo{});
     for (int i = 0; i < (int)layer_pools_.size() && i < (int)policies.size(); ++i) {
         layer_pools_[i].policy = policies[i];
@@ -332,9 +404,9 @@ bool PagedKVStorage::ensure_seq_capacity(int seq_id, int layer, int needed_slots
             for (int pid : newly_allocated) {
                 free_page(layer, pid);
             }
-            LOG_ERROR("PagedKVStorage: page allocation failed for seq=" +
-                      std::to_string(seq_id) + " layer=" + std::to_string(layer) +
-                      ", rolled back " + std::to_string(newly_allocated.size()) + " pages");
+            LOG_ERROR("PagedKVStorage: page allocation failed for seq=" + std::to_string(seq_id) +
+                      " layer=" + std::to_string(layer) + ", rolled back " +
+                      std::to_string(newly_allocated.size()) + " pages");
             return false;
         }
         newly_allocated.push_back(page_id);
@@ -343,8 +415,8 @@ bool PagedKVStorage::ensure_seq_capacity(int seq_id, int layer, int needed_slots
     return true;
 }
 
-bool PagedKVStorage::write_kv(int layer, int64_t pos, int seq_len,
-                              const float* k_data, const float* v_data) {
+bool PagedKVStorage::write_kv(int layer, int64_t pos, int seq_len, const float* k_data,
+                              const float* v_data) {
     // Legacy single-seq write: use seq_id=0
     return write_kv_seq(layer, 0, pos, seq_len, k_data, v_data);
 }
@@ -384,10 +456,9 @@ bool PagedKVStorage::write_kv_seq(int layer, int seq_id, int64_t pos, int seq_le
         }
         size_t k_row_bytes = KVCache::block_nbytes(kv_config_.type_k, kv_dim);
         size_t v_row_bytes = KVCache::block_nbytes(kv_config_.type_v, kv_dim);
-        cuda::launch_kv_scatter(k_data, v_data,
-                                d_key_page_ptrs_[layer], d_value_page_ptrs_[layer],
-                                d_page_ids, seq_len, pos, page_size_, kv_dim,
-                                k_row_bytes, v_row_bytes, kv_config_.type_k, 0);
+        cuda::launch_kv_scatter(k_data, v_data, d_key_page_ptrs_[layer], d_value_page_ptrs_[layer],
+                                d_page_ids, seq_len, pos, page_size_, kv_dim, k_row_bytes,
+                                v_row_bytes, kv_config_.type_k, 0);
 
         // Update host-side page metadata (filled cursor). The kernel wrote the
         // device data; we only track how full each touched page is.
@@ -484,9 +555,8 @@ TensorPtr PagedKVStorage::read_key(int layer) const {
         return nullptr;
 
     // Gather all sequences' K data into a contiguous FP32 tensor
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-                                         std::vector<int64_t>{total_filled, kv_dim},
-                                         DeviceType::CPU);
+    auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{total_filled, kv_dim},
+                                        DeviceType::CPU);
     float* dst = static_cast<float*>(out->data());
 
     int row = 0;
@@ -497,9 +567,8 @@ TensorPtr PagedKVStorage::read_key(int layer) const {
         for (int p = 0; p < (int)table.page_ids.size(); ++p) {
             int page_id = table.page_ids[p];
             const auto& page = layer_pages_[layer][page_id];
-            int rows_in_page = (p == (int)table.page_ids.size() - 1)
-                                 ? table.filled_in_last
-                                 : page_size_;
+            int rows_in_page =
+                (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
             for (int r = 0; r < rows_in_page; ++r) {
                 if (kv_config_.type_k == KVCacheDType::FP32) {
                     const float* src = page.key.fp32_row(r);
@@ -540,9 +609,8 @@ TensorPtr PagedKVStorage::read_value(int layer) const {
         return nullptr;
 
     // Gather all sequences' V data into a contiguous FP32 tensor
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-                                         std::vector<int64_t>{total_filled, kv_dim},
-                                         DeviceType::CPU);
+    auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{total_filled, kv_dim},
+                                        DeviceType::CPU);
     float* dst = static_cast<float*>(out->data());
 
     int row = 0;
@@ -553,9 +621,8 @@ TensorPtr PagedKVStorage::read_value(int layer) const {
         for (int p = 0; p < (int)table.page_ids.size(); ++p) {
             int page_id = table.page_ids[p];
             const auto& page = layer_pages_[layer][page_id];
-            int rows_in_page = (p == (int)table.page_ids.size() - 1)
-                                 ? table.filled_in_last
-                                 : page_size_;
+            int rows_in_page =
+                (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
             for (int r = 0; r < rows_in_page; ++r) {
                 if (kv_config_.type_v == KVCacheDType::FP32) {
                     const float* src = page.value.fp32_row(r);
@@ -606,18 +673,16 @@ TensorPtr PagedKVStorage::read_key_seq(int layer, int seq_id) const {
         return nullptr;
 
     int kv_dim = (layer < (int)kv_dims_.size()) ? kv_dims_[layer] : kv_dims_[0];
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-                                         std::vector<int64_t>{logical_len, kv_dim},
-                                         DeviceType::CPU);
+    auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{logical_len, kv_dim},
+                                        DeviceType::CPU);
     float* dst = static_cast<float*>(out->data());
 
     int row = 0;
     for (int p = 0; p < (int)table.page_ids.size(); ++p) {
         int page_id = table.page_ids[p];
         const auto& page = layer_pages_[layer][page_id];
-        int rows_in_page = (p == (int)table.page_ids.size() - 1)
-                             ? table.filled_in_last
-                             : page_size_;
+        int rows_in_page =
+            (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
         for (int r = 0; r < rows_in_page; ++r) {
             if (kv_config_.type_k == KVCacheDType::FP32) {
                 const float* src = page.key.fp32_row(r);
@@ -649,18 +714,16 @@ TensorPtr PagedKVStorage::read_value_seq(int layer, int seq_id) const {
         return nullptr;
 
     int kv_dim = (layer < (int)kv_dims_.size()) ? kv_dims_[layer] : kv_dims_[0];
-    auto out = std::make_shared<Tensor>(DataType::FP32,
-                                         std::vector<int64_t>{logical_len, kv_dim},
-                                         DeviceType::CPU);
+    auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{logical_len, kv_dim},
+                                        DeviceType::CPU);
     float* dst = static_cast<float*>(out->data());
 
     int row = 0;
     for (int p = 0; p < (int)table.page_ids.size(); ++p) {
         int page_id = table.page_ids[p];
         const auto& page = layer_pages_[layer][page_id];
-        int rows_in_page = (p == (int)table.page_ids.size() - 1)
-                             ? table.filled_in_last
-                             : page_size_;
+        int rows_in_page =
+            (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
         for (int r = 0; r < rows_in_page; ++r) {
             if (kv_config_.type_v == KVCacheDType::FP32) {
                 const float* src = page.value.fp32_row(r);
@@ -776,7 +839,8 @@ bool PagedKVStorage::seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1)
         dst_table.logical_len = std::max(dst_table.logical_len, p1 - p0);
         int last_idx = (int)dst_table.page_ids.size() - 1;
         if (last_idx >= 0) {
-            dst_table.filled_in_last = (int)(dst_table.logical_len - (int64_t)last_idx * page_size_);
+            dst_table.filled_in_last =
+                (int)(dst_table.logical_len - (int64_t)last_idx * page_size_);
             if (dst_table.filled_in_last <= 0 || dst_table.filled_in_last > page_size_) {
                 dst_table.filled_in_last = page_size_;
             }
@@ -845,8 +909,12 @@ size_t PagedKVStorage::active_bytes() const {
         for (const auto& [seq_id, tables] : seq_tables_) {
             if (l < (int)tables.size()) {
                 for (int page_id : tables[l].page_ids) {
-                    total += layer_pages_[l][page_id].key.capacity_bytes();
-                    total += layer_pages_[l][page_id].value.capacity_bytes();
+                    const auto& page = layer_pages_[l][page_id];
+                    // Roadmap 1.1: evicted pages no longer occupy primary memory.
+                    if (page.evicted)
+                        continue;
+                    total += page.key.capacity_bytes();
+                    total += page.value.capacity_bytes();
                 }
             }
         }
@@ -886,8 +954,15 @@ void PagedKVStorage::reset() {
             pool.free_page_set.insert(p);
             layer_pages_[l][p].filled = 0;
             layer_pages_[l][p].ref_count = 0;
+            // Roadmap 1.1: a reset must not leave pages in the evicted state —
+            // they are all returning to the free list. Any host copies are
+            // dropped (drop is a no-op for pages never evicted).
+            swapper_.drop(l, p);
+            layer_pages_[l][p].evicted = false;
         }
     }
+    offloaded_pages_ = 0;
+    brought_back_pages_ = 0;
     // Note: device page pointer tables are stable across reset() (the page
     // pool itself is not freed); only the per-sequence page_ids are cleared.
     // d_seq_page_ids_ is reused as-is (overwritten on next upload).
@@ -912,6 +987,249 @@ void* const* PagedKVStorage::d_value_page_ptrs(int layer) const {
 const int32_t* PagedKVStorage::upload_seq_page_table(int layer, int seq_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     return upload_seq_page_table_unlocked(layer, seq_id);
+}
+
+// =========================================================================
+// Roadmap 1.1: host offload (swap) helpers
+// =========================================================================
+
+namespace {
+
+// Raw data pointer of a page's KVCacheStorage (source for a host copy).
+const uint8_t* storage_raw_ptr(const KVCacheStorage& s) {
+    if (s.dtype == KVCacheDType::FP32)
+        return s.tensor ? reinterpret_cast<const uint8_t*>(s.tensor->data()) : nullptr;
+    if (s.device == DeviceType::CPU)
+        return s.h_data.empty() ? nullptr : s.h_data.data();
+#ifdef USE_CUDA
+    return static_cast<const uint8_t*>(s.d_data);
+#else
+    return nullptr;
+#endif
+}
+
+// Release the page's primary-memory data (keeps dtype/device/rows/row_bytes so
+// the storage can be re-allocated with the same layout by bring_back).
+void storage_release_data(KVCacheStorage& s) {
+    if (s.dtype == KVCacheDType::FP32) {
+        s.tensor.reset();
+    } else if (s.device == DeviceType::CPU) {
+        s.h_data.clear();
+        s.h_data.shrink_to_fit();
+    } else {
+#ifdef USE_CUDA
+        if (s.d_data) {
+            cudaFree(s.d_data);
+            s.d_data = nullptr;
+        }
+        s.d_bytes = 0;
+#endif
+    }
+}
+
+// Re-allocate the page's storage (same layout) and copy the host copy back in.
+bool storage_restore(KVCacheStorage& s, const uint8_t* src, size_t bytes) {
+    if (!src || bytes == 0)
+        return false;
+    s.alloc(s.dtype, s.device, s.max_rows, s.row_bytes);
+    if (s.dtype == KVCacheDType::FP32) {
+        void* dst = s.tensor ? s.tensor->data() : nullptr;
+        if (!dst)
+            return false;
+#ifdef USE_CUDA
+        if (s.device == DeviceType::CUDA) {
+            cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+        } else
+#endif
+        {
+            std::memcpy(dst, src, bytes);
+        }
+        return true;
+    }
+    if (s.device == DeviceType::CPU) {
+        if (s.h_data.size() < bytes)
+            return false;
+        std::memcpy(s.h_data.data(), src, bytes);
+        return true;
+    }
+#ifdef USE_CUDA
+    if (s.d_data && s.d_bytes >= bytes) {
+        cudaMemcpy(s.d_data, src, bytes, cudaMemcpyHostToDevice);
+        return true;
+    }
+#endif
+    return false;
+}
+
+}  // namespace
+
+// Rebuild the per-layer CUDA pointer tables after a page's storage pointer
+// changed (evicted -> nullptr, brought back -> new device pointer).
+void PagedKVStorage::refresh_cuda_ptr_tables_unlocked(int layer) {
+#ifdef USE_CUDA
+    if (device_ != DeviceType::CUDA || layer < 0 || layer >= (int)layer_pools_.size())
+        return;
+    int lmax = layer_pools_[layer].max_pages;
+    d_key_page_ptrs_host_[layer].resize(lmax);
+    d_value_page_ptrs_host_[layer].resize(lmax);
+    for (int p = 0; p < lmax; ++p) {
+        auto& page = layer_pages_[layer][p];
+        if (page.evicted) {
+            d_key_page_ptrs_host_[layer][p] = nullptr;
+            d_value_page_ptrs_host_[layer][p] = nullptr;
+        } else {
+            d_key_page_ptrs_host_[layer][p] = (kv_config_.type_k == KVCacheDType::FP32)
+                                                  ? static_cast<void*>(page.key.fp32_data())
+                                                  : page.key.d_q_data();
+            d_value_page_ptrs_host_[layer][p] = (kv_config_.type_v == KVCacheDType::FP32)
+                                                    ? static_cast<void*>(page.value.fp32_data())
+                                                    : page.value.d_q_data();
+        }
+    }
+    if (d_key_page_ptrs_[layer])
+        cudaMemcpy(d_key_page_ptrs_[layer], d_key_page_ptrs_host_[layer].data(),
+                   lmax * sizeof(void*), cudaMemcpyHostToDevice);
+    if (d_value_page_ptrs_[layer])
+        cudaMemcpy(d_value_page_ptrs_[layer], d_value_page_ptrs_host_[layer].data(),
+                   lmax * sizeof(void*), cudaMemcpyHostToDevice);
+#else
+    (void)layer;
+#endif
+}
+
+bool PagedKVStorage::offload_to_host(int layer, int page_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return offload_to_host_unlocked(layer, page_id);
+}
+
+bool PagedKVStorage::bring_back(int layer, int page_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return bring_back_unlocked(layer, page_id);
+}
+
+bool PagedKVStorage::offload_seq(int seq_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end())
+        return false;
+    bool any = false;
+    for (int l = 0; l < num_layers_; ++l) {
+        const auto& table = it->second[l];
+        for (int page_id : table.page_ids) {
+            // Already-evicted pages have nothing new to move; skip them so the
+            // caller can tell "this sequence was newly evicted" from "its pages
+            // were already on the host".
+            if (layer_pages_[l][page_id].evicted)
+                continue;
+            if (offload_to_host_unlocked(l, page_id))
+                any = true;
+        }
+    }
+    return any;
+}
+
+int PagedKVStorage::num_device_pages_in_use() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int n = 0;
+    for (int l = 0; l < num_layers_; ++l)
+        for (const auto& page : layer_pages_[l])
+            if (page.ref_count > 0 && !page.evicted)
+                n++;
+    return n;
+}
+
+bool PagedKVStorage::bring_back_seq(int seq_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end())
+        return false;
+    bool any = false;
+    for (int l = 0; l < num_layers_; ++l) {
+        const auto& table = it->second[l];
+        for (int page_id : table.page_ids) {
+            if (bring_back_unlocked(l, page_id))
+                any = true;
+        }
+    }
+    return any;
+}
+
+bool PagedKVStorage::offload_to_host_unlocked(int layer, int page_id) {
+    if (layer < 0 || layer >= (int)layer_pages_.size())
+        return false;
+    auto& page = layer_pages_[layer][page_id];
+    if (page.evicted)
+        return true;  // already offloaded
+    if (page.ref_count == 0)
+        return false;  // free page: nothing to evict
+
+    size_t k_bytes = page.key.capacity_bytes();
+    size_t v_bytes = page.value.capacity_bytes();
+    const uint8_t* k_src = storage_raw_ptr(page.key);
+    const uint8_t* v_src = storage_raw_ptr(page.value);
+    if (k_bytes == 0 && v_bytes == 0)
+        return false;
+
+    if (!swapper_.offload(layer, page_id, k_src, k_bytes, v_src, v_bytes))
+        return false;
+
+    storage_release_data(page.key);
+    storage_release_data(page.value);
+    page.evicted = true;
+    offloaded_pages_++;
+    refresh_cuda_ptr_tables_unlocked(layer);
+    return true;
+}
+
+bool PagedKVStorage::bring_back_unlocked(int layer, int page_id) {
+    if (layer < 0 || layer >= (int)layer_pages_.size())
+        return false;
+    auto& page = layer_pages_[layer][page_id];
+    if (!page.evicted)
+        return true;  // already on device
+
+    size_t k_bytes = 0, v_bytes = 0;
+    if (!swapper_.size(layer, page_id, &k_bytes, &v_bytes))
+        return false;
+
+    // Fetch the host copy into temporary buffers first, so a failed re-alloc
+    // does not leave the page half-restored.
+    std::vector<uint8_t> tmp_k(k_bytes), tmp_v(v_bytes);
+    if (!swapper_.bring_back(layer, page_id, tmp_k.data(), k_bytes, tmp_v.data(), v_bytes))
+        return false;
+
+    if (k_bytes && !storage_restore(page.key, tmp_k.data(), k_bytes))
+        return false;
+    if (v_bytes && !storage_restore(page.value, tmp_v.data(), v_bytes))
+        return false;
+
+    page.evicted = false;
+    brought_back_pages_++;
+    refresh_cuda_ptr_tables_unlocked(layer);
+    return true;
+}
+
+int PagedKVStorage::seq_num_pages(int seq_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end())
+        return 0;
+    int n = 0;
+    for (int l = 0; l < num_layers_; ++l)
+        n += (int)it->second[l].page_ids.size();
+    return n;
+}
+
+size_t PagedKVStorage::host_pool_bytes() const {
+    return swapper_.nbytes();
+}
+
+int PagedKVStorage::total_page_capacity() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int total = 0;
+    for (const auto& pool : layer_pools_)
+        total += pool.max_pages;
+    return total;
 }
 
 const int32_t* PagedKVStorage::upload_seq_page_table_unlocked(int layer, int seq_id) {
