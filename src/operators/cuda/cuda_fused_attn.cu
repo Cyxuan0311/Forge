@@ -8,11 +8,12 @@
 // 参考：llama.cpp 的 fattn-vec.cuh 模板化 <D, ncols, type_K, type_V>
 // =========================================================================
 
+#include <cstdio>
+
 #include "cuda_attn_common.cuh"
 #include "cuda_common.h"
 #include "forge/cuda_kernels.h"
-
-#include <cstdio>
+#include "forge/fp8_utils.h"
 
 namespace forge {
 namespace cuda {
@@ -29,17 +30,15 @@ namespace cuda {
 // =========================================================================
 
 template <int HEAD_DIM, int NUM_WARPS>
-__global__ void fused_attn_q4_0_decode_kernel(
-    const float* __restrict__ Q,
-    const uint8_t* __restrict__ q_K,
-    const uint8_t* __restrict__ q_V,
-    float* __restrict__ O,
-    int kv_len, int num_heads, int num_kv_heads,
-    size_t q_row_size,
-    const float* __restrict__ mask_row) {
-
+__global__ void fused_attn_q4_0_decode_kernel(const float* __restrict__ Q,
+                                              const uint8_t* __restrict__ q_K,
+                                              const uint8_t* __restrict__ q_V,
+                                              float* __restrict__ O, int kv_len, int num_heads,
+                                              int num_kv_heads, size_t q_row_size,
+                                              const float* __restrict__ mask_row) {
     int h = blockIdx.x;
-    if (h >= num_heads) return;
+    if (h >= num_heads)
+        return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
@@ -69,11 +68,13 @@ __global__ void fused_attn_q4_0_decode_kernel(
     float local_sum = 0.0f;
     float local_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
 
     // 主循环：每个线程处理 stride=block_size 的若干 KV 位置
     for (int j = tid; j < kv_len; j += block_size) {
-        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
 
         const uint8_t* k_row = q_K + (size_t)j * q_row_size + head_byte_offset;
         const uint8_t* v_row = q_V + (size_t)j * q_row_size + head_byte_offset;
@@ -99,7 +100,8 @@ __global__ void fused_attn_q4_0_decode_kernel(
             }
         }
         dot *= scale;
-        if (mask_row != nullptr) dot += mask_row[j];
+        if (mask_row != nullptr)
+            dot += mask_row[j];
 
         // ---- 在线 softmax 更新 ----
         float new_max = fmaxf(local_max, dot);
@@ -122,10 +124,8 @@ __global__ void fused_attn_q4_0_decode_kernel(
                 int val_hi = ((qs[i] >> 4) & 0x0F) - 8;
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
-                local_acc[idx_lo] =
-                    local_acc[idx_lo] * correction + weight * (val_lo * v_scale);
-                local_acc[idx_hi] =
-                    local_acc[idx_hi] * correction + weight * (val_hi * v_scale);
+                local_acc[idx_lo] = local_acc[idx_lo] * correction + weight * (val_lo * v_scale);
+                local_acc[idx_hi] = local_acc[idx_hi] * correction + weight * (val_hi * v_scale);
             }
         }
         local_max = new_max;
@@ -139,9 +139,11 @@ __global__ void fused_attn_q4_0_decode_kernel(
     float warp_sum = warp_reduce_sum(local_sum * rescale);
     float warp_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = local_acc[d] * rescale;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
 
     // ---- 跨 Warp 归约（共享内存）----
     __shared__ float s_warp_max[NUM_WARPS];
@@ -157,8 +159,7 @@ __global__ void fused_attn_q4_0_decode_kernel(
     }
     __syncthreads();
 
-    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
-        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
@@ -171,16 +172,12 @@ __global__ void fused_attn_q4_0_decode_kernel(
 
 template <int HEAD_DIM, int NUM_WARPS>
 __global__ void fused_attn_q4_0_decode_large_online_kernel(
-    const float* __restrict__ Q,
-    const uint8_t* __restrict__ q_K,
-    const uint8_t* __restrict__ q_V,
-    float* __restrict__ O,
-    int kv_len, int num_heads, int num_kv_heads,
-    size_t q_row_size,
+    const float* __restrict__ Q, const uint8_t* __restrict__ q_K, const uint8_t* __restrict__ q_V,
+    float* __restrict__ O, int kv_len, int num_heads, int num_kv_heads, size_t q_row_size,
     const float* __restrict__ mask_row) {
-
     int h = blockIdx.x;
-    if (h >= num_heads) return;
+    if (h >= num_heads)
+        return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
@@ -208,11 +205,13 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
     float local_sum = 0.0f;
     float local_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
 
     // 单遍：在线 softmax + 累加加权 V
     for (int j = tid; j < kv_len; j += block_size) {
-        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
 
         const uint8_t* k_row = q_K + (size_t)j * q_row_size + head_byte_offset;
         const uint8_t* v_row = q_V + (size_t)j * q_row_size + head_byte_offset;
@@ -238,7 +237,8 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
             }
         }
         dot *= scale;
-        if (mask_row != nullptr) dot += mask_row[j];
+        if (mask_row != nullptr)
+            dot += mask_row[j];
 
         // ---- 在线 softmax 更新 ----
         float new_max = fmaxf(local_max, dot);
@@ -261,10 +261,8 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
                 int val_hi = ((qs[i] >> 4) & 0x0F) - 8;
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
-                local_acc[idx_lo] =
-                    local_acc[idx_lo] * correction + weight * (val_lo * v_scale);
-                local_acc[idx_hi] =
-                    local_acc[idx_hi] * correction + weight * (val_hi * v_scale);
+                local_acc[idx_lo] = local_acc[idx_lo] * correction + weight * (val_lo * v_scale);
+                local_acc[idx_hi] = local_acc[idx_hi] * correction + weight * (val_hi * v_scale);
             }
         }
         local_max = new_max;
@@ -277,9 +275,11 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
     float warp_sum = warp_reduce_sum(local_sum * rescale);
     float warp_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = local_acc[d] * rescale;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
 
     // ---- 跨 Warp 归约（共享内存）----
     __shared__ float s_warp_max[NUM_WARPS];
@@ -295,46 +295,47 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
     }
     __syncthreads();
 
-    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
-        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
 // Launch function: Q4_0 融合 GQA Decode
 // =========================================================================
 
-void launch_fused_flash_attention_gqa_decode_q4_0(
-    const float* Q, const void* q_K, const void* q_V, float* O,
-    int kv_len, int num_heads, int num_kv_heads, int head_dim,
-    size_t q_row_size, const float* mask_row,
-    cudaStream_t stream) {
-
+void launch_fused_flash_attention_gqa_decode_q4_0(const float* Q, const void* q_K, const void* q_V,
+                                                  float* O, int kv_len, int num_heads,
+                                                  int num_kv_heads, int head_dim, size_t q_row_size,
+                                                  const float* mask_row, cudaStream_t stream) {
     int blocks = num_heads;
 
-#define LAUNCH_FUSED_Q4_0_DECODE(HD, NW)                                        \
-    fused_attn_q4_0_decode_kernel<HD, NW>                                       \
-        <<<blocks, 128, 0, stream>>>(Q, static_cast<const uint8_t*>(q_K),       \
-                                     static_cast<const uint8_t*>(q_V), O,       \
-                                     kv_len, num_heads, num_kv_heads,           \
-                                     q_row_size, mask_row)
+#define LAUNCH_FUSED_Q4_0_DECODE(HD, NW)                                                  \
+    fused_attn_q4_0_decode_kernel<HD, NW><<<blocks, 128, 0, stream>>>(                    \
+        Q, static_cast<const uint8_t*>(q_K), static_cast<const uint8_t*>(q_V), O, kv_len, \
+        num_heads, num_kv_heads, q_row_size, mask_row)
 
-#define LAUNCH_FUSED_Q4_0_DECODE_LARGE(HD)                                       \
-    fused_attn_q4_0_decode_large_online_kernel<HD, 4>                            \
-        <<<blocks, 128, 0, stream>>>(Q, static_cast<const uint8_t*>(q_K),        \
-                                     static_cast<const uint8_t*>(q_V), O,        \
-                                     kv_len, num_heads, num_kv_heads,            \
-                                     q_row_size, mask_row)
+#define LAUNCH_FUSED_Q4_0_DECODE_LARGE(HD)                                                \
+    fused_attn_q4_0_decode_large_online_kernel<HD, 4><<<blocks, 128, 0, stream>>>(        \
+        Q, static_cast<const uint8_t*>(q_K), static_cast<const uint8_t*>(q_V), O, kv_len, \
+        num_heads, num_kv_heads, q_row_size, mask_row)
 
     switch (head_dim) {
-    case 64:  LAUNCH_FUSED_Q4_0_DECODE(64, 4);  break;
-    case 96:  LAUNCH_FUSED_Q4_0_DECODE(96, 4);  break;
-    case 128: LAUNCH_FUSED_Q4_0_DECODE(128, 4); break;
-    case 256: LAUNCH_FUSED_Q4_0_DECODE_LARGE(256); break;
-    case 512: LAUNCH_FUSED_Q4_0_DECODE_LARGE(512); break;
+    case 64:
+        LAUNCH_FUSED_Q4_0_DECODE(64, 4);
+        break;
+    case 96:
+        LAUNCH_FUSED_Q4_0_DECODE(96, 4);
+        break;
+    case 128:
+        LAUNCH_FUSED_Q4_0_DECODE(128, 4);
+        break;
+    case 256:
+        LAUNCH_FUSED_Q4_0_DECODE_LARGE(256);
+        break;
+    case 512:
+        LAUNCH_FUSED_Q4_0_DECODE_LARGE(512);
+        break;
     default:
-        fprintf(stderr,
-                "[ERROR] fused_attn_q4_0_decode: unsupported head_dim=%d\n",
-                head_dim);
+        fprintf(stderr, "[ERROR] fused_attn_q4_0_decode: unsupported head_dim=%d\n", head_dim);
         break;
     }
 #undef LAUNCH_FUSED_Q4_0_DECODE
@@ -347,17 +348,15 @@ void launch_fused_flash_attention_gqa_decode_q4_0(
 // =========================================================================
 
 template <int HEAD_DIM, int NUM_WARPS>
-__global__ void fused_attn_f16_decode_kernel(
-    const float* __restrict__ Q,
-    const uint8_t* __restrict__ q_K,
-    const uint8_t* __restrict__ q_V,
-    float* __restrict__ O,
-    int kv_len, int num_heads, int num_kv_heads,
-    size_t q_row_size,
-    const float* __restrict__ mask_row) {
-
+__global__ void fused_attn_f16_decode_kernel(const float* __restrict__ Q,
+                                             const uint8_t* __restrict__ q_K,
+                                             const uint8_t* __restrict__ q_V, float* __restrict__ O,
+                                             int kv_len, int num_heads, int num_kv_heads,
+                                             size_t q_row_size,
+                                             const float* __restrict__ mask_row) {
     int h = blockIdx.x;
-    if (h >= num_heads) return;
+    if (h >= num_heads)
+        return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
@@ -382,15 +381,17 @@ __global__ void fused_attn_f16_decode_kernel(
     float local_sum = 0.0f;
     float local_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
 
     for (int j = tid; j < kv_len; j += block_size) {
-        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
 
-        const __half* k_row = reinterpret_cast<const __half*>(
-            q_K + (size_t)j * q_row_size + head_byte_offset);
-        const __half* v_row = reinterpret_cast<const __half*>(
-            q_V + (size_t)j * q_row_size + head_byte_offset);
+        const __half* k_row =
+            reinterpret_cast<const __half*>(q_K + (size_t)j * q_row_size + head_byte_offset);
+        const __half* v_row =
+            reinterpret_cast<const __half*>(q_V + (size_t)j * q_row_size + head_byte_offset);
 
         // Q·K 点积（F16 在线反量化）
         float dot = 0.0f;
@@ -399,7 +400,8 @@ __global__ void fused_attn_f16_decode_kernel(
             dot += s_q[d] * __half2float(k_row[d]);
         }
         dot *= scale;
-        if (mask_row != nullptr) dot += mask_row[j];
+        if (mask_row != nullptr)
+            dot += mask_row[j];
 
         // 在线 softmax
         float new_max = fmaxf(local_max, dot);
@@ -422,9 +424,11 @@ __global__ void fused_attn_f16_decode_kernel(
     float warp_sum = warp_reduce_sum(local_sum * rescale);
     float warp_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = local_acc[d] * rescale;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
 
     // ---- 跨 Warp 归约 ----
     __shared__ float s_warp_max[NUM_WARPS];
@@ -440,8 +444,7 @@ __global__ void fused_attn_f16_decode_kernel(
     }
     __syncthreads();
 
-    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
-        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
@@ -451,16 +454,12 @@ __global__ void fused_attn_f16_decode_kernel(
 
 template <int HEAD_DIM, int NUM_WARPS>
 __global__ void fused_attn_f16_decode_large_online_kernel(
-    const float* __restrict__ Q,
-    const uint8_t* __restrict__ q_K,
-    const uint8_t* __restrict__ q_V,
-    float* __restrict__ O,
-    int kv_len, int num_heads, int num_kv_heads,
-    size_t q_row_size,
+    const float* __restrict__ Q, const uint8_t* __restrict__ q_K, const uint8_t* __restrict__ q_V,
+    float* __restrict__ O, int kv_len, int num_heads, int num_kv_heads, size_t q_row_size,
     const float* __restrict__ mask_row) {
-
     int h = blockIdx.x;
-    if (h >= num_heads) return;
+    if (h >= num_heads)
+        return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
@@ -484,16 +483,18 @@ __global__ void fused_attn_f16_decode_large_online_kernel(
     float local_sum = 0.0f;
     float local_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
 
     // 单遍：在线 softmax + 累加加权 V
     for (int j = tid; j < kv_len; j += block_size) {
-        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
 
-        const __half* k_row = reinterpret_cast<const __half*>(
-            q_K + (size_t)j * q_row_size + head_byte_offset);
-        const __half* v_row = reinterpret_cast<const __half*>(
-            q_V + (size_t)j * q_row_size + head_byte_offset);
+        const __half* k_row =
+            reinterpret_cast<const __half*>(q_K + (size_t)j * q_row_size + head_byte_offset);
+        const __half* v_row =
+            reinterpret_cast<const __half*>(q_V + (size_t)j * q_row_size + head_byte_offset);
 
         // Q·K 点积（F16 在线反量化）
         float dot = 0.0f;
@@ -502,7 +503,8 @@ __global__ void fused_attn_f16_decode_large_online_kernel(
             dot += s_q[d] * __half2float(k_row[d]);
         }
         dot *= scale;
-        if (mask_row != nullptr) dot += mask_row[j];
+        if (mask_row != nullptr)
+            dot += mask_row[j];
 
         // 在线 softmax
         float new_max = fmaxf(local_max, dot);
@@ -525,9 +527,11 @@ __global__ void fused_attn_f16_decode_large_online_kernel(
     float warp_sum = warp_reduce_sum(local_sum * rescale);
     float warp_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = local_acc[d] * rescale;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
 
     // ---- 跨 Warp 归约 ----
     __shared__ float s_warp_max[NUM_WARPS];
@@ -543,46 +547,47 @@ __global__ void fused_attn_f16_decode_large_online_kernel(
     }
     __syncthreads();
 
-    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
-        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
 // Launch function: F16 融合 GQA Decode
 // =========================================================================
 
-void launch_fused_flash_attention_gqa_decode_f16(
-    const float* Q, const void* q_K, const void* q_V, float* O,
-    int kv_len, int num_heads, int num_kv_heads, int head_dim,
-    size_t q_row_size, const float* mask_row,
-    cudaStream_t stream) {
-
+void launch_fused_flash_attention_gqa_decode_f16(const float* Q, const void* q_K, const void* q_V,
+                                                 float* O, int kv_len, int num_heads,
+                                                 int num_kv_heads, int head_dim, size_t q_row_size,
+                                                 const float* mask_row, cudaStream_t stream) {
     int blocks = num_heads;
 
-#define LAUNCH_FUSED_F16_DECODE(HD, NW)                                         \
-    fused_attn_f16_decode_kernel<HD, NW>                                        \
-        <<<blocks, 128, 0, stream>>>(Q, static_cast<const uint8_t*>(q_K),       \
-                                     static_cast<const uint8_t*>(q_V), O,       \
-                                     kv_len, num_heads, num_kv_heads,           \
-                                     q_row_size, mask_row)
+#define LAUNCH_FUSED_F16_DECODE(HD, NW)                                                   \
+    fused_attn_f16_decode_kernel<HD, NW><<<blocks, 128, 0, stream>>>(                     \
+        Q, static_cast<const uint8_t*>(q_K), static_cast<const uint8_t*>(q_V), O, kv_len, \
+        num_heads, num_kv_heads, q_row_size, mask_row)
 
-#define LAUNCH_FUSED_F16_DECODE_LARGE(HD)                                        \
-    fused_attn_f16_decode_large_online_kernel<HD, 4>                             \
-        <<<blocks, 128, 0, stream>>>(Q, static_cast<const uint8_t*>(q_K),        \
-                                     static_cast<const uint8_t*>(q_V), O,        \
-                                     kv_len, num_heads, num_kv_heads,            \
-                                     q_row_size, mask_row)
+#define LAUNCH_FUSED_F16_DECODE_LARGE(HD)                                                 \
+    fused_attn_f16_decode_large_online_kernel<HD, 4><<<blocks, 128, 0, stream>>>(         \
+        Q, static_cast<const uint8_t*>(q_K), static_cast<const uint8_t*>(q_V), O, kv_len, \
+        num_heads, num_kv_heads, q_row_size, mask_row)
 
     switch (head_dim) {
-    case 64:  LAUNCH_FUSED_F16_DECODE(64, 4);  break;
-    case 96:  LAUNCH_FUSED_F16_DECODE(96, 4);  break;
-    case 128: LAUNCH_FUSED_F16_DECODE(128, 4); break;
-    case 256: LAUNCH_FUSED_F16_DECODE_LARGE(256); break;
-    case 512: LAUNCH_FUSED_F16_DECODE_LARGE(512); break;
+    case 64:
+        LAUNCH_FUSED_F16_DECODE(64, 4);
+        break;
+    case 96:
+        LAUNCH_FUSED_F16_DECODE(96, 4);
+        break;
+    case 128:
+        LAUNCH_FUSED_F16_DECODE(128, 4);
+        break;
+    case 256:
+        LAUNCH_FUSED_F16_DECODE_LARGE(256);
+        break;
+    case 512:
+        LAUNCH_FUSED_F16_DECODE_LARGE(512);
+        break;
     default:
-        fprintf(stderr,
-                "[ERROR] fused_attn_f16_decode: unsupported head_dim=%d\n",
-                head_dim);
+        fprintf(stderr, "[ERROR] fused_attn_f16_decode: unsupported head_dim=%d\n", head_dim);
         break;
     }
 #undef LAUNCH_FUSED_F16_DECODE
@@ -595,17 +600,15 @@ void launch_fused_flash_attention_gqa_decode_f16(
 // =========================================================================
 
 template <int HEAD_DIM, int NUM_WARPS>
-__global__ void fused_attn_q8_0_decode_kernel(
-    const float* __restrict__ Q,
-    const uint8_t* __restrict__ q_K,
-    const uint8_t* __restrict__ q_V,
-    float* __restrict__ O,
-    int kv_len, int num_heads, int num_kv_heads,
-    size_t q_row_size,
-    const float* __restrict__ mask_row) {
-
+__global__ void fused_attn_q8_0_decode_kernel(const float* __restrict__ Q,
+                                              const uint8_t* __restrict__ q_K,
+                                              const uint8_t* __restrict__ q_V,
+                                              float* __restrict__ O, int kv_len, int num_heads,
+                                              int num_kv_heads, size_t q_row_size,
+                                              const float* __restrict__ mask_row) {
     int h = blockIdx.x;
-    if (h >= num_heads) return;
+    if (h >= num_heads)
+        return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
@@ -633,10 +636,12 @@ __global__ void fused_attn_q8_0_decode_kernel(
     float local_sum = 0.0f;
     float local_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
 
     for (int j = tid; j < kv_len; j += block_size) {
-        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
 
         const uint8_t* k_row = q_K + (size_t)j * q_row_size + head_byte_offset;
         const uint8_t* v_row = q_V + (size_t)j * q_row_size + head_byte_offset;
@@ -657,7 +662,8 @@ __global__ void fused_attn_q8_0_decode_kernel(
             }
         }
         dot *= scale;
-        if (mask_row != nullptr) dot += mask_row[j];
+        if (mask_row != nullptr)
+            dot += mask_row[j];
 
         // 在线 softmax
         float new_max = fmaxf(local_max, dot);
@@ -690,9 +696,11 @@ __global__ void fused_attn_q8_0_decode_kernel(
     float warp_sum = warp_reduce_sum(local_sum * rescale);
     float warp_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = local_acc[d] * rescale;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
 
     // ---- 跨 Warp 归约 ----
     __shared__ float s_warp_max[NUM_WARPS];
@@ -708,8 +716,7 @@ __global__ void fused_attn_q8_0_decode_kernel(
     }
     __syncthreads();
 
-    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
-        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
@@ -719,16 +726,12 @@ __global__ void fused_attn_q8_0_decode_kernel(
 
 template <int HEAD_DIM, int NUM_WARPS>
 __global__ void fused_attn_q8_0_decode_large_online_kernel(
-    const float* __restrict__ Q,
-    const uint8_t* __restrict__ q_K,
-    const uint8_t* __restrict__ q_V,
-    float* __restrict__ O,
-    int kv_len, int num_heads, int num_kv_heads,
-    size_t q_row_size,
+    const float* __restrict__ Q, const uint8_t* __restrict__ q_K, const uint8_t* __restrict__ q_V,
+    float* __restrict__ O, int kv_len, int num_heads, int num_kv_heads, size_t q_row_size,
     const float* __restrict__ mask_row) {
-
     int h = blockIdx.x;
-    if (h >= num_heads) return;
+    if (h >= num_heads)
+        return;
 
     int kv_groups = num_heads / num_kv_heads;
     int kv_h = h / kv_groups;
@@ -756,11 +759,13 @@ __global__ void fused_attn_q8_0_decode_large_online_kernel(
     float local_sum = 0.0f;
     float local_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
 
     // 单遍：在线 softmax + 累加加权 V
     for (int j = tid; j < kv_len; j += block_size) {
-        if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
 
         const uint8_t* k_row = q_K + (size_t)j * q_row_size + head_byte_offset;
         const uint8_t* v_row = q_V + (size_t)j * q_row_size + head_byte_offset;
@@ -781,7 +786,8 @@ __global__ void fused_attn_q8_0_decode_large_online_kernel(
             }
         }
         dot *= scale;
-        if (mask_row != nullptr) dot += mask_row[j];
+        if (mask_row != nullptr)
+            dot += mask_row[j];
 
         // 在线 softmax
         float new_max = fmaxf(local_max, dot);
@@ -814,9 +820,11 @@ __global__ void fused_attn_q8_0_decode_large_online_kernel(
     float warp_sum = warp_reduce_sum(local_sum * rescale);
     float warp_acc[HEAD_DIM];
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = local_acc[d] * rescale;
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
 #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
 
     // ---- 跨 Warp 归约 ----
     __shared__ float s_warp_max[NUM_WARPS];
@@ -832,50 +840,218 @@ __global__ void fused_attn_q8_0_decode_large_online_kernel(
     }
     __syncthreads();
 
-    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
-        s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
 // =========================================================================
 // Launch function: Q8_0 融合 GQA Decode
 // =========================================================================
 
-void launch_fused_flash_attention_gqa_decode_q8_0(
-    const float* Q, const void* q_K, const void* q_V, float* O,
-    int kv_len, int num_heads, int num_kv_heads, int head_dim,
-    size_t q_row_size, const float* mask_row,
-    cudaStream_t stream) {
-
+void launch_fused_flash_attention_gqa_decode_q8_0(const float* Q, const void* q_K, const void* q_V,
+                                                  float* O, int kv_len, int num_heads,
+                                                  int num_kv_heads, int head_dim, size_t q_row_size,
+                                                  const float* mask_row, cudaStream_t stream) {
     int blocks = num_heads;
 
-#define LAUNCH_FUSED_Q8_0_DECODE(HD, NW)                                        \
-    fused_attn_q8_0_decode_kernel<HD, NW>                                       \
-        <<<blocks, 128, 0, stream>>>(Q, static_cast<const uint8_t*>(q_K),       \
-                                     static_cast<const uint8_t*>(q_V), O,       \
-                                     kv_len, num_heads, num_kv_heads,           \
-                                     q_row_size, mask_row)
+#define LAUNCH_FUSED_Q8_0_DECODE(HD, NW)                                                  \
+    fused_attn_q8_0_decode_kernel<HD, NW><<<blocks, 128, 0, stream>>>(                    \
+        Q, static_cast<const uint8_t*>(q_K), static_cast<const uint8_t*>(q_V), O, kv_len, \
+        num_heads, num_kv_heads, q_row_size, mask_row)
 
-#define LAUNCH_FUSED_Q8_0_DECODE_LARGE(HD)                                       \
-    fused_attn_q8_0_decode_large_online_kernel<HD, 4>                            \
-        <<<blocks, 128, 0, stream>>>(Q, static_cast<const uint8_t*>(q_K),        \
-                                     static_cast<const uint8_t*>(q_V), O,        \
-                                     kv_len, num_heads, num_kv_heads,            \
-                                     q_row_size, mask_row)
+#define LAUNCH_FUSED_Q8_0_DECODE_LARGE(HD)                                                \
+    fused_attn_q8_0_decode_large_online_kernel<HD, 4><<<blocks, 128, 0, stream>>>(        \
+        Q, static_cast<const uint8_t*>(q_K), static_cast<const uint8_t*>(q_V), O, kv_len, \
+        num_heads, num_kv_heads, q_row_size, mask_row)
 
     switch (head_dim) {
-    case 64:  LAUNCH_FUSED_Q8_0_DECODE(64, 4);  break;
-    case 96:  LAUNCH_FUSED_Q8_0_DECODE(96, 4);  break;
-    case 128: LAUNCH_FUSED_Q8_0_DECODE(128, 4); break;
-    case 256: LAUNCH_FUSED_Q8_0_DECODE_LARGE(256); break;
-    case 512: LAUNCH_FUSED_Q8_0_DECODE_LARGE(512); break;
+    case 64:
+        LAUNCH_FUSED_Q8_0_DECODE(64, 4);
+        break;
+    case 96:
+        LAUNCH_FUSED_Q8_0_DECODE(96, 4);
+        break;
+    case 128:
+        LAUNCH_FUSED_Q8_0_DECODE(128, 4);
+        break;
+    case 256:
+        LAUNCH_FUSED_Q8_0_DECODE_LARGE(256);
+        break;
+    case 512:
+        LAUNCH_FUSED_Q8_0_DECODE_LARGE(512);
+        break;
     default:
-        fprintf(stderr,
-                "[ERROR] fused_attn_q8_0_decode: unsupported head_dim=%d\n",
-                head_dim);
+        fprintf(stderr, "[ERROR] fused_attn_q8_0_decode: unsupported head_dim=%d\n", head_dim);
         break;
     }
 #undef LAUNCH_FUSED_Q8_0_DECODE
 #undef LAUNCH_FUSED_Q8_0_DECODE_LARGE
+}
+
+// =========================================================================
+// FP8 融合 GQA Decode Kernel（E4M3 / E5M2）
+// 每元素 1 字节、无 block/scale；kernel 内按 Fp8Fmt 在线反量化。
+// 单遍在线 softmax（与 q8_0 large 版本同构），支持 HEAD_DIM 64..512。
+// =========================================================================
+
+template <typename Fp8Fmt, int HEAD_DIM, int NUM_WARPS>
+__global__ void fused_attn_fp8_decode_kernel(const float* __restrict__ Q,
+                                             const uint8_t* __restrict__ q_K,
+                                             const uint8_t* __restrict__ q_V, float* __restrict__ O,
+                                             int kv_len, int num_heads, int num_kv_heads,
+                                             size_t q_row_size, const float* __restrict__ mask_row,
+                                             const float* __restrict__ k_scales,
+                                             const float* __restrict__ v_scales) {
+    int h = blockIdx.x;
+    if (h >= num_heads)
+        return;
+
+    int kv_groups = num_heads / num_kv_heads;
+    int kv_h = h / kv_groups;
+
+    int lane = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    // 1 byte/element, contiguous per kv head: offset = kv_h * HEAD_DIM
+    const size_t head_byte_offset = (size_t)kv_h * HEAD_DIM;
+
+    __shared__ float s_q[HEAD_DIM];
+    for (int d = tid; d < HEAD_DIM; d += block_size) {
+        s_q[d] = Q[h * HEAD_DIM + d];
+    }
+    __syncthreads();
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+
+    float local_max = -1e30f;
+    float local_sum = 0.0f;
+    float local_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
+
+    for (int j = tid; j < kv_len; j += block_size) {
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
+
+        const uint8_t* k_row = q_K + (size_t)j * q_row_size + head_byte_offset;
+        const uint8_t* v_row = q_V + (size_t)j * q_row_size + head_byte_offset;
+
+        float k_scale = (k_scales != nullptr) ? k_scales[j * num_kv_heads + kv_h] : 1.0f;
+        float v_scale = (v_scales != nullptr) ? v_scales[j * num_kv_heads + kv_h] : 1.0f;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            dot += s_q[d] * (fp8_load<Fp8Fmt>(k_row, d) * k_scale);
+        }
+        dot *= scale;
+        if (mask_row != nullptr)
+            dot += mask_row[j];
+
+        float new_max = fmaxf(local_max, dot);
+        float correction = expf(local_max - new_max);
+        float weight = expf(dot - new_max);
+        local_sum = local_sum * correction + weight;
+
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            local_acc[d] =
+                local_acc[d] * correction + weight * (fp8_load<Fp8Fmt>(v_row, d) * v_scale);
+        }
+        local_max = new_max;
+    }
+
+    float warp_max = warp_reduce_max(local_max);
+    float rescale = expf(local_max - warp_max);
+    float warp_sum = warp_reduce_sum(local_sum * rescale);
+    float warp_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+
+    __shared__ float s_warp_max[NUM_WARPS];
+    __shared__ float s_warp_sum[NUM_WARPS];
+    __shared__ float s_warp_acc[NUM_WARPS * HEAD_DIM];
+
+    if (lane == 0) {
+        s_warp_max[warp_id] = warp_max;
+        s_warp_sum[warp_id] = warp_sum;
+    }
+    for (int d = lane; d < HEAD_DIM; d += 32) {
+        s_warp_acc[warp_id * HEAD_DIM + d] = warp_acc[d];
+    }
+    __syncthreads();
+
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+}
+
+#define LAUNCH_FUSED_FP8_DECODE(FMT, HD)                                                  \
+    fused_attn_fp8_decode_kernel<FMT, HD, 4><<<blocks, 128, 0, stream>>>(                 \
+        Q, static_cast<const uint8_t*>(q_K), static_cast<const uint8_t*>(q_V), O, kv_len, \
+        num_heads, num_kv_heads, q_row_size, mask_row, k_scales, v_scales)
+
+void launch_fused_flash_attention_gqa_decode_fp8_e4m3(const float* Q, const void* q_K,
+                                                      const void* q_V, float* O, int kv_len,
+                                                      int num_heads, int num_kv_heads, int head_dim,
+                                                      size_t q_row_size, const float* mask_row,
+                                                      const float* k_scales, const float* v_scales,
+                                                      cudaStream_t stream) {
+    int blocks = num_heads;
+    switch (head_dim) {
+    case 64:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E4M3, 64);
+        break;
+    case 96:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E4M3, 96);
+        break;
+    case 128:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E4M3, 128);
+        break;
+    case 256:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E4M3, 256);
+        break;
+    case 512:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E4M3, 512);
+        break;
+    default:
+        fprintf(stderr, "[ERROR] fused_attn_fp8_e4m3_decode: unsupported head_dim=%d\n", head_dim);
+        break;
+    }
+}
+
+void launch_fused_flash_attention_gqa_decode_fp8_e5m2(const float* Q, const void* q_K,
+                                                      const void* q_V, float* O, int kv_len,
+                                                      int num_heads, int num_kv_heads, int head_dim,
+                                                      size_t q_row_size, const float* mask_row,
+                                                      const float* k_scales, const float* v_scales,
+                                                      cudaStream_t stream) {
+    int blocks = num_heads;
+    switch (head_dim) {
+    case 64:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E5M2, 64);
+        break;
+    case 96:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E5M2, 96);
+        break;
+    case 128:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E5M2, 128);
+        break;
+    case 256:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E5M2, 256);
+        break;
+    case 512:
+        LAUNCH_FUSED_FP8_DECODE(Fp8E5M2, 512);
+        break;
+    default:
+        fprintf(stderr, "[ERROR] fused_attn_fp8_e5m2_decode: unsupported head_dim=%d\n", head_dim);
+        break;
+    }
+#undef LAUNCH_FUSED_FP8_DECODE
 }
 
 }  // namespace cuda

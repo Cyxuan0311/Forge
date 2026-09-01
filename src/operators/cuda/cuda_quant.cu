@@ -1,5 +1,8 @@
+#include <type_traits>
+
 #include "cuda_common.h"
 #include "forge/cuda_kernels.h"
+#include "forge/fp8_utils.h"
 
 namespace forge {
 
@@ -171,13 +174,13 @@ void launch_dequant_q4_0_matrix(const void* q_data, float* out, int N, int K, cu
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     dequant_q4_0_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
-                                                                out, N, K);
+                                                               out, N, K);
 }
 
 // ---- Q4_0 Matrix Dequantization to FP16 ----
 
 __global__ void dequant_q4_0_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
-                                                 __half* __restrict__ out, int N, int K) {
+                                                __half* __restrict__ out, int N, int K) {
     const int Q4_0_BLOCK_SIZE = 18;
     const int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
@@ -320,7 +323,7 @@ void launch_dequant_q4_k_matrix(const void* q_data, float* out, int N, int K, cu
 // ---- Q4_K → FP16 Matrix Dequantization (for cached output_proj) ----
 
 __global__ void dequant_q4_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
-                                                 __half* __restrict__ out, int N, int K) {
+                                                __half* __restrict__ out, int N, int K) {
     const int QK_K = 256;
     const int Q4_K_BLOCK_SIZE = 144;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -374,7 +377,7 @@ __global__ void dequant_q4_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_da
 }
 
 void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K,
-                                      cudaStream_t stream) {
+                                     cudaStream_t stream) {
     int total = N * K;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
@@ -513,13 +516,13 @@ void launch_dequant_q6_k_matrix(const void* q_data, float* out, int N, int K, cu
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     dequant_q6_k_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
-                                                              out, N, K);
+                                                               out, N, K);
 }
 
 // ---- Q6_K → FP16 Matrix Dequantization (for cached output_proj) ----
 
 __global__ void dequant_q6_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
-                                                 __half* __restrict__ out, int N, int K) {
+                                                __half* __restrict__ out, int N, int K) {
     const int QK_K = 256;
     const int Q6_K_BLOCK_SIZE = 210;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -575,7 +578,7 @@ __global__ void dequant_q6_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_da
 }
 
 void launch_dequant_q6_k_matrix_fp16(const void* q_data, void* out, int N, int K,
-                                      cudaStream_t stream) {
+                                     cudaStream_t stream) {
     int total = N * K;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
@@ -587,7 +590,7 @@ void launch_dequant_q6_k_matrix_fp16(const void* q_data, void* out, int N, int K
 // Block layout: scales[16] + qs[64] + d(f16,2B) + dmin(f16,2B) = 84 bytes
 
 __global__ void dequant_q2_k_matrix_kernel(const uint8_t* __restrict__ q_data,
-                                          float* __restrict__ out, int N, int K) {
+                                           float* __restrict__ out, int N, int K) {
     const int QK_K = 256;
     const int Q2_K_BLOCK_SIZE = 84;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -636,14 +639,14 @@ void launch_dequant_q2_k_matrix(const void* q_data, float* out, int N, int K, cu
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     dequant_q2_k_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
-                                                              out, N, K);
+                                                               out, N, K);
 }
 
 // ---- Q3_K Matrix Dequantization ----
 // Block layout: hmask[32] + qs[64] + scales[12] + d(f16,2B) = 110 bytes
 
 __global__ void dequant_q3_k_matrix_kernel(const uint8_t* __restrict__ q_data,
-                                          float* __restrict__ out, int N, int K) {
+                                           float* __restrict__ out, int N, int K) {
     const int QK_K = 256;
     const int Q3_K_BLOCK_SIZE = 110;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
@@ -696,7 +699,7 @@ void launch_dequant_q3_k_matrix(const void* q_data, float* out, int N, int K, cu
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     dequant_q3_k_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
-                                                              out, N, K);
+                                                               out, N, K);
 }
 
 // ---- Q5_0 Matrix Dequantization ----
@@ -742,13 +745,12 @@ __global__ void dequant_q5_0_matrix_kernel(const uint8_t* __restrict__ q_data,
     out[idx] = static_cast<float>(q_val) * d;
 }
 
-void launch_dequant_q5_0_matrix(const void* q_data, float* out, int N, int K,
-                                cudaStream_t stream) {
+void launch_dequant_q5_0_matrix(const void* q_data, float* out, int N, int K, cudaStream_t stream) {
     int total = N * K;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    dequant_q5_0_matrix_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const uint8_t*>(q_data), out, N, K);
+    dequant_q5_0_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
+                                                               out, N, K);
 }
 
 // ---- Q5_1 Matrix Dequantization ----
@@ -796,13 +798,12 @@ __global__ void dequant_q5_1_matrix_kernel(const uint8_t* __restrict__ q_data,
     out[idx] = static_cast<float>(q_val) * d + m;
 }
 
-void launch_dequant_q5_1_matrix(const void* q_data, float* out, int N, int K,
-                                cudaStream_t stream) {
+void launch_dequant_q5_1_matrix(const void* q_data, float* out, int N, int K, cudaStream_t stream) {
     int total = N * K;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    dequant_q5_1_matrix_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const uint8_t*>(q_data), out, N, K);
+    dequant_q5_1_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
+                                                               out, N, K);
 }
 
 // ---- Q4_0 Quantization ----
@@ -832,9 +833,13 @@ __global__ void quantize_q4_0_kernel(const float* data, uint8_t* q_data, int n) 
 
     const int Q4_0_BLOCK_SIZE = 18;
     uint8_t* block_ptr = q_data + block_idx * Q4_0_BLOCK_SIZE;
-    __half scale_half = __float2half(d);
-    memcpy(block_ptr, &scale_half, sizeof(__half));
-    uint8_t* qs = block_ptr + sizeof(__half);
+    {
+        __half scale_half = __float2half(d);
+        uint16_t s;
+        memcpy(&s, &scale_half, sizeof(uint16_t));
+        *reinterpret_cast<uint16_t*>(block_ptr) = s;
+    }
+    uint8_t* qs = block_ptr + 2;
 
     for (int i = 0; i < 16; ++i) {
         int idx0 = start + i;
@@ -885,9 +890,13 @@ __global__ void quantize_q4_0_matrix_kernel(const float* __restrict__ data,
         float id = 1.0f / d;
 
         uint8_t* block_ptr = row_q + bi * Q4_0_BLOCK_SIZE;
-        __half scale_half = __float2half(d);
-        memcpy(block_ptr, &scale_half, sizeof(__half));
-        uint8_t* qs = block_ptr + sizeof(__half);
+        {
+            __half scale_half = __float2half(d);
+            uint16_t s;
+            memcpy(&s, &scale_half, sizeof(uint16_t));
+            *reinterpret_cast<uint16_t*>(block_ptr) = s;
+        }
+        uint8_t* qs = block_ptr + 2;
 
         for (int i = 0; i < 16; ++i) {
             int idx0 = start + i;
@@ -1073,7 +1082,7 @@ void launch_cublas_sgemm(const float* A, const float* B, float* C, int M, int K,
 // C: [M, N] FP32. cublasGemmEx requires Atype == Btype, so A must be converted;
 // accumulation still happens in FP32 (CUBLAS_COMPUTE_32F).
 void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M, int K, int N,
-                                   bool transB, cudaStream_t stream) {
+                                  bool transB, cudaStream_t stream) {
 #if FORGE_USE_CUBLAS
     cublasHandle_t handle = get_cublas_handle(stream);
 
@@ -1095,12 +1104,18 @@ void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M
 
     cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    cublasGemmEx(handle, opB, CUBLAS_OP_N, N, M, K, &alpha,
-                 B, CUDA_R_16F, transB ? K : N,
-                 a_fp16, CUDA_R_16F, K, &beta, C, CUDA_R_32F, N,
-                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cublasGemmEx(handle, opB, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16F, transB ? K : N, a_fp16,
+                 CUDA_R_16F, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 #else
-    (void)A; (void)B; (void)C; (void)M; (void)K; (void)N; (void)transB; (void)stream;
+    (void)A;
+    (void)B;
+    (void)C;
+    (void)M;
+    (void)K;
+    (void)N;
+    (void)transB;
+    (void)stream;
 #endif
 }
 
@@ -1127,8 +1142,175 @@ void launch_quantize_f16_matrix(const float* data, void* q_data, int num_rows, i
     int total = num_rows * row_len;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    quantize_f16_matrix_kernel<<<blocks, threads, 0, stream>>>(
+    quantize_f16_matrix_kernel<<<blocks, threads, 0, stream>>>(data, static_cast<uint8_t*>(q_data),
+                                                               num_rows, row_len);
+}
+
+// ---- FP8 Quantize (FP32 → FP8, per-element, 1 byte/element) ----
+
+__global__ void quantize_fp8_e4m3_matrix_kernel(const float* __restrict__ data,
+                                                uint8_t* __restrict__ q_data, int num_rows,
+                                                int row_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * row_len;
+    if (idx >= total)
+        return;
+    q_data[idx] = fp32_to_fp8_e4m3(data[idx]);
+}
+
+__global__ void quantize_fp8_e5m2_matrix_kernel(const float* __restrict__ data,
+                                                uint8_t* __restrict__ q_data, int num_rows,
+                                                int row_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * row_len;
+    if (idx >= total)
+        return;
+    q_data[idx] = fp32_to_fp8_e5m2(data[idx]);
+}
+
+void launch_quantize_fp8_e4m3_matrix(const float* data, void* q_data, int num_rows, int row_len,
+                                     cudaStream_t stream) {
+    int total = num_rows * row_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    quantize_fp8_e4m3_matrix_kernel<<<blocks, threads, 0, stream>>>(
         data, static_cast<uint8_t*>(q_data), num_rows, row_len);
+}
+
+void launch_quantize_fp8_e5m2_matrix(const float* data, void* q_data, int num_rows, int row_len,
+                                     cudaStream_t stream) {
+    int total = num_rows * row_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    quantize_fp8_e5m2_matrix_kernel<<<blocks, threads, 0, stream>>>(
+        data, static_cast<uint8_t*>(q_data), num_rows, row_len);
+}
+
+// ---- FP8 Dequantize (FP8 → FP32) ----
+__global__ void dequant_fp8_e4m3_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                               float* __restrict__ out, int num_rows, int row_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * row_len;
+    if (idx >= total)
+        return;
+    out[idx] = fp8_e4m3_to_fp32(q_data[idx]);
+}
+
+__global__ void dequant_fp8_e5m2_matrix_kernel(const uint8_t* __restrict__ q_data,
+                                               float* __restrict__ out, int num_rows, int row_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * row_len;
+    if (idx >= total)
+        return;
+    out[idx] = fp8_e5m2_to_fp32(q_data[idx]);
+}
+
+void launch_dequant_fp8_e4m3_matrix(const void* q_data, float* out, int num_rows, int row_len,
+                                    cudaStream_t stream) {
+    int total = num_rows * row_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_fp8_e4m3_matrix_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), out, num_rows, row_len);
+}
+
+void launch_dequant_fp8_e5m2_matrix(const void* q_data, float* out, int num_rows, int row_len,
+                                    cudaStream_t stream) {
+    int total = num_rows * row_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_fp8_e5m2_matrix_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), out, num_rows, row_len);
+}
+
+// ---- FP8 Scaled Quantize (FP32 → FP8, per-(row, kv_head) amax scale) ----
+// Each (token row, kv head) is normalized by its own amax so the E4M3/E5M2
+// mantissa covers the head's full dynamic range. Layout:
+//   data/q_data: [num_rows, num_kv_heads * head_dim] head-major
+//   scales:      [num_rows * num_kv_heads] float
+
+template <typename Fp8Fmt>
+__global__ void quantize_fp8_scaled_kernel(const float* __restrict__ data,
+                                           uint8_t* __restrict__ q_data, float* __restrict__ scales,
+                                           int num_kv_heads, int head_dim) {
+    int nh = blockIdx.x;  // j * num_kv_heads + h
+    int base = nh * head_dim;
+
+    float amax = 0.0f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        amax = fmaxf(amax, fabsf(data[base + d]));
+
+    __shared__ float sbuf[256];
+    sbuf[threadIdx.x] = amax;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sbuf[threadIdx.x] = fmaxf(sbuf[threadIdx.x], sbuf[threadIdx.x + off]);
+        __syncthreads();
+    }
+    float amax_total = sbuf[0];
+    // E4M3 max normal = 240, E5M2 max normal = 57344.
+    constexpr float FP8_MAX = (std::is_same<Fp8Fmt, Fp8E4M3>::value) ? 240.0f : 57344.0f;
+    float scale = (amax_total > 0.0f) ? (amax_total / FP8_MAX) : 1.0f;
+    if (threadIdx.x == 0)
+        scales[nh] = scale;
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        q_data[base + d] = fp8_store<Fp8Fmt>(data[base + d] / scale);
+    }
+}
+
+// ---- FP8 Scaled Dequantize (FP8 → FP32, applies per-(row, kv_head) scale) ----
+
+template <typename Fp8Fmt>
+__global__ void dequant_fp8_scaled_kernel(const uint8_t* __restrict__ q_data,
+                                          const float* __restrict__ scales, float* __restrict__ out,
+                                          int num_kv_heads, int head_dim, int kv_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = gridDim.x * blockDim.x;
+    if (idx >= total)
+        return;
+    int j = idx / kv_dim;
+    int h = (idx % kv_dim) / head_dim;
+    int nh = j * num_kv_heads + h;
+    out[idx] = fp8_load<Fp8Fmt>(q_data, idx) * scales[nh];
+}
+
+void launch_quantize_fp8_e4m3_scaled(const float* data, void* q_data, float* scales, int num_rows,
+                                     int num_kv_heads, int head_dim, cudaStream_t stream) {
+    int blocks = num_rows * num_kv_heads;
+    quantize_fp8_scaled_kernel<Fp8E4M3><<<blocks, 256, 0, stream>>>(
+        data, static_cast<uint8_t*>(q_data), scales, num_kv_heads, head_dim);
+}
+
+void launch_quantize_fp8_e5m2_scaled(const float* data, void* q_data, float* scales, int num_rows,
+                                     int num_kv_heads, int head_dim, cudaStream_t stream) {
+    int blocks = num_rows * num_kv_heads;
+    quantize_fp8_scaled_kernel<Fp8E5M2><<<blocks, 256, 0, stream>>>(
+        data, static_cast<uint8_t*>(q_data), scales, num_kv_heads, head_dim);
+}
+
+void launch_dequant_fp8_e4m3_scaled(const void* q_data, const float* scales, float* out,
+                                    int num_rows, int num_kv_heads, int head_dim,
+                                    cudaStream_t stream) {
+    int kv_dim = num_kv_heads * head_dim;
+    int total = num_rows * kv_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_fp8_scaled_kernel<Fp8E4M3><<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), scales, out, num_kv_heads, head_dim, kv_dim);
+}
+
+void launch_dequant_fp8_e5m2_scaled(const void* q_data, const float* scales, float* out,
+                                    int num_rows, int num_kv_heads, int head_dim,
+                                    cudaStream_t stream) {
+    int kv_dim = num_kv_heads * head_dim;
+    int total = num_rows * kv_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_fp8_scaled_kernel<Fp8E5M2><<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), scales, out, num_kv_heads, head_dim, kv_dim);
 }
 
 // ---- F16 Dequantize (F16 → FP32) ----
@@ -1148,8 +1330,8 @@ void launch_dequant_f16_matrix(const void* q_data, float* out, int num_rows, int
     int total = num_rows * row_len;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    dequant_f16_matrix_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const uint8_t*>(q_data), out, num_rows, row_len);
+    dequant_f16_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
+                                                              out, num_rows, row_len);
 }
 
 // ---- Q8_0 Quantize (FP32 → Q8_0) ----
@@ -1183,9 +1365,18 @@ __global__ void quantize_q8_0_matrix_kernel(const float* __restrict__ data,
         float id = 1.0f / d;
 
         uint8_t* block_ptr = row_q + bi * Q8_0_BLOCK_SIZE;
+        // Store the fp16 scale as a single 16-bit store. Writing it via memcpy
+        // or two byte-stores into this uint8_t* was observed to be clobbered by
+        // the subsequent aliased int8_t qs writes on some toolchains (the low
+        // byte was zeroed, producing a ~8%-off scale and logit cosine ~0.93).
+        // A 16-bit store is also symmetric with how dequantize/fused-attention
+        // read the scale back (uint16_t). block_ptr is 2-byte aligned (34B
+        // blocks), so the misaligned-store concern does not apply.
         __half d_half = __float2half(d);
-        memcpy(block_ptr, &d_half, sizeof(__half));
-        int8_t* qs = reinterpret_cast<int8_t*>(block_ptr + sizeof(__half));
+        uint16_t s;
+        memcpy(&s, &d_half, sizeof(uint16_t));
+        *reinterpret_cast<uint16_t*>(block_ptr) = s;
+        int8_t* qs = reinterpret_cast<int8_t*>(block_ptr + 2);
 
         for (int i = 0; i < BLOCK_ELEMS; ++i) {
             int idx = start + i;
@@ -1242,8 +1433,8 @@ void launch_dequant_q8_0_matrix(const void* q_data, float* out, int num_rows, in
     int total = num_rows * row_len;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    dequant_q8_0_matrix_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const uint8_t*>(q_data), out, num_rows, row_len);
+    dequant_q8_0_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
+                                                               out, num_rows, row_len);
 }
 
 // ---- Q4_K Quantize (FP32 → Q4_K) ----
@@ -1278,10 +1469,18 @@ __global__ void quantize_q4_k_matrix_kernel(const float* __restrict__ data,
         float id = 1.0f / d;
 
         uint8_t* block_ptr = row_q + bi * Q4_K_BLOCK_SIZE;
-        __half d_half = __float2half(d);
-        __half dmin_half = __float2half(0.0f);
-        memcpy(block_ptr, &d_half, sizeof(__half));
-        memcpy(block_ptr + 2, &dmin_half, sizeof(__half));
+        // Store fp16 d/dmin as 16-bit stores (see q8_0 kernel comment about
+        // memcpy/byte-store clobbering by subsequent aliased writes).
+        {
+            __half d_half = __float2half(d);
+            uint16_t sd;
+            memcpy(&sd, &d_half, sizeof(uint16_t));
+            *reinterpret_cast<uint16_t*>(block_ptr) = sd;
+            __half dmin_half = __float2half(0.0f);
+            uint16_t sdm;
+            memcpy(&sdm, &dmin_half, sizeof(uint16_t));
+            *reinterpret_cast<uint16_t*>(block_ptr + 2) = sdm;
+        }
 
         // Set all 6-bit scales to sc=1, m=0 → encoding: (m<<4)|sc = 0x01
         memset(block_ptr + 4, 0x01, 12);
@@ -1313,14 +1512,13 @@ void launch_quantize_q4_k_matrix(const float* data, void* q_data, int num_rows, 
 // =========================================================================
 
 static const uint8_t h_ksigns_iq2xs[128] = {
-      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
-    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
-    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
-     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
-    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
-     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
-     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
-    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+    0,   129, 130, 3,   132, 5,   6,   135, 136, 9,   10,  139, 12,  141, 142, 15,  144, 17,  18,
+    147, 20,  149, 150, 23,  24,  153, 154, 27,  156, 29,  30,  159, 160, 33,  34,  163, 36,  165,
+    166, 39,  40,  169, 170, 43,  172, 45,  46,  175, 48,  177, 178, 51,  180, 53,  54,  183, 184,
+    57,  58,  187, 60,  189, 190, 63,  192, 65,  66,  195, 68,  197, 198, 71,  72,  201, 202, 75,
+    204, 77,  78,  207, 80,  209, 210, 83,  212, 85,  86,  215, 216, 89,  90,  219, 92,  221, 222,
+    95,  96,  225, 226, 99,  228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111, 240, 113,
+    114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
 static const uint8_t h_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
@@ -1400,7 +1598,8 @@ __constant__ uint64_t c_iq2xxs_grid[256];
 static bool iq2_xxs_tables_uploaded = false;
 
 static void ensure_iq2_xxs_tables() {
-    if (iq2_xxs_tables_uploaded) return;
+    if (iq2_xxs_tables_uploaded)
+        return;
     cudaMemcpyToSymbol(c_ksigns_iq2xs, h_ksigns_iq2xs, sizeof(h_ksigns_iq2xs));
     cudaMemcpyToSymbol(c_kmask_iq2xs, h_kmask_iq2xs, sizeof(h_kmask_iq2xs));
     cudaMemcpyToSymbol(c_iq2xxs_grid, h_iq2xxs_grid, sizeof(h_iq2xxs_grid));
@@ -1410,14 +1609,15 @@ static void ensure_iq2_xxs_tables() {
 // IQ2_XXS matrix dequantization kernel
 // 32 threads per block, each block handles one 256-element block
 __global__ void dequant_iq2_xxs_matrix_kernel(const uint8_t* __restrict__ q_data,
-                                               float* __restrict__ out, int N, int K) {
+                                              float* __restrict__ out, int N, int K) {
     const int QK_K = 256;
     const int IQ2_XXS_BLOCK_SIZE = 66;
     int blocks_per_row = (K + QK_K - 1) / QK_K;
 
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total = (int64_t)N * K;
-    if (idx >= total) return;
+    if (idx >= total)
+        return;
 
     int row = idx / K;
     int col = idx % K;
@@ -1428,7 +1628,8 @@ __global__ void dequant_iq2_xxs_matrix_kernel(const uint8_t* __restrict__ q_data
     const uint8_t* row_ptr = q_data + (int64_t)row * blocks_per_row * IQ2_XXS_BLOCK_SIZE;
     const uint8_t* block_ptr = row_ptr + bi * IQ2_XXS_BLOCK_SIZE;
 
-    float d = __half2float(reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
+    float d = __half2float(
+        reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
     const uint16_t* qs = reinterpret_cast<const uint16_t*>(block_ptr + 2);
 
     int ib32 = col_in_block / 32;
@@ -1450,7 +1651,7 @@ __global__ void dequant_iq2_xxs_matrix_kernel(const uint8_t* __restrict__ q_data
 }
 
 void launch_dequant_iq2_xxs_matrix(const void* q_data, float* out, int N, int K,
-                                    cudaStream_t stream) {
+                                   cudaStream_t stream) {
     ensure_iq2_xxs_tables();
     int64_t total = (int64_t)N * K;
     int threads = 256;
@@ -1473,7 +1674,8 @@ __constant__ uint64_t c_iq2s_grid[1024];
 static bool iq2_s_tables_uploaded = false;
 
 static void ensure_iq2_s_tables() {
-    if (iq2_s_tables_uploaded) return;
+    if (iq2_s_tables_uploaded)
+        return;
     ensure_iq2_xxs_tables();  // uploads c_kmask_iq2xs
     cudaMemcpyToSymbol(c_iq2s_grid, forge::ops::iq2s_grid, sizeof(uint64_t) * 1024);
     iq2_s_tables_uploaded = true;
@@ -1523,8 +1725,7 @@ __global__ void dequant_iq2_s_matrix_kernel(const uint8_t* __restrict__ q_data,
     int grid_idx = qs_sub[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
     const uint8_t* grid = reinterpret_cast<const uint8_t*>(&c_iq2s_grid[grid_idx]);
 
-    out[idx] = db * static_cast<float>(grid[j]) *
-               (signs[l] & c_kmask_iq2xs[j] ? -1.f : 1.f);
+    out[idx] = db * static_cast<float>(grid[j]) * (signs[l] & c_kmask_iq2xs[j] ? -1.f : 1.f);
 }
 
 void launch_dequant_iq2_s_matrix(const void* q_data, float* out, int N, int K,
@@ -1549,7 +1750,8 @@ __constant__ uint64_t c_iq2xs_grid[512];
 static bool iq2_xs_tables_uploaded = false;
 
 void ensure_iq2_xs_tables() {
-    if (iq2_xs_tables_uploaded) return;
+    if (iq2_xs_tables_uploaded)
+        return;
     ensure_iq2_xxs_tables();  // uploads c_ksigns_iq2xs, c_kmask_iq2xs
     cudaMemcpyToSymbol(c_iq2xs_grid, forge::ops::iq2xs_grid, sizeof(uint64_t) * 512);
     iq2_xs_tables_uploaded = true;
@@ -1564,7 +1766,8 @@ __global__ void dequant_iq2_xs_matrix_kernel(const uint8_t* __restrict__ q_data,
 
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total = (int64_t)N * K;
-    if (idx >= total) return;
+    if (idx >= total)
+        return;
 
     int row = idx / K;
     int col = idx % K;
@@ -1578,23 +1781,21 @@ __global__ void dequant_iq2_xs_matrix_kernel(const uint8_t* __restrict__ q_data,
     float d = __half2float(
         reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
     const uint16_t* qs = reinterpret_cast<const uint16_t*>(block_ptr + 2);  // 32 uint16_t
-    const uint8_t* scales = block_ptr + 2 + 64;                              // 8 bytes
+    const uint8_t* scales = block_ptr + 2 + 64;                             // 8 bytes
 
-    int ib32 = col_in_block / 32;       // 0..7
-    int l = (col_in_block % 32) / 8;    // 0..3
-    int j = col_in_block % 8;           // 0..7
+    int ib32 = col_in_block / 32;     // 0..7
+    int l = (col_in_block % 32) / 8;  // 0..3
+    int j = col_in_block % 8;         // 0..7
 
     // l in {0,1} -> low nibble of scales[ib32]; l in {2,3} -> high nibble.
-    float db = (l / 2 == 0)
-                   ? d * (0.5f + (scales[ib32] & 0xF)) * 0.25f
-                   : d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+    float db = (l / 2 == 0) ? d * (0.5f + (scales[ib32] & 0xF)) * 0.25f
+                            : d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
 
     uint16_t q = qs[4 * ib32 + l];
     const uint8_t* grid = reinterpret_cast<const uint8_t*>(&c_iq2xs_grid[q & 511]);
     uint8_t signs = c_ksigns_iq2xs[q >> 9];
 
-    out[idx] = db * static_cast<float>(grid[j]) *
-               (signs & c_kmask_iq2xs[j] ? -1.f : 1.f);
+    out[idx] = db * static_cast<float>(grid[j]) * (signs & c_kmask_iq2xs[j] ? -1.f : 1.f);
 }
 
 void launch_dequant_iq2_xs_matrix(const void* q_data, float* out, int N, int K,
@@ -1620,7 +1821,8 @@ __constant__ uint32_t c_iq3s_grid[512];
 static bool iq3_s_tables_uploaded = false;
 
 void ensure_iq3_s_tables() {
-    if (iq3_s_tables_uploaded) return;
+    if (iq3_s_tables_uploaded)
+        return;
     ensure_iq2_xxs_tables();  // uploads c_ksigns_iq2xs, c_kmask_iq2xs
     cudaMemcpyToSymbol(c_iq3s_grid, forge::ops::iq3s_grid, sizeof(uint32_t) * 512);
     iq3_s_tables_uploaded = true;
@@ -1635,7 +1837,8 @@ __global__ void dequant_iq3_s_matrix_kernel(const uint8_t* __restrict__ q_data,
 
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total = (int64_t)N * K;
-    if (idx >= total) return;
+    if (idx >= total)
+        return;
 
     int row = idx / K;
     int col = idx % K;
@@ -1648,28 +1851,26 @@ __global__ void dequant_iq3_s_matrix_kernel(const uint8_t* __restrict__ q_data,
 
     float d = __half2float(
         reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
-    const uint8_t* qs = block_ptr + 2;                       // 64 bytes
-    const uint8_t* qh = block_ptr + 2 + 64;                  // 8 bytes
-    const uint8_t* signs = block_ptr + 2 + 64 + 8;           // 32 bytes
-    const uint8_t* scales = block_ptr + 2 + 64 + 8 + 32;     // 4 bytes
+    const uint8_t* qs = block_ptr + 2;                    // 64 bytes
+    const uint8_t* qh = block_ptr + 2 + 64;               // 8 bytes
+    const uint8_t* signs = block_ptr + 2 + 64 + 8;        // 32 bytes
+    const uint8_t* scales = block_ptr + 2 + 64 + 8 + 32;  // 4 bytes
 
     // The CPU loop iterates ib32 in pairs (0,2,4,6). Each iteration (= "iter")
     // covers 64 elements: sub-block pair (even=sub0, odd=sub1), 4 l, 8 j.
-    int iter = col_in_block / 64;          // 0..3  (ib32 = 2*iter)
-    int within = col_in_block % 64;        // 0..63
-    int sub = within / 32;                 // 0 (even, db1) or 1 (odd, db2)
-    int within_sub = within % 32;          // 0..31
-    int l = within_sub / 8;                // 0..3
-    int j = within_sub % 8;                // 0..7
+    int iter = col_in_block / 64;    // 0..3  (ib32 = 2*iter)
+    int within = col_in_block % 64;  // 0..63
+    int sub = within / 32;           // 0 (even, db1) or 1 (odd, db2)
+    int within_sub = within % 32;    // 0..31
+    int l = within_sub / 8;          // 0..3
+    int j = within_sub % 8;          // 0..7
 
     // Per-iter byte offsets within the block (matching the pointer increments).
     int qs_base = iter * 16 + sub * 8;
     int signs_idx = iter * 8 + sub * 4 + l;
     int qh_idx = iter * 2 + sub;
 
-    float db = (sub == 0)
-                   ? d * (1 + 2 * (scales[iter] & 0xF))
-                   : d * (1 + 2 * (scales[iter] >> 4));
+    float db = (sub == 0) ? d * (1 + 2 * (scales[iter] & 0xF)) : d * (1 + 2 * (scales[iter] >> 4));
 
     uint8_t qh_byte = qh[qh_idx];
     int grid1_idx = qs[qs_base + 2 * l + 0] | ((qh_byte << (8 - 2 * l)) & 256);
@@ -1682,8 +1883,8 @@ __global__ void dequant_iq3_s_matrix_kernel(const uint8_t* __restrict__ q_data,
     const uint8_t* grid = reinterpret_cast<const uint8_t*>(&c_iq3s_grid[grid_idx]);
     uint8_t sign_byte = signs[signs_idx];
 
-    out[idx] = db * static_cast<float>(grid[grid_elem]) *
-               (sign_byte & c_kmask_iq2xs[j] ? -1.f : 1.f);
+    out[idx] =
+        db * static_cast<float>(grid[grid_elem]) * (sign_byte & c_kmask_iq2xs[j] ? -1.f : 1.f);
 }
 
 void launch_dequant_iq3_s_matrix(const void* q_data, float* out, int N, int K,
@@ -1707,7 +1908,8 @@ __constant__ int8_t c_kvalues_iq4nl[16];
 static bool iq4_nl_tables_uploaded = false;
 
 static void ensure_iq4_nl_tables() {
-    if (iq4_nl_tables_uploaded) return;
+    if (iq4_nl_tables_uploaded)
+        return;
     static const int8_t h_kvalues_iq4nl[16] = {
         -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
     };
@@ -1716,13 +1918,14 @@ static void ensure_iq4_nl_tables() {
 }
 
 __global__ void dequant_iq4_nl_matrix_kernel(const uint8_t* __restrict__ q_data,
-                                              float* __restrict__ out, int N, int K) {
+                                             float* __restrict__ out, int N, int K) {
     const int IQ4_NL_BLOCK_SIZE = 18;
     int blocks_per_row = (K + 31) / 32;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * K;
-    if (idx >= total) return;
+    if (idx >= total)
+        return;
 
     int row = idx / K;
     int col = idx % K;
@@ -1733,7 +1936,8 @@ __global__ void dequant_iq4_nl_matrix_kernel(const uint8_t* __restrict__ q_data,
     const uint8_t* row_ptr = q_data + (int64_t)row * blocks_per_row * IQ4_NL_BLOCK_SIZE;
     const uint8_t* block_ptr = row_ptr + bi * IQ4_NL_BLOCK_SIZE;
 
-    float d = __half2float(reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
+    float d = __half2float(
+        reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
     const uint8_t* qs = block_ptr + 2;
 
     // IQ4_NL: qs[i] low nibble → element i, qs[i] high nibble → element i+16
@@ -1748,7 +1952,7 @@ __global__ void dequant_iq4_nl_matrix_kernel(const uint8_t* __restrict__ q_data,
 }
 
 void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
-                                   cudaStream_t stream) {
+                                  cudaStream_t stream) {
     ensure_iq4_nl_tables();
     int total = N * K;
     int threads = 256;
@@ -1761,8 +1965,8 @@ void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
 // Applies repeat penalty in-place on GPU logits.
 // Each thread handles one token_id from history, scattering to logits[tid].
 __global__ void repeat_penalty_kernel(float* __restrict__ logits,
-                                       const int32_t* __restrict__ token_history,
-                                       int n_history, float penalty, int vocab_size) {
+                                      const int32_t* __restrict__ token_history, int n_history,
+                                      float penalty, int vocab_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n_history) {
         int tid = token_history[idx];
@@ -1773,14 +1977,14 @@ __global__ void repeat_penalty_kernel(float* __restrict__ logits,
     }
 }
 
-void launch_repeat_penalty(float* logits, const int32_t* token_history,
-                           int n_history, float penalty, int vocab_size,
-                           cudaStream_t stream) {
-    if (n_history <= 0 || penalty == 1.0f) return;
+void launch_repeat_penalty(float* logits, const int32_t* token_history, int n_history,
+                           float penalty, int vocab_size, cudaStream_t stream) {
+    if (n_history <= 0 || penalty == 1.0f)
+        return;
     int threads = 256;
     int blocks = (n_history + threads - 1) / threads;
-    repeat_penalty_kernel<<<blocks, threads, 0, stream>>>(
-        logits, token_history, n_history, penalty, vocab_size);
+    repeat_penalty_kernel<<<blocks, threads, 0, stream>>>(logits, token_history, n_history, penalty,
+                                                          vocab_size);
 }
 
 }  // namespace cuda

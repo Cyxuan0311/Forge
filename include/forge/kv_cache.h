@@ -10,17 +10,19 @@ namespace forge {
 
 enum class KVCacheDType : int {
     FP32 = 0,
-    F16  = 1,
+    F16 = 1,
     Q8_0 = 2,
     Q4_0 = 3,  // renumbered, was 1
     Q4_K = 4,
+    FP8_E4M3 = 5,  // 1 byte/element, no block structure (Phase 0)
+    FP8_E5M2 = 6,
 };
 
 // Internal feature flag: selects the KV storage backend.
 // Default is Contiguous (existing KVCache). Paged is reserved for future phases.
 enum class KVStorageMode : int {
     Contiguous = 0,
-    Paged      = 1,
+    Paged = 1,
 };
 
 // Phase 6: per-layer memory policy.
@@ -28,10 +30,10 @@ enum class KVStorageMode : int {
 // different eviction/memory strategies. This formalizes the previously
 // implicit use_ring_buffer_ bool into a first-class concept.
 enum class KVLayerPolicy : int {
-    None           = 0,  // unset / default
-    Full           = 1,  // full attention, linear KV growth
-    SlidingWindow  = 2,  // SWA: ring buffer, window_size eviction
-    Recurrent      = 3,  // recurrent state (future: SSM/Mamba) — stub
+    None = 0,           // unset / default
+    Full = 1,           // full attention, linear KV growth
+    SlidingWindow = 2,  // SWA: ring buffer, window_size eviction
+    Recurrent = 3,      // recurrent state (future: SSM/Mamba) — stub
 };
 
 // K/V can have different quantization types (asymmetric KV cache).
@@ -43,8 +45,8 @@ struct KVCacheTypeConfig {
 // Per-cell metadata for sequence-aware KV cache.
 // Inspired by llama.cpp's llama_kv_cells — tracks which sequences own each cell.
 struct KVCellMeta {
-    int64_t pos = -1;            // token position, -1 = free cell
-    uint32_t seq_id_mask = 0;    // bitmask of owning sequences (bit i → seq_id i)
+    int64_t pos = -1;          // token position, -1 = free cell
+    uint32_t seq_id_mask = 0;  // bitmask of owning sequences (bit i → seq_id i)
 
     bool is_free() const { return pos == -1; }
     bool has_seq(int seq_id) const { return (seq_id_mask >> seq_id) & 1u; }
@@ -70,16 +72,16 @@ struct KVCacheStorage {
     DeviceType device = DeviceType::CPU;
 
     // --- FP32 path: TensorPtr (used when dtype == FP32) ---
-    TensorPtr tensor;   // FP32 Tensor, device-bound
+    TensorPtr tensor;  // FP32 Tensor, device-bound
 
     // --- Quantized path: raw buffers ---
-    std::vector<uint8_t> h_data;     // CPU-side quantized buffer
-    void* d_data = nullptr;          // CUDA-side quantized buffer
-    size_t d_bytes = 0;              // allocated size of d_data
+    std::vector<uint8_t> h_data;  // CPU-side quantized buffer
+    void* d_data = nullptr;       // CUDA-side quantized buffer
+    size_t d_bytes = 0;           // allocated size of d_data
 
     // --- Common ---
-    int max_rows = 0;                // max_seq_len
-    size_t row_bytes = 0;            // bytes per row (block_nbytes for quantized, kv_dim*4 for FP32)
+    int max_rows = 0;      // max_seq_len
+    size_t row_bytes = 0;  // bytes per row (block_nbytes for quantized, kv_dim*4 for FP32)
 
     KVCacheStorage() = default;
     ~KVCacheStorage();
@@ -97,6 +99,10 @@ struct KVCacheStorage {
 
     // Zero-fill all allocated storage
     void zero_fill();
+
+    // Release all allocated storage. Used for recurrent (SSM) layers that keep
+    // their state in a fixed-size recurrent buffer instead of the growing KV cache.
+    void free();
 
     // Total allocated bytes
     size_t capacity_bytes() const;
@@ -131,9 +137,11 @@ struct KVCacheStorage {
 struct KVCacheLayer {
     KVCacheStorage key_store;
     KVCacheStorage value_store;
-    int filled = 0;             // physical write cursor for non-ring; logical pos_max for ring
-    int logical_filled = 0;     // monotonic logical position max (all layers, for rollback/seq_rm)
-    int dequantized_filled = 0; // how many rows have been dequantized (for incremental dequant)
+    bool recurrent = false;      // Recurrent (SSM/Gated-DeltaNet) layer: state lives in a fixed
+                                 // recurrent buffer (e.g. Qwen35RecurrentMemory), not the KV cache.
+    int filled = 0;              // physical write cursor for non-ring; logical pos_max for ring
+    int logical_filled = 0;      // monotonic logical position max (all layers, for rollback/seq_rm)
+    int dequantized_filled = 0;  // how many rows have been dequantized (for incremental dequant)
 
     // Cell metadata — size max_seq_len, parallel to KV rows
     std::vector<KVCellMeta> cells;
@@ -197,8 +205,8 @@ public:
     int update(int layer, const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
 
     // --- Sequence-aware update (explicit seq_id and start position) ---
-    int update(int layer, int seq_id, int64_t pos,
-               const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
+    int update(int layer, int seq_id, int64_t pos, const TensorPtr& new_key,
+               const TensorPtr& new_value, int seq_len);
 
     // --- Sequence operations ---
 
@@ -211,6 +219,25 @@ public:
 
     // Remove all cells NOT owned by seq_id. Cells exclusively owned by other sequences are freed.
     void seq_keep(int seq_id);
+
+    // Roadmap 2.2: defragment the contiguous KV cache.
+    // Compacts alive cells (still owned by >=1 sequence) to the front of each
+    // layer, preserving their relative (position) order, and moves the underlying
+    // K/V row data. After defrag, slot index == logical position for every alive
+    // cell, so attention (which reads rows [0, filled) in slot order) stays correct.
+    // Positions are renumbered; call only when no sequence is mid-decode, or have
+    // the caller re-derive each sequence's positions from seq_filled()/filled().
+    // Ring-buffer (SWA) layers are skipped — they recycle in place and do not
+    // fragment.
+    void defrag();
+
+    // Compact only when fragmentation is detected (a free cell precedes an alive
+    // cell) and defrag is enabled. Wired into ContiguousKVStorage::seq_remove /
+    // release as the automatic trigger point.
+    void defrag_if_needed();
+
+    void set_defrag_enabled(bool enabled) { defrag_enabled_ = enabled; }
+    bool defrag_enabled() const { return defrag_enabled_; }
 
     // Find first free cell slot (linear scan with wraparound).
     // Returns -1 if cache is full.
@@ -245,6 +272,12 @@ public:
     // Access quantized CUDA cache pointers for fused attention kernels
     void* d_q_key_cache(int layer) const;
     void* d_q_value_cache(int layer) const;
+
+    // Per-(row, kv_head) FP8 scale buffers for scaled FP8 KV (contiguous CUDA path).
+    // Layout: [max_seq_len * num_kv_heads] float, indexed j*num_kv_heads + kv_h.
+    // nullptr when the layer is not FP8 / not on CUDA.
+    void* d_q_key_scale(int layer) const;
+    void* d_q_value_scale(int layer) const;
 
     DeviceType device() const { return device_; }
     KVCacheDType kv_dtype() const { return kv_dtype_; }
@@ -283,14 +316,23 @@ public:
     size_t value_row_bytes(int layer) const;
 
 private:
-    int update_fp32(int layer, int64_t start_pos,
-                    const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
-    int update_quantized(int layer, int64_t start_pos,
-                         const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
-    int update_quantized_cuda(int layer, int64_t start_pos,
-                              const TensorPtr& new_key, const TensorPtr& new_value, int seq_len);
+    int update_fp32(int layer, int64_t start_pos, const TensorPtr& new_key,
+                    const TensorPtr& new_value, int seq_len);
+    int update_quantized(int layer, int64_t start_pos, const TensorPtr& new_key,
+                         const TensorPtr& new_value, int seq_len);
+    int update_quantized_cuda(int layer, int64_t start_pos, const TensorPtr& new_key,
+                              const TensorPtr& new_value, int seq_len);
     void dequantize_layer_cuda(int layer);
     void init_cells(int layer);  // allocate cells vector for a layer
+
+    // Move the K/V row data of one cell from physical slot `from` to `to` for a
+    // layer (FP32 + quantized + dequantized FP32 shadow + FP8 per-(row,kv_head)
+    // scales). Device-aware.
+    void move_kv_row(int layer, int from, int to);
+
+    // Roadmap 2.2: opt-in automatic defrag trigger (off by default to keep the
+    // scheduler's position bookkeeping untouched unless explicitly enabled).
+    bool defrag_enabled_ = false;
 
     // Get the CUDA stream (returns nullptr for default stream)
     void* cuda_stream() const;
@@ -300,14 +342,14 @@ private:
     int head_dim_ = 0;
     std::vector<int> kv_dim_per_layer_;  // per-layer kv_dim for mixed-attention archs
     int max_seq_len_ = 0;
-    DeviceType device_ = DeviceType::CPU;               // fallback / primary device
-    std::vector<DeviceType> layer_devices_;             // per-layer device (empty = all on device_)
-    KVCacheDType kv_dtype_ = KVCacheDType::FP32;       // legacy: max(type_k, type_v)
-    KVCacheTypeConfig kv_config_;                        // per-K/V type config
+    DeviceType device_ = DeviceType::CPU;         // fallback / primary device
+    std::vector<DeviceType> layer_devices_;       // per-layer device (empty = all on device_)
+    KVCacheDType kv_dtype_ = KVCacheDType::FP32;  // legacy: max(type_k, type_v)
+    KVCacheTypeConfig kv_config_;                 // per-K/V type config
     int max_seqs_ = 32;  // max concurrent sequences (uint32_t bitmask supports up to 32)
 
     // Ring buffer mode (SWA sliding window)
-    int window_size_ = 0;       // maximum KV entries visible to attention
+    int window_size_ = 0;  // maximum KV entries visible to attention
     // Per-layer: whether ring buffer is active for this layer
     std::vector<bool> use_ring_buffer_;
     // Per-layer ring cursors: next slot to write (wraps at window_size_).
@@ -320,6 +362,12 @@ private:
 
     // CUDA stream for KV cache operations (default: nullptr = default stream)
     void* cuda_stream_ = nullptr;
+
+    // Per-(row, kv_head) FP8 scales for scaled FP8 KV (contiguous CUDA path only).
+    // Sized num_layers; each entry is a CUDA float buffer of max_seq_len*num_kv_heads,
+    // or nullptr when the layer is not FP8 / not on CUDA.
+    std::vector<void*> fp8_scale_k_;
+    std::vector<void*> fp8_scale_v_;
 };
 
 }  // namespace forge

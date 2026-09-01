@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "forge/cuda_kernels.h"
+#include "forge/fp8_utils.h"
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
 
@@ -116,21 +117,21 @@ static void fp32_to_fp16_batch_simd(const float* src, uint16_t* dst, int n) {
 static void fp16_to_fp32_batch_simd(const uint16_t* src, float* dst, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        uint16x4_t  h_vec = vld1_u16(src + i);
-        uint32x4_t  h     = vmovl_u16(h_vec);
+        uint16x4_t h_vec = vld1_u16(src + i);
+        uint32x4_t h = vmovl_u16(h_vec);
 
         uint32x4_t sign = vshlq_n_u32(vandq_u32(h, vdupq_n_u32(0x8000U)), 16);
         uint32x4_t mant = vandq_u32(h, vdupq_n_u32(0x03FFU));
-        uint32x4_t exp  = vshrq_n_u32(vandq_u32(h, vdupq_n_u32(0x7C00U)), 10);
+        uint32x4_t exp = vshrq_n_u32(vandq_u32(h, vdupq_n_u32(0x7C00U)), 10);
 
         // Normal/zero: biased_exp = exp + 127 - 15 = exp + 112
         uint32x4_t biased_exp = vaddq_u32(exp, vdupq_n_u32(112U));
         uint32x4_t is_inf_nan = vceqq_u32(exp, vdupq_n_u32(0x1FU));
 
-        uint32x4_t norm_f32 = vorrq_u32(sign,
-            vorrq_u32(vshlq_n_u32(biased_exp, 23), vshlq_n_u32(mant, 13)));
-        uint32x4_t inf_f32  = vorrq_u32(sign,
-            vorrq_u32(vshlq_n_u32(vdupq_n_u32(0xFFU), 23), vshlq_n_u32(mant, 13)));
+        uint32x4_t norm_f32 =
+            vorrq_u32(sign, vorrq_u32(vshlq_n_u32(biased_exp, 23), vshlq_n_u32(mant, 13)));
+        uint32x4_t inf_f32 =
+            vorrq_u32(sign, vorrq_u32(vshlq_n_u32(vdupq_n_u32(0xFFU), 23), vshlq_n_u32(mant, 13)));
 
         uint32x4_t f32 = vbslq_u32(is_inf_nan, inf_f32, norm_f32);
         vst1q_f32(dst + i, vreinterpretq_f32_u32(f32));
@@ -143,32 +144,27 @@ static void fp16_to_fp32_batch_simd(const uint16_t* src, float* dst, int n) {
 static void fp32_to_fp16_batch_simd(const float* src, uint16_t* dst, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        float32x4_t f    = vld1q_f32(src + i);
-        uint32x4_t  bits = vreinterpretq_u32_f32(f);
+        float32x4_t f = vld1q_f32(src + i);
+        uint32x4_t bits = vreinterpretq_u32_f32(f);
 
-        uint32x4_t sign = vshrq_n_u32(
-            vandq_u32(bits, vdupq_n_u32(0x80000000U)), 16);
-        uint32x4_t exp  = vshrq_n_u32(
-            vandq_u32(bits, vdupq_n_u32(0x7F800000U)), 23);
+        uint32x4_t sign = vshrq_n_u32(vandq_u32(bits, vdupq_n_u32(0x80000000U)), 16);
+        uint32x4_t exp = vshrq_n_u32(vandq_u32(bits, vdupq_n_u32(0x7F800000U)), 23);
         uint32x4_t mant = vandq_u32(bits, vdupq_n_u32(0x007FE000U));
 
         uint32x4_t is_ge_113 = vcgeq_u32(exp, vdupq_n_u32(113U));
         uint32x4_t is_ge_143 = vcgeq_u32(exp, vdupq_n_u32(143U));
-        uint32x4_t is_ff     = vceqq_u32(exp, vdupq_n_u32(0xFFU));
+        uint32x4_t is_ff = vceqq_u32(exp, vdupq_n_u32(0xFFU));
 
-        uint32x4_t norm_exp  = vsubq_u32(exp, vdupq_n_u32(112U));
+        uint32x4_t norm_exp = vsubq_u32(exp, vdupq_n_u32(112U));
         uint32x4_t norm_mant = vshrq_n_u32(mant, 13);
-        uint32x4_t norm = vorrq_u32(sign,
-            vorrq_u32(vshlq_n_u32(norm_exp, 10), norm_mant));
+        uint32x4_t norm = vorrq_u32(sign, vorrq_u32(vshlq_n_u32(norm_exp, 10), norm_mant));
 
-        uint32x4_t inf = vorrq_u32(sign,
-            vorrq_u32(vdupq_n_u32(0x7C00U), vshrq_n_u32(mant, 13)));
+        uint32x4_t inf = vorrq_u32(sign, vorrq_u32(vdupq_n_u32(0x7C00U), vshrq_n_u32(mant, 13)));
 
         uint32x4_t zero = sign;
 
-        uint32x4_t result = vbslq_u32(is_ff, inf,
-                            vbslq_u32(is_ge_143, inf,
-                            vbslq_u32(is_ge_113, norm, zero)));
+        uint32x4_t result =
+            vbslq_u32(is_ff, inf, vbslq_u32(is_ge_143, inf, vbslq_u32(is_ge_113, norm, zero)));
 
         uint16x4_t h = vmovn_u32(result);
         vst1_u16(dst + i, h);
@@ -189,22 +185,17 @@ static __vector unsigned int vsx_half_to_float4(__vector unsigned int h) {
     __vector unsigned int shift23 = vec_splats(23U);
     __vector unsigned int shift13 = vec_splats(13U);
 
-    __vector unsigned int sign = vec_sl(
-        vec_and(h, vec_splats(0x8000U)), shift16);
+    __vector unsigned int sign = vec_sl(vec_and(h, vec_splats(0x8000U)), shift16);
     __vector unsigned int mant = vec_and(h, vec_splats(0x03FFU));
-    __vector unsigned int exp  = vec_sr(
-        vec_and(h, vec_splats(0x7C00U)), shift10);
+    __vector unsigned int exp = vec_sr(vec_and(h, vec_splats(0x7C00U)), shift10);
 
     __vector unsigned int biased_exp = vec_add(exp, vec_splats(112U));
-    __vector unsigned int is_inf_nan =
-        (__vector unsigned int)vec_cmpeq(exp, vec_splats(0x1FU));
+    __vector unsigned int is_inf_nan = (__vector unsigned int)vec_cmpeq(exp, vec_splats(0x1FU));
 
-    __vector unsigned int norm_f32 = vec_or(sign,
-        vec_or(vec_sl(biased_exp, shift23),
-               vec_sl(mant, shift13)));
-    __vector unsigned int inf_f32  = vec_or(sign,
-        vec_or(vec_sl(vec_splats(0xFFU), shift23),
-               vec_sl(mant, shift13)));
+    __vector unsigned int norm_f32 =
+        vec_or(sign, vec_or(vec_sl(biased_exp, shift23), vec_sl(mant, shift13)));
+    __vector unsigned int inf_f32 =
+        vec_or(sign, vec_or(vec_sl(vec_splats(0xFFU), shift23), vec_sl(mant, shift13)));
 
     return vec_sel(norm_f32, inf_f32, is_inf_nan);
 }
@@ -212,14 +203,11 @@ static __vector unsigned int vsx_half_to_float4(__vector unsigned int h) {
 static void fp16_to_fp32_batch_simd(const uint16_t* src, float* dst, int n) {
     int i = 0;
     for (; i + 8 <= n; i += 8) {
-        __vector unsigned short hv = vec_xl(0,
-            (const unsigned short*)(src + i));
+        __vector unsigned short hv = vec_xl(0, (const unsigned short*)(src + i));
         __vector unsigned int h_lo = vec_and(
-            (__vector unsigned int)vec_unpackl((__vector signed short)hv),
-            vec_splats(0x0000FFFFU));
+            (__vector unsigned int)vec_unpackl((__vector signed short)hv), vec_splats(0x0000FFFFU));
         __vector unsigned int h_hi = vec_and(
-            (__vector unsigned int)vec_unpackh((__vector signed short)hv),
-            vec_splats(0x0000FFFFU));
+            (__vector unsigned int)vec_unpackh((__vector signed short)hv), vec_splats(0x0000FFFFU));
         vec_xst((__vector float)vsx_half_to_float4(h_hi), 0, dst + i);
         vec_xst((__vector float)vsx_half_to_float4(h_lo), 0, dst + i + 4);
     }
@@ -231,7 +219,7 @@ static void fp16_to_fp32_batch_simd(const uint16_t* src, float* dst, int n) {
 static void fp32_to_fp16_batch_simd(const float* src, uint16_t* dst, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        __vector float        fv   = vec_xl(0, src + i);
+        __vector float fv = vec_xl(0, src + i);
         __vector unsigned int bits = (__vector unsigned int)fv;
 
         __vector unsigned int shift16 = vec_splats(16U);
@@ -239,33 +227,25 @@ static void fp32_to_fp16_batch_simd(const float* src, uint16_t* dst, int n) {
         __vector unsigned int shift10 = vec_splats(10U);
         __vector unsigned int shift13 = vec_splats(13U);
 
-        __vector unsigned int sign = vec_sr(
-            vec_and(bits, vec_splats(0x80000000U)), shift16);
-        __vector unsigned int exp  = vec_sr(
-            vec_and(bits, vec_splats(0x7F800000U)), shift23);
-        __vector unsigned int mant = vec_and(bits,
-            vec_splats(0x007FE000U));
+        __vector unsigned int sign = vec_sr(vec_and(bits, vec_splats(0x80000000U)), shift16);
+        __vector unsigned int exp = vec_sr(vec_and(bits, vec_splats(0x7F800000U)), shift23);
+        __vector unsigned int mant = vec_and(bits, vec_splats(0x007FE000U));
 
-        __vector unsigned int is_ge_113 =
-            (__vector unsigned int)vec_cmpge(exp, vec_splats(113U));
-        __vector unsigned int is_ge_143 =
-            (__vector unsigned int)vec_cmpge(exp, vec_splats(143U));
-        __vector unsigned int is_ff =
-            (__vector unsigned int)vec_cmpeq(exp, vec_splats(0xFFU));
+        __vector unsigned int is_ge_113 = (__vector unsigned int)vec_cmpge(exp, vec_splats(113U));
+        __vector unsigned int is_ge_143 = (__vector unsigned int)vec_cmpge(exp, vec_splats(143U));
+        __vector unsigned int is_ff = (__vector unsigned int)vec_cmpeq(exp, vec_splats(0xFFU));
 
-        __vector unsigned int norm_exp  = vec_sub(exp, vec_splats(112U));
+        __vector unsigned int norm_exp = vec_sub(exp, vec_splats(112U));
         __vector unsigned int norm_mant = vec_sr(mant, shift13);
-        __vector unsigned int norm = vec_or(sign,
-            vec_or(vec_sl(norm_exp, shift10), norm_mant));
+        __vector unsigned int norm = vec_or(sign, vec_or(vec_sl(norm_exp, shift10), norm_mant));
 
-        __vector unsigned int inf = vec_or(sign,
-            vec_or(vec_splats(0x7C00U), vec_sr(mant, shift13)));
+        __vector unsigned int inf =
+            vec_or(sign, vec_or(vec_splats(0x7C00U), vec_sr(mant, shift13)));
 
         __vector unsigned int zero = sign;
 
         // vec_sel(a, b, c): bit from a where c=0, from b where c=1
-        __vector unsigned int result = vec_sel(zero, norm,
-            vec_or(is_ge_113, is_ff));
+        __vector unsigned int result = vec_sel(zero, norm, vec_or(is_ge_113, is_ff));
         result = vec_sel(result, inf, vec_or(is_ge_143, is_ff));
 
         __vector unsigned short h = vec_pack(result, result);
@@ -517,21 +497,39 @@ static void dequantize_q4_k_cpu(const uint8_t* q_data, float* out, int n, int ro
 
 static void quantize_cpu(KVCacheDType dtype, const float* data, uint8_t* q_data, int n) {
     switch (dtype) {
-    case KVCacheDType::F16:  quantize_f16_cpu(data, q_data, n); break;
-    case KVCacheDType::Q8_0: quantize_q8_0_cpu(data, q_data, n); break;
-    case KVCacheDType::Q4_0: quantize_q4_0_cpu(data, q_data, n); break;
-    case KVCacheDType::Q4_K: quantize_q4_k_cpu(data, q_data, n); break;
-    default: break;
+    case KVCacheDType::F16:
+        quantize_f16_cpu(data, q_data, n);
+        break;
+    case KVCacheDType::Q8_0:
+        quantize_q8_0_cpu(data, q_data, n);
+        break;
+    case KVCacheDType::Q4_0:
+        quantize_q4_0_cpu(data, q_data, n);
+        break;
+    case KVCacheDType::Q4_K:
+        quantize_q4_k_cpu(data, q_data, n);
+        break;
+    default:
+        break;
     }
 }
 
 static void dequantize_cpu(KVCacheDType dtype, const uint8_t* q_data, float* out, int n, int row) {
     switch (dtype) {
-    case KVCacheDType::F16:  dequantize_f16_cpu(q_data, out, n); break;
-    case KVCacheDType::Q8_0: dequantize_q8_0_cpu(q_data, out, n); break;
-    case KVCacheDType::Q4_0: dequantize_q4_0_cpu(q_data, out, n); break;
-    case KVCacheDType::Q4_K: dequantize_q4_k_cpu(q_data, out, n, row); break;
-    default: break;
+    case KVCacheDType::F16:
+        dequantize_f16_cpu(q_data, out, n);
+        break;
+    case KVCacheDType::Q8_0:
+        dequantize_q8_0_cpu(q_data, out, n);
+        break;
+    case KVCacheDType::Q4_0:
+        dequantize_q4_0_cpu(q_data, out, n);
+        break;
+    case KVCacheDType::Q4_K:
+        dequantize_q4_k_cpu(q_data, out, n, row);
+        break;
+    default:
+        break;
     }
 }
 
@@ -560,6 +558,9 @@ size_t KVCache::block_nbytes(KVCacheDType dtype, int n) {
         int num_blocks = (n + 255) / 256;
         return num_blocks * 144;
     }
+    case KVCacheDType::FP8_E4M3:
+    case KVCacheDType::FP8_E5M2:
+        return n;  // 1 byte per element, no block structure
     default:
         return n * sizeof(float);
     }
@@ -567,20 +568,42 @@ size_t KVCache::block_nbytes(KVCacheDType dtype, int n) {
 
 // Public wrappers for PagedKVStorage reuse
 void KVCache::quantize_row(KVCacheDType dtype, const float* src, uint8_t* dst, int n) {
-    if (dtype == KVCacheDType::FP32) {
+    switch (dtype) {
+    case KVCacheDType::FP32:
         std::memcpy(dst, src, n * sizeof(float));
-    } else {
+        break;
+    case KVCacheDType::FP8_E4M3:
+        for (int i = 0; i < n; ++i)
+            dst[i] = fp32_to_fp8_e4m3(src[i]);
+        break;
+    case KVCacheDType::FP8_E5M2:
+        for (int i = 0; i < n; ++i)
+            dst[i] = fp32_to_fp8_e5m2(src[i]);
+        break;
+    default:
         quantize_cpu(dtype, src, dst, n);
+        break;
     }
 }
 
 void KVCache::dequantize_row(KVCacheDType dtype, const uint8_t* src, float* dst, int n) {
-    if (dtype == KVCacheDType::FP32) {
+    switch (dtype) {
+    case KVCacheDType::FP32:
         std::memcpy(dst, src, n * sizeof(float));
-    } else {
+        break;
+    case KVCacheDType::FP8_E4M3:
+        for (int i = 0; i < n; ++i)
+            dst[i] = fp8_e4m3_to_fp32(src[i]);
+        break;
+    case KVCacheDType::FP8_E5M2:
+        for (int i = 0; i < n; ++i)
+            dst[i] = fp8_e5m2_to_fp32(src[i]);
+        break;
+    default:
         // row=0 is safe for all dtypes except Q4_K which uses row for block index.
         // PagedKVStorage calls this per-row with the correct row offset.
         dequantize_cpu(dtype, src, dst, n, 0);
+        break;
     }
 }
 
@@ -596,9 +619,14 @@ KVCacheStorage::~KVCacheStorage() {
 }
 
 KVCacheStorage::KVCacheStorage(KVCacheStorage&& o) noexcept
-    : dtype(o.dtype), device(o.device), tensor(std::move(o.tensor)),
-      h_data(std::move(o.h_data)), d_data(o.d_data), d_bytes(o.d_bytes),
-      max_rows(o.max_rows), row_bytes(o.row_bytes) {
+    : dtype(o.dtype),
+      device(o.device),
+      tensor(std::move(o.tensor)),
+      h_data(std::move(o.h_data)),
+      d_data(o.d_data),
+      d_bytes(o.d_bytes),
+      max_rows(o.max_rows),
+      row_bytes(o.row_bytes) {
     o.d_data = nullptr;
     o.d_bytes = 0;
 }
@@ -653,6 +681,25 @@ void KVCacheStorage::alloc(KVCacheDType dt, DeviceType dev, int rows, size_t rby
     }
 }
 
+void KVCacheStorage::free() {
+    if (device == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        if (d_data) {
+            cudaFree(d_data);
+            d_data = nullptr;
+        }
+#endif
+    } else {
+        h_data.clear();
+    }
+    tensor.reset();
+    d_bytes = 0;
+    max_rows = 0;
+    row_bytes = 0;
+    dtype = KVCacheDType::FP32;
+    device = DeviceType::CPU;
+}
+
 void KVCacheStorage::zero_fill() {
     if (dtype == KVCacheDType::FP32) {
         if (tensor)
@@ -685,7 +732,7 @@ float* KVCacheStorage::fp32_data() {
 
 const float* KVCacheStorage::fp32_data() const {
     return (dtype == KVCacheDType::FP32 && tensor) ? static_cast<const float*>(tensor->data())
-                                                    : nullptr;
+                                                   : nullptr;
 }
 
 uint8_t* KVCacheStorage::q_data() {
@@ -724,7 +771,18 @@ const float* KVCacheStorage::fp32_row(int row) const {
 // KVCache destructor
 // =========================================================================
 
-KVCache::~KVCache() = default;
+KVCache::~KVCache() {
+#ifdef USE_CUDA
+    for (void* p : fp8_scale_k_) {
+        if (p)
+            cudaFree(p);
+    }
+    for (void* p : fp8_scale_v_) {
+        if (p)
+            cudaFree(p);
+    }
+#endif
+}
 
 // =========================================================================
 // Initialization
@@ -750,12 +808,18 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
 
 static const char* kv_dtype_name(KVCacheDType dt) {
     switch (dt) {
-    case KVCacheDType::FP32: return "FP32";
-    case KVCacheDType::F16:  return "F16";
-    case KVCacheDType::Q8_0: return "Q8_0";
-    case KVCacheDType::Q4_0: return "Q4_0";
-    case KVCacheDType::Q4_K: return "Q4_K";
-    default: return "unknown";
+    case KVCacheDType::FP32:
+        return "FP32";
+    case KVCacheDType::F16:
+        return "F16";
+    case KVCacheDType::Q8_0:
+        return "Q8_0";
+    case KVCacheDType::Q4_0:
+        return "Q4_0";
+    case KVCacheDType::Q4_K:
+        return "Q4_K";
+    default:
+        return "unknown";
     }
 }
 
@@ -776,6 +840,15 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
     for (int i = 0; i < num_layers; ++i) {
         DeviceType layer_dev = layer_device(i);
 
+        // Recurrent (SSM) layers keep state in a fixed recurrent buffer, not the KV cache.
+        if (i < static_cast<int>(layer_policies_.size()) &&
+            layer_policies_[i] == KVLayerPolicy::Recurrent) {
+            layers_[i].recurrent = true;
+            layers_[i].filled = 0;
+            init_cells(i);
+            continue;
+        }
+
         // Allocate key storage in native dtype — no FP32 shadow for quantized modes
         size_t k_row_bytes = block_nbytes(kv_config.type_k, kv_dim);
         size_t v_row_bytes = block_nbytes(kv_config.type_v, kv_dim);
@@ -786,11 +859,39 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
         init_cells(i);
     }
 
+    // Allocate per-(row, kv_head) FP8 scale buffers for scaled FP8 KV
+    // (contiguous CUDA path). Only needed when a layer is FP8 and on CUDA.
+    fp8_scale_k_.assign(num_layers, nullptr);
+    fp8_scale_v_.assign(num_layers, nullptr);
+    bool need_scale =
+        (kv_config.type_k == KVCacheDType::FP8_E4M3 || kv_config.type_k == KVCacheDType::FP8_E5M2 ||
+         kv_config.type_v == KVCacheDType::FP8_E4M3 || kv_config.type_v == KVCacheDType::FP8_E5M2);
+    if (need_scale) {
+        for (int i = 0; i < num_layers; ++i) {
+#ifdef USE_CUDA
+            DeviceType layer_dev = layer_device(i);
+            if (layer_dev == DeviceType::CUDA) {
+                size_t n = static_cast<size_t>(max_seq_len) * num_kv_heads * sizeof(float);
+                if (kv_config.type_k == KVCacheDType::FP8_E4M3 ||
+                    kv_config.type_k == KVCacheDType::FP8_E5M2) {
+                    cudaMalloc(&fp8_scale_k_[i], n);
+                    cudaMemset(fp8_scale_k_[i], 0, n);
+                }
+                if (kv_config.type_v == KVCacheDType::FP8_E4M3 ||
+                    kv_config.type_v == KVCacheDType::FP8_E5M2) {
+                    cudaMalloc(&fp8_scale_v_[i], n);
+                    cudaMemset(fp8_scale_v_[i], 0, n);
+                }
+            }
+#endif
+        }
+    }
+
     LOG_INFO("KVCache initialized: " + std::to_string(num_layers) + " layers, " +
              std::to_string(num_kv_heads) + " kv_heads, " + std::to_string(head_dim) +
              " head_dim, " + std::to_string(max_seq_len) + " max_seq_len, " +
-             (device == DeviceType::CUDA ? "CUDA" : "CPU") + ", K=" + kv_dtype_name(kv_config.type_k) +
-             ", V=" + kv_dtype_name(kv_config.type_v));
+             (device == DeviceType::CUDA ? "CUDA" : "CPU") +
+             ", K=" + kv_dtype_name(kv_config.type_k) + ", V=" + kv_dtype_name(kv_config.type_v));
 
     return true;
 }
@@ -814,6 +915,13 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
     for (int i = 0; i < num_layers; ++i) {
         int dim = (i < (int)kv_dims.size()) ? kv_dims[i] : kv_dims.back();
         DeviceType layer_dev = layer_device(i);
+        if (i < static_cast<int>(layer_policies_.size()) &&
+            layer_policies_[i] == KVLayerPolicy::Recurrent) {
+            layers_[i].recurrent = true;
+            layers_[i].filled = 0;
+            init_cells(i);
+            continue;
+        }
         if (dim > 0) {
             size_t row_bytes = dim * sizeof(float);
             layers_[i].key_store.alloc(KVCacheDType::FP32, layer_dev, max_seq_len, row_bytes);
@@ -859,8 +967,8 @@ void KVCache::rollback(int64_t to_pos) {
             // speculative-decoding rollbacks O(rejected tokens) instead of
             // O(max_seq_len) per layer. Keep the pos>=to_pos guard so ring
             // buffers never clobber live wrapped cells.
-            const int64_t hi = std::min<int64_t>(layer.filled,
-                                                  static_cast<int64_t>(layer.cells.size()));
+            const int64_t hi =
+                std::min<int64_t>(layer.filled, static_cast<int64_t>(layer.cells.size()));
             for (int64_t p = std::max<int64_t>(to_pos, 0); p < hi; ++p) {
                 if (layer.cells[p].pos >= to_pos) {
                     layer.cells[p].pos = -1;
@@ -896,7 +1004,9 @@ void KVCache::set_ring_buffer(int window_size, int layer) {
         use_ring_buffer_[layer] = true;
     }
     int num_ring = 0;
-    for (auto b : use_ring_buffer_) if (b) ++num_ring;
+    for (auto b : use_ring_buffer_)
+        if (b)
+            ++num_ring;
     LOG_INFO("KVCache ring buffer: window_size=" + std::to_string(window_size) +
              ", ring_layers=" + std::to_string(num_ring) + "/" + std::to_string(layers_.size()));
 }
@@ -925,10 +1035,20 @@ void KVCache::set_layer_policies(const std::vector<KVLayerPolicy>& policies, int
         for (int i = 0; i < static_cast<int>(layer_policies_.size()); ++i) {
             if (layer_policies_[i] == KVLayerPolicy::SlidingWindow) {
                 use_ring_buffer_[i] = true;
+            } else if (layer_policies_[i] == KVLayerPolicy::Recurrent) {
+                // Recurrent (Gated DeltaNet / SSM) layers keep their state in a fixed-size
+                // recurrent buffer (Qwen35RecurrentMemory), not in the growing KV cache.
+                // Free any KV storage that may have been allocated and mark the layer so
+                // update()/attention() treat it as a no-op.
+                layers_[i].recurrent = true;
+                layers_[i].key_store.free();
+                layers_[i].value_store.free();
             }
         }
         int num_swa = 0;
-        for (auto b : use_ring_buffer_) if (b) ++num_swa;
+        for (auto b : use_ring_buffer_)
+            if (b)
+                ++num_swa;
         LOG_INFO("KVCache layer policies: swa_window=" + std::to_string(swa_window) +
                  ", swa_layers=" + std::to_string(num_swa) + "/" + std::to_string(layers_.size()));
     }
@@ -1009,10 +1129,10 @@ void KVCache::set_layer_devices(const std::vector<DeviceType>& layer_devices) {
                 // CUDA -> CPU or CUDA -> CUDA: read back from device
                 old_k_data.resize(rows * k_row_bytes);
                 old_v_data.resize(rows * v_row_bytes);
-                cudaMemcpy(old_k_data.data(), kv.key_store.d_q_data(),
-                           rows * k_row_bytes, cudaMemcpyDeviceToHost);
-                cudaMemcpy(old_v_data.data(), kv.value_store.d_q_data(),
-                           rows * v_row_bytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(old_k_data.data(), kv.key_store.d_q_data(), rows * k_row_bytes,
+                           cudaMemcpyDeviceToHost);
+                cudaMemcpy(old_v_data.data(), kv.value_store.d_q_data(), rows * v_row_bytes,
+                           cudaMemcpyDeviceToHost);
                 migration_possible = true;
             }
 #endif
@@ -1030,10 +1150,10 @@ void KVCache::set_layer_devices(const std::vector<DeviceType>& layer_devices) {
                     std::memcpy(kv.value_store.q_data(), old_v_data.data(), rows * v_row_bytes);
                 } else {
 #ifdef USE_CUDA
-                    cudaMemcpy(kv.key_store.d_q_data(), old_k_data.data(),
-                               rows * k_row_bytes, cudaMemcpyHostToDevice);
-                    cudaMemcpy(kv.value_store.d_q_data(), old_v_data.data(),
-                               rows * v_row_bytes, cudaMemcpyHostToDevice);
+                    cudaMemcpy(kv.key_store.d_q_data(), old_k_data.data(), rows * k_row_bytes,
+                               cudaMemcpyHostToDevice);
+                    cudaMemcpy(kv.value_store.d_q_data(), old_v_data.data(), rows * v_row_bytes,
+                               cudaMemcpyHostToDevice);
 #endif
                 }
             }
@@ -1044,7 +1164,9 @@ void KVCache::set_layer_devices(const std::vector<DeviceType>& layer_devices) {
     }
 
     int num_cuda = 0;
-    for (auto d : layer_devices_) if (d == DeviceType::CUDA) ++num_cuda;
+    for (auto d : layer_devices_)
+        if (d == DeviceType::CUDA)
+            ++num_cuda;
     LOG_INFO("KVCache per-layer device: " + std::to_string(num_cuda) + "/" +
              std::to_string(layers_.size()) + " layers on CUDA");
 }
@@ -1053,12 +1175,14 @@ void KVCache::set_layer_devices(const std::vector<DeviceTarget>& layer_devices) 
     // Convert DeviceTarget → DeviceType for the internal layer_devices_ vector
     std::vector<DeviceType> type_vec;
     type_vec.reserve(layer_devices.size());
-    for (auto& dt : layer_devices) type_vec.push_back(dt.type);
+    for (auto& dt : layer_devices)
+        type_vec.push_back(dt.type);
     set_layer_devices(type_vec);
 
     // For multi-GPU: cudaSetDevice before each layer's allocation
 #ifdef USE_CUDA
-    for (int i = 0; i < static_cast<int>(layers_.size()) && i < static_cast<int>(layer_devices.size()); ++i) {
+    for (int i = 0;
+         i < static_cast<int>(layers_.size()) && i < static_cast<int>(layer_devices.size()); ++i) {
         if (layer_devices[i].is_cuda()) {
             cudaSetDevice(layer_devices[i].device_id);
         }
@@ -1107,6 +1231,10 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
         LOG_ERROR("KVCache::update: invalid layer " + std::to_string(layer));
         return -1;
     }
+    if (layers_[layer].recurrent) {
+        // Recurrent (SSM) layer: state is maintained by the recurrent memory, not the KV cache.
+        return static_cast<int>(layers_[layer].filled + seq_len);
+    }
     int64_t start_pos = static_cast<int64_t>(layers_[layer].filled);
     return update(layer, 0, start_pos, new_key, new_value, seq_len);
 }
@@ -1115,8 +1243,8 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
 // Update (sequence-aware)
 // =========================================================================
 
-int KVCache::update(int layer, int seq_id, int64_t pos,
-                    const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+int KVCache::update(int layer, int seq_id, int64_t pos, const TensorPtr& new_key,
+                    const TensorPtr& new_value, int seq_len) {
     if (layer < 0 || layer >= static_cast<int>(layers_.size())) {
         LOG_ERROR("KVCache::update: invalid layer " + std::to_string(layer));
         return -1;
@@ -1125,6 +1253,12 @@ int KVCache::update(int layer, int seq_id, int64_t pos,
         LOG_ERROR("KVCache::update: invalid seq_id " + std::to_string(seq_id) +
                   ", max=" + std::to_string(max_seqs_));
         return -1;
+    }
+
+    // Recurrent (SSM) layers do not use the growing KV cache; their state is
+    // maintained by the recurrent memory (e.g. Qwen35RecurrentMemory).
+    if (layers_[layer].recurrent) {
+        return static_cast<int>(pos + seq_len);
     }
 
     bool layer_uses_ring = use_ring_buffer(layer);
@@ -1199,8 +1333,8 @@ int KVCache::update(int layer, int seq_id, int64_t pos,
 // FP32 update
 // =========================================================================
 
-int KVCache::update_fp32(int layer, int64_t start_pos,
-                         const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+int KVCache::update_fp32(int layer, int64_t start_pos, const TensorPtr& new_key,
+                         const TensorPtr& new_value, int seq_len) {
     auto& kv = layers_[layer];
     int kv_dim = this->kv_dim(layer);
     int filled = static_cast<int>(start_pos);
@@ -1254,8 +1388,8 @@ int KVCache::update_fp32(int layer, int64_t start_pos,
 // Quantized update (dispatches per type_k / type_v)
 // =========================================================================
 
-int KVCache::update_quantized(int layer, int64_t start_pos,
-                              const TensorPtr& new_key, const TensorPtr& new_value, int seq_len) {
+int KVCache::update_quantized(int layer, int64_t start_pos, const TensorPtr& new_key,
+                              const TensorPtr& new_value, int seq_len) {
     DeviceType layer_dev = this->layer_device(layer);
     if (layer_dev == DeviceType::CUDA) {
         int result = update_quantized_cuda(layer, start_pos, new_key, new_value, seq_len);
@@ -1338,21 +1472,21 @@ void KVCache::dequantize_layer(int layer) {
     }
     if (need_v && !kv.value_store.tensor) {
         auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
-        kv.value_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, kv.value_store.device);
+        kv.value_store.tensor =
+            std::make_shared<Tensor>(DataType::FP32, shape, kv.value_store.device);
     }
 
     if (need_k) {
         std::vector<float> h_out(new_rows * kv_dim);
         for (int s = start; s < filled; ++s) {
             const uint8_t* qk_src = kv.key_store.q_row(s);
-            dequantize_cpu(kv_config_.type_k, qk_src,
-                           h_out.data() + (s - start) * kv_dim, kv_dim, s);
+            dequantize_cpu(kv_config_.type_k, qk_src, h_out.data() + (s - start) * kv_dim, kv_dim,
+                           s);
         }
         if (kv.key_store.device == DeviceType::CUDA) {
 #ifdef USE_CUDA
             cudaMemcpy(static_cast<float*>(kv.key_store.tensor->data()) + start * kv_dim,
-                       h_out.data(), new_rows * kv_dim * sizeof(float),
-                       cudaMemcpyHostToDevice);
+                       h_out.data(), new_rows * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 #endif
         } else {
             std::memcpy(static_cast<float*>(kv.key_store.tensor->data()) + start * kv_dim,
@@ -1364,14 +1498,13 @@ void KVCache::dequantize_layer(int layer) {
         std::vector<float> h_out(new_rows * kv_dim);
         for (int s = start; s < filled; ++s) {
             const uint8_t* qv_src = kv.value_store.q_row(s);
-            dequantize_cpu(kv_config_.type_v, qv_src,
-                           h_out.data() + (s - start) * kv_dim, kv_dim, s);
+            dequantize_cpu(kv_config_.type_v, qv_src, h_out.data() + (s - start) * kv_dim, kv_dim,
+                           s);
         }
         if (kv.value_store.device == DeviceType::CUDA) {
 #ifdef USE_CUDA
             cudaMemcpy(static_cast<float*>(kv.value_store.tensor->data()) + start * kv_dim,
-                       h_out.data(), new_rows * kv_dim * sizeof(float),
-                       cudaMemcpyHostToDevice);
+                       h_out.data(), new_rows * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 #endif
         } else {
             std::memcpy(static_cast<float*>(kv.value_store.tensor->data()) + start * kv_dim,
@@ -1436,8 +1569,7 @@ TensorPtr KVCache::get_key_filled(int layer) const {
     if (ring && logical > window_size_) {
         int cursor = ring_cursor_[layer];
         int kvd = this->kv_dim(layer);
-        auto out = std::make_shared<Tensor>(DataType::FP32,
-                                            std::vector<int64_t>{window_size_, kvd},
+        auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{window_size_, kvd},
                                             store.device);
         float* dst = static_cast<float*>(out->data());
         const float* src = static_cast<const float*>(store.tensor->data());
@@ -1482,8 +1614,7 @@ TensorPtr KVCache::get_value_filled(int layer) const {
     if (ring && logical > window_size_) {
         int cursor = ring_cursor_[layer];
         int kvd = this->kv_dim(layer);
-        auto out = std::make_shared<Tensor>(DataType::FP32,
-                                            std::vector<int64_t>{window_size_, kvd},
+        auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{window_size_, kvd},
                                             store.device);
         float* dst = static_cast<float*>(out->data());
         const float* src = static_cast<const float*>(store.tensor->data());
@@ -1544,7 +1675,8 @@ size_t KVCache::active_bytes() const {
     size_t total = 0;
     for (int i = 0; i < static_cast<int>(layers_.size()); ++i) {
         const auto& layer = layers_[i];
-        int f = use_ring_buffer(i) ? std::min(layer.logical_filled, window_size_) : layer.logical_filled;
+        int f = use_ring_buffer(i) ? std::min(layer.logical_filled, window_size_)
+                                   : layer.logical_filled;
         total += static_cast<size_t>(f) * layer.key_store.row_bytes;
         total += static_cast<size_t>(f) * layer.value_store.row_bytes;
     }
@@ -1574,6 +1706,18 @@ void* KVCache::d_q_value_cache(int layer) const {
     return const_cast<void*>(layers_[layer].value_store.d_q_data());
 }
 
+void* KVCache::d_q_key_scale(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(fp8_scale_k_.size()))
+        return nullptr;
+    return fp8_scale_k_[layer];
+}
+
+void* KVCache::d_q_value_scale(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(fp8_scale_v_.size()))
+        return nullptr;
+    return fp8_scale_v_[layer];
+}
+
 size_t KVCache::key_row_bytes(int layer) const {
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return 0;
@@ -1590,9 +1734,8 @@ size_t KVCache::value_row_bytes(int layer) const {
 // CUDA quantized update
 // =========================================================================
 
-int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
-                                   const TensorPtr& new_key, const TensorPtr& new_value,
-                                   int seq_len) {
+int KVCache::update_quantized_cuda(int layer, int64_t start_pos, const TensorPtr& new_key,
+                                   const TensorPtr& new_value, int seq_len) {
 #ifdef USE_CUDA
     if (layer < 0 || layer >= static_cast<int>(layers_.size()))
         return -1;
@@ -1668,6 +1811,26 @@ int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
         case KVCacheDType::Q4_K:
             cuda::launch_quantize_q4_k_matrix(d_k, q_dst, seq_len, kv_dim, stream);
             break;
+        case KVCacheDType::FP8_E4M3:
+            if (fp8_scale_k_[layer]) {
+                cuda::launch_quantize_fp8_e4m3_scaled(
+                    d_k, q_dst,
+                    static_cast<float*>(fp8_scale_k_[layer]) + (size_t)filled * num_kv_heads_,
+                    seq_len, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_quantize_fp8_e4m3_matrix(d_k, q_dst, seq_len, kv_dim, stream);
+            }
+            break;
+        case KVCacheDType::FP8_E5M2:
+            if (fp8_scale_k_[layer]) {
+                cuda::launch_quantize_fp8_e5m2_scaled(
+                    d_k, q_dst,
+                    static_cast<float*>(fp8_scale_k_[layer]) + (size_t)filled * num_kv_heads_,
+                    seq_len, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_quantize_fp8_e5m2_matrix(d_k, q_dst, seq_len, kv_dim, stream);
+            }
+            break;
         default:
             break;
         }
@@ -1688,6 +1851,26 @@ int KVCache::update_quantized_cuda(int layer, int64_t start_pos,
             break;
         case KVCacheDType::Q4_K:
             cuda::launch_quantize_q4_k_matrix(d_v, q_dst, seq_len, kv_dim, stream);
+            break;
+        case KVCacheDType::FP8_E4M3:
+            if (fp8_scale_v_[layer]) {
+                cuda::launch_quantize_fp8_e4m3_scaled(
+                    d_v, q_dst,
+                    static_cast<float*>(fp8_scale_v_[layer]) + (size_t)filled * num_kv_heads_,
+                    seq_len, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_quantize_fp8_e4m3_matrix(d_v, q_dst, seq_len, kv_dim, stream);
+            }
+            break;
+        case KVCacheDType::FP8_E5M2:
+            if (fp8_scale_v_[layer]) {
+                cuda::launch_quantize_fp8_e5m2_scaled(
+                    d_v, q_dst,
+                    static_cast<float*>(fp8_scale_v_[layer]) + (size_t)filled * num_kv_heads_,
+                    seq_len, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_quantize_fp8_e5m2_matrix(d_v, q_dst, seq_len, kv_dim, stream);
+            }
             break;
         default:
             break;
@@ -1738,7 +1921,7 @@ void KVCache::dequantize_layer_cuda(int layer) {
     // Dequantize K
     if (kv_config_.type_k != KVCacheDType::FP32) {
         const uint8_t* q_src = static_cast<const uint8_t*>(kv.key_store.d_q_data()) +
-                                static_cast<size_t>(start) * k_row_size;
+                               static_cast<size_t>(start) * k_row_size;
         switch (kv_config_.type_k) {
         case KVCacheDType::F16:
             cuda::launch_dequant_f16_matrix(q_src, k_out, new_rows, kv_dim, stream);
@@ -1752,6 +1935,26 @@ void KVCache::dequantize_layer_cuda(int layer) {
         case KVCacheDType::Q4_K:
             cuda::launch_dequant_q4_k_matrix(q_src, k_out, new_rows, kv_dim, stream);
             break;
+        case KVCacheDType::FP8_E4M3:
+            if (fp8_scale_k_[layer]) {
+                cuda::launch_dequant_fp8_e4m3_scaled(
+                    q_src,
+                    static_cast<const float*>(fp8_scale_k_[layer]) + (size_t)start * num_kv_heads_,
+                    k_out, new_rows, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_dequant_fp8_e4m3_matrix(q_src, k_out, new_rows, kv_dim, stream);
+            }
+            break;
+        case KVCacheDType::FP8_E5M2:
+            if (fp8_scale_k_[layer]) {
+                cuda::launch_dequant_fp8_e5m2_scaled(
+                    q_src,
+                    static_cast<const float*>(fp8_scale_k_[layer]) + (size_t)start * num_kv_heads_,
+                    k_out, new_rows, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_dequant_fp8_e5m2_matrix(q_src, k_out, new_rows, kv_dim, stream);
+            }
+            break;
         default:
             break;
         }
@@ -1760,7 +1963,7 @@ void KVCache::dequantize_layer_cuda(int layer) {
     // Dequantize V
     if (kv_config_.type_v != KVCacheDType::FP32) {
         const uint8_t* q_src = static_cast<const uint8_t*>(kv.value_store.d_q_data()) +
-                                static_cast<size_t>(start) * v_row_size;
+                               static_cast<size_t>(start) * v_row_size;
         switch (kv_config_.type_v) {
         case KVCacheDType::F16:
             cuda::launch_dequant_f16_matrix(q_src, v_out, new_rows, kv_dim, stream);
@@ -1773,6 +1976,26 @@ void KVCache::dequantize_layer_cuda(int layer) {
             break;
         case KVCacheDType::Q4_K:
             cuda::launch_dequant_q4_k_matrix(q_src, v_out, new_rows, kv_dim, stream);
+            break;
+        case KVCacheDType::FP8_E4M3:
+            if (fp8_scale_v_[layer]) {
+                cuda::launch_dequant_fp8_e4m3_scaled(
+                    q_src,
+                    static_cast<const float*>(fp8_scale_v_[layer]) + (size_t)start * num_kv_heads_,
+                    v_out, new_rows, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_dequant_fp8_e4m3_matrix(q_src, v_out, new_rows, kv_dim, stream);
+            }
+            break;
+        case KVCacheDType::FP8_E5M2:
+            if (fp8_scale_v_[layer]) {
+                cuda::launch_dequant_fp8_e5m2_scaled(
+                    q_src,
+                    static_cast<const float*>(fp8_scale_v_[layer]) + (size_t)start * num_kv_heads_,
+                    v_out, new_rows, num_kv_heads_, head_dim_, stream);
+            } else {
+                cuda::launch_dequant_fp8_e5m2_matrix(q_src, v_out, new_rows, kv_dim, stream);
+            }
             break;
         default:
             break;
@@ -1907,6 +2130,129 @@ int KVCache::find_slot(int layer) const {
             return i;
     }
     return -1;
+}
+
+// =========================================================================
+// Roadmap 2.2: defragmentation
+// =========================================================================
+
+void KVCache::move_kv_row(int layer, int from, int to) {
+    auto move_store = [&](KVCacheStorage& store, void* fp8_scale) {
+        size_t rb = store.row_bytes;
+        if (rb == 0)
+            return;
+
+        if (store.device == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            if (store.dtype == KVCacheDType::FP32) {
+                cudaMemcpy(store.fp32_row(to), store.fp32_row(from), rb, cudaMemcpyDeviceToDevice);
+            } else {
+                cudaMemcpy(store.q_row(to), store.q_row(from), rb, cudaMemcpyDeviceToDevice);
+            }
+            if (store.tensor) {
+                int kvd = kv_dim(layer);
+                cudaMemcpy(static_cast<float*>(store.tensor->data()) + (size_t)to * kvd,
+                           static_cast<float*>(store.tensor->data()) + (size_t)from * kvd,
+                           (size_t)kvd * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+#endif
+        } else {
+            if (store.dtype == KVCacheDType::FP32) {
+                std::memcpy(store.fp32_row(to), store.fp32_row(from), rb);
+            } else {
+                std::memcpy(store.q_row(to), store.q_row(from), rb);
+            }
+            if (store.tensor) {
+                int kvd = kv_dim(layer);
+                float* d = static_cast<float*>(store.tensor->data());
+                std::memcpy(d + (size_t)to * kvd, d + (size_t)from * kvd,
+                            (size_t)kvd * sizeof(float));
+            }
+        }
+
+        // FP8 per-(row, kv_head) scales (contiguous CUDA path only; nullptr on CPU).
+        if (fp8_scale) {
+            int heads = num_kv_heads_ > 0 ? num_kv_heads_ : 1;
+            size_t sz = (size_t)heads * sizeof(float);
+#ifdef USE_CUDA
+            if (store.device == DeviceType::CUDA) {
+                cudaMemcpy(static_cast<float*>(fp8_scale) + (size_t)to * heads,
+                           static_cast<float*>(fp8_scale) + (size_t)from * heads, sz,
+                           cudaMemcpyDeviceToDevice);
+            } else
+#endif
+            {
+                std::memcpy(static_cast<float*>(fp8_scale) + (size_t)to * heads,
+                            static_cast<float*>(fp8_scale) + (size_t)from * heads, sz);
+            }
+        }
+    };
+
+    move_store(layers_[layer].key_store, fp8_scale_k_.empty() ? nullptr : fp8_scale_k_[layer]);
+    move_store(layers_[layer].value_store, fp8_scale_v_.empty() ? nullptr : fp8_scale_v_[layer]);
+}
+
+void KVCache::defrag() {
+    for (int i = 0; i < num_layers(); ++i) {
+        if (use_ring_buffer(i))
+            continue;  // ring layers recycle in place; no fragmentation
+
+        auto& kv = layers_[i];
+        int n = static_cast<int>(kv.cells.size());
+        int write = 0;
+        for (int read = 0; read < n; ++read) {
+            KVCellMeta c = kv.cells[read];
+            if (c.is_free())
+                continue;
+
+            if (read == write) {
+                c.pos = write;
+                kv.cells[write] = c;
+                ++write;
+                continue;
+            }
+
+            // Move K/V row data first (read > write, so source and destination
+            // rows are distinct and the source is still intact).
+            move_kv_row(i, read, write);
+            c.pos = write;
+            kv.cells[write] = c;
+            // Vacate the old slot.
+            kv.cells[read].pos = -1;
+            kv.cells[read].seq_id_mask = 0;
+            ++write;
+        }
+        // Remaining slots are free and contiguous at the tail.
+        for (int j = write; j < n; ++j) {
+            kv.cells[j].pos = -1;
+            kv.cells[j].seq_id_mask = 0;
+        }
+
+        kv.filled = write;
+        kv.logical_filled = write;
+        if (kv.dequantized_filled > write)
+            kv.dequantized_filled = write;
+    }
+}
+
+void KVCache::defrag_if_needed() {
+    if (!defrag_enabled_)
+        return;
+
+    for (int i = 0; i < num_layers(); ++i) {
+        if (use_ring_buffer(i))
+            continue;
+        const auto& cells = layers_[i].cells;
+        bool seen_free = false;
+        for (const auto& cell : cells) {
+            if (cell.is_free()) {
+                seen_free = true;
+            } else if (seen_free) {
+                defrag();  // fragmented: a hole precedes an alive cell
+                return;
+            }
+        }
+    }
 }
 
 int KVCache::seq_filled(int layer, int seq_id) const {
