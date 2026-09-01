@@ -158,10 +158,17 @@ if(FORGE_BUILD_PYTHON)
       "${CMAKE_SOURCE_DIR}/.cache/fetchcontent"
       CACHE PATH "FetchContent cache directory")
 
+  # Default to the upstream repo. Users behind a mirror can override with:
+  #   -DFORGE_PYBIND11_REPO=https://ghproxy.net/https://github.com/pybind/pybind11.git
+  # or transparently via: git config --global url."https://ghproxy.net/https://github.com/".insteadOf "https://github.com/"
+  set(FORGE_PYBIND11_REPO
+      "https://github.com/pybind/pybind11.git"
+      CACHE STRING "pybind11 git repository URL (mirror-friendly)")
+
   include(FetchContent)
   FetchContent_Declare(
     pybind11
-    GIT_REPOSITORY https://ghproxy.net/https://github.com/pybind/pybind11.git
+    GIT_REPOSITORY "${FORGE_PYBIND11_REPO}"
     GIT_TAG v2.13.6)
   FetchContent_MakeAvailable(pybind11)
 else()

@@ -24,6 +24,13 @@
 include(CheckCXXCompilerFlag)
 include(CheckCXXSourceCompiles)
 
+# MSVC has no -fsyntax-only; use /Zs for syntax-only checks.
+if(MSVC)
+  set(_forge_syntax_only "/Zs")
+else()
+  set(_forge_syntax_only "-fsyntax-only")
+endif()
+
 # ---- Level 1: Architecture detection ----
 if(DEFINED FORGE_ARCH)
   string(TOUPPER "${FORGE_ARCH}" FORGE_ARCH)
@@ -121,17 +128,23 @@ if(FORGE_ARCH STREQUAL "X86")
       # the probe source determines success: 0-byte object => feature available.
       set(_probe_dir "${CMAKE_BINARY_DIR}/CMakeFiles/forge_cpu_probe")
 
-      # AVX2: check __AVX2__ && __FMA__ && __F16C__
+      # AVX2: check __AVX2__ && __FMA__ && __F16C__ (GCC/Clang); MSVC defines
+      # _M_AVX2 with /arch:AVX2 and has no __FMA__/__F16C__ macros (both are
+      # implied by /arch:AVX2), so the probe must differ per compiler.
       file(MAKE_DIRECTORY "${_probe_dir}")
-      file(
-        WRITE "${_probe_dir}/probe_avx2.cpp"
-        "#if !defined(__AVX2__) || !defined(__FMA__) || !defined(__F16C__)\n"
-        "#error \"AVX2 not available\"\n" "#endif\n"
-        "int probe_avx2(){ return 0; }\n")
+      if(MSVC)
+        set(_probe_avx2_src
+            "#if !defined(_M_AVX2)\n#error \"AVX2 not available\"\n#endif\nint probe_avx2(){ return 0; }\n")
+      else()
+        set(_probe_avx2_src
+            "#if !defined(__AVX2__) || !defined(__FMA__) || !defined(__F16C__)\n"
+            "#error \"AVX2 not available\"\n#endif\nint probe_avx2(){ return 0; }\n")
+      endif()
+      file(WRITE "${_probe_dir}/probe_avx2.cpp" "${_probe_avx2_src}")
       execute_process(
         COMMAND
           "${CMAKE_CXX_COMPILER}" ${CMAKE_CXX_COMPILER_ARG1} ${CMAKE_CXX_FLAGS}
-          "${_forge_probe_flags}" -fsyntax-only "${_probe_dir}/probe_avx2.cpp"
+          "${_forge_probe_flags}" ${_forge_syntax_only} "${_probe_dir}/probe_avx2.cpp"
         RESULT_VARIABLE _avx2_probe_reply
         ERROR_VARIABLE _avx2_probe_err)
       if(_avx2_probe_reply EQUAL 0)
@@ -143,7 +156,11 @@ if(FORGE_ARCH STREQUAL "X86")
 
       if(FORGE_CPU_HAS_AVX2)
         message(STATUS "  AVX2: YES (via ${_forge_probe_flags})")
-        check_cxx_compiler_flag("-mavx2 -mfma -mf16c" COMPILER_SUPPORTS_AVX2)
+        if(MSVC)
+          check_cxx_compiler_flag("/arch:AVX2" COMPILER_SUPPORTS_AVX2)
+        else()
+          check_cxx_compiler_flag("-mavx2 -mfma -mf16c" COMPILER_SUPPORTS_AVX2)
+        endif()
         if(NOT COMPILER_SUPPORTS_AVX2)
           message(
             WARNING
@@ -169,7 +186,7 @@ if(FORGE_ARCH STREQUAL "X86")
       execute_process(
         COMMAND
           "${CMAKE_CXX_COMPILER}" ${CMAKE_CXX_COMPILER_FLAG1} ${CMAKE_CXX_FLAGS}
-          "${_forge_probe_flags}" -fsyntax-only "${_probe_dir}/probe_avx512.cpp"
+          "${_forge_probe_flags}" ${_forge_syntax_only} "${_probe_dir}/probe_avx512.cpp"
         RESULT_VARIABLE _avx512_probe
         ERROR_VARIABLE _avx512_probe_err)
       if(_avx512_probe EQUAL 0)
@@ -182,9 +199,13 @@ if(FORGE_ARCH STREQUAL "X86")
 
       if(FORGE_CPU_HAS_AVX512_VNNI)
         message(STATUS "  AVX-512 VNNI: YES (via ${_forge_probe_flags})")
-        check_cxx_compiler_flag(
-          "-mavx512f -mavx512bw -mavx512vnni -mavx512vl -mf16c"
-          COMPILER_SUPPORTS_AVX512_VNNI)
+        if(MSVC)
+          check_cxx_compiler_flag("/arch:AVX512" COMPILER_SUPPORTS_AVX512_VNNI)
+        else()
+          check_cxx_compiler_flag(
+            "-mavx512f -mavx512bw -mavx512vnni -mavx512vl -mf16c"
+            COMPILER_SUPPORTS_AVX512_VNNI)
+        endif()
         if(NOT COMPILER_SUPPORTS_AVX512_VNNI)
           message(
             WARNING
@@ -264,7 +285,7 @@ elseif(FORGE_ARCH STREQUAL "ARM64")
       execute_process(
         COMMAND
           "${CMAKE_CXX_COMPILER}" ${CMAKE_CXX_COMPILER_ARG1} ${CMAKE_CXX_FLAGS}
-          "${_forge_arm_probe_flags}" -fsyntax-only
+          "${_forge_arm_probe_flags}" ${_forge_syntax_only}
           "${_probe_dir}/probe_neon.cpp"
         RESULT_VARIABLE _neon_result
         ERROR_VARIABLE _neon_err)
@@ -287,7 +308,7 @@ elseif(FORGE_ARCH STREQUAL "ARM64")
       execute_process(
         COMMAND
           "${CMAKE_CXX_COMPILER}" ${CMAKE_CXX_COMPILER_FLAG1} ${CMAKE_CXX_FLAGS}
-          "${_forge_arm_probe_flags}" -fsyntax-only
+          "${_forge_arm_probe_flags}" ${_forge_syntax_only}
           "${_probe_dir}/probe_dotprod.cpp"
         RESULT_VARIABLE _dotprod_result
         ERROR_VARIABLE _dotprod_err)
@@ -311,7 +332,7 @@ elseif(FORGE_ARCH STREQUAL "ARM64")
       execute_process(
         COMMAND
           "${CMAKE_CXX_COMPILER}" ${CMAKE_CXX_COMPILER_FLAG1} ${CMAKE_CXX_FLAGS}
-          "${_forge_arm_probe_flags}" -fsyntax-only
+          "${_forge_arm_probe_flags}" ${_forge_syntax_only}
           "${_probe_dir}/probe_i8mm.cpp"
         RESULT_VARIABLE _i8mm_result
         ERROR_VARIABLE _i8mm_err)
@@ -354,7 +375,7 @@ elseif(FORGE_ARCH STREQUAL "PPC64")
          "int probe_vsx(){ return 0; }\n")
     execute_process(
       COMMAND "${CMAKE_CXX_COMPILER}" ${CMAKE_CXX_COMPILER_ARG1}
-              ${CMAKE_CXX_FLAGS} -fsyntax-only "${_probe_dir}/probe_vsx.cpp"
+              ${CMAKE_CXX_FLAGS} ${_forge_syntax_only} "${_probe_dir}/probe_vsx.cpp"
       RESULT_VARIABLE _vsx_result
       ERROR_VARIABLE _vsx_err)
     if(_vsx_result EQUAL 0)
