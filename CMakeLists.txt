@@ -182,8 +182,10 @@ add_library(
   src/core/memory_planner.cpp
   src/core/compute_graph.cpp
   src/debug/logger.cpp
+  src/inference/kv_block_swapper.cpp
   src/inference/kv_cache.cpp
   src/inference/kv_memory.cpp
+  src/inference/kv_sizing.cpp
   src/inference/kv_storage.cpp
   src/inference/prefix_cache.cpp)
 target_include_directories(
@@ -255,6 +257,8 @@ add_library(
   src/inference/engines/transformer_engine.cpp
   src/inference/engines/expert_page_cache.cpp
   src/inference/engines/deepseek_engine.cpp
+  src/inference/engines/dflash_engine.cpp
+  src/inference/dflash_draft_provider.cpp
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/gemma4_engine.cpp
   src/inference/engines/phimoe_engine.cpp
@@ -283,7 +287,6 @@ add_library(
   src/inference/context.cpp
   src/inference/sampler.cpp
   src/inference/generator.cpp
-  src/inference/paged_kv_cache.cpp
   src/inference/attention_mask.cpp
   src/inference/request_scheduler.cpp
   src/inference/speculative.cpp

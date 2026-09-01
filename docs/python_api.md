@@ -83,6 +83,10 @@ ctx.forward(input_tokens)              # Single forward pass
 ctx.generate(input_tokens, max_new=128) # Generate from prompt
 ctx.reset()                            # Reset KV cache
 ctx.warmup()                           # Warm up CUDA kernels
+
+# Production default: HIGH_ACCURACY (q8_0 KV, per-token logits cosine >= 0.999)
+ctx = model.create_context(kv_cache_precision="high_accuracy", gpu_layers=-1)
+# Values: "auto" | "high_accuracy" (-> q8_0) | "high_throughput" (-> fp8_e4m3)
 ```
 
 ### Tokenizer

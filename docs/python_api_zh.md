@@ -125,7 +125,13 @@ model.generate_stream(
 
 ```python
 ctx = model.create_context(kv_cache_dtype="fp32", gpu_layers=-1)
+# 生产默认：启用 HIGH_ACCURACY（q8_0 KV，逐 token logits 余弦 >= 0.999）
+ctx = model.create_context(kv_cache_precision="high_accuracy", gpu_layers=-1)
+# 或使用枚举（值：AUTO / HIGH_ACCURACY / HIGH_THROUGHPUT）
+ctx = model.create_context(kv_cache_precision=forge.KVCachePrecision.HIGH_ACCURACY)
 ```
+
+`kv_cache_precision` 取值非 `"auto"` 时覆盖 `kv_cache_dtype`：`high_accuracy` → `q8_0`（1/4 显存），`high_throughput` → `fp8_e4m3`（1/8 显存，≈0.988 余弦，吞吐优先）。
 
 | 方法 | 说明 |
 |------|------|

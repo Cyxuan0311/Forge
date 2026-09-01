@@ -156,7 +156,7 @@ Two cache implementations (`include/forge/kv_cache.h`):
 | Type | Description |
 |------|-------------|
 | **Contiguous KVCache** | Fixed-size pre-allocated buffer, direct indexing |
-| **PagedKVCache** | Block-based allocation, enables continuous batching |
+| **PagedKVStorage** | Page-based allocation (dtype-aware), enables continuous batching & prefix sharing |
 
 Both support FP32 and Q4_0 quantization for the KV cache data.
 

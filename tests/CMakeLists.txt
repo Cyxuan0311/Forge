@@ -73,6 +73,44 @@ add_executable(forge-spec-test test_spec_verify.cpp)
 forge_link_native(forge-spec-test)
 add_test(NAME spec-verify COMMAND forge-spec-test)
 
+# DFlash / DSPark (Phase 2): iSWA routing + config parse. Part 1 loads the real
+# dflash GGUF to verify parse_dflash_config populates the sliding-window
+# metadata; Part 2 is a self-contained KVCache ring-buffer test proving the
+# iSWA routing. Engine integration (Part 3) needs a matched drafter+target pair
+# and is skipped unless FORGE_TEST_DFLASH_MODEL + FORGE_TEST_TARGET_MODEL are set.
+add_executable(forge-dflash-test test_dflash.cpp)
+forge_link_native(forge-dflash-test)
+add_test(NAME dflash COMMAND forge-dflash-test)
+
+# KV auto-capacity sizing (roadmap 1.2): per-sequence footprint arithmetic and
+# the max_num_seqs derivation from a device memory budget. Host-only.
+add_executable(forge-kv-sizing-test test_kv_sizing.cpp)
+forge_link_native(forge-kv-sizing-test)
+add_test(NAME kv-sizing COMMAND forge-kv-sizing-test)
+
+# KV page offload (roadmap 1.1): whole-sequence host swap (evict/bring back)
+# with bit-exact restore, so swapped-out requests resume with identical
+# attention results. Host-only; exercised end-to-end through PagedKVStorage.
+add_executable(forge-kv-offload-test test_kv_offload.cpp)
+forge_link_native(forge-kv-offload-test)
+add_test(NAME kv-offload COMMAND forge-kv-offload-test)
+
+# Roadmap 2.2: contiguous KV cache defragmentation (host-only).
+add_executable(forge-kv-defrag-test test_kv_defrag.cpp)
+forge_link_native(forge-kv-defrag-test)
+add_test(NAME kv-defrag COMMAND forge-kv-defrag-test)
+
+# Roadmap 2.3 Phase B: Qwen35 recurrent-memory per-sequence state and
+# speculative snapshot/rollback contract (host-only; GPU mirror optional).
+add_executable(forge-qwen35-recurrent-test test_qwen35_recurrent.cpp)
+forge_link_native(forge-qwen35-recurrent-test)
+add_test(NAME qwen35-recurrent COMMAND forge-qwen35-recurrent-test)
+
+# Roadmap 2.5: prefill whole-segment quantized write (requires CUDA).
+add_executable(forge-kv-quant-segment-test test_kv_quant_segment.cpp)
+forge_link_native(forge-kv-quant-segment-test)
+add_test(NAME kv-quant-segment COMMAND forge-kv-quant-segment-test)
+
 # Parallel GGUF scanner (inspect).
 add_executable(forge-inspect-scanner-test test_inspect_scanner.cpp)
 target_include_directories(
@@ -114,7 +152,7 @@ add_executable(
   ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/quant_tables.cpp)
 target_include_directories(
   forge-q3k-decode-bisect PRIVATE ${PROJECT_SOURCE_DIR}/include
-                                  ${PROJECT_SOURCE_DIR}/src)
+                                  ${PROJECT_SOURCE_DIR})
 
 # -----------------------------------------------------------------------------
 # CUDA MMQ kernels vs CPU-dequant golden (built only when CUDA is present).
@@ -127,6 +165,11 @@ if(CUDAToolkit_FOUND)
     ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
   forge_link_native(forge-mmq-ref-test)
   add_test(NAME mmq-ref COMMAND forge-mmq-ref-test)
+
+  # Q8_0 quantize/dequantize round-trip + per-block scale validation.
+  add_executable(forge-q8-roundtrip-test test_q8_roundtrip.cu)
+  forge_link_native(forge-q8-roundtrip-test)
+  add_test(NAME q8-roundtrip COMMAND forge-q8-roundtrip-test)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -152,111 +195,19 @@ else()
 endif()
 
 # -----------------------------------------------------------------------------
-# Cross-architecture kernel tests (cross-compile + QEMU).
+# Cross-architecture kernel tests (ARM64 NEON, PPC64 VSX) are OPT-IN.
 #
-# These sources use NEON/VSX intrinsics and cannot be compiled by the host
-# compiler, so each is cross-built with <triple>-linux-gnu-g++ and executed
-# under QEMU via CTest. A test is registered only when BOTH the cross compiler
-# and its qemu emulator are found; otherwise it is silently skipped.
+# They require a cross toolchain + QEMU and pull in arch-specific headers that
+# do not build on every host, so they are gated behind FORGE_BUILD_CROSS_TESTS
+# (default OFF). Enable explicitly with -DFORGE_BUILD_CROSS_TESTS=ON.
 #
-# Included here:
-#   * tests/test_arm64_neon_kernels.cpp, tests/test_ppc64_vsx_kernels.cpp
-#     (top-level historical locations)
-#   * every *.cpp under tests/arch/arm64/ and tests/arch/ppc64/ (auto-discovered)
+# The actual cross-build logic lives in cmake/cross_tests.cmake.
 # -----------------------------------------------------------------------------
-
-# Helper: locate a cross gcc + qemu emulator pair and register a ctest entry.
-#   name        test label prefix
-#   src         test source (relative to PROJECT_SOURCE_DIR)
-#   triple_gcc  cross compiler binary name
-#   qemu_candidates  qemu binary names tried in order
-#   cflags      arch-specific compile flags
-#   inc_dirs    extra -I include directories (relative to PROJECT_SOURCE_DIR)
-function(
-  forge_add_cross_test
-  name
-  src
-  triple_gcc
-  qemu_candidates
-  cflags
-  inc_dirs)
-  find_program(${name}_GCC ${triple_gcc})
-  set(qemu_found "")
-  foreach(q IN LISTS qemu_candidates)
-    find_program(${name}_QEMU ${q})
-    if(${name}_QEMU)
-      set(qemu_found ${${name}_QEMU})
-      break()
-    endif()
-    unset(${name}_QEMU CACHE)
-  endforeach()
-
-  if(NOT ${name}_GCC OR NOT qemu_found)
-    message(STATUS "tests: skipping ${name} (need ${triple_gcc} + qemu)")
-    return()
-  endif()
-
-  set(out_dir ${PROJECT_BINARY_DIR}/tests/cross)
-  file(MAKE_DIRECTORY ${out_dir})
-  set(out_bin ${out_dir}/${name})
-
-  set(inc_args "")
-  foreach(d IN LISTS inc_dirs)
-    list(APPEND inc_args -I${PROJECT_SOURCE_DIR}/${d})
-  endforeach()
-
-  add_custom_command(
-    OUTPUT ${out_bin}
-    COMMAND
-      ${${name}_GCC} -std=c++17 -O2 -static ${cflags} -I${PROJECT_SOURCE_DIR}
-      -I${PROJECT_SOURCE_DIR}/include ${inc_args} ${PROJECT_SOURCE_DIR}/${src}
-      ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp -o ${out_bin}
-    DEPENDS ${PROJECT_SOURCE_DIR}/${src}
-            ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp
-    COMMENT "Cross-building ${name} (${triple_gcc})"
-    VERBATIM)
-  # Build the cross binary as part of the default `cmake --build build`.
-  add_custom_target(${name}-build ALL DEPENDS ${out_bin})
-
-  # ctest wrapper script so `ctest` transparently runs under qemu.
-  set(runner ${out_dir}/${name}.sh)
-  file(WRITE ${runner} "#!/bin/sh\nexec ${qemu_found} ${out_bin}\n")
-  execute_process(COMMAND chmod +x ${runner})
-
-  add_test(NAME ${name} COMMAND ${runner})
-  message(STATUS "tests: ${name} -> ${triple_gcc} + ${qemu_found}")
-endfunction()
-
-# Top-level historical cross tests.
-forge_add_cross_test(
-  neon-arm64-kernels tests/test_arm64_neon_kernels.cpp aarch64-linux-gnu-g++
-  "qemu-aarch64-static;qemu-aarch64" "-DUSE_NEON;-march=armv8.2-a+dotprod" "")
-
-forge_add_cross_test(
-  vsx-ppc64-kernels tests/test_ppc64_vsx_kernels.cpp powerpc64le-linux-gnu-g++
-  "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8" "")
-
-# Auto-discover every *.cpp under tests/arch/<arch>/ and cross-build it with
-# the matching toolchain + include path.
-file(GLOB ARM64_SOURCES CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/arch/arm64/*.cpp")
-foreach(src IN LISTS ARM64_SOURCES)
-  get_filename_component(stem ${src} NAME_WE)
-  forge_add_cross_test(
-    arm64-${stem} tests/arch/arm64/${stem}.cpp aarch64-linux-gnu-g++
-    "qemu-aarch64-static;qemu-aarch64" "-DUSE_NEON;-march=armv8.2-a+dotprod"
-    "src/operators/cpu/arch/arm64")
-endforeach()
-
-file(GLOB PPC64_SOURCES CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/arch/ppc64/*.cpp")
-foreach(src IN LISTS PPC64_SOURCES)
-  get_filename_component(stem ${src} NAME_WE)
-  forge_add_cross_test(
-    ppc64-${stem} tests/arch/ppc64/${stem}.cpp powerpc64le-linux-gnu-g++
-    "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8"
-    "src/operators/cpu/arch/ppc64")
-endforeach()
+option(FORGE_BUILD_CROSS_TESTS
+       "Build cross-architecture (ARM64/PPC64) kernel tests under QEMU" OFF)
+if(FORGE_BUILD_CROSS_TESTS)
+  include(${PROJECT_SOURCE_DIR}/cmake/cross_tests.cmake)
+endif()
 
 # -----------------------------------------------------------------------------
 # Micro-benchmarks (gated by FORGE_BUILD_BENCHMARKS, default OFF; not

@@ -130,6 +130,56 @@ esac
 echo -e "  → PerfProfiler: ${GREEN}$FORGE_PROFILING${NC}"
 echo
 
+# --- Cross-arch tests (ARM64/PPC64 under QEMU) ---
+echo -e "${CYAN}Cross-arch tests:${NC}"
+USE_CROSS_TESTS=$(ask_option "Build ARM/PPC cross tests under QEMU? (y/n)" "n")
+case $USE_CROSS_TESTS in
+    y|Y|yes) USE_CROSS_TESTS="ON" ;;
+    *) USE_CROSS_TESTS="OFF" ;;
+esac
+echo -e "  → Cross tests: ${GREEN}$USE_CROSS_TESTS${NC}"
+echo
+
+# --- Native build (-march=native) ---
+echo -e "${CYAN}Native build:${NC}"
+USE_NATIVE=$(ask_option "Tune for this CPU (-march=native)? (y/n)" "y")
+case $USE_NATIVE in
+    y|Y|yes) USE_NATIVE="ON" ;;
+    *) USE_NATIVE="OFF" ;;
+esac
+echo -e "  → Native build: ${GREEN}$USE_NATIVE${NC}"
+echo
+
+# --- Python bindings ---
+echo -e "${CYAN}Python bindings:${NC}"
+USE_PYTHON=$(ask_option "Build Python bindings? (y/n)" "y")
+case $USE_PYTHON in
+    y|Y|yes) USE_PYTHON="ON" ;;
+    *) USE_PYTHON="OFF" ;;
+esac
+echo -e "  → Python: ${GREEN}$USE_PYTHON${NC}"
+echo
+
+# --- Tests ---
+echo -e "${CYAN}Tests:${NC}"
+USE_TESTS=$(ask_option "Build forge test executables? (y/n)" "n")
+case $USE_TESTS in
+    y|Y|yes) USE_TESTS="ON" ;;
+    *) USE_TESTS="OFF" ;;
+esac
+echo -e "  → Tests: ${GREEN}$USE_TESTS${NC}"
+echo
+
+# --- Benchmarks ---
+echo -e "${CYAN}Benchmarks:${NC}"
+USE_BENCH=$(ask_option "Build micro-benchmarks? (y/n)" "n")
+case $USE_BENCH in
+    y|Y|yes) USE_BENCH="ON" ;;
+    *) USE_BENCH="OFF" ;;
+esac
+echo -e "  → Benchmarks: ${GREEN}$USE_BENCH${NC}"
+echo
+
 # --- Parallel Jobs ---
 NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 echo -e "${CYAN}Build Parallelism:${NC}"
@@ -154,6 +204,11 @@ if [ "$USE_CUDA" = "ON" ]; then
 fi
 echo -e "  OpenBLAS:       ${GREEN}$USE_OPENBLAS${NC}"
 echo -e "  PerfProfiler:   ${GREEN}$FORGE_PROFILING${NC}"
+echo -e "  Cross Tests:    ${GREEN}$USE_CROSS_TESTS${NC}"
+echo -e "  Native Build:   ${GREEN}$USE_NATIVE${NC}"
+echo -e "  Python:         ${GREEN}$USE_PYTHON${NC}"
+echo -e "  Tests:          ${GREEN}$USE_TESTS${NC}"
+echo -e "  Benchmarks:     ${GREEN}$USE_BENCH${NC}"
 echo -e "  Parallel Jobs:  ${GREEN}$JOBS${NC}"
 echo -e "  Build Dir:      ${GREEN}$BUILD_DIR${NC}"
 echo -e "${CYAN}========================================${NC}"
@@ -189,6 +244,16 @@ if [ "$USE_OPENBLAS" = "ON" ]; then
 fi
 
 CMAKE_ARGS+=(-DFORGE_PROFILING="$FORGE_PROFILING")
+CMAKE_ARGS+=(-DFORGE_NATIVE_BUILD="$USE_NATIVE")
+CMAKE_ARGS+=(-DFORGE_BUILD_PYTHON="$USE_PYTHON")
+CMAKE_ARGS+=(-DFORGE_BUILD_TESTS="$USE_TESTS")
+# FORGE_BUILD_CROSS_TESTS / FORGE_BUILD_BENCHMARKS are defined inside
+# tests/CMakeLists.txt, so only pass them when the test suite is enabled;
+# otherwise CMake warns "Manually-specified variables were not used".
+if [ "$USE_TESTS" = "ON" ]; then
+  CMAKE_ARGS+=(-DFORGE_BUILD_CROSS_TESTS="$USE_CROSS_TESTS")
+  CMAKE_ARGS+=(-DFORGE_BUILD_BENCHMARKS="$USE_BENCH")
+fi
 
 cmake "${CMAKE_ARGS[@]}"
 
