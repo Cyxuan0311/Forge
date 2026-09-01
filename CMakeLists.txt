@@ -314,7 +314,7 @@ target_include_directories(
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CUDAToolkit_INCLUDE_DIRS}
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/operators
           ${CMAKE_CURRENT_SOURCE_DIR}/third_party/jinja
-          ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann)
+          ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge_infer PUBLIC USE_CUDA)
 endif()
