@@ -4,7 +4,7 @@
 #include <cstring>
 #include <vector>
 
-#include "forge/cuda_kernels.h"
+#include "forge/cuda_kernels.h"  // fused + paged decode launches (F16/Q8_0/Q4_0/FP8)
 #include "forge/inference/layers/attention_executor.h"
 #include "forge/inference/layers/qwen35_rope.h"
 #include "forge/inference/tensor_device_utils.h"
@@ -23,7 +23,8 @@ namespace {
 // 与重构前的行为一致。
 std::vector<float> load_head_norm_weight(const TensorPtr& w, int head_dim) {
     std::vector<float> out(head_dim, 1.0f);
-    if (!w || w->dtype() != DataType::FP32) return out;
+    if (!w || w->dtype() != DataType::FP32)
+        return out;
     auto cpu = ensure_cpu(w);
     std::memcpy(out.data(), cpu->data(), head_dim * sizeof(float));
     return out;
@@ -36,17 +37,18 @@ void per_head_rms_norm_cpu(float* data, const std::vector<float>& weight, int se
         for (int h = 0; h < num_heads; ++h) {
             float* head_ptr = data + s * num_heads * head_dim + h * head_dim;
             float norm_sq = 0.0f;
-            for (int d = 0; d < head_dim; ++d) norm_sq += head_ptr[d] * head_ptr[d];
+            for (int d = 0; d < head_dim; ++d)
+                norm_sq += head_ptr[d] * head_ptr[d];
             float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + eps);
-            for (int d = 0; d < head_dim; ++d) head_ptr[d] *= inv_rms * weight[d];
+            for (int d = 0; d < head_dim; ++d)
+                head_ptr[d] *= inv_rms * weight[d];
         }
     }
 }
 
 }  // namespace
 
-TensorPtr Qwen35FullAttention::attend(const TensorPtr& normed,
-                                      const LayerExecutionContext& lctx) {
+TensorPtr Qwen35FullAttention::attend(const TensorPtr& normed, const LayerExecutionContext& lctx) {
     const auto& lw = lctx.weights;
     if (!lw.attn_q() || !lw.attn_k() || !lw.attn_v() || !lw.attn_output()) {
         LOG_ERROR("Qwen35FullAttention: layer " + std::to_string(lctx.layer_idx) +
@@ -80,8 +82,8 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
         lw.attn_v()->dtype() == DataType::Q4_K) {
         // 三个投影共享同一输入: 融合为单次量化 + 单 OpenMP 区 (省 2 个 gemm 调用)。
         // 返回拼接 [q|k|v], 按 N 切分 (M 很小, 拷贝开销可忽略)。
-        auto qkv_fused = ops::matmul_transB_fused_qkv_q4_k(normed, lw.attn_q(), lw.attn_k(),
-                                                           lw.attn_v());
+        auto qkv_fused =
+            ops::matmul_transB_fused_qkv_q4_k(normed, lw.attn_q(), lw.attn_k(), lw.attn_v());
         int Nq = static_cast<int>(lw.attn_q()->shape()[0]);
         int Nk = static_cast<int>(lw.attn_k()->shape()[0]);
         int Nv = static_cast<int>(lw.attn_v()->shape()[0]);
@@ -91,15 +93,13 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
                                           DeviceType::CPU);
         k = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, Nk},
                                      DeviceType::CPU);
-        v = std::make_shared<Tensor>(DataType::FP32,
-                                     std::vector<int64_t>{seq_len, Nv},
+        v = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, Nv},
                                      DeviceType::CPU);
         for (int s = 0; s < seq_len; ++s) {
             const float* row = src + s * row_stride;
             std::memcpy(static_cast<float*>(q_full->data()) + s * Nq, row, Nq * sizeof(float));
             std::memcpy(static_cast<float*>(k->data()) + s * Nk, row + Nq, Nk * sizeof(float));
-            std::memcpy(static_cast<float*>(v->data()) + s * Nv, row + Nq + Nk,
-                        Nv * sizeof(float));
+            std::memcpy(static_cast<float*>(v->data()) + s * Nv, row + Nq + Nk, Nv * sizeof(float));
         }
     } else {
         q_full = ensure_cpu(ops::matmul_transB(normed, lw.attn_q()));
@@ -110,7 +110,7 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
     auto q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim},
                                       DeviceType::CPU);
     auto gate = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim},
-                                        DeviceType::CPU);
+                                         DeviceType::CPU);
 
     const float* qf_data = static_cast<const float*>(q_full->data());
     float* q_data = static_cast<float*>(q->data());
@@ -141,8 +141,7 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
     auto q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CPU);
     auto k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CPU);
     Qwen35Rope::apply_cpu(static_cast<const float*>(q->data()),
-                          static_cast<const float*>(k->data()),
-                          static_cast<float*>(q_rope->data()),
+                          static_cast<const float*>(k->data()), static_cast<float*>(q_rope->data()),
                           static_cast<float*>(k_rope->data()), seq_len, num_heads, num_kv_heads,
                           head_dim, n_rot, lctx.start_pos(), cfg.rope_theta);
 
@@ -155,12 +154,10 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
     TensorPtr k_expanded = kv_cache_.get_key_filled(lctx.layer_idx);
     TensorPtr v_expanded = kv_cache_.get_value_filled(lctx.layer_idx);
     if (num_kv_heads < num_heads) {
-        k_expanded = AttentionExecutor::expand_kv_heads(ensure_cpu(k_expanded), total_len,
-                                                        num_heads, num_kv_heads, head_dim,
-                                                        DeviceType::CPU);
-        v_expanded = AttentionExecutor::expand_kv_heads(ensure_cpu(v_expanded), total_len,
-                                                        num_heads, num_kv_heads, head_dim,
-                                                        DeviceType::CPU);
+        k_expanded = AttentionExecutor::expand_kv_heads(
+            ensure_cpu(k_expanded), total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
+        v_expanded = AttentionExecutor::expand_kv_heads(
+            ensure_cpu(v_expanded), total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
     }
 
     // dev 为 CPU 时这三个搬运都是 no-op; 保留是为了兼容"CUDA 但走 CPU 前处理"的情形。
@@ -168,9 +165,8 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
     k_expanded = restore_device(k_expanded, lctx.device);
     v_expanded = restore_device(v_expanded, lctx.device);
 
-    auto attn_out = ops::scaled_dot_product_attention_2d(q_attn, k_expanded, v_expanded, seq_len,
-                                                         total_len, num_heads, head_dim, nullptr,
-                                                         true);
+    auto attn_out = ops::scaled_dot_product_attention_2d(
+        q_attn, k_expanded, v_expanded, seq_len, total_len, num_heads, head_dim, nullptr, true);
 
     // Gated attention: output = sigmoid(gate) * attn_out
     auto attn_out_cpu = ensure_cpu(attn_out);
@@ -205,11 +201,10 @@ TensorPtr Qwen35FullAttention::attend_cuda(const TensorPtr& normed,
     auto q = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim},
                                       DeviceType::CUDA);
     auto gate = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{seq_len, q_dim},
-                                        DeviceType::CUDA);
-    forge::cuda::launch_split_q_gate(static_cast<const float*>(q_full->data()),
-                                     static_cast<float*>(q->data()),
-                                     static_cast<float*>(gate->data()), seq_len, num_heads,
-                                     head_dim, stream);
+                                         DeviceType::CUDA);
+    forge::cuda::launch_split_q_gate(
+        static_cast<const float*>(q_full->data()), static_cast<float*>(q->data()),
+        static_cast<float*>(gate->data()), seq_len, num_heads, head_dim, stream);
 
     if (lw.attn_q_norm()) {
         auto q_norm_w = to_gpu(lw.attn_q_norm());
@@ -228,18 +223,73 @@ TensorPtr Qwen35FullAttention::attend_cuda(const TensorPtr& normed,
 
     auto q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
     auto k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), DeviceType::CUDA);
-    forge::cuda::launch_rope_gqa(static_cast<const float*>(q->data()),
-                                 static_cast<const float*>(k->data()),
-                                 static_cast<float*>(q_rope->data()),
-                                 static_cast<float*>(k_rope->data()), num_heads, num_kv_heads,
-                                 head_dim, seq_len, lctx.start_pos(), cfg.rope_theta, stream);
+    forge::cuda::launch_rope_gqa(
+        static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
+        static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), num_heads,
+        num_kv_heads, head_dim, seq_len, lctx.start_pos(), cfg.rope_theta, stream);
 
     kv_cache_.update(lctx.layer_idx, lctx.seq_id(), lctx.start_pos(), k_rope, v, seq_len);
+    const int total_len = kv_cache_.filled(lctx.layer_idx);
+
+    // ---- Phase 0 / 0.1: fused decode for quantized KV (skip FP32 staging) ----
+    // For decode (seq_len==1) with symmetric quantized KV, read the cache
+    // directly inside the attention kernel instead of materializing FP32.
+    void* d_q_K = kv_cache_.d_q_key_cache(lctx.layer_idx);
+    void* d_q_V = kv_cache_.d_q_value_cache(lctx.layer_idx);
+    const auto kv_cfg = kv_cache_.kv_config();
+    const bool fused_kv =
+        (seq_len == 1 && d_q_K != nullptr && d_q_V != nullptr && kv_cfg.type_k == kv_cfg.type_v);
+    if (fused_kv) {
+        auto attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, q_dim}, DeviceType::CUDA);
+        size_t q_row_size = KVCache::block_nbytes(kv_cfg.type_k, num_kv_heads * head_dim);
+        const float* Q = static_cast<const float*>(q_rope->data());
+        float* O = static_cast<float*>(attn_out->data());
+        bool ok = true;
+        switch (kv_cfg.type_k) {
+        case KVCacheDType::F16:
+            cuda::launch_fused_flash_attention_gqa_decode_f16(Q, d_q_K, d_q_V, O, total_len,
+                                                              num_heads, num_kv_heads, head_dim,
+                                                              q_row_size, nullptr, stream);
+            break;
+        case KVCacheDType::Q8_0:
+            cuda::launch_fused_flash_attention_gqa_decode_q8_0(Q, d_q_K, d_q_V, O, total_len,
+                                                               num_heads, num_kv_heads, head_dim,
+                                                               q_row_size, nullptr, stream);
+            break;
+        case KVCacheDType::Q4_0:
+            cuda::launch_fused_flash_attention_gqa_decode_q4_0(Q, d_q_K, d_q_V, O, total_len,
+                                                               num_heads, num_kv_heads, head_dim,
+                                                               q_row_size, nullptr, stream);
+            break;
+        case KVCacheDType::FP8_E4M3:
+            cuda::launch_fused_flash_attention_gqa_decode_fp8_e4m3(
+                Q, d_q_K, d_q_V, O, total_len, num_heads, num_kv_heads, head_dim, q_row_size,
+                nullptr, static_cast<const float*>(kv_cache_.d_q_key_scale(lctx.layer_idx)),
+                static_cast<const float*>(kv_cache_.d_q_value_scale(lctx.layer_idx)), stream);
+            break;
+        case KVCacheDType::FP8_E5M2:
+            cuda::launch_fused_flash_attention_gqa_decode_fp8_e5m2(
+                Q, d_q_K, d_q_V, O, total_len, num_heads, num_kv_heads, head_dim, q_row_size,
+                nullptr, static_cast<const float*>(kv_cache_.d_q_key_scale(lctx.layer_idx)),
+                static_cast<const float*>(kv_cache_.d_q_value_scale(lctx.layer_idx)), stream);
+            break;
+        default:
+            ok = false;
+            break;
+        }
+        if (ok) {
+            forge::cuda::launch_sigmoid_multiply(static_cast<const float*>(gate->data()), O,
+                                                 seq_len * q_dim, stream);
+            return ops::matmul_transB(attn_out, lw.attn_output());
+        }
+    }
+
+    // ---- Fallback: dequantize then standard attention (prefill, FP32, asymmetric) ----
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(lctx.layer_idx);
     }
 
-    const int total_len = kv_cache_.filled(lctx.layer_idx);
     TensorPtr k_expanded = kv_cache_.get_key_filled(lctx.layer_idx);
     TensorPtr v_expanded = kv_cache_.get_value_filled(lctx.layer_idx);
     if (num_kv_heads < num_heads) {
@@ -249,9 +299,8 @@ TensorPtr Qwen35FullAttention::attend_cuda(const TensorPtr& normed,
                                                         num_kv_heads, head_dim, DeviceType::CUDA);
     }
 
-    auto attn_out = ops::scaled_dot_product_attention_2d(q_rope, k_expanded, v_expanded, seq_len,
-                                                         total_len, num_heads, head_dim, nullptr,
-                                                         true);
+    auto attn_out = ops::scaled_dot_product_attention_2d(
+        q_rope, k_expanded, v_expanded, seq_len, total_len, num_heads, head_dim, nullptr, true);
 
     forge::cuda::launch_sigmoid_multiply(static_cast<const float*>(gate->data()),
                                          static_cast<float*>(attn_out->data()), seq_len * q_dim,

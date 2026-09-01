@@ -4,20 +4,48 @@
 #include <cstring>
 
 #include "forge/context.h"
+#include "forge/dflash_draft_provider.h"
 #include "forge/engine.h"
 #include "forge/inference/forward_request.h"
-#include "forge/mtp_draft_provider.h"
+#include "forge/inference/layers/qwen35_recurrent_memory.h"
 #include "forge/kv_cache.h"
 #include "forge/logger.h"
+#include "forge/mtp_draft_provider.h"
 #include "forge/perf_profiler.h"
 #include "forge/tensor.h"
 
 namespace forge {
 
+namespace {
+
+// 2.3: spec 部分拒绝后, recurrent (SSM) 状态已回滚到 draft 前的快照; 已接受的
+// token (last_token + 前 n_accepted 个 draft) 需要重新前向一次, 把 conv/ssm 状态
+// 推进到"接受点之后", 与 KVCache::rollback(in.pos + n_accepted + 1) 后的位置对齐。
+// 重放对 KV 是幂等的: 覆盖写相同位置, 前向是确定性的。
+void replay_recurrent(InferenceEngine* engine, InferenceContext& ctx, int32_t last_token,
+                      const std::vector<int32_t>& drafts, int n_accepted, int64_t start_pos) {
+    if (!engine)
+        return;
+    const int n = n_accepted + 1;
+    auto ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{n}, DeviceType::CPU);
+    int32_t* p = static_cast<int32_t*>(ids->data());
+    p[0] = last_token;
+    if (n_accepted > 0) {
+        std::memcpy(p + 1, drafts.data(), static_cast<size_t>(n_accepted) * sizeof(int32_t));
+    }
+    if (ctx.device() == DeviceType::CUDA) {
+        ids->to_device(DeviceType::CUDA);
+    }
+    engine->forward_request(ForwardRequest::from_ids(ids, start_pos));
+}
+
+}  // namespace
+
 SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler,
                                          const SpeculativeConfig& cfg)
     : ctx_(ctx), sampler_(sampler), cfg_(cfg) {
-    if (!cfg_.enabled) return;
+    if (!cfg_.enabled)
+        return;
 
     // Build chain in priority order: MTP > Model > NgramMod > Ngram
     // Each provider is tried in order at draft time; first that yields
@@ -31,9 +59,27 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
             LOG_WARN("SpeculativeExecutor: MTP provider unavailable, skipping");
         }
     }
+    // DFlash / DSPark standalone drafter: shares the target's token_embd/lm_head
+    // and fuses target multi-layer hiddens as the encoder input. Tried right
+    // after MTP so a matched drafter takes priority over n-gram self-draft.
+    if (!cfg_.draft_arch.empty() && (cfg_.draft_arch == "dflash" || cfg_.draft_arch == "dspark")) {
+        if (cfg_.draft_model_path.empty()) {
+            LOG_WARN(
+                "SpeculativeExecutor: --spec-draft-arch set but no drafter GGUF "
+                "(--spec-draft-model); skipping DFlash");
+        } else {
+            auto dflash = std::make_unique<DFlashDraftProvider>(cfg_, ctx_, *ctx_.engine(),
+                                                                ctx_.model().config().vocab_size);
+            if (dflash->valid()) {
+                providers_.push_back(std::move(dflash));
+            } else {
+                LOG_WARN("SpeculativeExecutor: DFlash provider unavailable, skipping");
+            }
+        }
+    }
     if (!cfg_.draft_model_path.empty()) {
         auto draft = std::make_unique<ModelDraftProvider>(cfg_, ctx_.params(),
-                                                           ctx_.model().config().vocab_size);
+                                                          ctx_.model().config().vocab_size);
         if (draft->valid()) {
             providers_.push_back(std::move(draft));
         } else {
@@ -42,29 +88,32 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
     }
     if (cfg_.use_ngram_mod) {
         auto mod = std::make_unique<NgramModProvider>(
-            cfg_.ngram_mod_n, cfg_.ngram_mod_n_min, cfg_.ngram_mod_n_max,
-            cfg_.ngram_mod_pool_size);
+            cfg_.ngram_mod_n, cfg_.ngram_mod_n_min, cfg_.ngram_mod_n_max, cfg_.ngram_mod_pool_size);
         providers_.push_back(std::move(mod));
         LOG_INFO(std::string("SpeculativeExecutor: draft provider 'ngram-mod' enabled, n_match=") +
-                 std::to_string(cfg_.ngram_mod_n) + " pool=" + std::to_string(cfg_.ngram_mod_pool_size));
+                 std::to_string(cfg_.ngram_mod_n) +
+                 " pool=" + std::to_string(cfg_.ngram_mod_pool_size));
     }
     if (cfg_.use_ngram && !cfg_.no_ngram) {
         auto ngram = std::make_unique<NgramDraftProvider>(cfg_.ngram_n, cfg_.ngram_min);
         providers_.push_back(std::move(ngram));
     } else if (cfg_.use_ngram_mod && cfg_.no_ngram) {
-        LOG_INFO("SpeculativeExecutor: plain n-gram fallback disabled (--no-ngram); "
-                 "isolating ngram-mod provider only");
+        LOG_INFO(
+            "SpeculativeExecutor: plain n-gram fallback disabled (--no-ngram); "
+            "isolating ngram-mod provider only");
     }
     if (!providers_.empty()) {
-        provider_ = nullptr; // legacy single pointer not used when chain present
+        provider_ = nullptr;  // legacy single pointer not used when chain present
         // For backwards compat keep provider_ pointing to primary
         // but valid() now checks providers_.empty()
         std::string names;
         for (auto& p : providers_) {
-            if (!names.empty()) names += ",";
+            if (!names.empty())
+                names += ",";
             names += p->name();
         }
-        LOG_INFO(std::string("SpeculativeExecutor: chain [") + names + "] n_draft=" + std::to_string(cfg_.n_draft));
+        LOG_INFO(std::string("SpeculativeExecutor: chain [") + names +
+                 "] n_draft=" + std::to_string(cfg_.n_draft));
     }
 }
 
@@ -105,8 +154,8 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     }
     if (accept_ewma_ >= 0.0) {
         // target draft proportional to acceptance, clamped to [1, cfg_.n_draft]
-        int target = static_cast<int>(std::max(1.0, std::min<double>(cfg_.n_draft,
-                                                                      adaptive_draft_ * (0.5 + accept_ewma_))));
+        int target = static_cast<int>(
+            std::max(1.0, std::min<double>(cfg_.n_draft, adaptive_draft_ * (0.5 + accept_ewma_))));
         adaptive_draft_ = target;
     }
     const int n_draft = std::min({adaptive_draft_, cfg_.n_draft, in.max_tokens - 1});
@@ -139,8 +188,8 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     }
 
     const int n_rows = static_cast<int>(drafts.size()) + 1;
-    auto input_ids = std::make_shared<Tensor>(DataType::INT32,
-                                              std::vector<int64_t>{n_rows}, DeviceType::CPU);
+    auto input_ids =
+        std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{n_rows}, DeviceType::CPU);
     int32_t* ids_ptr = static_cast<int32_t*>(input_ids->data());
     ids_ptr[0] = in.last_token;
     std::memcpy(ids_ptr + 1, drafts.data(), drafts.size() * sizeof(int32_t));
@@ -148,17 +197,24 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         input_ids->to_device(DeviceType::CUDA);
     }
 
+    // 2.3: speculative 部分拒绝 draft 时回滚 recurrent (SSM) 状态, 与 KV
+    // rollback 语义对齐。快照保存在 draft 验证前, spec 路径 seq_id 恒为 0。
+    auto* rmem = engine->recurrent_memory();
+    if (rmem)
+        rmem->snapshot(0);
+
     TensorPtr logits_all;
     {
         PERF_SCOPE("speculative/verify_forward");
-        logits_all = engine->forward_request(
-            ForwardRequest::from_ids(input_ids, in.pos));
+        logits_all = engine->forward_request(ForwardRequest::from_ids(input_ids, in.pos));
     }
 
-    if (!logits_all || logits_all->ndim() < 2 ||
-        logits_all->shape()[0] < n_rows) {
+    if (!logits_all || logits_all->ndim() < 2 || logits_all->shape()[0] < n_rows) {
         LOG_WARN("SpeculativeExecutor: verify forward failed, falling back to plain decode");
         ++stats_.n_fallback_steps;
+        // 状态已在 forward 中推进但本轮作废, 恢复到 draft 前, 与 KV 行为对齐。
+        if (rmem)
+            rmem->rollback(0);
         return out;
     }
     if (logits_all->device() != DeviceType::CPU) {
@@ -184,7 +240,13 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     const bool full_accept = (vr.n_accepted == static_cast<int>(drafts.size()));
     if (!full_accept) {
         KVCache* kv = engine->kv_cache();
-        if (kv) kv->rollback(in.pos + vr.n_accepted + 1);
+        if (kv)
+            kv->rollback(in.pos + vr.n_accepted + 1);
+        // recurrent 状态回到 draft 前快照, 再重放已接受 token 推进到接受点。
+        if (rmem) {
+            rmem->rollback(0);
+            replay_recurrent(engine, ctx_, in.last_token, drafts, vr.n_accepted, in.pos);
+        }
     }
 
     out.speculated = true;
@@ -192,8 +254,8 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
 
     // Update acceptance EWMA (used by adaptive draft sizing next round).
     {
-        const double round_acc = drafts.empty() ? 0.0
-                                                 : static_cast<double>(vr.n_accepted) / drafts.size();
+        const double round_acc =
+            drafts.empty() ? 0.0 : static_cast<double>(vr.n_accepted) / drafts.size();
         if (accept_ewma_ < 0.0) {
             accept_ewma_ = round_acc;
         } else {
@@ -221,14 +283,16 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
 void SpeculativeExecutor::rollback_kv(int64_t valid_end_pos) {
     auto* engine = ctx_.engine();
     KVCache* kv = engine ? engine->kv_cache() : nullptr;
-    if (kv) kv->rollback(valid_end_pos);
+    if (kv)
+        kv->rollback(valid_end_pos);
 }
 
 void SpeculativeExecutor::notify_confirmed(int32_t token) {
     for (auto& p : providers_) {
         p->accept({token});
     }
-    if (provider_) provider_->accept({token});
+    if (provider_)
+        provider_->accept({token});
 }
 
 }  // namespace forge

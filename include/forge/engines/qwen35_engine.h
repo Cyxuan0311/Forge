@@ -13,6 +13,9 @@ public:
 
     void reset() override;
 
+    Qwen35RecurrentMemory* recurrent_memory() override { return &recurrent_memory_; }
+    const Qwen35RecurrentMemory* recurrent_memory() const override { return &recurrent_memory_; }
+
     // ------------------------------------------------------------------
     // DeepSeek-MTP style nextn head (single trained MTP layer, qwen35).
     // ------------------------------------------------------------------
@@ -28,8 +31,8 @@ public:
     //   h_next = shared_head_norm(x)      (falls back to output_norm)
     //   logits = lm_head(h_next)          (shared_head_head or output_weight)
     // `h_prev` must be [1, hidden_dim] FP32; outputs land on its device.
-    TensorPtr mtp_step(int32_t token, const TensorPtr& h_prev, int64_t pos,
-                       int seq_id, TensorPtr* logits_out);
+    TensorPtr mtp_step(int32_t token, const TensorPtr& h_prev, int64_t pos, int seq_id,
+                       TensorPtr* logits_out);
 
 protected:
     TensorPtr forward_layer(const TensorPtr& hidden, const LayerExecutionContext& lctx) override;
@@ -37,8 +40,7 @@ protected:
 
 private:
     // FFN 对 FullAttention 与 LinearAttention 两种层型完全相同。
-    TensorPtr apply_ffn(const TensorPtr& hidden_after_attn,
-                        const LayerExecutionContext& lctx);
+    TensorPtr apply_ffn(const TensorPtr& hidden_after_attn, const LayerExecutionContext& lctx);
 
     // recurrent state 由 InferenceContext 的 HybridMemory 持有, engine 只引用。
     Qwen35RecurrentMemory& recurrent_memory_;

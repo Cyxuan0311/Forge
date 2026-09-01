@@ -26,18 +26,34 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
         // through to the materialize-then-attend FP32 decode path.
         if (p.paged && p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
             switch (p.kv_type_k) {
-            case KVCacheDType::Q4_0: return AttentionPath::CUDA_PAGED_Q4_0_DECODE;
-            case KVCacheDType::F16:  return AttentionPath::CUDA_PAGED_F16_DECODE;
-            case KVCacheDType::Q8_0: return AttentionPath::CUDA_PAGED_Q8_0_DECODE;
-            default: break;  // Unsupported symmetric type → FP32 fallback
+            case KVCacheDType::Q4_0:
+                return AttentionPath::CUDA_PAGED_Q4_0_DECODE;
+            case KVCacheDType::F16:
+                return AttentionPath::CUDA_PAGED_F16_DECODE;
+            case KVCacheDType::Q8_0:
+                return AttentionPath::CUDA_PAGED_Q8_0_DECODE;
+            case KVCacheDType::FP8_E4M3:
+                return AttentionPath::CUDA_PAGED_FP8_E4M3_DECODE;
+            case KVCacheDType::FP8_E5M2:
+                return AttentionPath::CUDA_PAGED_FP8_E5M2_DECODE;
+            default:
+                break;  // Unsupported symmetric type → FP32 fallback
             }
         }
         if (p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
             switch (p.kv_type_k) {
-            case KVCacheDType::Q4_0: return AttentionPath::CUDA_FUSED_Q4_0_DECODE;
-            case KVCacheDType::F16:  return AttentionPath::CUDA_FUSED_F16_DECODE;
-            case KVCacheDType::Q8_0: return AttentionPath::CUDA_FUSED_Q8_0_DECODE;
-            default: break;  // Unsupported symmetric type → FP32 fallback
+            case KVCacheDType::Q4_0:
+                return AttentionPath::CUDA_FUSED_Q4_0_DECODE;
+            case KVCacheDType::F16:
+                return AttentionPath::CUDA_FUSED_F16_DECODE;
+            case KVCacheDType::Q8_0:
+                return AttentionPath::CUDA_FUSED_Q8_0_DECODE;
+            case KVCacheDType::FP8_E4M3:
+                return AttentionPath::CUDA_FUSED_FP8_E4M3_DECODE;
+            case KVCacheDType::FP8_E5M2:
+                return AttentionPath::CUDA_FUSED_FP8_E5M2_DECODE;
+            default:
+                break;  // Unsupported symmetric type → FP32 fallback
             }
         }
         // FP32 or asymmetric KV → standard FP32 decode kernel
@@ -50,19 +66,40 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
 
 const char* attention_path_name(AttentionPath path) {
     switch (path) {
-    case AttentionPath::CPU_MHA:                return "CPU_MHA";
-    case AttentionPath::CPU_GQA:                return "CPU_GQA";
-    case AttentionPath::CUDA_FP32_PREFILL:      return "CUDA_FP32_PREFILL";
-    case AttentionPath::CUDA_FP32_DECODE:       return "CUDA_FP32_DECODE";
-    case AttentionPath::CUDA_GENERIC_MHA:       return "CUDA_GENERIC_MHA";
-    case AttentionPath::CUDA_FUSED_Q4_0_DECODE: return "CUDA_FUSED_Q4_0_DECODE";
-    case AttentionPath::CUDA_FUSED_F16_DECODE:  return "CUDA_FUSED_F16_DECODE";
-    case AttentionPath::CUDA_FUSED_Q8_0_DECODE: return "CUDA_FUSED_Q8_0_DECODE";
-    case AttentionPath::CUDA_PAGED_Q4_0_DECODE: return "CUDA_PAGED_Q4_0_DECODE";
-    case AttentionPath::CUDA_PAGED_F16_DECODE:  return "CUDA_PAGED_F16_DECODE";
-    case AttentionPath::CUDA_PAGED_Q8_0_DECODE: return "CUDA_PAGED_Q8_0_DECODE";
-    case AttentionPath::UNSUPPORTED:            return "UNSUPPORTED";
-    default:                                    return "UNKNOWN";
+    case AttentionPath::CPU_MHA:
+        return "CPU_MHA";
+    case AttentionPath::CPU_GQA:
+        return "CPU_GQA";
+    case AttentionPath::CUDA_FP32_PREFILL:
+        return "CUDA_FP32_PREFILL";
+    case AttentionPath::CUDA_FP32_DECODE:
+        return "CUDA_FP32_DECODE";
+    case AttentionPath::CUDA_GENERIC_MHA:
+        return "CUDA_GENERIC_MHA";
+    case AttentionPath::CUDA_FUSED_Q4_0_DECODE:
+        return "CUDA_FUSED_Q4_0_DECODE";
+    case AttentionPath::CUDA_FUSED_F16_DECODE:
+        return "CUDA_FUSED_F16_DECODE";
+    case AttentionPath::CUDA_FUSED_Q8_0_DECODE:
+        return "CUDA_FUSED_Q8_0_DECODE";
+    case AttentionPath::CUDA_FUSED_FP8_E4M3_DECODE:
+        return "CUDA_FUSED_FP8_E4M3_DECODE";
+    case AttentionPath::CUDA_FUSED_FP8_E5M2_DECODE:
+        return "CUDA_FUSED_FP8_E5M2_DECODE";
+    case AttentionPath::CUDA_PAGED_Q4_0_DECODE:
+        return "CUDA_PAGED_Q4_0_DECODE";
+    case AttentionPath::CUDA_PAGED_F16_DECODE:
+        return "CUDA_PAGED_F16_DECODE";
+    case AttentionPath::CUDA_PAGED_Q8_0_DECODE:
+        return "CUDA_PAGED_Q8_0_DECODE";
+    case AttentionPath::CUDA_PAGED_FP8_E4M3_DECODE:
+        return "CUDA_PAGED_FP8_E4M3_DECODE";
+    case AttentionPath::CUDA_PAGED_FP8_E5M2_DECODE:
+        return "CUDA_PAGED_FP8_E5M2_DECODE";
+    case AttentionPath::UNSUPPORTED:
+        return "UNSUPPORTED";
+    default:
+        return "UNKNOWN";
     }
 }
 

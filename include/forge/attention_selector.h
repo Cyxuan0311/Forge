@@ -21,25 +21,29 @@ namespace forge {
 
 enum class AttentionPath {
     // CPU paths
-    CPU_MHA,          // CPU multi-head attention (no GQA)
-    CPU_GQA,          // CPU grouped-query attention
+    CPU_MHA,  // CPU multi-head attention (no GQA)
+    CPU_GQA,  // CPU grouped-query attention
 
     // CUDA FP32 paths (K/V in FP32, no fused dequant)
-    CUDA_FP32_PREFILL,    // CUDA GQA prefill (q_len > 1)
-    CUDA_FP32_DECODE,     // CUDA GQA decode  (q_len == 1, FP32 KV)
-    CUDA_GENERIC_MHA,     // CUDA non-GQA (uses generic ops)
+    CUDA_FP32_PREFILL,  // CUDA GQA prefill (q_len > 1)
+    CUDA_FP32_DECODE,   // CUDA GQA decode  (q_len == 1, FP32 KV)
+    CUDA_GENERIC_MHA,   // CUDA non-GQA (uses generic ops)
 
     // CUDA fused paths (K/V in quantized format, dequantized on-the-fly)
-    CUDA_FUSED_Q4_0_DECODE,  // CUDA GQA decode with Q4_0 KV
-    CUDA_FUSED_F16_DECODE,   // CUDA GQA decode with F16 KV
-    CUDA_FUSED_Q8_0_DECODE,  // CUDA GQA decode with Q8_0 KV
+    CUDA_FUSED_Q4_0_DECODE,      // CUDA GQA decode with Q4_0 KV
+    CUDA_FUSED_F16_DECODE,       // CUDA GQA decode with F16 KV
+    CUDA_FUSED_Q8_0_DECODE,      // CUDA GQA decode with Q8_0 KV
+    CUDA_FUSED_FP8_E4M3_DECODE,  // CUDA GQA decode with FP8 E4M3 KV
+    CUDA_FUSED_FP8_E5M2_DECODE,  // CUDA GQA decode with FP8 E5M2 KV
 
     // CUDA paged paths (Phase 4): KV held in fixed-size pages; the decode kernel
     // traverses the per-sequence page table directly. No materialization.
     // FP32 paged KV falls back to CUDA_FP32_DECODE (materialize then attend).
-    CUDA_PAGED_Q4_0_DECODE,  // CUDA paged GQA decode with Q4_0 KV
-    CUDA_PAGED_F16_DECODE,   // CUDA paged GQA decode with F16 KV
-    CUDA_PAGED_Q8_0_DECODE,  // CUDA paged GQA decode with Q8_0 KV
+    CUDA_PAGED_Q4_0_DECODE,      // CUDA paged GQA decode with Q4_0 KV
+    CUDA_PAGED_F16_DECODE,       // CUDA paged GQA decode with F16 KV
+    CUDA_PAGED_Q8_0_DECODE,      // CUDA paged GQA decode with Q8_0 KV
+    CUDA_PAGED_FP8_E4M3_DECODE,  // CUDA paged GQA decode with FP8 E4M3 KV
+    CUDA_PAGED_FP8_E5M2_DECODE,  // CUDA paged GQA decode with FP8 E5M2 KV
 
     // Fallback
     UNSUPPORTED,
@@ -49,13 +53,13 @@ enum class AttentionPath {
 
 struct AttentionProblem {
     DeviceType device = DeviceType::CPU;
-    int seq_len = 1;           // q_len (1 for decode, >1 for prefill)
+    int seq_len = 1;  // q_len (1 for decode, >1 for prefill)
     int num_heads = 0;
     int num_kv_heads = 0;
     int head_dim = 0;
 
     // KV cache state (relevant for CUDA decode path selection)
-    bool has_quantized_kv = false;        // d_q_K && d_q_V available
+    bool has_quantized_kv = false;  // d_q_K && d_q_V available
     KVCacheDType kv_type_k = KVCacheDType::FP32;
     KVCacheDType kv_type_v = KVCacheDType::FP32;
 

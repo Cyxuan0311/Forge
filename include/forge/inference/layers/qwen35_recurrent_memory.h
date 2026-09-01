@@ -8,7 +8,12 @@
 //
 // 阶段 8 已把所有权收归 InferenceContext 的 HybridMemory, engine 只持有引用。
 // 状态是逐 token 累积的, 与 KV cache 一样属于"推理期可变状态"。
+//
+// 2.3: 状态改为按 seq_id 隔离（每序列一份 conv/ssm 状态, 惰性分配）。speculative
+// decoding 部分拒绝 draft 时, 通过 snapshot(seq_id)/rollback(seq_id) 把状态回滚到
+// 接受点, 与 KVCache::rollback 的语义对齐。
 
+#include <unordered_map>
 #include <vector>
 
 #include "forge/model.h"
@@ -39,27 +44,30 @@ class Qwen35RecurrentMemory {
 public:
     ~Qwen35RecurrentMemory();
 
-    // 推导维度并为每个 LinearAttention 层分配状态。cfg.use_ssm 为 false 时不做事。
+    // 推导维度。状态缓冲按 seq_id 惰性分配（首次访问某序列时创建）。
     void init(const ModelConfig& cfg, const ModelWeights& weights);
 
-    // 状态清零。维度和已分配的缓冲保持不变。
+    // 清空所有序列的状态内容（已分配的缓冲保留, 维度不变）。
     void reset();
 
     const Qwen35SsmDims& dims() const { return dims_; }
     bool initialized() const { return initialized_; }
 
-    float* conv_state_cpu(int layer_idx) { return cpu_states_[layer_idx].conv_state.data(); }
-    float* ssm_state_cpu(int layer_idx) { return cpu_states_[layer_idx].ssm_state.data(); }
+    // ---- per-sequence state accessors (首次访问时惰性分配该序列缓冲) ----
+    float* conv_state_cpu(int seq_id, int layer_idx);
+    float* ssm_state_cpu(int seq_id, int layer_idx);
 
-    // 未编译 CUDA 时 device_states_ 为空, 返回 nullptr 而不是越界。
-    float* conv_state_gpu(int layer_idx) {
-        if (layer_idx >= static_cast<int>(device_states_.size())) return nullptr;
-        return device_states_[layer_idx].conv_state;
-    }
-    float* ssm_state_gpu(int layer_idx) {
-        if (layer_idx >= static_cast<int>(device_states_.size())) return nullptr;
-        return device_states_[layer_idx].ssm_state;
-    }
+    // 未编译 CUDA 或该序列无 GPU 缓冲时返回 nullptr 而不是越界。
+    float* conv_state_gpu(int seq_id, int layer_idx);
+    float* ssm_state_gpu(int seq_id, int layer_idx);
+
+    // ---- speculative rollback (per sequence) ----
+    // snapshot: 保存当前状态到快照缓冲（CPU 深拷贝 + GPU D2D 拷贝）。
+    // rollback: 从快照恢复; 若该序列从未 snapshot 过则为 no-op。
+    // reset_seq: 仅清零该序列的状态内容。
+    void snapshot(int seq_id);
+    void rollback(int seq_id);
+    void reset_seq(int seq_id);
 
 private:
     struct CpuState {
@@ -70,10 +78,24 @@ private:
         float* conv_state = nullptr;
         float* ssm_state = nullptr;
     };
+    // 每序列: 活跃状态(CPU+GPU) + 快照(CPU+GPU)。快照 GPU 缓冲在首次
+    // snapshot() 时惰性分配。snap_valid 标记该序列是否 snapshot 过:
+    // 从未 snapshot 的序列 rollback() 必须是 no-op（否则会错误地把尚未
+    // 初始化的零快照写回活跃状态）。
+    struct PerSeqState {
+        std::vector<CpuState> cpu;
+        std::vector<DeviceState> dev;
+        std::vector<CpuState> cpu_snap;
+        std::vector<DeviceState> dev_snap;
+        bool snap_valid = false;
+    };
+
+    PerSeqState& ensure_seq(int seq_id);
 
     Qwen35SsmDims dims_;
-    std::vector<CpuState> cpu_states_;
-    std::vector<DeviceState> device_states_;
+    int num_layers_ = 0;
+    std::vector<int> linear_layer_idx_;  // 只对 LinearAttention 层持有真实缓冲
+    std::unordered_map<int, PerSeqState> seqs_;
     bool initialized_ = false;
 };
 

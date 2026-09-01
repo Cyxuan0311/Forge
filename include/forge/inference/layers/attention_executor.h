@@ -30,7 +30,8 @@ public:
     // mask: 可选 [q_len, kv_len] additive bias。
     // seq_id: 当前序列 id (paged CUDA decode 用 per-seq page table; -1 = legacy)
     TensorPtr attend(const TensorPtr& q, const ModelConfig& cfg, int layer_idx, int seq_len,
-                     DeviceType dev, const TensorPtr& mask = nullptr, int seq_id = -1);
+                     DeviceType dev, const TensorPtr& mask = nullptr, int seq_id = -1,
+                     bool causal = true);
 
     // GQA 的 KV head 复制。DeepSeek/Qwen3.5 的非 flash-attention 路径需要显式展开,
     // 因此放在这里共享, 不再由 TransformerEngine 提供 protected helper。

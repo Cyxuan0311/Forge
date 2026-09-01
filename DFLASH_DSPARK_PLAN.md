@@ -110,6 +110,14 @@ verify_draft_tokens(logits_all, draft_tokens, ...)  // 复用, 不改
 
 验收：`cmake --build build -j` 通过；`--spec-draft-arch dflash` 能解析但不触发实际 draft（provider 未注册时打日志跳过）。
 
+#### 阶段 0 验收（2026-08-30）— ✅
+- **配置骨架**：`SpeculativeConfig`（`include/forge/speculative.h`）新增 `draft_arch` / `draft_target_layers` / `draft_mask_token_id` / `draft_n_spec` 四个字段。
+- **dflash 配置解析**：`parse_dflash_config`（`src/model/arch_config_parser.cpp`）读取 `target_layers` 数组、`n_embd_inp_enc`、`attention.sliding_window`/`sliding_window_pattern`；经 `arch_registrations.cpp` 的 `ConfigParserAutoRegister _cfg_dflash("dflash", parse_dflash_config)` + `EngineAutoRegister _eng_dflash("dflash", ...)` + `WeightInitAutoRegister` + `ArchCapabilityAutoRegister` 注册。
+- **CLI 接线**：`src/cli/cli_args.cpp` 新增 `--spec-draft-arch dflash|dspark`、`--spec-draft-target-layers "2,5,8"`、`--spec-draft-mask-id N`、`--spec-draft-n N`，并自动开启 `args.spec.enabled`；`src/cli/forge_cli.cpp` 透传 `SpeculativeConfig`。
+- **provider 注册**：`SpeculativeExecutor`（`src/inference/speculative_executor.cpp`）在 MTP 之后按 `cfg_.draft_arch=="dflash"||"dspark"` 注册 `DFlashDraftProvider`，缺失 `--spec-draft-model` 或 `valid()` 失败时打日志跳过（优雅回退）。
+- **Python 绑定**：`src/bindings/core_types.cpp` 暴露 `SpeculativeConfig.draft_arch` / `draft_target_layers` / `draft_mask_token_id` / `draft_n_spec` 的 `def_readwrite`；并修正两条 legacy 位置构造 `py::init<...>` 重载——`SpeculativeConfig` 为聚合类型、C++17 下无法括号位置构造，改为 lambda 逐字段构造以保留向后兼容并恢复 `forge` python 模块可编译。
+- **验收命令**：`--spec-draft-arch dflash` 可解析；C++ 全量（`forge-cli` / `forge-dflash-test` 17/17 / `forge-spec-test` 20/20）与 python 模块 `forge` 均编译通过。
+
 ### 阶段 1 — target 多层特征导出（前置件）
 
 | 文件 | 动作 |
@@ -154,6 +162,15 @@ public:
 
 验收：单测 —— encoder 输出维度 `n_embd`、context-KV 注入后 draft 首层 K/V 与 target 投影值一致；小模型端到端能产出 N 个候选 token（greedy 校验）。
 
+#### 阶段 2 验收（2026-08-30）— ✅
+- **iSWA 路由补齐**：`parse_dflash_config`（`src/model/arch_config_parser.cpp`）新增读取 `attention.sliding_window` 与 `attention.sliding_window_pattern`，写入 `ModelConfig::n_swa` / `swa_layers`（与 Gemma4 解析对齐）。`TransformerEngine::init_kv_cache` 据此对 SWA 层启用 KV cache 环形缓冲、Full 层线性增长——DFlash 的 iSWA（`[1,1,1,1,1,0]`）现在与 llama.cpp `dflash.cpp` 的 `use_iswa` 分支等价，无需改 attention kernel。
+- **非因果 decode / 共享权重 / embedding 入口**：`DflashEngine`（`src/inference/engines/dflash_engine.cpp`）的 `encode` / `precompute_context_kv` / `decode` / `forward_layer` 已实现，`set_target()` 借用 target 的 `token_embedding` / `output_weight` / `output_norm`，`forward_request.h` 的 `from_embedding` 入口已就绪。
+- **验收单测**：`tests/test_dflash.cpp`（`forge-dflash-test`）。
+  - Part 1（本环境可跑）：加载真实 dflash GGUF，断言 `arch_type=="dflash"`、`n_swa==4096`、`swa_layers==[1,1,1,1,1,0]`。
+  - Part 2（自包含必跑）：`KVCache` 环形缓冲单测——SWA 层 `filled()` 收敛到窗口、Full 层线性增长，证明 iSWA 路由机制。
+  - Part 3（需配对 target，优雅跳过）：`DflashEngine` 端到端——encoder 维度、context-KV 注入、decode 产出 `[N, vocab]` logits、长前缀下 SWA 淘汰。
+- **缺失项说明**：真实端到端（Part 3）需 Qwen3.6-35B-A3B target（35B MoE，本环境 RAM 7.4G / GPU 6G 跑不动），故用真实 GGUF 仅做配置校验 + 自包含 KV 路由单测覆盖；引擎端到端留待更大环境或更小 target 验证（受 `FORGE_TEST_TARGET_MODEL` 控制）。
+
 ### 阶段 3 — DFlashDraftProvider（草稿逻辑）
 
 | 文件 | 动作 |
@@ -194,6 +211,14 @@ private:
 
 `accept()`：同 `ModelDraftProvider::accept`——回滚 draft KV 到承诺前缀，重放确认 token（保持下轮前缀一致）。
 
+#### 阶段 3 验收（2026-08-30）— ✅
+- **DFlashDraftProvider 实现**：`include/forge/dflash_draft_provider.h` + `src/inference/dflash_draft_provider.cpp`，继承 `IDraftProvider`，构造时加载 dflash GGUF、配对 `target` 引擎（`set_target` 借用 `token_embedding`/`output_weight`/`output_norm`），并开启 target 的 `captures_layer_hiddens()`。
+- **draft() 数据流对齐验证对齐**：① `target.take_layer_hiddens(target_layers_)` 取承诺前缀多层 hidden（每次 draft 重新前向承诺前缀以刷新，幂等于 target KV）；② `encode` → context feature；③ `precompute_context_kv(committed_ids)` 注入 draft KV；④ `decode([anchor, MASK×N])` 非因果并行 → `[N+1, vocab]`；⑤ 贪心采样 N 个候选（anchor 行预测第 1 个、MASK 行预测其余），与 `SpeculativeExecutor::step` 的 target 因果验证批次逐 token 对齐（`resample-consistency` 保证无损）。
+- **dflash 独立加载修复**：`src/model/model.cpp` 对 `dflash`/`dspark` 跳过 `token_embd`/`output` 强制加载；并显式载入 `fc.weight` / `output_norm_enc.weight`（它们不在通用层映射内）。`src/model/model_weights.cpp` 的 `ModelWeights::init` 兼容 `fc`/`fc.weight`/`model.fcs.0` 命名。
+- **接入 SpeculativeExecutor**：`src/inference/speculative_executor.cpp` 紧接 MTP 之后注册 `DFlashDraftProvider`（`--spec-draft-arch dflash --spec-model <dflash.gguf>`），`valid()` 失败打日志跳过；CLI 参数（`--spec-draft-target-layers`/`--spec-draft-mask-id`/`--spec-draft-n`）阶段 0/5 已接好。
+- **验收单测**（`tests/test_dflash.cpp`）：新增 Stage-3 校验——dflash 独立加载成功、arch==dflash、`dflash_fc`（`fc.weight`）解析进 `DflashEngine`、`layers.size()==6`。共 13/13 通过。
+- **缺失项说明**：真实端到端（接受率 > 0、greedy 下文本逐 token 一致）需配对 Qwen3.6-35B-A3B target（本环境跑不动），留待更大环境或更小配对 target（受 `FORGE_TEST_TARGET_MODEL` 控制，测试 Part 3 已挂载）。`refresh_prefix_hiddens` 每轮重前向承诺前缀换取 target 多层 hidden，是正确但非最优实现（未来可拼接 verify 前向的 hidden 免去重算），已注释标注。
+
 ### 阶段 4 — DSPark 变体
 
 | 文件 | 动作 |
@@ -203,6 +228,13 @@ private:
 
 对齐 vLLM `dspark/speculator.py:_sample_sequential`：从左到右每个位置 `logits_i = base_logits[:,i] + markov_bias(markov_embed(prev))`，再 Gumbel/argmax 采样，`prev = sampled`。
 
+#### 阶段 4 验收（2026-08-30）— ✅
+- **DSPark 权重与访问器**：`ModelWeights` 新增 `dflash_markov_embed` / `dflash_markov_bias` / `dflash_draft_id_to_target_id`；`ModelWeights::init` 兼容 `markov_embed`/`markov_embed.weight`、`markov_bias`/`markov_bias.weight`、`draft_id_to_target_id` 命名（`src/model/model.h` + `src/model/model_weights.cpp`）。
+- **顺序 Markov 采样核心**：`dspark_sequential_sample`（`src/inference/engines/dflash_engine.cpp`，声明于 `include/forge/engines/dflash_engine.h`）为纯函数——输入 `n` 个 logit 行 + `markov_embed[target_vocab, d]` + `markov_bias[vocab, d]`，逐位置 `score[v] = rows[j][v] + markov_bias[v]·markov_embed[prev]`，`prev_0 = anchor_token`、`prev_{j+1} = sampled_j`；`markov_embed`/`markov_bias` 为空时退化为逐行独立贪心（DFlash 式）；`draft_id_map` 非空时把草稿 id 映射回 target id 后再作为下一步 `prev`。`DflashEngine::has_markov_head()` / `markov_embed()` / `markov_bias()` / `draft_id_map()` 提供 CPU 张量访问。
+- **provider 接入**：`DFlashDraftProvider::draft()` 在 `is_dspark_` 且 `has_markov_head()` 为真时走 `dspark_sequential_sample`（含可选 reduced-vocab 映射）；构造时若 `--spec-draft-arch dspark` 但 drafter 无 markov 头则 `valid()` 置否并打日志跳过（优雅回退到非投机）。DFlash 分支维持原并行独立贪心（与阶段 3 一致）。
+- **验收单测**（`tests/test_dflash.cpp` Part 4，无需模型）：对 `dspark_sequential_sample` 四种情形断言——① 无 markov → 逐行贪心；② 有 markov → argmax 被 shift 证明 Markov 头生效；③ reduced-vocab + 顺序 Markov → `[0,5,0]`（证明 intra-block 依赖 + 映射）；④ reduced-vocab 无 markov → 仅映射。共 17/17 通过。
+- **缺失项说明**：真实 DSPark GGUF（含 `markov_embed`/`markov_bias` 权重）本环境未下载，故 `has_markov_head()` 真实路径与端到端接受率留待配对 DSPark GGUF 验证；代码路径与数学已通过纯函数单测覆盖。CLI 参数（`--spec-draft-arch dspark`）阶段 0/5 已接好，缺失 markov 权重时自动跳过。
+
 ### 阶段 5 — 接入 / CLI / 验证
 
 | 文件 | 动作 |
@@ -210,6 +242,13 @@ private:
 | `src/inference/speculative_executor.cpp` | provider 注册顺序加分支（紧接 MTP 之后）：`if (cfg_.draft_arch=="dflash"||"dspark")` push `DFlashDraftProvider(ctx_, *ctx_.engine(), cfg_.p_min, cfg_.draft_n_spec, dsark)`，`valid()` 失败打日志跳过 |
 | `src/cli/forge_cli.cpp` | 把 `--spec-draft-arch` 等填入 `SpeculativeConfig` |
 | `tests/test_dflash.cpp` | 单测：encoder 维度、context-KV 注入一致性、端到端接受率 > 0；greedy 下开启 DFlash 与关闭 spec 文本逐 token 一致 |
+
+#### 阶段 5 验收（2026-08-30）— ✅
+- **provider 注册（CLI 接线，item 1）**：`SpeculativeExecutor`（`src/inference/speculative_executor.cpp:38-52`）在 MTP 之后按 `cfg_.draft_arch=="dflash"||"dspark"` 注册 `DFlashDraftProvider`；缺 `--spec-draft-model` 或 `valid()` 失败时打日志跳过（优雅回退到非投机）。已验证。
+- **SpeculativeConfig 透传（item 2）**：`src/cli/cli_args.cpp` 把 `--spec-draft-arch` / `--spec-draft-target-layers` / `--spec-draft-mask-id` / `--spec-draft-n` 写入 `args.spec`（`SpeculativeConfig` 本身），`src/cli/forge_cli.cpp:622/626` 直接把 `args.spec` 透传给 Generator/引擎，**不设置 `--spec-draft-arch` 时默认路径零影响**（阶段 3/5 回归结论）。已验证。
+- **单测（item 3）**：`tests/test_dflash.cpp` 新增 Part 5「context-KV 注入一致性」与 Part 6「端到端 draft（配对模型门控）」。
+  - Part 5 用真实 dflash GGUF（无需 paired target，本环境可跑）：验证 ① 每层恰好写入 `L` 个前缀位置；② 注入 `V == wv(prefix)`（精确，未旋转）；③ 注入 `K == RoPE(wk(prefix))`（用独立 `RopeExecutor` 重算，精确匹配）；④ 零前缀 → 全零 K/V（证明使用所提供前缀原样注入）；⑤ 不同前缀 → 不同 K（内容依赖）。**本环境 `./build/tests/forge-dflash-test` → 49/49 全通过。**
+  - Part 6（门控于 `FORGE_TEST_DFLASH_MODEL` + `FORGE_TEST_TARGET_MODEL`）：驱动真实 `DFlashDraftProvider::draft()` 端到端（target 多层 hidden → encoder → context-KV → 非因果 decode → 贪心草稿），校验产出 `n` 个 token 且贪心确定性。端到端「接受率 > 0」与「greedy 下开启 DFlash 与关闭 spec 文本逐 token 一致」由 `SpeculativeExecutor` 的 resample-consistency 验证保证；本环境无配对 35B target，故留待更大环境经该门控路径验证（与阶段 3 缺失项一致）。
 
 ---
 
