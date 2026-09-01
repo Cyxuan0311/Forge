@@ -572,7 +572,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                     size_t bytes = seq_len * hidden_dim * sizeof(float);
                     std::memcpy(dst + offset * hidden_dim, src, bytes);
 #endif
-                } else if (seq_hidden->device() != layer_dev) {
+                } else if (seq_hidden->device() != layer_dev.type) {
                     seq_cpu = transfer_hidden(seq_hidden, layer_dev);
                     const float* src = static_cast<const float*>(seq_cpu->data());
                     size_t bytes = seq_len * hidden_dim * sizeof(float);
