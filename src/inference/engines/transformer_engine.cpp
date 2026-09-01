@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "cpu/simd.h"
 #include "forge/backend.h"
 #include "forge/backend_scheduler.h"
 #include "forge/context.h"
@@ -16,8 +17,6 @@
 #include "forge/logger.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
-
-#include "cpu/simd.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -112,17 +111,18 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
     layer_devices_.resize(num_layers);
     if (gpu_layers_per_dev.empty()) {
         for (int i = 0; i < num_layers; ++i) {
-            layer_devices_[i] = (gpu_layers_ < 0) ? DeviceTarget::cuda(0)
-                               : (i < gpu_layers_)  ? DeviceTarget::cuda(0)
+            layer_devices_[i] = (gpu_layers_ < 0)   ? DeviceTarget::cuda(0)
+                                : (i < gpu_layers_) ? DeviceTarget::cuda(0)
                                                     : DeviceTarget::cpu();
         }
     } else {
         int offset = 0;
-        for (size_t dev_id = 0; dev_id < gpu_layers_per_dev.size() && offset < num_layers; ++dev_id) {
+        for (size_t dev_id = 0; dev_id < gpu_layers_per_dev.size() && offset < num_layers;
+             ++dev_id) {
             int n = gpu_layers_per_dev[dev_id];
             for (int i = 0; i < n && offset < num_layers; ++i, ++offset) {
-                layer_devices_[offset] = n > 0 ? DeviceTarget::cuda(static_cast<int>(dev_id))
-                                                : DeviceTarget::cpu();
+                layer_devices_[offset] =
+                    n > 0 ? DeviceTarget::cuda(static_cast<int>(dev_id)) : DeviceTarget::cpu();
             }
         }
         // Remaining layers (if any) go to CPU
@@ -141,13 +141,15 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
     // [n_expert] device vector seeded from the layer device; set_expert_placement()
     // can later override individual experts. Default = inherits layer device,
     // so current behavior is unchanged.
-    if (!expert_devices_.empty()) expert_devices_.clear();
+    if (!expert_devices_.empty())
+        expert_devices_.clear();
     expert_devices_.resize(num_layers);
     for (int i = 0; i < num_layers; ++i) {
         auto gate_exps = weights_.layers[i].ffn_gate_exps();
         if (gate_exps && gate_exps->shape().size() == 3) {
             const int n_expert = static_cast<int>(gate_exps->shape()[2]);
-            if (n_expert > 0) expert_devices_[i].assign(n_expert, layer_devices_[i]);
+            if (n_expert > 0)
+                expert_devices_[i].assign(n_expert, layer_devices_[i]);
         }
     }
 
@@ -160,8 +162,8 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
             LOG_INFO("set_gpu_layers: token_embedding kept on CPU (offload_embedding=false)");
         } else {
             LOG_WARN("set_gpu_layers: token_embedding is on " +
-                     std::to_string(static_cast<int>(token_emb->device())) +
-                     " but expected " + std::to_string(static_cast<int>(first_dev)) +
+                     std::to_string(static_cast<int>(token_emb->device())) + " but expected " +
+                     std::to_string(static_cast<int>(first_dev)) +
                      ". Moving to target device (legacy loading path).");
             token_emb->to_device(first_dev);
         }
@@ -172,17 +174,18 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
         DeviceType expected_type = layer_devices_[i].type;
         auto& lw = weights_.layers[i];
         for (auto& [name, tensor] : lw.weights) {
-            if (!tensor || tensor->device() == expected_type) continue;
+            if (!tensor || tensor->device() == expected_type)
+                continue;
             // P2: with expert paging enabled, deliberately keep the monolithic
             // 3D expert tensors on the host. Only individually paged experts are
             // uploaded (by ensure_resident), so expert VRAM tracks the routed
             // working set instead of the whole expert pool. Without this the 3D
             // tensor would occupy VRAM in full and paging could never save any.
-            const bool is_expert_3d =
-                tensor->shape().size() == 3 &&
-                (name == "ffn_gate_exps" || name == "ffn_up_exps" ||
-                 name == "ffn_down_exps" || name == "ffn_gate_up_exps");
-            if (expert_paging_enabled_ && is_expert_3d) continue;
+            const bool is_expert_3d = tensor->shape().size() == 3 &&
+                                      (name == "ffn_gate_exps" || name == "ffn_up_exps" ||
+                                       name == "ffn_down_exps" || name == "ffn_gate_up_exps");
+            if (expert_paging_enabled_ && is_expert_3d)
+                continue;
 
             LOG_WARN("set_gpu_layers: layer " + std::to_string(i) + " weight '" + name +
                      "' is on device " + std::to_string(static_cast<int>(tensor->device())) +
@@ -196,8 +199,8 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
     auto out_w = weights_.output_weight;
     if (out_w && out_w->device() != last_dev) {
         LOG_WARN("set_gpu_layers: output_weight is on " +
-                 std::to_string(static_cast<int>(out_w->device())) +
-                 " but expected " + std::to_string(static_cast<int>(last_dev)) +
+                 std::to_string(static_cast<int>(out_w->device())) + " but expected " +
+                 std::to_string(static_cast<int>(last_dev)) +
                  ". Moving to target device (legacy loading path).");
     }
 
@@ -209,7 +212,9 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
     }
 
     int num_cuda = 0;
-    for (auto d : layer_devices_) if (d.is_cuda()) ++num_cuda;
+    for (auto d : layer_devices_)
+        if (d.is_cuda())
+            ++num_cuda;
     LOG_INFO("CPU offload configured: gpu_layers=" + std::to_string(gpu_layers) + "/" +
              std::to_string(num_layers) + ", CUDA layers=" + std::to_string(num_cuda));
 
@@ -227,14 +232,16 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
             auto geu = weights_.layers[i].ffn_gate_up_exps();
             const bool is_moe =
                 (ge && ge->shape().size() == 3) || (geu && geu->shape().size() == 3);
-            if (is_moe) experts_per_layer[i] = cfg_n_expert;
+            if (is_moe)
+                experts_per_layer[i] = cfg_n_expert;
         }
         expert_page_cache_.resize(num_layers, experts_per_layer);
     }
 }
 
 DeviceType TransformerEngine::layer_device(int layer_idx) const {
-    if (!layer_devices_.empty() && layer_idx >= 0 && layer_idx < static_cast<int>(layer_devices_.size()))
+    if (!layer_devices_.empty() && layer_idx >= 0 &&
+        layer_idx < static_cast<int>(layer_devices_.size()))
         return layer_devices_[layer_idx].type;
     if (gpu_layers_ < 0)
         return model_.device();
@@ -244,7 +251,8 @@ DeviceType TransformerEngine::layer_device(int layer_idx) const {
 }
 
 DeviceTarget TransformerEngine::layer_device_target(int layer_idx) const {
-    if (!layer_devices_.empty() && layer_idx >= 0 && layer_idx < static_cast<int>(layer_devices_.size()))
+    if (!layer_devices_.empty() && layer_idx >= 0 &&
+        layer_idx < static_cast<int>(layer_devices_.size()))
         return layer_devices_[layer_idx];
     if (gpu_layers_ < 0)
         return DeviceTarget::cuda(0);
@@ -256,16 +264,16 @@ DeviceTarget TransformerEngine::layer_device_target(int layer_idx) const {
 // ---- Expert-level placement (MoE partial activation) ----
 
 void TransformerEngine::set_expert_placement(int layer, const std::vector<int>& gpu_experts,
-                                              int n_expert) {
+                                             int n_expert) {
     if (layer < 0 || layer >= static_cast<int>(weights_.layers.size()))
         return;
     if (expert_devices_.size() < weights_.layers.size())
         expert_devices_.resize(weights_.layers.size());
     auto& vec = expert_devices_[layer];
-    vec.assign(n_expert, layer_device_target(
-                              layer));  // default: inherit layer device
+    vec.assign(n_expert, layer_device_target(layer));  // default: inherit layer device
     for (int e : gpu_experts) {
-        if (e >= 0 && e < n_expert) vec[e] = DeviceTarget::cuda(0);
+        if (e >= 0 && e < n_expert)
+            vec[e] = DeviceTarget::cuda(0);
     }
     LOG_INFO("set_expert_placement: layer " + std::to_string(layer) + " -> " +
              std::to_string(gpu_experts.size()) + "/" + std::to_string(n_expert) +
@@ -282,9 +290,9 @@ DeviceTarget TransformerEngine::expert_device(int layer, int expert) const {
 }
 
 bool TransformerEngine::expert_source(int layer, std::vector<TensorPtr>& src3d,
-                                      std::vector<ExpertSlot>& slots,
-                                      int& expert_dim) const {
-    if (layer < 0 || layer >= static_cast<int>(weights_.layers.size())) return false;
+                                      std::vector<ExpertSlot>& slots, int& expert_dim) const {
+    if (layer < 0 || layer >= static_cast<int>(weights_.layers.size()))
+        return false;
     const auto& lw = weights_.layers[layer];
 
     // Architectures differ: PhiMoE exposes separate ffn_gate/up/down_exps;
@@ -302,14 +310,16 @@ bool TransformerEngine::expert_source(int layer, std::vector<TensorPtr>& src3d,
     add(lw.ffn_up_exps(), ExpertSlot::Up);
     add(lw.ffn_down_exps(), ExpertSlot::Down);
     add(lw.ffn_gate_up_exps(), ExpertSlot::GateUp);
-    if (src3d.empty()) return false;
+    if (src3d.empty())
+        return false;
 
     // Which axis indexes experts? Match against the configured expert count; the
     // axis differs by architecture (PhiMoE: 0, Gemma4: 2). If it cannot be
     // determined we refuse rather than guess, and paging stays off for this
     // model (the non-paging path keeps working unchanged).
     const int n_expert = model_.config().n_expert;
-    if (n_expert <= 0) return false;
+    if (n_expert <= 0)
+        return false;
     const auto& s = src3d[0]->shape();
     expert_dim = -1;
     for (int d = 0; d < 3; ++d) {
@@ -326,18 +336,19 @@ void TransformerEngine::sync_experts_resident(int layer,
     // P2: record the routed experts and, when paging is enabled, materialise +
     // move each one onto the layer's device. Paging is off by default, in which
     // case this only accumulates router statistics and touches no weight.
-    if (active_experts.empty()) return;
+    if (active_experts.empty())
+        return;
 
     std::vector<TensorPtr> src3d;
     std::vector<ExpertSlot> slots;
     int expert_dim = 0;
-    if (!expert_source(layer, src3d, slots, expert_dim)) return;
+    if (!expert_source(layer, src3d, slots, expert_dim))
+        return;
 
     const DeviceTarget target = layer_device_target(layer);
     const int64_t step = ++expert_step_;  // mutable, LRU ordering
-    expert_page_cache_.record_active(layer, active_experts, step,
-                                     expert_paging_enabled_, src3d, slots,
-                                     expert_dim, target);
+    expert_page_cache_.record_active(layer, active_experts, step, expert_paging_enabled_, src3d,
+                                     slots, expert_dim, target);
 }
 
 TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceTarget target) const {
@@ -362,11 +373,9 @@ TensorPtr TransformerEngine::transfer_hidden(const TensorPtr& hidden, DeviceTarg
             cudaDeviceEnablePeerAccess(src_dev, 0);
 
             cudaSetDevice(src_dev);
-            auto transferred = std::make_shared<Tensor>(hidden->dtype(), hidden->shape(),
-                                                        DeviceType::CUDA);
-            cudaMemcpyPeer(transferred->data(), dst_dev,
-                           hidden->data(), src_dev,
-                           hidden->nbytes());
+            auto transferred =
+                std::make_shared<Tensor>(hidden->dtype(), hidden->shape(), DeviceType::CUDA);
+            cudaMemcpyPeer(transferred->data(), dst_dev, hidden->data(), src_dev, hidden->nbytes());
             cudaSetDevice(dst_dev);
             return transferred;
         }
@@ -390,7 +399,8 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
 
     DeviceTarget first_dev = layer_device_target(0);
 #ifdef USE_CUDA
-    if (first_dev.is_cuda()) cudaSetDevice(first_dev.device_id);
+    if (first_dev.is_cuda())
+        cudaSetDevice(first_dev.device_id);
 #endif
 
     auto token_emb = model_.weights().get("token_embedding");
@@ -403,9 +413,10 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
     // When token_embedding is on CPU (offload_embedding=false), run embedding on CPU
     // then transfer result to the first layer's device.
     DeviceType emb_dev = token_emb->device();
-    auto ids_for_embed = transfer_hidden(req.input_ids,
-                                         (emb_dev != first_dev.type && emb_dev == DeviceType::CPU)
-                                             ? DeviceTarget::cpu() : first_dev);
+    auto ids_for_embed =
+        transfer_hidden(req.input_ids, (emb_dev != first_dev.type && emb_dev == DeviceType::CPU)
+                                           ? DeviceTarget::cpu()
+                                           : first_dev);
 
     TensorPtr hidden;
     {
@@ -447,7 +458,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
 
     // Collect per-sequence logits results
     struct SeqResult {
-        int batch_idx;   // index in original batch
+        int batch_idx;  // index in original batch
         int vocab_size;
         std::vector<float> logits;
     };
@@ -463,13 +474,13 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         // ==== Step 1: Fused embedding for all tokens ====
         DeviceTarget first_dev = layer_device_target(0);
 #ifdef USE_CUDA
-        if (first_dev.is_cuda()) cudaSetDevice(first_dev.device_id);
+        if (first_dev.is_cuda())
+            cudaSetDevice(first_dev.device_id);
 #endif
 
         // Build flat [total_tokens] token ID tensor
-        auto flat_ids = std::make_shared<Tensor>(DataType::INT32,
-                                                  std::vector<int64_t>{total_tokens},
-                                                  DeviceType::CPU);
+        auto flat_ids = std::make_shared<Tensor>(
+            DataType::INT32, std::vector<int64_t>{total_tokens}, DeviceType::CPU);
         int32_t* ids_ptr = static_cast<int32_t*>(flat_ids->data());
         for (const auto& item : ubatch.items) {
             std::memcpy(ids_ptr, item.tokens.data(), item.tokens.size() * sizeof(int32_t));
@@ -510,16 +521,16 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         for (int layer = 0; layer < cfg.num_layers; ++layer) {
             DeviceTarget layer_dev = layer_device_target(layer);
 #ifdef USE_CUDA
-            if (layer_dev.is_cuda()) cudaSetDevice(layer_dev.device_id);
+            if (layer_dev.is_cuda())
+                cudaSetDevice(layer_dev.device_id);
 #endif
             hidden = transfer_hidden(hidden, layer_dev);
 
             // Split hidden by sequence, forward_layer per sequence, concat back
             auto offsets = ubatch.token_offsets();
             int hidden_dim = static_cast<int>(hidden->shape().back());
-            auto layer_out = std::make_shared<Tensor>(DataType::FP32,
-                                                       std::vector<int64_t>{total_tokens, hidden_dim},
-                                                       layer_dev.type);
+            auto layer_out = std::make_shared<Tensor>(
+                DataType::FP32, std::vector<int64_t>{total_tokens, hidden_dim}, layer_dev.type);
             float* dst = static_cast<float*>(layer_out->data());
 
             for (int i = 0; i < ubatch.size(); i++) {
@@ -528,13 +539,16 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                 int offset = offsets[i];
 
                 // Extract this sequence's slice from flat hidden
-                TensorPtr seq_hidden = std::make_shared<Tensor>(hidden->slice(0, offset, offset + seq_len));
+                TensorPtr seq_hidden =
+                    std::make_shared<Tensor>(hidden->slice(0, offset, offset + seq_len));
 
                 // Forward through this layer for this sequence
                 {
                     PERF_SCOPE_FMT("forward_batch/layer_%d", layer);
-                    SET_PERF_CONTEXT(item.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu", seq_len);
-                    auto seq_req = ForwardRequest::from_hidden(seq_len, item.start_pos, item.seq_id);
+                    SET_PERF_CONTEXT(item.seq_id, "layer", layer,
+                                     layer_dev.is_cuda() ? "cuda" : "cpu", seq_len);
+                    auto seq_req =
+                        ForwardRequest::from_hidden(seq_len, item.start_pos, item.seq_id);
                     seq_hidden =
                         forward_layer(seq_hidden, make_layer_context(layer, seq_req, layer_dev));
                 }
@@ -551,8 +565,8 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                     // GPU→GPU: use cudaMemcpy instead of CPU memmove
                     size_t bytes = seq_len * hidden_dim * sizeof(float);
                     cudaMemcpyAsync(dst + offset * hidden_dim,
-                                     static_cast<const float*>(seq_hidden->data()),
-                                     bytes, cudaMemcpyDeviceToDevice);
+                                    static_cast<const float*>(seq_hidden->data()), bytes,
+                                    cudaMemcpyDeviceToDevice);
 #else
                     const float* src = static_cast<const float*>(seq_hidden->data());
                     size_t bytes = seq_len * hidden_dim * sizeof(float);
@@ -615,10 +629,11 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
                 int prev_rows = static_cast<int>(all_logits_result->shape()[0]);
                 int cur_rows = static_cast<int>(logits_cpu->shape()[0]);
                 int vs = static_cast<int>(logits_cpu->shape()[1]);
-                auto merged = std::make_shared<Tensor>(DataType::FP32,
-                                                        std::vector<int64_t>{prev_rows + cur_rows, vs},
-                                                        DeviceType::CPU);
-                std::memcpy(merged->data(), all_logits_result->data(), prev_rows * vs * sizeof(float));
+                auto merged = std::make_shared<Tensor>(
+                    DataType::FP32, std::vector<int64_t>{prev_rows + cur_rows, vs},
+                    DeviceType::CPU);
+                std::memcpy(merged->data(), all_logits_result->data(),
+                            prev_rows * vs * sizeof(float));
                 std::memcpy(static_cast<float*>(merged->data()) + prev_rows * vs,
                             logits_cpu->data(), cur_rows * vs * sizeof(float));
                 all_logits_result = merged;
@@ -663,16 +678,15 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
 
     // Assemble [n_seq, vocab_size] result in original batch order
     int n_seq = batch.size();
-    auto result = std::make_shared<Tensor>(DataType::FP32,
-                                            std::vector<int64_t>{n_seq, vocab_size},
-                                            DeviceType::CPU);
+    auto result = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{n_seq, vocab_size},
+                                           DeviceType::CPU);
     float* dst = static_cast<float*>(result->data());
     std::memset(dst, 0, n_seq * vocab_size * sizeof(float));
 
     for (auto& res : results) {
         if (res.batch_idx >= 0 && res.batch_idx < n_seq) {
-            std::memcpy(dst + res.batch_idx * vocab_size,
-                        res.logits.data(), vocab_size * sizeof(float));
+            std::memcpy(dst + res.batch_idx * vocab_size, res.logits.data(),
+                        vocab_size * sizeof(float));
         }
     }
 
@@ -785,8 +799,11 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     // Initialize paged storage if paged mode is enabled
     if (kv_memory_ && kv_memory_->is_paged()) {
         std::vector<int> kv_dims(cfg.num_layers, cfg.num_kv_heads * cfg.head_dim);
-        int page_size = 16;  // Phase 3: fixed page size, benchmark-tuned later
-        int max_num_seqs = 32;
+        // Roadmap 1.2: both knobs come from ContextParams. page_size defaults to
+        // 16; max_num_seqs == 0 lets PagedKVStorage derive the limit from the
+        // free device memory instead of the historical hard-coded 32.
+        const int page_size = ctx_.params().page_size > 0 ? ctx_.params().page_size : 16;
+        const int max_num_seqs = ctx_.params().max_num_seqs;  // 0 => auto-size
         KVCacheTypeConfig kv_config;
         kv_config.type_k = kv_cache_dtype_;
         kv_config.type_v = kv_cache_dtype_;
@@ -801,8 +818,8 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         }
         // Paged storage follows the KV cache device: CUDA engine → CUDA pages,
         // CPU engine → CPU pages (Phase 3 behavior).
-        if (!kv_memory_->init_storage(cfg.num_layers, kv_dims, kv_max_seq,
-                                      kv_dev, kv_config, page_size, max_num_seqs)) {
+        if (!kv_memory_->init_storage(cfg.num_layers, kv_dims, kv_max_seq, kv_dev, kv_config,
+                                      page_size, max_num_seqs)) {
             LOG_ERROR("Failed to initialize paged KV storage");
         }
     }
@@ -851,12 +868,14 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
         DeviceTarget layer_dev = layer_device_target(layer);
 #ifdef USE_CUDA
-        if (layer_dev.is_cuda()) cudaSetDevice(layer_dev.device_id);
+        if (layer_dev.is_cuda())
+            cudaSetDevice(layer_dev.device_id);
 #endif
         cur_hidden = transfer_hidden(cur_hidden, layer_dev);
         {
             PERF_SCOPE_FMT("forward/layer_%d", layer);
-            SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu", req.n_tokens);
+            SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu",
+                             req.n_tokens);
             cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
         }
         if (captures_layer_hiddens()) {
@@ -983,7 +1002,8 @@ TensorPtr TransformerEngine::expand_kv_heads(const TensorPtr& kv, int seq_len, i
     } else {
         const float* kv_data = static_cast<const float*>(kv->data());
         float* out_data = static_cast<float*>(expanded->data());
-        forge::cpu::expand_kv_heads_f32(kv_data, out_data, seq_len, num_heads, num_kv_heads, head_dim);
+        forge::cpu::expand_kv_heads_f32(kv_data, out_data, seq_len, num_heads, num_kv_heads,
+                                        head_dim);
     }
 
     return expanded;

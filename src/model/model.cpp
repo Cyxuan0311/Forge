@@ -8,7 +8,7 @@
 #include <stdexcept>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#    include <cuda_runtime.h>
 #endif
 
 #include "forge/gguf_model.h"
@@ -176,14 +176,14 @@ bool Model::load(const std::string& model_path, int n_gpu_layers) {
     } else {
         int gpu_count = std::min(n_gpu_layers, num_layers);
         if (gpu_count < n_gpu_layers) {
-            LOG_WARN("n_gpu_layers=" + std::to_string(n_gpu_layers) +
-                     " exceeds num_layers=" + std::to_string(num_layers) + ", clamping to " +
-                     std::to_string(gpu_count));
+            LOG_WARN("n_gpu_layers=" + std::to_string(n_gpu_layers) + " exceeds num_layers=" +
+                     std::to_string(num_layers) + ", clamping to " + std::to_string(gpu_count));
         }
         for (int i = 0; i < num_layers; ++i) {
             layer_devices[i] = (i < gpu_count) ? DeviceType::CUDA : DeviceType::CPU;
         }
-        if (gpu_count == 0) primary_dev = DeviceType::CPU;
+        if (gpu_count == 0)
+            primary_dev = DeviceType::CPU;
     }
 
     bool result = load_from_loader(*loader_, layer_devices);
@@ -465,50 +465,83 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
         // (partial offload), keep token_embedding on CPU (aligns with llama.cpp).
         bool is_partial_offload = !layer_devices.empty();
         for (int i = 1; i < config_.num_layers && is_partial_offload; ++i) {
-            if (layer_devices[i] != layer_devices[0]) break;
-            if (i == config_.num_layers - 1) is_partial_offload = false;
+            if (layer_devices[i] != layer_devices[0])
+                break;
+            if (i == config_.num_layers - 1)
+                is_partial_offload = false;
         }
-        DeviceType emb_dev = (!offload_embedding_ && is_partial_offload)
-                                 ? DeviceType::CPU
-                                 : first_layer_dev;
+        DeviceType emb_dev =
+            (!offload_embedding_ && is_partial_offload) ? DeviceType::CPU : first_layer_dev;
 
-        auto te = load_tensor("token_embd.weight", emb_dev);
-        if (!te) {
-            LOG_ERROR("Failed to load token embedding");
-            return false;
-        }
-        weight_store_.set("token_embedding", te);
+        if (config_.arch_type == "dflash" || config_.arch_type == "dspark") {
+            // DFlash / DSPark drafters share the target model's token embedding
+            // and lm_head (llama.cpp ctx_other). The GGUF carries no token_embd /
+            // output tensors by design; they are borrowed at runtime via
+            // DflashEngine::set_target(). Skip the mandatory load so the drafter
+            // can be loaded standalone and paired with a target engine.
+            LOG_INFO("model load: '" + config_.arch_type +
+                     "' shares target token_embd/output; local load skipped");
+            // DFlash-specific encoder weights are NOT part of the generic layer
+            // mapping, so load them explicitly into the weight store.
+            auto fc = load_tensor("fc.weight", last_layer_dev);
+            if (fc)
+                weight_store_.set("fc", fc);
+            else
+                LOG_WARN("model load: dflash encoder weight 'fc.weight' missing");
+            auto enc = load_tensor("output_norm_enc.weight", last_layer_dev);
+            if (!enc)
+                enc = load_tensor("enc.output_norm.weight", last_layer_dev);
+            if (enc)
+                weight_store_.set("output_norm_enc", enc);
+            else
+                LOG_WARN(
+                    "model load: dflash encoder weight "
+                    "'output_norm_enc.weight'/'enc.output_norm.weight' missing");
+        } else {
+            auto te = load_tensor("token_embd.weight", emb_dev);
+            if (!te) {
+                LOG_ERROR("Failed to load token embedding");
+                return false;
+            }
+            weight_store_.set("token_embedding", te);
 
-        auto on = load_tensor("output_norm.weight", last_layer_dev);
-        if (on)
-            weight_store_.set("output_norm", on);
+            auto on = load_tensor("output_norm.weight", last_layer_dev);
+            if (on)
+                weight_store_.set("output_norm", on);
 
-        auto ow = load_tensor("output.weight", last_layer_dev);
-        if (ow) {
-            weight_store_.set("output_weight", ow);
-        } else if (config_.tie_embeddings) {
-            weight_store_.set("output_weight", te);
+            auto ow = load_tensor("output.weight", last_layer_dev);
+            if (ow) {
+                weight_store_.set("output_weight", ow);
+            } else if (config_.tie_embeddings) {
+                weight_store_.set("output_weight", te);
+            }
         }
 
         // phimoe model-level biases (output_norm.bias, output.bias)
         if (config_.arch_type == "phimoe") {
             auto onb = load_tensor("output_norm.bias", last_layer_dev);
-            if (onb) weight_store_.set("output_norm_bias", onb);
+            if (onb)
+                weight_store_.set("output_norm_bias", onb);
             auto ob = load_tensor("output.bias", last_layer_dev);
-            if (ob) weight_store_.set("output_bias", ob);
+            if (ob)
+                weight_store_.set("output_bias", ob);
         }
 
         // Gemma4 per-layer embedding weights (model-level, not per-blk)
         if (config_.arch_type == "gemma4") {
             auto ple = load_tensor("per_layer_token_embd.weight", first_layer_dev);
-            if (ple) weight_store_.set("per_layer_tok_embd", ple);
+            if (ple)
+                weight_store_.set("per_layer_tok_embd", ple);
             auto plmp = load_tensor("per_layer_model_proj.weight", last_layer_dev);
-            if (plmp) weight_store_.set("per_layer_model_proj", plmp);
+            if (plmp)
+                weight_store_.set("per_layer_model_proj", plmp);
             auto plpn = load_tensor("per_layer_proj_norm.weight", last_layer_dev);
-            if (plpn) weight_store_.set("per_layer_proj_norm", plpn);
+            if (plpn)
+                weight_store_.set("per_layer_proj_norm", plpn);
             // RoPE frequency factors for proportional RoPE (full-attention layers)
             auto rf = load_tensor("rope_freqs.weight", first_layer_dev);
-            if (rf) weight_store_.set("rope_freqs", rf);
+            if (rf)
+                weight_store_.set("rope_freqs", rf);
         }
 
         // Build GGUF-specific layer mapping based on the arch mapping
@@ -633,7 +666,8 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 if (wq) {
                     int wq_rows = static_cast<int>(wq->shape()[0]);
                     // Use actual head dim inferred from tensor shape for robustness
-                    int wq_head_dim = (layer_num_heads > 0) ? wq_rows / layer_num_heads : wq_rows / config_.num_heads;
+                    int wq_head_dim = (layer_num_heads > 0) ? wq_rows / layer_num_heads
+                                                            : wq_rows / config_.num_heads;
                     int wq_num_heads = wq_rows / wq_head_dim;
                     weight_store_.set(base + ".wq",
                                       inverse_neox_permute_rows(wq, wq_num_heads, wq_head_dim));
@@ -670,8 +704,7 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 // past layer_devices.size(); use the last real trunk device.
                 DeviceType dev = layer_devices.empty() ? first_layer_dev : layer_devices.back();
 
-                auto set_if = [&](const std::string& canonical,
-                                  const std::string& gguf_name) {
+                auto set_if = [&](const std::string& canonical, const std::string& gguf_name) {
                     auto t = load_tensor(gguf_name, dev);
                     if (t)
                         weight_store_.set(canonical, t);
@@ -686,8 +719,7 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 set_if(base + ".attn_gate", blk + ".attn_gate.weight");
                 set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
                 set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
-                set_if(base + ".post_attention_norm",
-                       blk + ".post_attention_norm.weight");
+                set_if(base + ".post_attention_norm", blk + ".post_attention_norm.weight");
                 set_if(base + ".ssm_norm", blk + ".ssm_norm.weight");
                 set_if(base + ".ssm_a", blk + ".ssm_a");
                 set_if(base + ".ssm_dt", blk + ".ssm_dt.bias");
@@ -808,7 +840,8 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceTarget
     // so CUDA allocations land on the correct GPU.
     std::vector<DeviceType> type_vec;
     type_vec.reserve(layer_devices.size());
-    for (auto& dt : layer_devices) type_vec.push_back(dt.type);
+    for (auto& dt : layer_devices)
+        type_vec.push_back(dt.type);
 
 #ifdef USE_CUDA
     // Set device before model-level weights (token_embedding, output)
@@ -823,17 +856,18 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceTarget
 
     // Load using the DeviceType overload (model-level + per-layer tensor loading)
     bool ok = load_from_loader(loader, type_vec);
-    if (!ok) return false;
+    if (!ok)
+        return false;
 
-    // Set cudaSetDevice per layer block for CUDA allocations
-    // Note: this is a best-effort approach since the actual tensor loading
-    // happens inside load_from_loader(DeviceType). The per-layer loop in that
-    // function calls loader.get_tensor(name, layer_dev) which creates tensors
-    // on the target device type. For multi-GPU, we need to ensure the correct
-    // CUDA context is active during allocation. Since load_from_loader(DeviceType)
-    // iterates layers sequentially, and DeviceTarget preserves the per-layer
-    // device_id, we rely on the model loading being done with contiguous GPU
-    // assignments where cudaSetDevice before a block covers all layers in that block.
+        // Set cudaSetDevice per layer block for CUDA allocations
+        // Note: this is a best-effort approach since the actual tensor loading
+        // happens inside load_from_loader(DeviceType). The per-layer loop in that
+        // function calls loader.get_tensor(name, layer_dev) which creates tensors
+        // on the target device type. For multi-GPU, we need to ensure the correct
+        // CUDA context is active during allocation. Since load_from_loader(DeviceType)
+        // iterates layers sequentially, and DeviceTarget preserves the per-layer
+        // device_id, we rely on the model loading being done with contiguous GPU
+        // assignments where cudaSetDevice before a block covers all layers in that block.
 #ifdef USE_CUDA
     for (int i = 0; i < config_.num_layers && i < static_cast<int>(layer_devices.size()); ++i) {
         if (layer_devices[i].is_cuda()) {

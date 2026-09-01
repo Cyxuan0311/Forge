@@ -1,9 +1,9 @@
+#include <cmath>
+
 #include "forge/arch_config_parsers.h"
 #include "forge/arch_registry.h"
 #include "forge/logger.h"
 #include "forge/model_loader.h"
-
-#include <cmath>
 
 namespace forge {
 
@@ -112,6 +112,21 @@ ModelConfig parse_dflash_config(ModelLoader& loader, const std::string& arch) {
         LOG_WARN("dflash: metadata '" + arch +
                  ".target_layers' missing; draft encoder input cannot be sized");
     }
+
+    // iSWA (interleaved sliding window attention): a BOOL pattern marks which
+    // draft layers use a sliding window of size `attention.sliding_window`
+    // (the rest use full attention). Forge routes this via the KV-cache ring
+    // buffer (see TransformerEngine::init_kv_cache), exactly like Gemma4.
+    // Without populating these fields, n_swa stays 0 and every layer runs full
+    // attention, diverging from the reference drafter (Qwen3.6-35B-A3B-DFlash:
+    // window=4096, pattern=[1,1,1,1,1,0] -> 5 SWA + 1 full layer).
+    cfg.n_swa = static_cast<int>(loader.get_metadata_int(arch + ".attention.sliding_window", 0));
+    auto swa_pattern =
+        loader.get_metadata_int_array(arch + ".attention.sliding_window_pattern", {});
+    cfg.swa_layers.resize(cfg.num_layers, 0);
+    for (size_t i = 0; i < swa_pattern.size() && i < (size_t)cfg.num_layers; ++i) {
+        cfg.swa_layers[i] = static_cast<int>(swa_pattern[i]);
+    }
     return cfg;
 }
 
@@ -178,10 +193,8 @@ ModelConfig parse_deepseek_v2_config(ModelLoader& loader, const std::string& arc
     cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
     cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
     cfg.use_mla = (cfg.kv_lora_rank > 0);
-    cfg.n_routed_experts =
-        static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-    cfg.n_shared_experts =
-        static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
+    cfg.n_routed_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
+    cfg.n_shared_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
     cfg.num_expert_per_tok =
         static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
     if (cfg.kv_lora_rank > 0) {
@@ -196,10 +209,8 @@ ModelConfig parse_deepseek_v3_config(ModelLoader& loader, const std::string& arc
     cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".kv_lora_rank", 0));
     cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".q_lora_rank", 0));
     cfg.use_mla = (cfg.kv_lora_rank > 0);
-    cfg.n_routed_experts =
-        static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
-    cfg.n_shared_experts =
-        static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
+    cfg.n_routed_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_routed_experts", 0));
+    cfg.n_shared_experts = static_cast<int>(loader.get_metadata_int(arch + ".n_shared_experts", 0));
     cfg.num_expert_per_tok =
         static_cast<int>(loader.get_metadata_int(arch + ".num_expert_per_tok", 0));
     if (cfg.kv_lora_rank > 0) {
@@ -225,14 +236,12 @@ ModelConfig parse_qwen35_config(ModelLoader& loader, const std::string& arch) {
     } else {
         cfg.n_nextn_layers = 0;
     }
-    cfg.ssm_group_count =
-        static_cast<int>(loader.get_metadata_int(arch + ".ssm.group_count", 0));
+    cfg.ssm_group_count = static_cast<int>(loader.get_metadata_int(arch + ".ssm.group_count", 0));
     cfg.ssm_time_step_rank =
         static_cast<int>(loader.get_metadata_int(arch + ".ssm.time_step_rank", 0));
     cfg.ssm_inner_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.inner_size", 0));
     cfg.ssm_state_size = static_cast<int>(loader.get_metadata_int(arch + ".ssm.state_size", 0));
-    cfg.ssm_conv_kernel =
-        static_cast<int>(loader.get_metadata_int(arch + ".ssm.conv_kernel", 0));
+    cfg.ssm_conv_kernel = static_cast<int>(loader.get_metadata_int(arch + ".ssm.conv_kernel", 0));
     cfg.full_attention_interval =
         static_cast<int>(loader.get_metadata_int(arch + ".full_attention_interval", 0));
 
@@ -316,7 +325,7 @@ ModelConfig parse_falcon_config(ModelLoader& loader, const std::string& arch) {
 
 ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch) {
     auto cfg = parse_common_gguf_config(loader, arch);
-    cfg.use_neox_rope = false;  // Gemma4 GGUF already stores weights in half-split format
+    cfg.use_neox_rope = false;           // Gemma4 GGUF already stores weights in half-split format
     cfg.rope_type = RopeType::Standard;  // Half-split format → standard RoPE pairing
     cfg.tie_embeddings = true;
     cfg.ffn_activation = ActivationType::GeGLU;
@@ -333,18 +342,15 @@ ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch) {
         static_cast<int>(loader.get_metadata_int(arch + ".expert_feed_forward_length", 0));
 
     // MoE configuration
-    cfg.n_expert =
-        static_cast<int>(loader.get_metadata_int(arch + ".expert_count", 0));
-    cfg.n_expert_used =
-        static_cast<int>(loader.get_metadata_int(arch + ".expert_used_count", 0));
+    cfg.n_expert = static_cast<int>(loader.get_metadata_int(arch + ".expert_count", 0));
+    cfg.n_expert_used = static_cast<int>(loader.get_metadata_int(arch + ".expert_used_count", 0));
 
     // Sliding Window Attention
-    cfg.n_swa =
-        static_cast<int>(loader.get_metadata_int(arch + ".attention.sliding_window", 0));
+    cfg.n_swa = static_cast<int>(loader.get_metadata_int(arch + ".attention.sliding_window", 0));
 
     // SWA layer pattern (BOOL array, now supported by gguf_model.cpp)
-    auto swa_pattern = loader.get_metadata_int_array(
-        arch + ".attention.sliding_window_pattern", {});
+    auto swa_pattern =
+        loader.get_metadata_int_array(arch + ".attention.sliding_window_pattern", {});
     cfg.swa_layers.resize(cfg.num_layers, 0);
     for (size_t i = 0; i < swa_pattern.size() && i < (size_t)cfg.num_layers; ++i) {
         cfg.swa_layers[i] = static_cast<int>(swa_pattern[i]);
@@ -373,8 +379,8 @@ ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch) {
         // Fallback: infer from tensor shapes
         for (int i = 0; i < cfg.num_layers; ++i) {
             if (cfg.swa_layers[i] == 1) {
-                auto k_norm_shape = loader.get_tensor_shape(
-                    "blk." + std::to_string(i) + ".attn_k_norm.weight");
+                auto k_norm_shape =
+                    loader.get_tensor_shape("blk." + std::to_string(i) + ".attn_k_norm.weight");
                 if (k_norm_shape.size() >= 1 && k_norm_shape[0] > 0) {
                     cfg.head_dim_swa = static_cast<int>(k_norm_shape[0]);
                     cfg.num_kv_heads_swa = cfg.num_kv_heads;

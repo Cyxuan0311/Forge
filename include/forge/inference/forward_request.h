@@ -20,6 +20,22 @@ struct ForwardRequest {
     // 输入 token id。从 hidden state 直接进入时(forward_from_hidden)为空。
     TensorPtr input_ids;
 
+    // 已算好的 embedding（跳过 embedding lookup，直接进入 forward_layers）。
+    // 用于 DFlash 的 embd batch 注入 / 共享 target embedding 的草稿输入。
+    TensorPtr input_embeddings;
+
+    // 从已算好的 embedding 构造请求（跳过 token embedding lookup）。
+    static ForwardRequest from_embedding(const TensorPtr& emb, int n_tokens, int64_t start_pos,
+                                         int seq_id = 0) {
+        ForwardRequest req;
+        req.input_embeddings = emb;
+        req.n_tokens = n_tokens;
+        req.start_pos = start_pos;
+        req.seq_id = seq_id;
+        req.is_prefill = n_tokens > 1;
+        return req;
+    }
+
     // 本次前向处理的 token 数量。
     // 注意: 不从 input_ids 推导, 因为 hidden-state 入口没有 input_ids。
     int n_tokens = 0;

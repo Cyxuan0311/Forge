@@ -67,7 +67,9 @@ void register_core_types(py::module_& m) {
         .value("F16", KVCacheDType::F16)
         .value("Q8_0", KVCacheDType::Q8_0)
         .value("Q4_0", KVCacheDType::Q4_0)
-        .value("Q4_K", KVCacheDType::Q4_K);
+        .value("Q4_K", KVCacheDType::Q4_K)
+        .value("FP8_E4M3", KVCacheDType::FP8_E4M3)
+        .value("FP8_E5M2", KVCacheDType::FP8_E5M2);
 
     // Phase 6: per-layer memory policy (None_ avoids the Python `None` keyword).
     py::enum_<KVLayerPolicy>(m, "KVLayerPolicy")
@@ -88,38 +90,61 @@ void register_core_types(py::module_& m) {
         .def_static("q4_k_m", &QuantPolicy::q4_k_m);
 
     // ---- SpeculativeConfig ----
+    // SpeculativeConfig is an aggregate (no multi-arg constructor), so the legacy
+    // positional py::init<...> overloads below build it field-by-field via a
+    // lambda (C++17-safe; aggregate cannot be parenthesized-constructed).
     py::class_<SpeculativeConfig>(m, "SpeculativeConfig")
         .def(py::init<>())
-        // Legacy 10-arg overload for backward compat (positional)
-        .def(py::init<bool, int, int, float, bool,
-                      const std::string&, int, bool, int, int>(),
-             py::arg("enabled") = false,
-             py::arg("n_draft") = 5,
-             py::arg("n_min") = 0,
-             py::arg("p_min") = 0.0f,
-             py::arg("print_stats") = false,
-             py::arg("draft_model_path") = "",
-             py::arg("draft_gpu_layers") = -1,
-             py::arg("use_ngram") = true,
-             py::arg("ngram_n") = 5,
-             py::arg("ngram_min") = 2)
-        .def(py::init<bool, int, int, float, bool,
-                      const std::string&, int, bool, bool, int, int,
-                      bool, int, int, int>(),
-             py::arg("enabled") = false,
-             py::arg("n_draft") = 5,
-             py::arg("n_min") = 0,
-             py::arg("p_min") = 0.0f,
-             py::arg("print_stats") = false,
-             py::arg("draft_model_path") = "",
-             py::arg("draft_gpu_layers") = -1,
-             py::arg("use_mtp") = false,
-             py::arg("use_ngram") = true,
-             py::arg("ngram_n") = 5,
-             py::arg("ngram_min") = 2,
-             py::arg("use_ngram_mod") = false,
-             py::arg("ngram_mod_n") = 24,
-             py::arg("ngram_mod_n_min") = 48,
+        // Legacy 10-arg overload for backward compat (positional).
+        .def(py::init([](bool enabled, int n_draft, int n_min, float p_min, bool print_stats,
+                         const std::string& draft_model_path, int draft_gpu_layers, bool use_ngram,
+                         int ngram_n, int ngram_min) {
+                 SpeculativeConfig c;
+                 c.enabled = enabled;
+                 c.n_draft = n_draft;
+                 c.n_min = n_min;
+                 c.p_min = p_min;
+                 c.print_stats = print_stats;
+                 c.draft_model_path = draft_model_path;
+                 c.draft_gpu_layers = draft_gpu_layers;
+                 c.use_ngram = use_ngram;
+                 c.ngram_n = ngram_n;
+                 c.ngram_min = ngram_min;
+                 return c;
+             }),
+             py::arg("enabled") = false, py::arg("n_draft") = 5, py::arg("n_min") = 0,
+             py::arg("p_min") = 0.0f, py::arg("print_stats") = false,
+             py::arg("draft_model_path") = "", py::arg("draft_gpu_layers") = -1,
+             py::arg("use_ngram") = true, py::arg("ngram_n") = 5, py::arg("ngram_min") = 2)
+        // Legacy 15-arg overload for backward compat (positional).
+        .def(py::init([](bool enabled, int n_draft, int n_min, float p_min, bool print_stats,
+                         const std::string& draft_model_path, int draft_gpu_layers, bool use_mtp,
+                         bool use_ngram, int ngram_n, int ngram_min, bool use_ngram_mod,
+                         int ngram_mod_n, int ngram_mod_n_min, int ngram_mod_n_max) {
+                 SpeculativeConfig c;
+                 c.enabled = enabled;
+                 c.n_draft = n_draft;
+                 c.n_min = n_min;
+                 c.p_min = p_min;
+                 c.print_stats = print_stats;
+                 c.draft_model_path = draft_model_path;
+                 c.draft_gpu_layers = draft_gpu_layers;
+                 c.use_mtp = use_mtp;
+                 c.use_ngram = use_ngram;
+                 c.ngram_n = ngram_n;
+                 c.ngram_min = ngram_min;
+                 c.use_ngram_mod = use_ngram_mod;
+                 c.ngram_mod_n = ngram_mod_n;
+                 c.ngram_mod_n_min = ngram_mod_n_min;
+                 c.ngram_mod_n_max = ngram_mod_n_max;
+                 return c;
+             }),
+             py::arg("enabled") = false, py::arg("n_draft") = 5, py::arg("n_min") = 0,
+             py::arg("p_min") = 0.0f, py::arg("print_stats") = false,
+             py::arg("draft_model_path") = "", py::arg("draft_gpu_layers") = -1,
+             py::arg("use_mtp") = false, py::arg("use_ngram") = true, py::arg("ngram_n") = 5,
+             py::arg("ngram_min") = 2, py::arg("use_ngram_mod") = false,
+             py::arg("ngram_mod_n") = 24, py::arg("ngram_mod_n_min") = 48,
              py::arg("ngram_mod_n_max") = 64)
         .def_readwrite("enabled", &SpeculativeConfig::enabled)
         .def_readwrite("n_draft", &SpeculativeConfig::n_draft)
@@ -135,7 +160,12 @@ void register_core_types(py::module_& m) {
         .def_readwrite("ngram_mod_n", &SpeculativeConfig::ngram_mod_n)
         .def_readwrite("ngram_mod_n_min", &SpeculativeConfig::ngram_mod_n_min)
         .def_readwrite("ngram_mod_n_max", &SpeculativeConfig::ngram_mod_n_max)
-        .def_readwrite("ngram_mod_pool_size", &SpeculativeConfig::ngram_mod_pool_size);
+        .def_readwrite("ngram_mod_pool_size", &SpeculativeConfig::ngram_mod_pool_size)
+        // DFlash / DSPark standalone drafter (DFLASH_DSPARK_PLAN.md, Phase 0).
+        .def_readwrite("draft_arch", &SpeculativeConfig::draft_arch)
+        .def_readwrite("draft_target_layers", &SpeculativeConfig::draft_target_layers)
+        .def_readwrite("draft_mask_token_id", &SpeculativeConfig::draft_mask_token_id)
+        .def_readwrite("draft_n_spec", &SpeculativeConfig::draft_n_spec);
 
     // ---- SpeculativeStats ----
     py::class_<SpeculativeStats>(m, "SpeculativeStats")
@@ -172,14 +202,23 @@ void register_core_types(py::module_& m) {
         .def_readonly("finished", &GenerationResult::finished)
         .def_readonly("finish_reason", &GenerationResult::finish_reason)
         .def_property_readonly("spec_stats", [](const GenerationResult& r) -> py::object {
-            if (!r.spec_stats) return py::none();
+            if (!r.spec_stats)
+                return py::none();
             return py::cast(*r.spec_stats);
         });
+
+    // ---- KVCachePrecision ----
+    py::enum_<KVCachePrecision>(m, "KVCachePrecision")
+        .value("AUTO", KVCachePrecision::AUTO)
+        .value("HIGH_ACCURACY", KVCachePrecision::HIGH_ACCURACY)
+        .value("HIGH_THROUGHPUT", KVCachePrecision::HIGH_THROUGHPUT)
+        .export_values();
 
     // ---- ContextConfig ----
     py::class_<ContextConfig>(m, "ContextConfig")
         .def(py::init<>())
         .def_readwrite("kv_cache_dtype", &ContextConfig::kv_cache_dtype)
+        .def_readwrite("kv_cache_precision", &ContextConfig::kv_cache_precision)
         .def_readwrite("kv_cache_type_k", &ContextConfig::kv_cache_type_k)
         .def_readwrite("kv_cache_type_v", &ContextConfig::kv_cache_type_v)
         .def_readwrite("kv_storage", &ContextConfig::kv_storage)
@@ -204,9 +243,7 @@ void register_core_types(py::module_& m) {
         .def("device", &Tensor::device)
         .def("numel", &Tensor::numel)
         .def("nbytes", &Tensor::nbytes)
-        .def(
-            "strides",
-            [](const Tensor& t) -> std::vector<int64_t> { return t.strides(); })
+        .def("strides", [](const Tensor& t) -> std::vector<int64_t> { return t.strides(); })
         .def("zero_", &Tensor::zero_)
         .def(
             "copy_from", [](Tensor& self, const Tensor& other) { self.copy_from(other); },
@@ -240,12 +277,13 @@ void register_core_types(py::module_& m) {
                 return std::make_shared<Tensor>(
                     Tensor::from_buffer(reinterpret_cast<void*>(ptr), dtype, shape, device, own));
             },
-            py::arg("ptr"), py::arg("dtype"), py::arg("shape"),
-            py::arg("device") = DeviceType::CPU, py::arg("own") = false)
+            py::arg("ptr"), py::arg("dtype"), py::arg("shape"), py::arg("device") = DeviceType::CPU,
+            py::arg("own") = false)
         .def("numpy", [](TensorPtr& t) { return tensor_to_numpy(t); });
 
     // ---- dtype helper functions (quant_traits.h) ----
-    m.def("dtype_size", &dtype_size, py::arg("dt"), "Element size in bytes (0 for quantized types)");
+    m.def("dtype_size", &dtype_size, py::arg("dt"),
+          "Element size in bytes (0 for quantized types)");
     m.def("dtype_name", &dtype_name, py::arg("dt"), "Human-readable dtype name");
     m.def("dtype_block_size", &dtype_block_size, py::arg("dt"),
           "Bytes per quantization block (0 for non-quantized)");
@@ -263,24 +301,27 @@ void register_core_types(py::module_& m) {
         py::arg("dt"), "Get dequant_row function pointer (0 if N/A)");
 
     // ---- Memory counters (Phase 0 baseline) ----
-    m.def("get_memory_counters", []() -> py::dict {
-        auto snap = MemoryCounters::instance().snapshot();
-        py::dict d;
-        d["cpu_malloc"] = snap.cpu_malloc;
-        d["cpu_free"] = snap.cpu_free;
-        d["cuda_malloc"] = snap.cuda_malloc;
-        d["cuda_free"] = snap.cuda_free;
-        d["h2d_copies"] = snap.h2d_copies;
-        d["d2h_copies"] = snap.d2h_copies;
-        d["d2d_copies"] = snap.d2d_copies;
-        d["h2d_bytes"] = snap.h2d_bytes;
-        d["d2h_bytes"] = snap.d2h_bytes;
-        d["d2d_bytes"] = snap.d2d_bytes;
-        return d;
-    }, "Get current memory allocation/copy counters");
-    m.def("reset_memory_counters", []() {
-        MemoryCounters::instance().reset();
-    }, "Reset all memory counters to zero");
+    m.def(
+        "get_memory_counters",
+        []() -> py::dict {
+            auto snap = MemoryCounters::instance().snapshot();
+            py::dict d;
+            d["cpu_malloc"] = snap.cpu_malloc;
+            d["cpu_free"] = snap.cpu_free;
+            d["cuda_malloc"] = snap.cuda_malloc;
+            d["cuda_free"] = snap.cuda_free;
+            d["h2d_copies"] = snap.h2d_copies;
+            d["d2h_copies"] = snap.d2h_copies;
+            d["d2d_copies"] = snap.d2d_copies;
+            d["h2d_bytes"] = snap.h2d_bytes;
+            d["d2h_bytes"] = snap.d2h_bytes;
+            d["d2d_bytes"] = snap.d2d_bytes;
+            return d;
+        },
+        "Get current memory allocation/copy counters");
+    m.def(
+        "reset_memory_counters", []() { MemoryCounters::instance().reset(); },
+        "Reset all memory counters to zero");
 
     // ---- ModelConfig ----
     py::class_<ModelConfig>(m, "ModelConfig")

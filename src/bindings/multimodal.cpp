@@ -127,8 +127,7 @@ py::dict PyMultimodalModel::generate(py::array_t<int32_t, py::array::c_style> pr
                                      int max_new_tokens, float temperature, int top_k, float top_p,
                                      float repeat_penalty, bool do_sample, uint64_t seed,
                                      int eos_token_id, const std::string& kv_cache_dtype_str,
-                                     int gpu_layers,
-                                     const std::vector<int32_t>& stop_token_ids) {
+                                     int gpu_layers, const std::vector<int32_t>& stop_token_ids) {
     auto ctx = std::make_unique<InferenceContext>(model_);
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, *ctx);
     if (!engine) {
@@ -256,7 +255,7 @@ void register_multimodal(py::module_& m) {
                                py::return_value_policy::reference)
         .def("create_context", &PyMultimodalModel::create_context,
              py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
-             py::arg("offload_kqv") = true,
+             py::arg("kv_cache_precision") = "auto", py::arg("offload_kqv") = true,
              py::arg("speculative_config") = forge::SpeculativeConfig{},
              py::return_value_policy::take_ownership);
 }

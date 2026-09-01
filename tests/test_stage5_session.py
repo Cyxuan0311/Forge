@@ -30,7 +30,9 @@ def llm():
         def __init__(self):
             self._ctx = _MockCtx()
             self.tokenizer = None
-            self.template = forge_llm._PlainTemplate()
+            # ChatTemplateEngine() is the no-jinja plain template (see
+            # forge_llm.py); the old _PlainTemplate name no longer exists.
+            self.template = forge.ChatTemplateEngine()
 
         @property
         def context(self):

@@ -18,6 +18,7 @@ class Model;
 class InferenceContext;
 class KVCache;
 class KVMemory;
+class Qwen35RecurrentMemory;
 
 class InferenceEngine {
 public:
@@ -62,6 +63,12 @@ public:
     // The cache itself is owned by InferenceContext; this is a forwarding accessor.
     virtual KVCache* kv_cache() { return nullptr; }
     virtual const KVCache* kv_cache() const { return nullptr; }
+
+    // Access the engine's recurrent (Gated Delta Net / SSM) memory, used for
+    // per-sequence snapshot/rollback during speculative decoding. Returns
+    // nullptr for engines without recurrent state (attention-only models).
+    virtual Qwen35RecurrentMemory* recurrent_memory() { return nullptr; }
+    virtual const Qwen35RecurrentMemory* recurrent_memory() const { return nullptr; }
 
     // Access the engine's KV memory (unified interface for scheduler).
     // Returns nullptr if not available.

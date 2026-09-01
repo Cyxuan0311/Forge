@@ -21,8 +21,14 @@ void LayerWeights::to_device(DeviceType device) {
 bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     token_embedding = store.get("token_embedding");
     if (!token_embedding) {
-        LOG_ERROR("ModelWeights::init: token_embedding not found");
-        return false;
+        // DFlash / DSPark borrow the target model's token embedding at runtime,
+        // so its absence is expected for these architectures.
+        if (config.arch_type != "dflash" && config.arch_type != "dspark") {
+            LOG_ERROR("ModelWeights::init: token_embedding not found");
+            return false;
+        }
+        LOG_INFO("ModelWeights::init: '" + config.arch_type +
+                 "' has no token_embedding (shared with target); borrowing at runtime");
     }
 
     output_norm = store.get("output_norm");
@@ -38,6 +44,25 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     per_layer_tok_embd = store.get("per_layer_tok_embd");
     per_layer_model_proj = store.get("per_layer_model_proj");
     per_layer_proj_norm = store.get("per_layer_proj_norm");
+
+    // DFlash / DSPark encoder weights (shared token_embd / lm_head come from target)
+    dflash_fc = store.get("fc");
+    if (!dflash_fc)
+        dflash_fc = store.get("fc.weight");
+    if (!dflash_fc)
+        dflash_fc = store.get("model.fcs.0");
+    dflash_output_norm_enc = store.get("output_norm_enc");
+    if (!dflash_output_norm_enc)
+        dflash_output_norm_enc = store.get("output_norm_enc.weight");
+
+    // DSPark sequential Markov head (optional; absent for plain DFlash).
+    dflash_markov_embed = store.get("markov_embed");
+    if (!dflash_markov_embed)
+        dflash_markov_embed = store.get("markov_embed.weight");
+    dflash_markov_bias = store.get("markov_bias");
+    if (!dflash_markov_bias)
+        dflash_markov_bias = store.get("markov_bias.weight");
+    dflash_draft_id_to_target_id = store.get("draft_id_to_target_id");
 
     if (output_weight && output_weight->device() == DeviceType::CPU) {
         bool has_fused_kernel =

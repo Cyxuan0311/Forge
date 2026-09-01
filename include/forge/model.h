@@ -79,21 +79,22 @@ struct ModelConfig {
     bool has_post_ffn_norm = false;
 
     // Gemma4-specific fields
-    int n_embd_per_layer = 0;            // per-layer embedding dimension (0 = disabled)
-    int n_ff_exp = 0;                    // expert FFN intermediate dimension
-    int n_expert = 0;                    // total number of experts
-    int n_expert_used = 0;               // number of experts per token (top-K)
-    int n_swa = 0;                       // sliding window attention size
-    std::vector<int> swa_layers;         // which layers use SWA (1=SWA, 0=full attention)
-    int n_layer_kv_from_start = 0;       // layers with own KV cache (from start)
-    bool use_qk_norm = false;            // whether to apply QK-norm before attention
-    int head_dim_swa = 0;               // head dimension for SWA layers (0 = same as head_dim)
-    int num_heads_swa = 0;              // number of attention heads for SWA layers (0 = same as num_heads)
-    int num_kv_heads_swa = 0;           // number of KV heads for SWA layers (0 = same as num_kv_heads)
-    float rope_theta_swa = 10000.0f;    // RoPE freq base for SWA layers
-    int rope_dim_count = 0;             // RoPE dimension count for full-attention layers
-    int rope_dim_count_swa = 0;         // RoPE dimension count for SWA layers
-    std::vector<int32_t> suppress_tokens; // tokens to suppress during generation (set to -INF in logits)
+    int n_embd_per_layer = 0;       // per-layer embedding dimension (0 = disabled)
+    int n_ff_exp = 0;               // expert FFN intermediate dimension
+    int n_expert = 0;               // total number of experts
+    int n_expert_used = 0;          // number of experts per token (top-K)
+    int n_swa = 0;                  // sliding window attention size
+    std::vector<int> swa_layers;    // which layers use SWA (1=SWA, 0=full attention)
+    int n_layer_kv_from_start = 0;  // layers with own KV cache (from start)
+    bool use_qk_norm = false;       // whether to apply QK-norm before attention
+    int head_dim_swa = 0;           // head dimension for SWA layers (0 = same as head_dim)
+    int num_heads_swa = 0;     // number of attention heads for SWA layers (0 = same as num_heads)
+    int num_kv_heads_swa = 0;  // number of KV heads for SWA layers (0 = same as num_kv_heads)
+    float rope_theta_swa = 10000.0f;  // RoPE freq base for SWA layers
+    int rope_dim_count = 0;           // RoPE dimension count for full-attention layers
+    int rope_dim_count_swa = 0;       // RoPE dimension count for SWA layers
+    std::vector<int32_t>
+        suppress_tokens;  // tokens to suppress during generation (set to -INF in logits)
 
     // ---- DFlash / DSPark standalone draft model (speculative decoding) ----
     // The drafter is a lightweight transformer that shares the target model's
@@ -247,11 +248,26 @@ struct ModelWeights {
     TensorPtr token_embedding;
     TensorPtr token_embedding_fp32;  // Pre-dequantized FP32 cache for CPU transposed embedding
     TensorPtr output_norm;
-    TensorPtr output_norm_bias;      // Optional output norm bias (phimoe)
+    TensorPtr output_norm_bias;  // Optional output norm bias (phimoe)
     TensorPtr output_weight;
-    TensorPtr output_bias;           // Optional output projection bias (phimoe)
+    TensorPtr output_bias;         // Optional output projection bias (phimoe)
     TensorPtr output_weight_fp32;  // Pre-dequantized FP32 cache for CPU output_proj
     std::vector<LayerWeights> layers;
+
+    // DFlash / DSPark draft encoder weights. The drafter shares the target
+    // model's token embedding and lm_head (borrowed at runtime), but carries its
+    // own encoder projector and encoder output norm.
+    TensorPtr dflash_fc;               // encoder projector: [n_embd_inp_enc, hidden]
+    TensorPtr dflash_output_norm_enc;  // encoder output norm (RMSNorm)
+
+    // DSPark sequential Markov head (absent for plain DFlash). The drafter feeds
+    // the previously sampled token through markov_embed and adds markov_bias to
+    // the next position's logits, injecting intra-block dependence.
+    TensorPtr dflash_markov_embed;  // [target_vocab, d]
+    TensorPtr dflash_markov_bias;   // [target_vocab, d]
+    // Optional reduced draft vocab: draft logits are over a smaller vocabulary and
+    // each draft id is mapped back to the target id via this int32 table.
+    TensorPtr dflash_draft_id_to_target_id;  // [draft_vocab] int32
 
     // Gemma4 per-layer embedding weights
     TensorPtr per_layer_tok_embd;
@@ -499,9 +515,9 @@ struct ArchCapabilityAutoRegister {
     FORGE_REGISTER_ARCH_IMPL(__LINE__, arch, engine_creator, config_fn, weight_init_fn, cap)
 
 // Registration without engine (for architectures that fall back to capability-based lookup)
-#define FORGE_REGISTER_ARCH_NO_ENGINE_IMPL2(line, arch, config_fn, weight_init_fn, cap)  \
-    static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn); \
-    static ::forge::WeightInitAutoRegister _weight_init_reg_##line(arch, weight_init_fn);\
+#define FORGE_REGISTER_ARCH_NO_ENGINE_IMPL2(line, arch, config_fn, weight_init_fn, cap)   \
+    static ::forge::ConfigParserAutoRegister _config_parser_reg_##line(arch, config_fn);  \
+    static ::forge::WeightInitAutoRegister _weight_init_reg_##line(arch, weight_init_fn); \
     static ::forge::ArchCapabilityAutoRegister _arch_cap_reg_##line(arch, cap)
 
 #define FORGE_REGISTER_ARCH_NO_ENGINE_IMPL(line, arch, config_fn, weight_init_fn, cap) \
@@ -588,9 +604,9 @@ private:
     ModelLoaderPtr loader_;
     ModelLoaderPtr vision_loader_;  // For mmproj/vision weights
 
-    std::string load_mode_;        // "mmap" (default), "mlock", "mmap_mlock"
-    bool offload_embedding_ = true; // default: follow first layer device
-    bool prefetch_ = true;          // warm page cache at load (see set_prefetch)
+    std::string load_mode_;          // "mmap" (default), "mlock", "mmap_mlock"
+    bool offload_embedding_ = true;  // default: follow first layer device
+    bool prefetch_ = true;           // warm page cache at load (see set_prefetch)
 };
 
 }  // namespace forge

@@ -20,18 +20,23 @@ class InferenceEngine;
 struct ContextParams {
     int max_seq_len = 4096;
     int gpu_layers = -1;
-    bool offload_kqv = true;  // false = keep KV cache on CPU even when layers are on GPU
+    bool offload_kqv = true;        // false = keep KV cache on CPU even when layers are on GPU
     bool offload_embedding = true;  // false = keep token_embedding on CPU during partial offload
-    KVCacheDType kv_cache_dtype = KVCacheDType::FP32;  // legacy: sets both K and V
-    KVCacheTypeConfig kv_cache_config;                  // per-K/V type config
+    KVCacheDType kv_cache_dtype = KVCacheDType::FP32;           // legacy: sets both K and V
+    KVCacheTypeConfig kv_cache_config;                          // per-K/V type config
     KVStorageMode kv_storage_mode = KVStorageMode::Contiguous;  // internal: storage backend
     DeviceType device = DeviceType::CUDA;
     int batch_size = 1;
-    int n_batch = 512;          // max tokens per forward_batch() call
-    int n_ubatch = 256;         // max tokens per internal micro-batch
-    int n_threads = 4;          // decode (single-token) thread count
-    int n_threads_batch = 8;    // prefill/batch (multi-token) thread count
-    QuantPolicy quant_policy;   // per-tensor 混合精度策略
+    int n_batch = 512;        // max tokens per forward_batch() call
+    int n_ubatch = 256;       // max tokens per internal micro-batch
+    int n_threads = 4;        // decode (single-token) thread count
+    int n_threads_batch = 8;  // prefill/batch (multi-token) thread count
+    // Paged KV storage knobs (roadmap 1.2). page_size is the token count of one
+    // page; max_num_seqs == 0 means "auto-size from the free device memory", a
+    // positive value pins the concurrency limit and keeps the legacy behaviour.
+    int page_size = 16;
+    int max_num_seqs = 0;
+    QuantPolicy quant_policy;              // per-tensor 混合精度策略
     SpeculativeConfig speculative_config;  // speculative decoding 配置
 
     KVCacheDType type_k() const { return kv_cache_config.type_k; }

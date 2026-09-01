@@ -115,8 +115,8 @@ void register_model(py::module_& m) {
              py::arg("rms_norm_eps") = 1e-6f, py::arg("max_seq_len") = 4096,
              py::arg("arch_type") = "llama", py::arg("norm_type") = "rmsnorm",
              py::arg("activation") = "silu_gelu", py::arg("tie_embeddings") = false,
-             py::arg("device") = "cuda",
-             py::arg("n_swa") = 0, py::arg("swa_layers") = std::vector<int>{})
+             py::arg("device") = "cuda", py::arg("n_swa") = 0,
+             py::arg("swa_layers") = std::vector<int>{})
         .def("load_gguf", &PyModel::load_gguf, py::arg("path"), py::arg("device") = "cuda",
              py::arg("quant_policy") = QuantPolicy{})
         .def("load_auto", &PyModel::load_auto, py::arg("path"), py::arg("device") = "cuda")
@@ -128,9 +128,10 @@ void register_model(py::module_& m) {
                 return self.get_model().load_vision_weights(mmproj_path, dev);
             },
             py::arg("mmproj_path"), py::arg("device") = "cpu")
-        .def("create_context", &PyModel::create_context,
-             py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
-             py::arg("offload_kqv") = true, py::arg("speculative_config") = forge::SpeculativeConfig{},
+        .def("create_context", &PyModel::create_context, py::arg("kv_cache_dtype") = "fp32",
+             py::arg("gpu_layers") = -1, py::arg("kv_cache_precision") = "auto",
+             py::arg("offload_kqv") = true,
+             py::arg("speculative_config") = forge::SpeculativeConfig{},
              py::return_value_policy::take_ownership)
         .def("generate", &PyModel::generate, py::arg("prompt_ids"), py::arg("max_new_tokens") = 256,
              py::arg("temperature") = 1.0f, py::arg("top_k") = 0, py::arg("top_p") = 1.0f,
@@ -153,15 +154,14 @@ void register_model(py::module_& m) {
                                py::return_value_policy::reference_internal)
         .def("ensure_default_context", &PyModel::ensure_default_context,
              py::arg("kv_cache_dtype") = "fp32", py::arg("gpu_layers") = -1,
-             py::return_value_policy::reference_internal);
+             py::arg("kv_cache_precision") = "auto", py::return_value_policy::reference_internal);
 
     py::class_<PyInferenceContext>(m, "InferenceContext")
         .def("forward", &PyInferenceContext::forward, py::arg("input_ids"),
              py::arg("start_pos") = 0)
-        .def("forward_sample", &PyInferenceContext::forward_sample,
-             py::arg("input_ids"), py::arg("start_pos"), py::arg("temperature"),
-             py::arg("top_k"), py::arg("top_p"), py::arg("repeat_penalty"),
-             py::arg("token_history"))
+        .def("forward_sample", &PyInferenceContext::forward_sample, py::arg("input_ids"),
+             py::arg("start_pos"), py::arg("temperature"), py::arg("top_k"), py::arg("top_p"),
+             py::arg("repeat_penalty"), py::arg("token_history"))
         .def("forward_with_embeddings", &PyInferenceContext::forward_with_embeddings,
              py::arg("embeddings"), py::arg("start_pos") = 0)
         .def("get_embeddings", &PyInferenceContext::get_embeddings, py::arg("input_ids"))
@@ -176,37 +176,39 @@ void register_model(py::module_& m) {
         .def("cuda_graph_enabled", &PyInferenceContext::cuda_graph_enabled)
         .def("memory_stats", &PyInferenceContext::memory_stats)
         // Phase 5: seq-level KV operations for Session fork / prefix sharing
-        .def("seq_share", &PyInferenceContext::seq_share,
-             py::arg("src_seq"), py::arg("dst_seq"), py::arg("p0"), py::arg("p1"))
-        .def("seq_remove", &PyInferenceContext::seq_remove,
-             py::arg("seq_id"), py::arg("p0"), py::arg("p1"))
+        .def("seq_share", &PyInferenceContext::seq_share, py::arg("src_seq"), py::arg("dst_seq"),
+             py::arg("p0"), py::arg("p1"))
+        .def("seq_remove", &PyInferenceContext::seq_remove, py::arg("seq_id"), py::arg("p0"),
+             py::arg("p1"))
         .def("seq_keep", &PyInferenceContext::seq_keep, py::arg("seq_id"))
         .def("seq_release", &PyInferenceContext::seq_release, py::arg("seq_id"))
         .def("is_paged", &PyInferenceContext::is_paged)
-        .def_property("n_batch",
-            [](PyInferenceContext& self) { return self.get().params().n_batch; },
+        .def_property(
+            "n_batch", [](PyInferenceContext& self) { return self.get().params().n_batch; },
             [](PyInferenceContext& self, int v) { self.get().params_mut().n_batch = v; })
-        .def_property("n_ubatch",
-            [](PyInferenceContext& self) { return self.get().params().n_ubatch; },
+        .def_property(
+            "n_ubatch", [](PyInferenceContext& self) { return self.get().params().n_ubatch; },
             [](PyInferenceContext& self, int v) { self.get().params_mut().n_ubatch = v; })
-        .def_property("n_threads",
-            [](PyInferenceContext& self) { return self.get().params().n_threads; },
+        .def_property(
+            "n_threads", [](PyInferenceContext& self) { return self.get().params().n_threads; },
             [](PyInferenceContext& self, int v) { self.get().params_mut().n_threads = v; })
-        .def_property("n_threads_batch",
+        .def_property(
+            "n_threads_batch",
             [](PyInferenceContext& self) { return self.get().params().n_threads_batch; },
             [](PyInferenceContext& self, int v) { self.get().params_mut().n_threads_batch = v; })
         .def("generate", &PyInferenceContext::generate, py::arg("tokens"),
              py::arg("config") = GenerationConfig{},
              "Generate tokens using this context (KV cache may be reused across calls).")
         .def("generate_stream", &PyInferenceContext::generate_stream, py::arg("tokens"),
-             py::arg("config"), py::arg("callback"),
-             "Streaming generation using this context.")
+             py::arg("config"), py::arg("callback"), "Streaming generation using this context.")
         // Phase 2: explicit KV-driven generation aliases (multi-turn context reuse)
         .def("generate_kv", &PyInferenceContext::generate_kv, py::arg("tokens"),
              py::arg("config") = GenerationConfig{},
-             "Legacy Compatibility: Alias for generate() to explicitly indicate context-KV generation.")
+             "Legacy Compatibility: Alias for generate() to explicitly indicate context-KV "
+             "generation.")
         .def("generate_stream_kv", &PyInferenceContext::generate_stream_kv, py::arg("tokens"),
              py::arg("config"), py::arg("callback"),
-             "Legacy Compatibility: Alias for generate_stream() to explicitly indicate context-KV generation.")
+             "Legacy Compatibility: Alias for generate_stream() to explicitly indicate context-KV "
+             "generation.")
         .def_property_readonly("device", &PyInferenceContext::device);
 }
