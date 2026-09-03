@@ -1,0 +1,84 @@
+# ============================================================================
+# Forge Kernel Manifest — single source of truth for quantized GEMV dispatch
+# ============================================================================
+#
+# 历史问题: 这个文件建立之前, GEMV dispatch 存在两份互相矛盾的 source of truth:
+#   A. src/operators/cuda/cuda_gemv_instances.cu  (手工维护, 实际生效)
+#   B. tools/generate_gemv_instances.py           (生成模板, 早已过期)
+#
+# B 中 Q4_0 仍指向已下线的 launch_gemv_q4_0_transB (scalar smem/splitK),
+# 而 A 中 Q4_0 早已切到 launch_gemv_q4_0_q8_1 (Q8_1 + dp4a)。
+# 任何人重新运行生成器都会把 16 种量化类型中的 15 种打回慢路径。
+#
+# 修复方式: 本文件成为唯一 source of truth, 由
+#   tools/generate_gemv_instances.py
+# 生成 cuda_gemv_instances.cu。CI 通过 `--check` 保证两者不漂移。
+#
+# 新增量化类型的正确流程:
+#   1. 在 include/forge/types.h 的 DataType 枚举中分配索引
+#   2. 在 src/operators/cuda/cuda_gemv.cu 中实现 launch_gemv_<type>_q8_1[_batch]
+#   3. 在 include/forge/cuda_kernels.h 或 cuda_gemv.h 中声明
+#   4. 在下方 dispatch 列表按索引填入函数名
+#   5. 运行 `python tools/generate_gemv_instances.py` 重新生成
+#   6. 提交生成结果与本文件
+#
+# 注意: dispatch 数组大小必须等于 DataType 枚举的最大值 + 1。
+# 当前为 21 (IQ4_XS = 20)。新增类型时必须同步扩大。
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 需要显式实例化通用模板 kernel 的类型。
+# 生成的 INST_GEMV(DataType::X) 会实例化 launch_gemv_typed_transB 与
+# launch_gemv_typed_transB_batch 两个模板。
+#
+# 这些"通用模板"走 CudaQuantTraits<DT>::dot_block(), 是逐元素 scalar 实现
+# (见 cuda_gemv_tmpl.cuh:38-41), 性能低于专用的 Q8_1 + dp4a kernel。
+# 它们保留的用途:
+#   - 作为新量化类型接入时的参考实现 / 正确性基线
+#   - MoE expert GEMV 目前仍在使用 (cuda_moe.cu:207), 见优化计划 Phase 1-A
+# ---------------------------------------------------------------------------
+template_instances:
+  - Q4_0
+  - Q4_1
+  - Q4_K
+  - Q8_0
+  - Q2_K
+  - Q3_K
+  - Q5_K
+  - Q6_K
+
+# ---------------------------------------------------------------------------
+# GEMV dispatch 表。索引必须严格对应 include/forge/types.h 的 DataType 枚举值。
+#
+# 字段:
+#   i     - DataType 枚举索引
+#   name  - 枚举名 (仅用于生成注释, 便于人工核对)
+#   gemv  - M == 1 的 GEMV 入口, 无实现填 null
+#   batch - M > 1 的 batched GEMV 入口, 无实现填 null
+#   note  - 注释, 说明该路径的实现特征
+# ---------------------------------------------------------------------------
+dispatch:
+  # --- 非量化 / 未支持 ---
+  - {i: 0,  name: FP32,     gemv: null,                     batch: null,                          note: "" }
+  - {i: 1,  name: FP16,     gemv: null,                     batch: null,                          note: "" }
+  # --- GGUF 量化格式 ---
+  - {i: 2,  name: Q4_0,     gemv: launch_gemv_q4_0_q8_1,    batch: launch_gemv_q4_0_q8_1_batch,   note: "Q8_1+dp4a" }
+  - {i: 3,  name: Q4_1,     gemv: launch_gemv_q4_1_q8_1,    batch: launch_gemv_q4_1_q8_1_batch,   note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 4,  name: Q4_K,     gemv: launch_gemv_q4_k_q8_1,    batch: launch_gemv_q4_k_q8_1_batch,   note: "special Q8_1+dp4a" }
+  - {i: 5,  name: INT8,     gemv: null,                     batch: null,                          note: "" }
+  - {i: 6,  name: INT32,    gemv: null,                     batch: null,                          note: "" }
+  - {i: 7,  name: Q8_0,     gemv: launch_gemv_q8_0_q8_1,    batch: launch_gemv_q8_0_q8_1_batch,   note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 8,  name: Q5_0,     gemv: launch_gemv_q5_0_q8_1,    batch: launch_gemv_q5_0_q8_1_batch,   note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 9,  name: Q5_1,     gemv: launch_gemv_q5_1_q8_1,    batch: launch_gemv_q5_1_q8_1_batch,   note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 10, name: Q2_K,     gemv: launch_gemv_q2_k_q8_1,    batch: launch_gemv_q2_k_q8_1_batch,   note: "special Q8_1+dp4a" }
+  - {i: 11, name: Q3_K,     gemv: launch_gemv_q3_k_smem,    batch: launch_gemv_q3_k_q8_1_batch,   note: "special smem+dp4a" }
+  - {i: 12, name: Q5_K,     gemv: launch_gemv_q5_k_q8_1,    batch: launch_gemv_q5_k_q8_1_batch,   note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 13, name: Q6_K,     gemv: launch_gemv_q6_k_q8_1,    batch: launch_gemv_q6_k_q8_1_batch,   note: "Q8_1+dp4a (Phase 5)" }
+  # --- iq 系列 (llama.cpp 风格极低比特) ---
+  - {i: 14, name: IQ2_S,    gemv: launch_gemv_iq2_s_q8_1,   batch: launch_gemv_iq2_s_q8_1_batch,  note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 15, name: BF16,     gemv: null,                     batch: null,                          note: "" }
+  - {i: 16, name: IQ2_XXS,  gemv: launch_gemv_iq2_xxs_q8_1, batch: launch_gemv_iq2_xxs_q8_1_batch, note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 17, name: IQ4_NL,   gemv: launch_gemv_iq4_nl_q8_1,  batch: launch_gemv_iq4_nl_q8_1_batch,  note: "Q8_1+dp4a (Phase 5)" }
+  - {i: 18, name: IQ2_XS,   gemv: launch_gemv_iq2_xs_q8_1,  batch: launch_gemv_iq2_xs_q8_1_batch,  note: "Q8_1+dp4a (M=1, direct quantized GEMV)" }
+  - {i: 19, name: IQ3_S,    gemv: launch_gemv_iq3_s_q8_1,   batch: launch_gemv_iq3_s_q8_1_batch,   note: "Q8_1+dp4a (M=1, direct quantized GEMV)" }
+  - {i: 20, name: IQ4_XS,   gemv: launch_gemv_iq4_xs_q8_1,  batch: launch_gemv_iq4_xs_q8_1_batch,  note: "Q8_1+dp4a (136B/256elem block)" }

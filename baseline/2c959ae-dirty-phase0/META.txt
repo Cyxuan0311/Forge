@@ -1,0 +1,8 @@
+# Forge Phase 0 baseline
+commit:   2c959ae775b7481f86cb0d609b4aeeb0103687db
+dirty:    dirty
+date:     2026-09-03T15:57:57+08:00
+gpu:      NVIDIA GeForce RTX 4050 Laptop GPU, 8.9, 6141 MiB, 581.57
+cuda:     12.8
+cmake:    USE_CUBLAS=ON  ARCH=89
+build:    Release

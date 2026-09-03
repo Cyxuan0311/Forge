@@ -1,0 +1,15 @@
+===== moe_multigemv =====
+
+=== OMP_NUM_THREADS=1 ===
+  quantize_row_q8_K: K=4096=0.007ms  (2xK=960=0.007ms)
+
+  [hot: same 2 experts]
+  shared_input           full=   0.795  dots_divmod=  0.890  nested=  0.904  nested_pf=  0.884  pf_rowfull= 0.892  bw= 0.885  inline=  0.000  omp_empty=  0.000  ms
+  batched_pairs          full=   0.449  dots_divmod=  0.452  nested=  0.442  nested_pf=  0.436  pf_rowfull= 0.452  bw= 0.442  inline=  0.000  omp_empty=  0.000  ms
+
+=== OMP_NUM_THREADS=16 ===
+  quantize_row_q8_K: K=4096=0.006ms  (2xK=960=0.006ms)
+
+  [hot: same 2 experts]
+  shared_input           full=   0.364  dots_divmod=  0.562  nested=  0.562  nested_pf=  0.563  pf_rowfull= 0.564  bw= 0.563  inline=  0.001  omp_empty=  0.000  ms
+  batched_pairs          full=   0.191  dots_divmod=  0.179  nested=  0.179  nested_pf=  0.179  pf_rowfull= 0.180  bw= 0.179  inline=  0.001  omp_empty=  0.000  ms

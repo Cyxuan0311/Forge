@@ -11,8 +11,8 @@
 | CUDA Toolkit | 11.0+ | ❌ | opt-in via `FORGE_USE_CUDA=ON` |
 | Python 3 | 3.8+ | ❌ | Only needed for Python bindings |
 | NumPy | any | ❌ | Only needed for Python bindings |
-| cuBLAS | bundled with CUDA Toolkit | ❌ | opt-in via `USE_CUBLAS=ON` |
-| OpenBLAS | 0.3+ | ❌ | opt-in via `USE_OPENBLAS=ON` |
+| cuBLAS | bundled with CUDA Toolkit | ❌ | optional; **ON by default** when CUDA is enabled — disable with `USE_CUBLAS=OFF` to use Forge's built-in tiled GEMM |
+| OpenBLAS | 0.3+ | ❌ | optional; **OFF by default** — enable with `USE_OPENBLAS=ON` |
 | OpenMP | any (compiler built-in) | ❌ | auto-detected for CPU parallelism |
 
 ### Platform-specific Install
@@ -119,7 +119,7 @@ cmake -B build -DFORGE_CUDA_ARCH="75;86;89"   # portable binary
 | Backend | Type | Auto-detected | Enabled By |
 |---------|------|---------------|------------|
 | CUDA | GPU kernel execution | ❌ (requires toolkit) | `CUDAToolkit_FOUND` |
-| cuBLAS | GPU FP32 GEMM | ❌ (requires CUDA) | `USE_CUBLAS=ON` |
+| cuBLAS | GPU FP32 GEMM | ❌ (requires CUDA) | `USE_CUBLAS=ON` (default) |
 | AVX2 | CPU SIMD | ✅ at configure time | `COMPILER_SUPPORTS_AVX2` |
 | OpenMP | CPU threading | ✅ at configure time | `OpenMP_CXX_FOUND` |
 | OpenBLAS | CPU FP32 GEMM | ❌ (requires library) | `USE_OPENBLAS=ON` |

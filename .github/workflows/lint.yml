@@ -79,6 +79,27 @@ jobs:
           find . -name '*.sh' -not -path './build/*' -not -path './_deps/*' \
             -exec shellcheck {} +
 
+  kernel-manifest:
+    name: Kernel Manifest Up-to-date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: pip install PyYAML
+
+      # kernel_manifest.yaml is the single source of truth for the GEMV
+      # dispatch tables. Fail if the generated .cu has drifted from it --
+      # the old generator silently pointed Q4_0 at a retired scalar kernel.
+      - name: Check cuda_gemv_instances.cu matches kernel_manifest.yaml
+        run: python tools/generate_gemv_instances.py --check
+
   yamllint:
     name: YAML Formatting (yamllint)
     runs-on: ubuntu-latest

@@ -1,0 +1,6 @@
+===== ffn_q2k =====
+Q2_K FFN-up decode bench: gate/up [14336, 4096], threads=16
+memcpy ceiling :    1.426 ms     27.03 GB/s
+pure vectorized read :    0.334 ms    115.39 GB/s
+REAL fused FFN-up:    0.609 ms     63.26 GB/s
+real/memcpy = 0.427

@@ -17,6 +17,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
+    # Only needed to run tools/generate_gemv_instances.py (codegen).
+    # Not required to build or use Forge.
+    "PyYAML>=6.0",
 ]
 
 [tool.setuptools.packages.find]

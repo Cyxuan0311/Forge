@@ -11,8 +11,8 @@
 | CUDA Toolkit | 11.0+ | ❌ | 通过 `FORGE_USE_CUDA=ON` 开启 |
 | Python 3 | 3.8+ | ❌ | 仅 Python 绑定需要 |
 | NumPy | 任意 | ❌ | 仅 Python 绑定需要 |
-| cuBLAS | 随 CUDA Toolkit 提供 | ❌ | 通过 `USE_CUBLAS=ON` 开启 |
-| OpenBLAS | 0.3+ | ❌ | 通过 `USE_OPENBLAS=ON` 开启 |
+| cuBLAS | 随 CUDA Toolkit 提供 | ❌ | 可选；启用 CUDA 时**默认 ON** — 用 `USE_CUBLAS=OFF` 关闭，改用 Forge 内置 tiled GEMM |
+| OpenBLAS | 0.3+ | ❌ | 可选；**默认 OFF** — 用 `USE_OPENBLAS=ON` 开启 |
 | OpenMP | 任意（编译器内置） | ❌ | 自动检测，用于 CPU 并行 |
 
 ### 各平台安装
@@ -119,7 +119,7 @@ cmake -B build -DFORGE_CUDA_ARCH="75;86;89"   # 便携二进制
 | 后端 | 类型 | 自动检测 | 启用条件 |
 |------|------|---------|---------|
 | CUDA | GPU 内核执行 | ❌（需 toolkit） | `CUDAToolkit_FOUND` |
-| cuBLAS | GPU FP32 GEMM | ❌（需 CUDA） | `USE_CUBLAS=ON` |
+| cuBLAS | GPU FP32 GEMM | ❌（需 CUDA） | `USE_CUBLAS=ON`（默认） |
 | AVX2 | CPU SIMD 加速 | ✅ 编译时 | `COMPILER_SUPPORTS_AVX2` |
 | OpenMP | CPU 多线程 | ✅ 编译时 | `OpenMP_CXX_FOUND` |
 | OpenBLAS | CPU FP32 GEMM | ❌（需安装库） | `USE_OPENBLAS=ON` |

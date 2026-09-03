@@ -1,0 +1,2 @@
+===== moe_real =====
+OMP_NUM_THREADS=16  REAL shared_input=   0.342 ms  REAL batched_pairs=   0.189 ms
