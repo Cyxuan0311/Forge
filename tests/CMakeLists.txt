@@ -186,6 +186,12 @@ if(CUDAToolkit_FOUND)
     ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
   forge_link_native(forge-phase1-bc-ref-test)
   add_test(NAME phase1-bc-ref COMMAND forge-phase1-bc-ref-test)
+
+  # Phase 2-C: Vectorized FP32 prefill vs Scalar prefill parity (bit-exact
+  # reformat) and both vs a CPU naive GQA reference.
+  add_executable(forge-attn-backend-parity-test test_attention_backend_parity.cpp)
+  forge_link_native(forge-attn-backend-parity-test)
+  add_test(NAME attn-backend-parity COMMAND forge-attn-backend-parity-test)
 endif()
 
 # -----------------------------------------------------------------------------
