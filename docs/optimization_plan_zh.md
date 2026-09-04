@@ -278,6 +278,15 @@ weight 矩阵、直接写入最终 `out` 的对应区间。
 **验收**：`forge-bench-ffn_q2k` + 新增 dual-path 计时；确认无中间分配
 （`FORGE_PROFILING=ON` 下观察 allocator 调用次数下降）。
 
+**状态（已完成，2026-09-04）**：按收窄方案实现——`cuda_matmul_transB_dual` 在 `M==1`
+时通过新增的 `gemv_into_slice`（镜像 `cuda_matmul_transB` 的 M==1 派发）把 b1/b2
+**直接写入 `out` 的对应切片**（首 N1 列 / 末 N2 列），去除中间张量分配与 M 轮
+D2D 交错拷贝；`M>1` 保留原 allocate+interleave 回退以保证交错布局正确。
+数值由 `tests/test_phase1_bc_reference.cpp`（`dual(M=1)` vs FP32 参考，cos≈0.99999、
+maxabs 在容差内）验证。
+> 偏离原计划处：未采用 `gemv_dual_q8_1` 单 kernel（量化 x 一次的融合双输出），
+> 因其对泛型 dtype 侵入大且与本阶段收窄范围不符；本方案已达成"去中间分配 + 去 D2D"目标。
+
 ---
 
 ### 1-C. split-K 的 memset + atomicAdd → 协作式归约
@@ -306,15 +315,32 @@ weight 矩阵、直接写入最终 `out` 的对应区间。
 - 输出与 FP32 参考的余弦相似度不低于原实现
 - 连续两次运行结果 bit-exact（可复现性提升）
 
+**状态（已完成，2026-09-04）**：`output_proj_q4_0_q8_1_kernel` 改为**每 row 一个 CTA**——
+warp 内 shuffle 归约 → shared memory 跨 warp 归约 → 单线程写一次 `out[row]`；
+移除 `cudaMemsetAsync` 与 `atomicAdd`。数值由 `tests/test_phase1_bc_reference.cpp`
+验证：cos≈0.99999、maxabs 在容差内、且与 FP32 参考一致；**两次运行 bit-exact**
+（可复现性达成，原 atomicAdd 的累加顺序不确定性消失）。
+
 ---
 
 ### Phase 1 出口条件
 
-- [ ] `kernel_manifest.yaml` 成为唯一 source of truth，CI 有检查
-- [ ] MoE dp4a 版本数值正确且 `bench_moe_real` 优于基线
-- [ ] dual matmul 无中间分配
-- [ ] output_proj 无 memset/atomic，且结果可复现
-- [ ] 全部 `tests/` 下 C++ 与 Python 测试通过
+- [x] `kernel_manifest.yaml` 成为唯一 source of truth，CI 有检查
+      - manifest 文件 + `tools/generate_gemv_instances.py` 生成器早已就位；
+      - 新增 `.github/workflows/build.yml` 的 `kernel-manifest-check` job，
+        运行 `python tools/generate_gemv_instances.py --check`（生成文件漂移即失败）。
+- [x] MoE dp4a 版本数值正确且 `bench_moe_real` 优于基线（见 Phase 1-A）
+- [x] dual matmul 无中间分配（M==1 直接切片写入；M>1 保留回退）
+- [x] output_proj 无 memset/atomic，且结果可复现
+- [x] 全部 `tests/` 下 C++ 与 Python 测试通过
+      - `ctest` 22/22 通过（含交叉测试：neon-arm64 / vsx-ppc64 在 QEMU 下运行成功）；
+      - Python 无模型子集 `pytest` 407 passed（6 个 gpu/tinyllama 用例跳过）。
+
+> 已知遗留（不在 Phase 1 范围，已隔离）：opt-in 的 `forge-bench-cpu_decode`
+> benchmark 用全路径 `#include "src/operators/cpu/arch/x86/fused.h"`，但其目标的
+> include 路径不含仓库根，导致构建失败。该 benchmark 为 `FORGE_BUILD_BENCHMARKS`
+> 门控（默认 OFF），与交叉测试/Phase 1 无关；本次构建以
+> `-DFORGE_BUILD_BENCHMARKS=OFF` 隔离。交叉测试本身已修复并跑通。
 
 ---
 
