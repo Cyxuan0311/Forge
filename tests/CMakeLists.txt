@@ -192,6 +192,12 @@ if(CUDAToolkit_FOUND)
   add_executable(forge-attn-backend-parity-test test_attention_backend_parity.cpp)
   forge_link_native(forge-attn-backend-parity-test)
   add_test(NAME attn-backend-parity COMMAND forge-attn-backend-parity-test)
+
+  # Phase 2-B: FP8 (E4M3/E5M2) fused prefill vs FP32 prefill over the same
+  # dequantized KV (bit-exact, isolates kernel correctness from FP8 error).
+  add_executable(forge-attn-fp8-prefill-test test_attention_fp8_prefill.cpp)
+  forge_link_native(forge-attn-fp8-prefill-test)
+  add_test(NAME attn-fp8-prefill COMMAND forge-attn-fp8-prefill-test)
 endif()
 
 # -----------------------------------------------------------------------------
