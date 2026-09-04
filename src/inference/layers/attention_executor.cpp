@@ -503,10 +503,20 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
-        cuda::launch_flash_attention_gqa(
-            static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
-            static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
-            seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal);
+        // Phase 2-C: prefer the Vectorized backend (Q tile + float4 K/V) when
+        // supported; fall back to the Scalar kernel otherwise. Numerics identical.
+        AttentionBackend backend = choose_attention_backend(problem);
+        if (backend == AttentionBackend::Vectorized) {
+            cuda::launch_flash_attention_gqa_vectorized(
+                static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
+                static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
+                seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal);
+        } else {
+            cuda::launch_flash_attention_gqa(
+                static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
+                static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
+                seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal);
+        }
 #else
         attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
                                                             total_len, num_heads, num_kv_heads,
