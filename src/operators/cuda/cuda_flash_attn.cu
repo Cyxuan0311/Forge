@@ -178,6 +178,105 @@ __global__ void flash_attn_gqa_kernel(const float* Q, const float* K, const floa
         s_warp_max, s_warp_sum, s_warp_acc, o_row, 0, lane);
 }
 
+// =========================================================================
+// GQA Prefill kernel — VECTORIZED single-pass online softmax (Phase 2-C base)
+//
+// Same algorithm / numerics as flash_attn_gqa_kernel (Scalar), but:
+//   - Q is loaded ONCE into shared memory (Q tile) and reused across all KV
+//     positions. The Scalar kernel re-reads Q from global memory on every KV
+//     iteration (q_len * kv_len redundant global fetches per block).
+//   - K/V are loaded with float4 vectorized accesses (HEAD_DIM must be %4==0).
+// The d-accumulation order is identical, so outputs are bit-exact vs Scalar.
+// (Full KV-tiling to eliminate local_acc[HEAD_DIM] is deferred — see plan 2-C.)
+// =========================================================================
+
+template <int HEAD_DIM, int BLOCK_SIZE>
+__global__ void flash_attn_gqa_kernel_vectorized(const float* Q, const float* K, const float* V,
+                                                  float* O, int q_len, int kv_len, int num_heads,
+                                                  int num_kv_heads, const float* mask, bool causal) {
+    int h = blockIdx.y;
+    int qi = blockIdx.x;
+    if (h >= num_heads || qi >= q_len) return;
+
+    int q_pos = kv_len - q_len + qi;
+    int kv_groups = num_heads / num_kv_heads;
+    int kv_h = h / kv_groups;
+
+    const float* q_row = Q + qi * num_heads * HEAD_DIM + h * HEAD_DIM;
+    float* o_row = O + qi * num_heads * HEAD_DIM + h * HEAD_DIM;
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    constexpr int VEC_COUNT = HEAD_DIM / 4;
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+
+    // Q tile in shared memory — loaded cooperatively once, reused per KV position.
+    __shared__ float s_q[HEAD_DIM];
+    for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) s_q[d] = q_row[d];
+    __syncthreads();
+
+    float local_max = -1e30f;
+    float local_sum = 0.0f;
+    float local_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) local_acc[d] = 0.0f;
+
+    for (int j = tid; j < kv_len; j += BLOCK_SIZE) {
+        float m_val = (mask != nullptr) ? mask[qi * kv_len + j] : 0.0f;
+        if (m_val < -1e20f) continue;
+        if (!mask && causal && j > q_pos) continue;
+
+        const float* k_row = K + j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
+        const float* v_row = V + j * num_kv_heads * HEAD_DIM + kv_h * HEAD_DIM;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (int vi = 0; vi < VEC_COUNT; ++vi) {
+            float4 kv = *reinterpret_cast<const float4*>(k_row + vi * 4);
+            float4 qv = *reinterpret_cast<const float4*>(s_q + vi * 4);
+            dot += kv.x * qv.x + kv.y * qv.y + kv.z * qv.z + kv.w * qv.w;
+        }
+        dot *= scale;
+        dot += m_val;
+
+        float new_max = fmaxf(local_max, dot);
+        float correction = expf(local_max - new_max);
+        float weight = expf(dot - new_max);
+        local_sum = local_sum * correction + weight;
+
+#pragma unroll
+        for (int vi = 0; vi < VEC_COUNT; ++vi) {
+            float4 vf = *reinterpret_cast<const float4*>(v_row + vi * 4);
+            local_acc[vi * 4 + 0] = local_acc[vi * 4 + 0] * correction + weight * vf.x;
+            local_acc[vi * 4 + 1] = local_acc[vi * 4 + 1] * correction + weight * vf.y;
+            local_acc[vi * 4 + 2] = local_acc[vi * 4 + 2] * correction + weight * vf.z;
+            local_acc[vi * 4 + 3] = local_acc[vi * 4 + 3] * correction + weight * vf.w;
+        }
+        local_max = new_max;
+    }
+
+    float w_max = warp_reduce_max(local_max);
+    float rescale = expf(local_max - w_max);
+    float w_sum = warp_reduce_sum(local_sum * rescale);
+    float w_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = local_acc[d] * rescale;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) w_acc[d] = warp_reduce_sum(w_acc[d]);
+
+    __shared__ float s_warp_max[NUM_WARPS];
+    __shared__ float s_warp_sum[NUM_WARPS];
+    __shared__ float s_warp_acc[NUM_WARPS * HEAD_DIM];
+    if (lane == 0) { s_warp_max[warp_id] = w_max; s_warp_sum[warp_id] = w_sum; }
+    for (int d = lane; d < HEAD_DIM; d += 32) s_warp_acc[warp_id * HEAD_DIM + d] = w_acc[d];
+    __syncthreads();
+
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(
+        s_warp_max, s_warp_sum, s_warp_acc, o_row, 0, lane);
+}
+
 void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, float* O, int q_len,
                                 int kv_len, int num_heads, int num_kv_heads, int head_dim,
                                 const float* mask, bool causal, cudaStream_t stream) {
@@ -194,6 +293,27 @@ void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, 
     case 256: LAUNCH(256); break;
     case 512: LAUNCH(512); break;
     default:  fprintf(stderr, "[ERROR] flash_attn_gqa: unsupported head_dim=%d\n", head_dim); break;
+    }
+#undef LAUNCH
+}
+
+void launch_flash_attention_gqa_vectorized(const float* Q, const float* K, const float* V, float* O,
+                                            int q_len, int kv_len, int num_heads, int num_kv_heads,
+                                            int head_dim, const float* mask, bool causal,
+                                            cudaStream_t stream) {
+    dim3 grid(q_len, num_heads);
+    int threads = 128;
+#define LAUNCH(HD) flash_attn_gqa_kernel_vectorized<HD, 128><<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, mask, causal)
+    switch (head_dim) {
+    case 16:  LAUNCH(16);  break;
+    case 32:  LAUNCH(32);  break;
+    case 64:  LAUNCH(64);  break;
+    case 72:  LAUNCH(72);  break;
+    case 96:  LAUNCH(96);  break;
+    case 128: LAUNCH(128); break;
+    case 256: LAUNCH(256); break;
+    case 512: LAUNCH(512); break;
+    default:  fprintf(stderr, "[ERROR] flash_attn_gqa_vectorized: unsupported head_dim=%d\n", head_dim); break;
     }
 #undef LAUNCH
 }
