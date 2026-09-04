@@ -1,23 +1,77 @@
 <p align="center">
-  <img src="resource/logo.png" alt="Forge" width="60%">
+  <img src="resource/logo.png" alt="Forge" width="45%">
 </p>
 
 <h1 align="center">Forge</h1>
 
 <p align="center">
-  <strong>Lightweight LLM Inference Engine</strong> — Pure C++/CUDA, No Heavy Dependencies
+  <strong>Lightweight LLM Inference Engine</strong><br>
+  Pure C++/CUDA · Minimal Dependencies · Custom Kernels
 </p>
 
 <p align="center">
-  English | <a href="README_zh.md">中文</a>
+  <a href="README_zh.md">中文</a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="version">
-  <img src="https://img.shields.io/badge/C++-17-blue" alt="C++17">
-  <img src="https://img.shields.io/badge/CUDA-12.8+-green" alt="CUDA">
-  <img src="https://img.shields.io/badge/license-MIT-yellow" alt="license">
+  <a href="https://github.com/Cyxuan0311/Forge/stargazers">
+    <img src="https://img.shields.io/github/stars/Cyxuan0311/Forge?style=flat-square&logo=github&logoColor=white&label=Stars&labelColor=18181B&color=76B900" alt="GitHub Stars">
+  </a>
+  <a href="https://github.com/Cyxuan0311/Forge/network/members">
+    <img src="https://img.shields.io/github/forks/Cyxuan0311/Forge?style=flat-square&logo=github&logoColor=white&label=Forks&labelColor=18181B&color=52525B" alt="GitHub Forks">
+  </a>
+  <a href="https://github.com/Cyxuan0311/Forge/issues">
+    <img src="https://img.shields.io/github/issues/Cyxuan0311/Forge?style=flat-square&logo=github&logoColor=white&label=Issues&labelColor=18181B&color=52525B" alt="GitHub Issues">
+  </a>
+  <img src="https://img.shields.io/github/license/Cyxuan0311/Forge?style=flat-square&label=MIT&labelColor=18181B&color=A1A1AA" alt="MIT License">
 </p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/C%2B%2B-17-18181B?style=flat-square&logo=cplusplus&logoColor=white&labelColor=18181B" alt="C++17">
+  <img src="https://img.shields.io/badge/CUDA-12.8%2B-76B900?style=flat-square&logo=nvidia&logoColor=white&labelColor=18181B" alt="CUDA 12.8+">
+  <img src="https://img.shields.io/badge/Custom-Kernels-76B900?style=flat-square&labelColor=18181B" alt="Custom Kernels">
+</p>
+
+---
+
+## Overview
+
+**Forge** is a lightweight LLM inference engine written from scratch in **C++ and CUDA**.
+
+It provides a minimal, transparent, and high-performance inference stack without PyTorch, TensorFlow, or other heavyweight ML frameworks.
+
+### Highlights
+
+* **Pure C++/CUDA** — minimal runtime dependencies
+* **Custom CUDA kernels** — GEMM, GEMV, Flash Attention, RMSNorm, RoPE, sampling, and more
+* **Optimized CPU backend** — AVX2 + OpenMP
+* **Quantized inference** — Q4_0, Q4_1, Q4_K, Q6_K, Q8_0
+* **Optional BLAS** — cuBLAS / OpenBLAS
+* **Multiple architectures** — LLaMA, DeepSeek, Qwen3.5, Qwen3-VL, Gemma4, MiniCPM-V
+
+---
+
+## Architecture
+
+Forge keeps the inference path compact, from user-facing interfaces down to optimized CPU/GPU kernels.
+
+<p align="center">
+  <img src="resource/arch.png" alt="Forge Architecture" width="100%">
+</p>
+
+```text
+Model
+  ↓
+Inference Engine
+  ↓
+Operators
+  ↓
+CPU / CUDA Kernels
+  ↓
+Hardware
+```
+
+See [Architecture](docs/architecture.md) for the detailed design.
 
 ---
 
@@ -29,47 +83,23 @@
 
 ---
 
-## Description
+## Quick Start
 
-Forge is a lightweight LLM inference engine written from scratch in C++ and CUDA. The main goal is to provide a minimal, transparent, and high-performance inference stack — no PyTorch, no TensorFlow, no heavy framework dependencies.
+### Requirements
 
-- Plain C++/CUDA — zero dependency on ML frameworks
-- Hand-written CUDA kernels (GEMM, GEMV, flash attention, RMS norm, RoPE, etc.)
-- Hand-tuned AVX2 kernels with OpenMP parallelism
-- Q4_0, Q4_1, Q4_K, Q6_K, Q8_0 quantization
-- cuBLAS / OpenBLAS optional — default OFF, pure custom kernels used instead
-- Supports LLaMA, DeepSeek (MLA), Qwen3.5 (Hybrid SSM+Attention), Qwen3-VL (multimodal), Gemma4 (MoE+SWA), MiniCPM-V (multimodal)
+* CMake ≥ 3.18
+* C++17 compiler
+* CUDA Toolkit ≥ 12.8 for GPU inference
+* Python 3 + NumPy for Python examples
 
----
-
-## Quick start
+### Build
 
 ```bash
 git clone https://github.com/Cyxuan0311/Forge.git
 cd Forge
 
-cmake -B build && cmake --build build -j
-
-# CLI inference
-./build/forge-cli -m model.gguf -p "Hello" --stream
-
-# Python inference
-python examples/qwen_inference.py --model-path model.gguf --device cuda
-```
-
-**Dependencies**: CMake ≥ 3.18, CUDA Toolkit, Python 3 (NumPy)
-
-### Python API
-
-```python
-import forge
-
-model = forge.Model("model.gguf", device="cuda")
-tokenizer = forge.Tokenizer("model.gguf")
-
-tokens = tokenizer.encode("Hello, world!")
-result = model.generate(tokens, max_new_tokens=128)
-print(tokenizer.decode(result))
+cmake -B build
+cmake --build build -j
 ```
 
 ### CLI
@@ -79,111 +109,82 @@ print(tokenizer.decode(result))
 ./build/forge-cli -m model.gguf --stream
 
 # One-shot generation
-./build/forge-cli -m model.gguf -p "Once upon a time" -n 128
+./build/forge-cli \
+    -m model.gguf \
+    -p "Hello, world!" \
+    -n 128
 ```
 
----
-
-## Build options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `USE_CUDA` | ON | Enable CUDA backend (requires CUDA Toolkit) |
-| `USE_CUBLAS` | ON | Use cuBLAS for GPU GEMM; OFF uses pure CUDA tiled GEMM |
-| `USE_OPENBLAS` | OFF | Use OpenBLAS for CPU FP32 GEMM; default uses hand-tuned AVX2 kernels |
+### Python
 
 ```bash
-# Pure custom CUDA kernels, no cuBLAS
-cmake -B build -DUSE_CUBLAS=OFF
-
-# Enable OpenBLAS for CPU FP32 matmul
-cmake -B build -DUSE_OPENBLAS=ON
-
-# Fully self-contained build
-cmake -B build -DUSE_CUBLAS=OFF -DUSE_OPENBLAS=OFF
+python examples/qwen_inference.py \
+    --model-path model.gguf \
+    --device cuda
 ```
+
+For detailed build and usage instructions, see the [documentation](#documentation).
 
 ---
 
-## Supported architectures
+## Supported Models
 
-| Architecture | Example Models | Attention | Multimodal |
-|-------------|---------------|-----------|------------|
-| LLaMA | TinyLlama, Qwen2.5, Qwen3-VL | GQA | ✅ VLM (Qwen3-VL) |
-| DeepSeek | DeepSeek-V2/V3, DeepSeek-R1 | MLA | ❌ |
-| Qwen3.5 | Qwen3.5-MoE | Hybrid (SSM + Gated Delta Net + Full Attn) | ❌ |
-| Gemma4 | Gemma4 | SWA + Full Attention (MoE) | ❌ |
-| MiniCPM-V | MiniCPM-V 4.6 | GQA | ✅ VLM |
+| Architecture  | Example Models               | Structure                                | Multimodal |
+| ------------- | ---------------------------- | ---------------------------------------- | ---------: |
+| **LLaMA**     | TinyLlama, Qwen2.5, Qwen3-VL | GQA                                      |          ✅ |
+| **DeepSeek**  | DeepSeek-V2/V3, DeepSeek-R1  | MLA                                      |          ❌ |
+| **Qwen3.5**   | Qwen3.5-MoE                  | Hybrid SSM + Gated Delta Net + Attention |          ❌ |
+| **Gemma4**    | Gemma4                       | SWA + Full Attention + MoE               |          ❌ |
+| **MiniCPM-V** | MiniCPM-V 4.6                | GQA                                      |          ✅ |
 
-<details>
-<summary>Operation details</summary>
-
-| Operation | GPU (CUDA) | CPU |
-|-----------|-----------|-----|
-| Matrix multiply (FP32) | cuBLAS GEMM or tiled GEMM kernel | OpenBLAS or AVX2 gemm |
-| Matrix multiply (quantized) | Fused dequant + GEMV kernel | Fused dequant + GEMV AVX2 |
-| Flash attention | Custom CUDA kernel | AVX2 + OpenMP |
-| RMS norm | Custom CUDA kernel | AVX2 + OpenMP |
-| RoPE | Custom CUDA kernel | AVX2 |
-| SiLU / GELU | Custom CUDA kernel | AVX2 polynomial |
-| Sampler (argmax) | Custom CUDA kernel | AVX2 reduction |
-| Embedding | Custom CUDA kernel | Pure C++ |
-| KV cache | cudaMemcpy | memcpy |
-
-</details>
+See [Supported Models](docs/models.md) for details.
 
 ---
 
 ## Performance
 
-Detailed benchmark reports (Forge vs llama.cpp, GPU & CPU) are generated via the `report/` module and stored in `resource/reports/`.
+Forge includes a benchmark pipeline under `report/`.
 
-### Qwen2.5-7B-Instruct Q4_0 (RTX 4050 Laptop)
+### Qwen2.5-7B-Instruct Q4_0
+
+**RTX 4050 Laptop GPU**
 
 <p align="center">
-  <img src="resource/reports/qwen2.5-7b-instruct/performance_report.png" alt="Qwen2.5 Performance Report" width="70%">
+  <img
+    src="resource/reports/qwen2.5-7b-instruct/performance_report.png"
+    alt="Qwen2.5 Performance Report"
+    width="70%"
+  >
 </p>
 
-<details>
-<summary>Notes</summary>
+Benchmarks can be reproduced locally:
 
-- Measured with 100-token decode, prompt lengths 1–256
-- CPU backend: AVX2 + 16 threads
-- GPU backend: CUDA (cuBLAS offloaded)
-- Quantized GEMV kernels (Q4_0 decode path) bypass cuBLAS entirely — cuBLAS is only used for FP32 GEMM (M > 1, non-quantized weights)
-- OpenBLAS only affects CPU FP32 GEMM paths; quantized GEMV paths use hand-tuned AVX2 kernels
-- GPU baseline includes CUDA kernel warmup
+```bash
+python -m report.runner
+```
 
-</details>
-
-> Run `python -m report.runner` to regenerate benchmarks on your hardware.
+Detailed results and methodology are available under `resource/reports/`.
 
 ---
 
-## Backends
-
-| Backend | Target |
-|---------|--------|
-| CUDA | NVIDIA GPU |
-| AVX2 | x86-64 CPU |
-| OpenMP | CPU (threading) |
-| cuBLAS (optional) | NVIDIA GPU (FP32 GEMM) |
-| OpenBLAS (optional) | CPU (FP32 GEMM) |
-
 ## Documentation
 
-- [Build guide](docs/build.md)
-- [Dependencies](docs/dependencies.md)
-- [Python API](docs/python_api.md)
-- [CLI usage](docs/cli.md)
-- [Supported models](docs/models.md)
-- [Architecture](docs/architecture.md)
+| Document                             | Description                      |
+| ------------------------------------ | -------------------------------- |
+| [Build Guide](docs/build.md)         | Build and configuration          |
+| [Dependencies](docs/dependencies.md) | Dependencies and environment     |
+| [Python API](docs/python_api.md)     | Python interface                 |
+| [CLI Usage](docs/cli.md)             | Command-line inference           |
+| [Supported Models](docs/models.md)   | Model architecture support       |
+| [Architecture](docs/architecture.md) | Internal architecture and design |
 
 ---
 
 ## Contributing
 
-PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+Issues, optimizations, new operators, and model support are welcome.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
