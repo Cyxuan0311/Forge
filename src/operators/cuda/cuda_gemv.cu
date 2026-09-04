@@ -446,76 +446,6 @@ void launch_gemv_q2_k_q8_1(const float* x, const void* q_weight, float* out,
 #define GEMV_QR6_K 2
 #define GEMV_QI6_K (GEMV_QK_K / (4 * GEMV_QR6_K))  // 32
 
-// ---- Q4_K × Q8_1 dot product for one iqs position (ported from llama.cpp) ----
-// Processes QR4_K=2 groups of 2×4 int8 values = 64 elements per call
-static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
-    const void* __restrict__ vbq, const block_q8_1_gemv* __restrict__ bq8_1,
-    const int& kbx, const int& iqs)
-{
-    // Q4_K block layout: dm[4] + scales[12] + qs[128]
-    const uint8_t* bq4_K = (const uint8_t*)vbq + kbx * 144;
-
-    int v[2];
-    int u[2 * GEMV_QR4_K];
-    float d8[GEMV_QR4_K];
-
-    // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
-    const int bq8_offset = GEMV_QR4_K * ((iqs / 2) / (GEMV_QI8_1 / 2));
-
-    // Read 2 packed int32 values from qs (offset 16 in Q4_K block)
-    // qs layout: 128 bytes, organized as 8 sub-blocks of 32 bytes
-    // Each sub-block: 16 bytes for low nibble of 32 elements, 16 bytes for high nibble
-    const int* q4 = (const int*)(bq4_K + 16 + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
-    v[0] = q4[0];
-    v[1] = q4[4];
-
-    // Unpack scales and mins from scales[12] (offset 4 in Q4_K block)
-    const uint16_t* scales = (const uint16_t*)(bq4_K + 4);
-    uint16_t aux[2];
-    const int j = bq8_offset / 2;
-    if (j < 2) {
-        aux[0] = scales[j + 0] & 0x3f3f;
-        aux[1] = scales[j + 2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
-    }
-    const uint8_t* sc = (const uint8_t*)aux;
-    const uint8_t* m  = sc + 2;
-
-    // Read Q8_1 values
-#pragma unroll
-    for (int i = 0; i < GEMV_QR4_K; ++i) {
-        const block_q8_1_gemv* bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
-        const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
-        u[2 * i + 0] = q8[0];
-        u[2 * i + 1] = q8[4];
-    }
-
-    // ---- vec_dot_q4_K_q8_1_impl_vmmq (inlined) ----
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
-
-#pragma unroll
-    for (int i = 0; i < GEMV_QR4_K; ++i) {
-        // Extract 4-bit nibbles, replicate to 4 bytes
-        const int v0i = (v[0] >> (4 * i)) & 0x0F0F0F0F;
-        const int v1i = (v[1] >> (4 * i)) & 0x0F0F0F0F;
-
-        // dot1: weighted dot product
-        const int dot1 = forge_dp4a(v1i, u[2 * i + 1], forge_dp4a(v0i, u[2 * i + 0], 0));
-        // dot2: sum of Q8_1 values (for the min offset)
-        const int dot2 = forge_dp4a(0x01010101, u[2 * i + 1], forge_dp4a(0x01010101, u[2 * i + 0], 0));
-
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
-    }
-
-    // dm = half2 (d, dmin)
-    const float2 dm4f = __half22float2(*(const half2*)bq4_K);
-    return dm4f.x * sumf_d - dm4f.y * sumf_m;
-}
 
 // Q4_K × Q8_1 GEMV kernel: one warp per output row
 __global__ void gemv_q4_k_q8_1_kernel(
@@ -600,41 +530,6 @@ void launch_gemv_q4_k_q8_1(const float* x, const void* q_weight, float* out,
 //   dot = scale * d8 * (dp4a(packed_low, q8_packed) + dp4a(packed_high, q8_packed+16)
 //                        - 8 * dp4a(0x01010101, all_q8_packed))
 
-// ---- vec_dot_q4_0_q8_1: dot product of one Q4_0 block × one Q8_1 block (32 elements) ----
-// Extracted as an independent primitive (Phase 5), aligned with vec_dot_q2_K_q8_1 etc.
-static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
-    const uint8_t* __restrict__ block_ptr,
-    const block_q8_1_gemv* __restrict__ q8_blk)
-{
-    uint16_t scale_bits;
-    memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
-    float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
-    float d8 = __low2float(q8_blk->ds);
-
-    const uint8_t* qs = block_ptr + 2;
-    const int* q8_int = (const int*)q8_blk->qs;
-
-    float block_sum = 0.0f;
-    int bsum = 0;
-
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        uint32_t qs4;
-        memcpy(&qs4, qs + j * 4, 4);
-
-        int q4_low = qs4 & 0x0F0F0F0F;
-        int q4_high = (qs4 >> 4) & 0x0F0F0F0F;
-
-        int u_low = q8_int[j];
-        int u_high = q8_int[j + 4];
-
-        block_sum += (float)(forge_dp4a(q4_low, u_low, 0) + forge_dp4a(q4_high, u_high, 0));
-        bsum += forge_dp4a(0x01010101, u_low, 0) + forge_dp4a(0x01010101, u_high, 0);
-    }
-
-    block_sum -= 8.0f * (float)bsum;
-    return scale * d8 * block_sum;
-}
 
 __global__ void gemv_q4_0_q8_1_kernel(
     const block_q8_1_gemv* __restrict__ x_q8,
@@ -1092,28 +987,6 @@ void launch_gemv_q4_1_q8_1_batch(const float* x, const void* q_weight, float* ou
 // Weight = qs[i] * d  (signed int8, no bias)
 // ============================================================================
 
-static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
-    const uint8_t* __restrict__ block_ptr,
-    const block_q8_1_gemv* __restrict__ q8_blk)
-{
-    uint16_t d_bits;
-    memcpy(&d_bits, block_ptr, sizeof(uint16_t));
-    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
-    float d8 = __low2float(q8_blk->ds);
-
-    const int8_t* qs = reinterpret_cast<const int8_t*>(block_ptr + 2);
-    const int* q8_int = (const int*)q8_blk->qs;
-
-    int sumi = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        int qs_int;
-        memcpy(&qs_int, qs + j * 4, 4);
-        sumi = forge_dp4a(qs_int, q8_int[j], sumi);
-    }
-
-    return d * d8 * (float)sumi;
-}
 
 __global__ void gemv_q8_0_q8_1_kernel(
     const block_q8_1_gemv* __restrict__ x_q8,
@@ -1365,47 +1238,6 @@ void launch_gemv_q5_k_q8_1_batch(const float* x, const void* q_weight, float* ou
 // Weight = d * scale * (6bit_val - 32)
 // ============================================================================
 
-static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
-    const void* __restrict__ vbq, const block_q8_1_gemv* __restrict__ bq8_1,
-    const int& kbx, const int& iqs)
-{
-    const uint8_t* bq6_K = (const uint8_t*)vbq + kbx * 210;
-
-    const int bq8_offset = 2 * GEMV_QR6_K * (iqs / (GEMV_QI6_K / 2)) + (iqs % (GEMV_QI6_K / 2)) / (GEMV_QI6_K / 4);
-    const int scale_offset = (GEMV_QI6_K / 4) * (iqs / (GEMV_QI6_K / 2)) + (iqs % (GEMV_QI6_K / 2)) / (GEMV_QI6_K / 8);
-    const int vh_shift = 2 * ((iqs % (GEMV_QI6_K / 2)) / (GEMV_QI6_K / 4));
-
-    const int vl = get_int_b2(bq6_K, iqs);
-    const int vh = get_int_b2(bq6_K + 128, (GEMV_QI6_K / 4) * (iqs / (GEMV_QI6_K / 2)) + iqs % (GEMV_QI6_K / 4)) >> vh_shift;
-
-    uint16_t d_bits;
-    memcpy(&d_bits, bq6_K + 208, 2);
-    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
-
-    const int8_t* scales = reinterpret_cast<const int8_t*>(bq6_K + 192) + scale_offset;
-
-    int u[GEMV_QR6_K];
-    float d8[GEMV_QR6_K];
-
-#pragma unroll
-    for (int i = 0; i < GEMV_QR6_K; ++i) {
-        u[i] = get_int_b4(bq8_1[bq8_offset + 2 * i].qs, iqs % GEMV_QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + 2 * i].ds);
-    }
-
-    float sumf = 0.0f;
-
-#pragma unroll
-    for (int i = 0; i < GEMV_QR6_K; ++i) {
-        const int sc = scales[4 * i];
-        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
-        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = __vsubss4((vil | vih), 0x20202020);
-        sumf += d8[i] * (forge_dp4a(vi, u[i], 0) * sc);
-    }
-
-    return d * sumf;
-}
 
 __global__ void gemv_q6_k_q8_1_kernel(
     const block_q8_1_gemv* __restrict__ x_q8,
@@ -3253,6 +3085,10 @@ void launch_ffn_down_fused_q4_0_q8_1(const float* ffn_mid, const void* q_w2,
 // Each warp handles a subset of K-blocks for one row, atomicAdd to combine.
 // Uses dp4a for int8×int8 dot product instead of FP32 scalar.
 
+// Cooperative reduction: one CUDA block per output row. The block's warps split
+// the K-dimension (split-K); each warp reduces its K-subset, warps combine via
+// shared memory, and a single thread writes out[row]. No memset and no atomicAdd,
+// so the result is deterministic across runs (bit-exact reproducibility).
 __global__ void output_proj_q4_0_q8_1_kernel(
     const block_q8_1_gemv* __restrict__ x_q8,
     const uint8_t* __restrict__ q_weight,
@@ -3262,13 +3098,12 @@ __global__ void output_proj_q4_0_q8_1_kernel(
     constexpr int BLOCK_ELEMS = 32;
     int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
 
-    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int lane = (blockIdx.x * blockDim.x + threadIdx.x) % 32;
-
-    int row = global_warp_id / warps_per_row;
-    int sub_warp = global_warp_id % warps_per_row;
-
+    int row = blockIdx.x;
     if (row >= N) return;
+
+    int lane = threadIdx.x % 32;
+    int sub_warp = threadIdx.x / 32;
+    if (sub_warp >= warps_per_row) return;
 
     const uint8_t* row_ptr = q_weight + (size_t)row * num_blocks_row * Q4_0_BLOCK_SIZE;
 
@@ -3321,8 +3156,24 @@ __global__ void output_proj_q4_0_q8_1_kernel(
     sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
     sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
 
-    if (lane == 0) {
-        atomicAdd(&out[row], sum);
+    // Block reduce via shared memory: one float per warp.
+    extern __shared__ float warp_sums[];
+    if (lane == 0) warp_sums[sub_warp] = sum;
+    __syncthreads();
+
+    if (sub_warp == 0) {
+        float total = 0.0f;
+        for (int w = lane; w < warps_per_row; w += 32) {
+            total += warp_sums[w];
+        }
+        total += __shfl_down_sync(0xFFFFFFFF, total, 16);
+        total += __shfl_down_sync(0xFFFFFFFF, total, 8);
+        total += __shfl_down_sync(0xFFFFFFFF, total, 4);
+        total += __shfl_down_sync(0xFFFFFFFF, total, 2);
+        total += __shfl_down_sync(0xFFFFFFFF, total, 1);
+        if (lane == 0) {
+            out[row] = total;
+        }
     }
 }
 
@@ -3338,18 +3189,16 @@ void launch_output_proj_q4_0_q8_1(const float* x, const void* q_weight, float* o
     int q8_blocks_grid = (num_q8_blocks + q8_threads - 1) / q8_threads;
     quantize_q8_1_kernel<<<q8_blocks_grid, q8_threads, 0, stream>>>(x, x_q8, K);
 
-    // Step 2: Launch output proj kernel with split-K
+    // Step 2: one block per output row (split-K), cooperative block reduction.
     int num_blocks_row = (K + 31) / 32;
     int warps_per_row = (num_blocks_row + 31) / 32;
     if (warps_per_row < 1) warps_per_row = 1;
     if (warps_per_row > 16) warps_per_row = 16;
 
-    int warps_per_block = 8;
-    int threads = warps_per_block * 32;
-    int total_warps = N * warps_per_row;
-    int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
-    cudaMemsetAsync(out, 0, N * sizeof(float), stream);
-    output_proj_q4_0_q8_1_kernel<<<blocks, threads, 0, stream>>>(
+    int threads = warps_per_row * 32;
+    int blocks = N;
+    size_t shared_bytes = (size_t)warps_per_row * sizeof(float);
+    output_proj_q4_0_q8_1_kernel<<<blocks, threads, shared_bytes, stream>>>(
         x_q8, static_cast<const uint8_t*>(q_weight), out, K, N, warps_per_row);
 }
 
