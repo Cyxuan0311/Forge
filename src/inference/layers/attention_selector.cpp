@@ -60,7 +60,17 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
         return AttentionPath::CUDA_FP32_DECODE;
     }
 
-    // GQA prefill (seq_len > 1)
+    // GQA prefill (seq_len > 1): prefer fused FP8 KV when available.
+    if (p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
+        switch (p.kv_type_k) {
+        case KVCacheDType::FP8_E4M3:
+            return AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL;
+        case KVCacheDType::FP8_E5M2:
+            return AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL;
+        default:
+            break;  // Unsupported symmetric type → FP32 prefill
+        }
+    }
     return AttentionPath::CUDA_FP32_PREFILL;
 }
 
@@ -108,6 +118,10 @@ const char* attention_path_name(AttentionPath path) {
         return "CUDA_FUSED_FP8_E4M3_DECODE";
     case AttentionPath::CUDA_FUSED_FP8_E5M2_DECODE:
         return "CUDA_FUSED_FP8_E5M2_DECODE";
+    case AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL:
+        return "CUDA_FUSED_FP8_E4M3_PREFILL";
+    case AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL:
+        return "CUDA_FUSED_FP8_E5M2_PREFILL";
     case AttentionPath::CUDA_PAGED_Q4_0_DECODE:
         return "CUDA_PAGED_Q4_0_DECODE";
     case AttentionPath::CUDA_PAGED_F16_DECODE:

@@ -36,6 +36,12 @@ enum class AttentionPath {
     CUDA_FUSED_FP8_E4M3_DECODE,  // CUDA GQA decode with FP8 E4M3 KV
     CUDA_FUSED_FP8_E5M2_DECODE,  // CUDA GQA decode with FP8 E5M2 KV
 
+    // CUDA fused FP8 prefill (Phase 2-B): KV held in FP8 (scaled, 1 byte/el),
+    // dequantized on-the-fly inside the kernel. Long-context win = no FP32
+    // materialization of the whole KV cache during prefill.
+    CUDA_FUSED_FP8_E4M3_PREFILL,  // CUDA GQA prefill with FP8 E4M3 KV
+    CUDA_FUSED_FP8_E5M2_PREFILL,  // CUDA GQA prefill with FP8 E5M2 KV
+
     // CUDA paged paths (Phase 4): KV held in fixed-size pages; the decode kernel
     // traverses the per-sequence page table directly. No materialization.
     // FP32 paged KV falls back to CUDA_FP32_DECODE (materialize then attend).
