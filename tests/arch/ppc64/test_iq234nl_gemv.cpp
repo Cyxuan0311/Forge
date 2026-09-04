@@ -13,6 +13,8 @@
  *   qemu-ppc64le ./test_iq234nl_gemv_vsx
  */
 
+#include "gemv.h"
+#include "gemm.h"
 #include "quants.h"
 #include "quant_tables.h"
 

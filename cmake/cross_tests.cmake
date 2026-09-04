@@ -60,6 +60,11 @@ function(
     COMMAND
       ${${name}_GCC} -std=c++17 -O2 -static ${cflags} -I${PROJECT_SOURCE_DIR}
       -I${PROJECT_SOURCE_DIR}/include ${inc_args} ${PROJECT_SOURCE_DIR}/${src}
+      # quant_tables.cpp provides iq3s_grid / kmask_iq2xs (referenced by the
+      # arch/*.h SIMD kernels via extern); it is architecture-independent table
+      # data and must be linked into the standalone cross binary (see the
+      # cross-compile command documented in each test source).
+      ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/quant_tables.cpp
       ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp -o ${out_bin}
     DEPENDS ${PROJECT_SOURCE_DIR}/${src}
             ${PROJECT_SOURCE_DIR}/tests/cross_host_mem_stub.cpp

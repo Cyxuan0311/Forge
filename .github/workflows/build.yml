@@ -99,6 +99,26 @@ jobs:
             build/forge*.so
             build/*.a
 
+  kernel-manifest-check:
+    # Guard against the GEMV dispatch tables drifting from their single source
+    # of truth. kernel_manifest.yaml is rendered into cuda_gemv_instances.cu by
+    # tools/generate_gemv_instances.py; --check fails the build if the generated
+    # file is out of date (any edit to the manifest must be followed by a re-run
+    # of the generator and a commit of the regenerated output).
+    name: Kernel manifest drift check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install PyYAML
+      - name: Verify generated GEMV instances match kernel_manifest.yaml
+        run: python tools/generate_gemv_instances.py --check
+
   build-linux-no-cublas:
     name: Linux (CUDA ${{ matrix.cuda }}, no cuBLAS)
     runs-on: ubuntu-latest

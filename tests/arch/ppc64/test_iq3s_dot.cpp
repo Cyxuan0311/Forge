@@ -12,6 +12,8 @@
  *   qemu-ppc64le ./test_iq3s_dot_vsx
  */
 
+#include "gemv.h"
+#include "gemm.h"
 #include "quants.h"
 #include "quant_tables.h"
 
