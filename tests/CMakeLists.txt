@@ -170,6 +170,22 @@ if(CUDAToolkit_FOUND)
   add_executable(forge-q8-roundtrip-test test_q8_roundtrip.cu)
   forge_link_native(forge-q8-roundtrip-test)
   add_test(NAME q8-roundtrip COMMAND forge-q8-roundtrip-test)
+
+  # Phase 1-A: MoE expert GEMV (Q8_1 + dp4a) must match the main-path 2D
+  # batch GEMV (shared vec_dot primitives) for Q4_0/Q8_0/Q4_K/Q6_K.
+  add_executable(forge-moe-dp4a-ref-test test_moe_dp4a_reference.cpp)
+  forge_link_native(forge-moe-dp4a-ref-test)
+  add_test(NAME moe-dp4a-ref COMMAND forge-moe-dp4a-ref-test)
+
+  # Phase 1-B + 1-C: dual matmul (M==1 slice write) and output_proj cooperative
+  # reduction vs FP32 CPU reference; output_proj also checked for run-to-run
+  # bit-exactness (no atomicAdd).
+  add_executable(
+    forge-phase1-bc-ref-test
+    test_phase1_bc_reference.cpp
+    ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
+  forge_link_native(forge-phase1-bc-ref-test)
+  add_test(NAME phase1-bc-ref COMMAND forge-phase1-bc-ref-test)
 endif()
 
 # -----------------------------------------------------------------------------
