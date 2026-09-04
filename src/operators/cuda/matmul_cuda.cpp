@@ -233,14 +233,66 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
     }
 }
 
+// Single-row (M == 1, decode) GEMV dispatched by weight dtype, written directly
+// into the caller-provided contiguous output slice `o_slice` (size [1, N_cols]).
+// Mirrors the M == 1 branch of cuda_matmul_transB but avoids allocating an
+// intermediate tensor.
+static void gemv_into_slice(const float* a_data, const TensorPtr& b, float* o_slice, int K,
+                            int N_cols) {
+    const bool quantized = is_quantized_type(b->dtype());
+
+    auto gemv = device_gemv_fn(b->dtype());
+    if (gemv) {
+        gemv(a_data, b->data(), o_slice, K, N_cols, 0);
+        return;
+    }
+    if (quantized) {
+        // No dedicated M == 1 kernel: reuse the batched GEMV (on-the-fly
+        // dequant) with M == 1, or dequantize the weight to FP32 and GEMV.
+        auto gemv_batch = device_gemv_batch_fn(b->dtype());
+        if (gemv_batch) {
+            gemv_batch(a_data, b->data(), o_slice, 1, K, N_cols, 0);
+            return;
+        }
+        auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
+        if (!dequant_matrix)
+            capability_failure("matmul_transB_dual", b->dtype(), 1, K, N_cols);
+        auto b_scratch = dequant_b_on_device(dequant_matrix, b, N_cols, K);
+        cuda::launch_gemv_transB(a_data, b_scratch.as_float(), o_slice, K, N_cols);
+        return;
+    }
+    // FP32: cuBLAS for large N (output_proj), custom GEMV otherwise.
+    if (N_cols > 4096) {
+        cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_slice, 1, K,
+                                  N_cols, true);
+    } else {
+        cuda::launch_gemv_transB(a_data, static_cast<const float*>(b->data()), o_slice, K,
+                                 N_cols);
+    }
+}
+
 void cuda_matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const TensorPtr& b2,
                              const TensorPtr& out, int M, int K, int N1, int N2) {
     (void)K;
     const int N = N1 + N2;
+    float* o_data = static_cast<float*>(out->data());
+    const float* a_data = static_cast<const float*>(a->data());
+
+    if (M == 1) {
+        // Decode: write b1 into the first N1 columns and b2 into the last N2
+        // columns of `out` directly. No intermediate tensor allocation and no
+        // device-to-device interleave copies.
+        gemv_into_slice(a_data, b1, o_data, K, N1);
+        gemv_into_slice(a_data, b2, o_data + N1, K, N2);
+        return;
+    }
+
+    // M > 1 (batched prefill / verification): the strided interleave layout
+    // cannot be produced by a single contiguous GEMV write, so fall back to the
+    // general allocate + interleave path, which is verified for all dtypes.
     auto out1 = ops::matmul_transB(a, b1);
     auto out2 = ops::matmul_transB(a, b2);
 
-    float* o_data = static_cast<float*>(out->data());
     const float* o1_data = static_cast<const float*>(out1->data());
     const float* o2_data = static_cast<const float*>(out2->data());
     for (int m = 0; m < M; ++m) {
