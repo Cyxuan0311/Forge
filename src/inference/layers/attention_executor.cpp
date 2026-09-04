@@ -467,6 +467,16 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         const auto& kv_cfg = kv_cache_.kv_config();
         problem.kv_type_k = kv_cfg.type_k;
         problem.kv_type_v = kv_cfg.type_v;
+    } else if (dev == DeviceType::CUDA && seq_len > 1 && !paged) {
+        // Prefill (Phase 2-B): FP8/quantized KV cache read directly by the fused
+        // prefill kernel — no FP32 materialization. Paged prefill keeps the
+        // FP32 materialize path for now.
+        void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
+        void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
+        problem.has_quantized_kv = (d_q_K != nullptr && d_q_V != nullptr);
+        const auto& kv_cfg = kv_cache_.kv_config();
+        problem.kv_type_k = kv_cfg.type_k;
+        problem.kv_type_v = kv_cfg.type_v;
     }
 
     AttentionPath path = choose_attention_path(problem);
@@ -524,6 +534,53 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
 #endif
         break;
     }
+    // ---- Phase 2-B: fused FP8 prefill (read quantized KV, no materialize) ----
+    case AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL:
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        {
+            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
+            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
+            size_t q_row_size =
+                KVCache::block_nbytes(KVCacheDType::FP8_E4M3, num_kv_heads * head_dim);
+            const float* k_scales = static_cast<const float*>(kv_cache_.d_q_key_scale(layer_idx));
+            const float* v_scales = static_cast<const float*>(kv_cache_.d_q_value_scale(layer_idx));
+            cuda::launch_fused_flash_attention_gqa_prefill_fp8_e4m3(
+                static_cast<const float*>(q->data()), d_q_K, d_q_V,
+                static_cast<float*>(attn_out->data()), seq_len, total_len, num_heads, num_kv_heads,
+                head_dim, q_row_size, mask_data, causal, k_scales, v_scales, 0);
+        }
+#else
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx), seq_len,
+            total_len, num_heads, num_kv_heads, head_dim, mask, true);
+#endif
+        break;
+
+    case AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL:
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        {
+            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
+            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
+            size_t q_row_size =
+                KVCache::block_nbytes(KVCacheDType::FP8_E5M2, num_kv_heads * head_dim);
+            const float* k_scales = static_cast<const float*>(kv_cache_.d_q_key_scale(layer_idx));
+            const float* v_scales = static_cast<const float*>(kv_cache_.d_q_value_scale(layer_idx));
+            cuda::launch_fused_flash_attention_gqa_prefill_fp8_e5m2(
+                static_cast<const float*>(q->data()), d_q_K, d_q_V,
+                static_cast<float*>(attn_out->data()), seq_len, total_len, num_heads, num_kv_heads,
+                head_dim, q_row_size, mask_data, causal, k_scales, v_scales, 0);
+        }
+#else
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx), seq_len,
+            total_len, num_heads, num_kv_heads, head_dim, mask, true);
+#endif
+        break;
+
     case AttentionPath::CUDA_FP32_DECODE: {
         TensorPtr k_sliced, v_sliced;
         get_kv_on_device(k_sliced, v_sliced);
