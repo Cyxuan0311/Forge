@@ -419,6 +419,20 @@ void launch_fused_flash_attention_gqa_decode_fp8_e5m2(
     int num_kv_heads, int head_dim, size_t q_row_size, const float* mask_row = nullptr,
     const float* k_scales = nullptr, const float* v_scales = nullptr, cudaStream_t stream = 0);
 
+// Phase 2-B: FP8 fused GQA PREFILL (online dequant). q_K/q_V point at the
+// quantized cache; mask is the 2-D [q_len, kv_len] mask (or nullptr for causal).
+// Numerically equivalent to FP32 prefill over the dequantized KV (within FP8 error).
+void launch_fused_flash_attention_gqa_prefill_fp8_e4m3(
+    const float* Q, const void* q_K, const void* q_V, float* O, int q_len, int kv_len,
+    int num_heads, int num_kv_heads, int head_dim, size_t q_row_size,
+    const float* mask = nullptr, bool causal = true, const float* k_scales = nullptr,
+    const float* v_scales = nullptr, cudaStream_t stream = 0);
+void launch_fused_flash_attention_gqa_prefill_fp8_e5m2(
+    const float* Q, const void* q_K, const void* q_V, float* O, int q_len, int kv_len,
+    int num_heads, int num_kv_heads, int head_dim, size_t q_row_size,
+    const float* mask = nullptr, bool causal = true, const float* k_scales = nullptr,
+    const float* v_scales = nullptr, cudaStream_t stream = 0);
+
 // ---- Paged Flash Attention (Phase 4) ----
 // KV cache is held in fixed-size pages; the sequence page table (page_ids)
 // maps logical KV index -> physical page id. K/V rows are resolved through
