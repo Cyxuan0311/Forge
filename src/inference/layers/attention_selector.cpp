@@ -64,6 +64,28 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
     return AttentionPath::CUDA_FP32_PREFILL;
 }
 
+AttentionBackend choose_attention_backend(const AttentionProblem& p) {
+    // Vectorized FP32 prefill requires head_dim % 4 == 0 for float4 K/V loads.
+    // All supported prefill head dims (16/32/64/72/96/128/256/512) satisfy this.
+    if (p.device == DeviceType::CUDA && p.seq_len > 1 && (p.head_dim % 4) == 0) {
+        return AttentionBackend::Vectorized;
+    }
+    return AttentionBackend::Scalar;
+}
+
+const char* attention_backend_name(AttentionBackend backend) {
+    switch (backend) {
+    case AttentionBackend::Scalar:
+        return "Scalar";
+    case AttentionBackend::Vectorized:
+        return "Vectorized";
+    case AttentionBackend::TensorCore:
+        return "TensorCore";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 const char* attention_path_name(AttentionPath path) {
     switch (path) {
     case AttentionPath::CPU_MHA:

@@ -49,6 +49,21 @@ enum class AttentionPath {
     UNSUPPORTED,
 };
 
+// ---- Attention backend enumeration ----
+//
+// Selects the *implementation style* for the chosen path. This is orthogonal to
+// AttentionPath (which selects the dtype/dispatch family). The pipeline intent:
+//   - Scalar     : thread-centric kernel (Q re-read from global per KV position)
+//   - Vectorized : Q loaded once into shared memory (Q tile) + float4 K/V loads
+//   - TensorCore : reserved for a future MMA-tiled backend
+// Phase 2-C introduces Vectorized for the CUDA FP32 prefill path.
+
+enum class AttentionBackend {
+    Scalar,
+    Vectorized,
+    TensorCore,
+};
+
 // ---- Problem descriptor ----
 
 struct AttentionProblem {
@@ -74,8 +89,18 @@ struct AttentionProblem {
 
 AttentionPath choose_attention_path(const AttentionProblem& problem);
 
+// ---- Backend selection (implementation style for the chosen path) ----
+//
+// Returns Vectorized for the CUDA FP32 prefill path when the head_dim is a
+// multiple of 4 (float4-vectorizable); Scalar otherwise. TensorCore is reserved.
+AttentionBackend choose_attention_backend(const AttentionProblem& problem);
+
 // ---- Human-readable path name (for logging/debugging) ----
 
 const char* attention_path_name(AttentionPath path);
+
+// ---- Human-readable backend name (for logging/debugging) ----
+
+const char* attention_backend_name(AttentionBackend backend);
 
 }  // namespace forge
