@@ -419,19 +419,52 @@ void launch_fused_flash_attention_gqa_decode_fp8_e5m2(
     int num_kv_heads, int head_dim, size_t q_row_size, const float* mask_row = nullptr,
     const float* k_scales = nullptr, const float* v_scales = nullptr, cudaStream_t stream = 0);
 
-// Phase 2-B: FP8 fused GQA PREFILL (online dequant). q_K/q_V point at the
-// quantized cache; mask is the 2-D [q_len, kv_len] mask (or nullptr for causal).
-// Numerically equivalent to FP32 prefill over the dequantized KV (within FP8 error).
-void launch_fused_flash_attention_gqa_prefill_fp8_e4m3(
-    const float* Q, const void* q_K, const void* q_V, float* O, int q_len, int kv_len,
-    int num_heads, int num_kv_heads, int head_dim, size_t q_row_size,
-    const float* mask = nullptr, bool causal = true, const float* k_scales = nullptr,
-    const float* v_scales = nullptr, cudaStream_t stream = 0);
-void launch_fused_flash_attention_gqa_prefill_fp8_e5m2(
-    const float* Q, const void* q_K, const void* q_V, float* O, int q_len, int kv_len,
-    int num_heads, int num_kv_heads, int head_dim, size_t q_row_size,
-    const float* mask = nullptr, bool causal = true, const float* k_scales = nullptr,
-    const float* v_scales = nullptr, cudaStream_t stream = 0);
+// ---- KV-tiled flash-attention PREFILL (Phase 2-C tiling + Phase 2-B formats) ----
+// One shared kernel template; the KV dtype is a compile-time policy and both
+// contiguous and paged layouts are supported. Unlike the kernels above, this
+// family does NOT keep a per-thread local_acc[HEAD_DIM] accumulator: KV is
+// processed in tiles and the accumulator is distributed over the head dim,
+// which is what makes larger head dims viable occupancy-wise.
+// mask is the 2-D [q_len, kv_len] mask (or nullptr for causal-only).
+// k_scales/v_scales are the per-(row, kv_head) FP8 scale buffers, or nullptr.
+
+// Contiguous FP32 KV (row stride = num_kv_heads * head_dim floats).
+void launch_fused_flash_attention_gqa_prefill_fp32(const float* Q, const float* K, const float* V,
+                                                    float* O, int q_len, int kv_len, int num_heads,
+                                                    int num_kv_heads, int head_dim,
+                                                    const float* mask = nullptr,
+                                                    bool causal = true, cudaStream_t stream = 0);
+
+// Contiguous quantized KV (row_bytes =
+// KVCache::block_nbytes(dtype, num_kv_heads * head_dim)).
+#define FORGE_DECL_QUANT_PREFILL(NAME)                                                          \
+    void NAME(const float* Q, const void* q_K, const void* q_V, float* O, int q_len, int kv_len, \
+              int num_heads, int num_kv_heads, int head_dim, size_t q_row_size,                \
+              const float* mask = nullptr, bool causal = true,                                 \
+              const float* k_scales = nullptr, const float* v_scales = nullptr,                 \
+              cudaStream_t stream = 0)
+
+FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_f16);
+FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q8_0);
+FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e4m3);
+FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e5m2);
+
+// Paged quantized KV: rows resolve through page_ptrs[page_ids[j / page_size]].
+#define FORGE_DECL_PAGED_PREFILL(NAME)                                                        \
+    void NAME(const float* Q, void* const* k_pages, void* const* v_pages,                    \
+              const int32_t* page_ids, float* O, int q_len, int kv_len, int num_heads,        \
+              int num_kv_heads, int head_dim, int page_size, size_t q_row_size,               \
+              const float* mask = nullptr, bool causal = true,                                \
+              const float* k_scales = nullptr, const float* v_scales = nullptr,               \
+              cudaStream_t stream = 0)
+
+FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_f16);
+FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_q8_0);
+FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp8_e4m3);
+FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp8_e5m2);
+
+#undef FORGE_DECL_QUANT_PREFILL
+#undef FORGE_DECL_PAGED_PREFILL
 
 // ---- Paged Flash Attention (Phase 4) ----
 // KV cache is held in fixed-size pages; the sequence page table (page_ids)
