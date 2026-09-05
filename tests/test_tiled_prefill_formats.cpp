@@ -28,23 +28,33 @@
 #include "forge/fp8_utils.h"
 
 using forge::cuda::launch_flash_attention_gqa_vectorized;
+using forge::cuda::launch_flash_attention_gqa_decode;
 using forge::cuda::launch_fused_flash_attention_gqa_prefill_f16;
 using forge::cuda::launch_fused_flash_attention_gqa_prefill_fp32;
 using forge::cuda::launch_fused_flash_attention_gqa_prefill_fp8_e4m3;
 using forge::cuda::launch_fused_flash_attention_gqa_prefill_fp8_e5m2;
 using forge::cuda::launch_fused_flash_attention_gqa_prefill_q8_0;
+using forge::cuda::launch_fused_flash_attention_gqa_prefill_q4_0;
+using forge::cuda::launch_fused_flash_attention_gqa_decode_f16;
+using forge::cuda::launch_fused_flash_attention_gqa_decode_fp8_e4m3;
+using forge::cuda::launch_fused_flash_attention_gqa_decode_fp8_e5m2;
+using forge::cuda::launch_fused_flash_attention_gqa_decode_q8_0;
+using forge::cuda::launch_fused_flash_attention_gqa_decode_q4_0;
 using forge::cuda::launch_paged_flash_attention_gqa_prefill_f16;
+using forge::cuda::launch_paged_flash_attention_gqa_prefill_fp32;
 using forge::cuda::launch_paged_flash_attention_gqa_prefill_fp8_e4m3;
 using forge::cuda::launch_paged_flash_attention_gqa_prefill_fp8_e5m2;
 using forge::cuda::launch_paged_flash_attention_gqa_prefill_q8_0;
+using forge::cuda::launch_paged_flash_attention_gqa_prefill_q4_0;
 
 namespace {
 
-enum class Fmt { Fp32, F16, Q8_0, Fp8E4M3, Fp8E5M2 };
+enum class Fmt { Fp32, Q4_0, F16, Q8_0, Fp8E4M3, Fp8E5M2 };
 
 const char* fmt_name(Fmt f) {
     switch (f) {
     case Fmt::Fp32:     return "FP32";
+    case Fmt::Q4_0:     return "Q4_0";
     case Fmt::F16:      return "F16";
     case Fmt::Q8_0:     return "Q8_0";
     case Fmt::Fp8E4M3:  return "E4M3";
@@ -53,13 +63,16 @@ const char* fmt_name(Fmt f) {
     }
 }
 
-// Minimum head_dim per format (Q8_0 quantizes in 32-element blocks).
-int fmt_min_hd(Fmt f) { return (f == Fmt::Q8_0) ? 32 : 16; }
+// Minimum head_dim per format (Q4_0/Q8_0 quantize in 32-element blocks).
+int fmt_min_hd(Fmt f) {
+    return (f == Fmt::Q8_0 || f == Fmt::Q4_0) ? 32 : 16;
+}
 
 // Bytes per KV row for `nkv` heads of `hd` elements.
 size_t fmt_row_bytes(Fmt f, int nkv, int hd) {
     switch (f) {
     case Fmt::Fp32:    return (size_t)nkv * hd * sizeof(float);
+    case Fmt::Q4_0:    return (size_t)((nkv * hd + 31) / 32) * 18;
     case Fmt::F16:     return (size_t)nkv * hd * sizeof(__half);
     case Fmt::Q8_0:    return (size_t)((nkv * hd + 31) / 32) * 34;
     case Fmt::Fp8E4M3:
@@ -86,6 +99,33 @@ void quantize(Fmt f, const std::vector<float>& src, int rows, int nkv, int hd,
         for (size_t i = 0; i < src.size(); ++i) {
             __half h = __float2half(src[i]);
             std::memcpy(dst.data() + i * sizeof(__half), &h, sizeof(__half));
+        }
+        return;
+    }
+    if (f == Fmt::Q4_0) {
+        // Blocks of 32; hd % 32 == 0 keeps head boundaries block-aligned,
+        // matching the kernel's kv_h * (hd/32) * 18 offset. Values are stored
+        // as unsigned 4-bit (val + 8) so the kernel can subtract 8.
+        const int nblk = (nkv * hd) / 32;
+        for (int r = 0; r < rows; ++r) {
+            for (int b = 0; b < nblk; ++b) {
+                const float* blk = &src[(size_t)r * kv_dim + (size_t)b * 32];
+                float amax = 0.f;
+                for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(blk[i]));
+                const float s = (amax > 0.f) ? (amax / 8.0f) : 1.0f;
+                uint8_t* out = dst.data() + (size_t)r * rb + (size_t)b * 18;
+                __half hs = __float2half(s);
+                std::memcpy(out, &hs, sizeof(__half));
+                uint8_t* qs = out + 2;
+                // Engine layout: byte i packs element i (low) and element i+16 (high).
+                for (int i = 0; i < 16; ++i) {
+                    int q0 = static_cast<int>(std::round(blk[i] / s));
+                    int q1 = static_cast<int>(std::round(blk[i + 16] / s));
+                    q0 = std::min(7, std::max(-8, q0)) + 8;
+                    q1 = std::min(7, std::max(-8, q1)) + 8;
+                    qs[i] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+                }
+            }
         }
         return;
     }
@@ -146,6 +186,26 @@ void dequantize(Fmt f, const std::vector<uint8_t>& src, int rows, int nkv, int h
             __half h;
             std::memcpy(&h, src.data() + i * sizeof(__half), sizeof(__half));
             dst[i] = __half2float(h);
+        }
+        return;
+    }
+    if (f == Fmt::Q4_0) {
+        const int nblk = (nkv * hd) / 32;
+        for (int r = 0; r < rows; ++r) {
+            for (int b = 0; b < nblk; ++b) {
+                const uint8_t* in = src.data() + (size_t)r * rb + (size_t)b * 18;
+                __half hs;
+                std::memcpy(&hs, in, sizeof(__half));
+                const float s = __half2float(hs);
+                const uint8_t* qs = in + 2;
+                // Engine layout: byte i packs element i (low) and element i+16 (high).
+                for (int i = 0; i < 16; ++i) {
+                    const int lo = (qs[i] & 0x0F) - 8;
+                    const int hi = ((qs[i] >> 4) & 0x0F) - 8;
+                    dst[(size_t)r * kv_dim + (size_t)b * 32 + i] = lo * s;
+                    dst[(size_t)r * kv_dim + (size_t)b * 32 + i + 16] = hi * s;
+                }
+            }
         }
         return;
     }
@@ -288,6 +348,11 @@ bool run_contiguous(Fmt fmt, int hd, int q_len, int kv_len, int nh, int nkv, boo
         launch_fused_flash_attention_gqa_prefill_fp32(d_Q, d_Kd, d_Vd, d_ofmt, q_len, kv_len, nh,
                                                       nkv, hd, nullptr, causal, 0);
         break;
+    case Fmt::Q4_0:
+        launch_fused_flash_attention_gqa_prefill_q4_0(d_Q, d_qK, d_qV, d_ofmt, q_len, kv_len, nh,
+                                                      nkv, hd, rb, nullptr, causal, nullptr,
+                                                      nullptr, 0);
+        break;
     case Fmt::F16:
         launch_fused_flash_attention_gqa_prefill_f16(d_Q, d_qK, d_qV, d_ofmt, q_len, kv_len, nh,
                                                      nkv, hd, rb, nullptr, causal, nullptr, nullptr,
@@ -407,8 +472,35 @@ bool run_paged(Fmt fmt, int hd, int q_len, int kv_len, int nh, int nkv, int page
         cudaMemcpy(d_vs, vs.data(), vs.size() * 4, cudaMemcpyHostToDevice);
     }
 
+    // Contiguous FP32 K/V for the paged-FP32 reference launch.
+    float *d_Kd = nullptr, *d_Vd = nullptr;
+    if (fmt == Fmt::Fp32) {
+        std::vector<float> Kd, Vd;
+        dequantize(fmt, qK, kv_len, nkv, hd, ks, Kd);
+        dequantize(fmt, qV, kv_len, nkv, hd, vs, Vd);
+        cudaMalloc(&d_Kd, Kd.size() * 4);
+        cudaMalloc(&d_Vd, Vd.size() * 4);
+        cudaMemcpy(d_Kd, Kd.data(), Kd.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_Vd, Vd.data(), Vd.size() * 4, cudaMemcpyHostToDevice);
+    }
+
     // Paged launch. (Paged FP8 KV carries no row scales in this engine.)
     switch (fmt) {
+    case Fmt::Fp32:
+        launch_paged_flash_attention_gqa_prefill_fp32(d_Q, d_kpages, d_vpages, d_ids, d_opaged,
+                                                      q_len, kv_len, nh, nkv, hd, page_size, rb,
+                                                      nullptr, causal, nullptr, nullptr, 0);
+        launch_fused_flash_attention_gqa_prefill_fp32(d_Q, d_Kd, d_Vd, d_ocont, q_len, kv_len, nh,
+                                                      nkv, hd, nullptr, causal, 0);
+        break;
+    case Fmt::Q4_0:
+        launch_paged_flash_attention_gqa_prefill_q4_0(d_Q, d_kpages, d_vpages, d_ids, d_opaged,
+                                                      q_len, kv_len, nh, nkv, hd, page_size, rb,
+                                                      nullptr, causal, nullptr, nullptr, 0);
+        launch_fused_flash_attention_gqa_prefill_q4_0(d_Q, d_qK, d_qV, d_ocont, q_len, kv_len, nh,
+                                                      nkv, hd, rb, nullptr, causal, nullptr,
+                                                      nullptr, 0);
+        break;
     case Fmt::F16:
         launch_paged_flash_attention_gqa_prefill_f16(d_Q, d_kpages, d_vpages, d_ids, d_opaged,
                                                      q_len, kv_len, nh, nkv, hd, page_size, rb,
@@ -442,7 +534,7 @@ bool run_paged(Fmt fmt, int hd, int q_len, int kv_len, int nh, int nkv, int page
                                                           d_vs, 0);
         break;
     default:
-        break;  // paged FP32 is not wired (materialize path)
+        break;
     }
     cudaDeviceSynchronize();
 
@@ -490,6 +582,122 @@ bool run_paged(Fmt fmt, int hd, int q_len, int kv_len, int nh, int nkv, int page
     cudaFree(d_Q); cudaFree(d_opaged); cudaFree(d_ocont); cudaFree(d_qK); cudaFree(d_qV);
     if (d_ks) cudaFree(d_ks);
     if (d_vs) cudaFree(d_vs);
+    if (d_Kd) cudaFree(d_Kd);
+    if (d_Vd) cudaFree(d_Vd);
+    return ok;
+}
+
+// ---- Tiled DECODE (q_len == 1) ----------------------------------------------
+//
+// Decoding reuses the same tiled kernel with q_len == 1 (Q/O layouts coincide,
+// the 2-D mask degenerates to a 1-D row, causal is a no-op). It is checked
+// against the previously-shipped decode kernel for the same format — which must
+// agree to ~1e-7 — and against the CPU reference.
+
+bool run_decode(Fmt fmt, int hd, int kv_len, int nh, int nkv, std::mt19937& rng) {
+    const size_t q_elems = (size_t)nh * hd;  // q_len == 1
+    const size_t kv_elems = (size_t)kv_len * nkv * hd;
+
+    std::vector<float> Q(q_elems), K(kv_elems), V(kv_elems);
+    std::uniform_real_distribution<float> ur(-1.0f, 1.0f);
+    for (auto& v : Q) v = ur(rng);
+    for (auto& v : K) v = ur(rng);
+    for (auto& v : V) v = ur(rng);
+
+    std::vector<uint8_t> qK, qV;
+    std::vector<float> ks, vs, unused;
+    quantize(fmt, K, kv_len, nkv, hd, qK, ks, unused);
+    quantize(fmt, V, kv_len, nkv, hd, qV, vs, unused);
+
+    std::vector<float> Kd, Vd;
+    dequantize(fmt, qK, kv_len, nkv, hd, ks, Kd);
+    dequantize(fmt, qV, kv_len, nkv, hd, vs, Vd);
+
+    float *d_Q = nullptr, *d_Kd = nullptr, *d_Vd = nullptr;
+    float *d_onew = nullptr, *d_oold = nullptr;
+    uint8_t *d_qK = nullptr, *d_qV = nullptr;
+    float *d_ks = nullptr, *d_vs = nullptr;
+    cudaMalloc(&d_Q, Q.size() * 4);
+    cudaMalloc(&d_Kd, Kd.size() * 4);
+    cudaMalloc(&d_Vd, Vd.size() * 4);
+    cudaMalloc(&d_onew, q_elems * 4);
+    cudaMalloc(&d_oold, q_elems * 4);
+    cudaMalloc(&d_qK, qK.size());
+    cudaMalloc(&d_qV, qV.size());
+    cudaMemcpy(d_Q, Q.data(), Q.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Kd, Kd.data(), Kd.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Vd, Vd.data(), Vd.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_qK, qK.data(), qK.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_qV, qV.data(), qV.size(), cudaMemcpyHostToDevice);
+
+    const bool fp8 = (fmt == Fmt::Fp8E4M3 || fmt == Fmt::Fp8E5M2);
+    if (fp8) {
+        cudaMalloc(&d_ks, ks.size() * 4);
+        cudaMalloc(&d_vs, vs.size() * 4);
+        cudaMemcpy(d_ks, ks.data(), ks.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_vs, vs.data(), vs.size() * 4, cudaMemcpyHostToDevice);
+    }
+
+    const size_t rb = fmt_row_bytes(fmt, nkv, hd);
+    switch (fmt) {
+    case Fmt::Fp32:
+        launch_fused_flash_attention_gqa_prefill_fp32(d_Q, d_Kd, d_Vd, d_onew, 1, kv_len, nh, nkv,
+                                                      hd, nullptr, false, 0);
+        launch_flash_attention_gqa_decode(d_Q, d_Kd, d_Vd, d_oold, kv_len, nh, nkv, hd, nullptr, 0);
+        break;
+    case Fmt::Q4_0:
+        launch_fused_flash_attention_gqa_prefill_q4_0(d_Q, d_qK, d_qV, d_onew, 1, kv_len, nh, nkv,
+                                                      hd, rb, nullptr, false, nullptr, nullptr, 0);
+        launch_fused_flash_attention_gqa_decode_q4_0(d_Q, d_qK, d_qV, d_oold, kv_len, nh, nkv, hd,
+                                                     rb, nullptr, 0);
+        break;
+    case Fmt::F16:
+        launch_fused_flash_attention_gqa_prefill_f16(d_Q, d_qK, d_qV, d_onew, 1, kv_len, nh, nkv,
+                                                     hd, rb, nullptr, false, nullptr, nullptr, 0);
+        launch_fused_flash_attention_gqa_decode_f16(d_Q, d_qK, d_qV, d_oold, kv_len, nh, nkv, hd,
+                                                    rb, nullptr, 0);
+        break;
+    case Fmt::Q8_0:
+        launch_fused_flash_attention_gqa_prefill_q8_0(d_Q, d_qK, d_qV, d_onew, 1, kv_len, nh, nkv,
+                                                      hd, rb, nullptr, false, nullptr, nullptr, 0);
+        launch_fused_flash_attention_gqa_decode_q8_0(d_Q, d_qK, d_qV, d_oold, kv_len, nh, nkv, hd,
+                                                     rb, nullptr, 0);
+        break;
+    case Fmt::Fp8E4M3:
+        launch_fused_flash_attention_gqa_prefill_fp8_e4m3(d_Q, d_qK, d_qV, d_onew, 1, kv_len, nh,
+                                                          nkv, hd, rb, nullptr, false, d_ks, d_vs, 0);
+        launch_fused_flash_attention_gqa_decode_fp8_e4m3(d_Q, d_qK, d_qV, d_oold, kv_len, nh, nkv,
+                                                         hd, rb, nullptr, d_ks, d_vs, 0);
+        break;
+    case Fmt::Fp8E5M2:
+        launch_fused_flash_attention_gqa_prefill_fp8_e5m2(d_Q, d_qK, d_qV, d_onew, 1, kv_len, nh,
+                                                          nkv, hd, rb, nullptr, false, d_ks, d_vs, 0);
+        launch_fused_flash_attention_gqa_decode_fp8_e5m2(d_Q, d_qK, d_qV, d_oold, kv_len, nh, nkv,
+                                                         hd, rb, nullptr, d_ks, d_vs, 0);
+        break;
+    }
+    cudaDeviceSynchronize();
+
+    std::vector<float> o_new(q_elems), o_old(q_elems);
+    cudaMemcpy(o_new.data(), d_onew, q_elems * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(o_old.data(), d_oold, q_elems * 4, cudaMemcpyDeviceToHost);
+
+    std::vector<float> o_ref;
+    ref_gqa(Q, Kd, Vd, 1, kv_len, nh, nkv, hd, false, o_ref);
+
+    const double cos_old = cosine(o_new, o_old);
+    const double mabs = max_abs(o_new, o_old);
+    const double cos_ref = cosine(o_new, o_ref);
+    const bool ok = (cos_old >= 0.9999) && (mabs <= 1e-4) && (cos_ref >= 0.999);
+
+    printf("  %-5s HD=%-3d kv=%d h=%d kvh=%d  cos(vs legacy decode)=%.6f maxabs=%.3e "
+           "cos(cpu)=%.6f  %s\n",
+           fmt_name(fmt), hd, kv_len, nh, nkv, cos_old, mabs, cos_ref, ok ? "ok" : "FAIL");
+
+    cudaFree(d_Q); cudaFree(d_Kd); cudaFree(d_Vd); cudaFree(d_onew); cudaFree(d_oold);
+    cudaFree(d_qK); cudaFree(d_qV);
+    if (d_ks) cudaFree(d_ks);
+    if (d_vs) cudaFree(d_vs);
     return ok;
 }
 
@@ -505,7 +713,7 @@ int main() {
     bool all_ok = true;
 
     printf("[contiguous]\n");
-    for (Fmt f : {Fmt::Fp32, Fmt::F16, Fmt::Q8_0, Fmt::Fp8E4M3, Fmt::Fp8E5M2}) {
+    for (Fmt f : {Fmt::Fp32, Fmt::Q4_0, Fmt::F16, Fmt::Q8_0, Fmt::Fp8E4M3, Fmt::Fp8E5M2}) {
         for (int hd : {32, 64, 128}) {
             if (hd < fmt_min_hd(f)) continue;
             for (bool causal : {false, true}) {
@@ -515,7 +723,7 @@ int main() {
     }
 
     printf("[paged vs contiguous]\n");
-    for (Fmt f : {Fmt::F16, Fmt::Q8_0, Fmt::Fp8E4M3, Fmt::Fp8E5M2}) {
+    for (Fmt f : {Fmt::Fp32, Fmt::Q4_0, Fmt::F16, Fmt::Q8_0, Fmt::Fp8E4M3, Fmt::Fp8E5M2}) {
         for (bool causal : {false, true}) {
             all_ok &= run_paged(f, 64, 32, 128, 8, 2, 64, causal, rng);
         }
@@ -523,6 +731,16 @@ int main() {
         all_ok &= run_paged(f, 64, 16, 200, 8, 2, 64, true, rng);
     }
 
-    printf("%s\n", all_ok ? "tiled-prefill-formats: PASS" : "tiled-prefill-formats: FAIL");
+    printf("[tiled decode vs legacy decode kernel]\n");
+    for (Fmt f : {Fmt::Fp32, Fmt::Q4_0, Fmt::F16, Fmt::Q8_0, Fmt::Fp8E4M3, Fmt::Fp8E5M2}) {
+        for (int hd : {64, 128}) {
+            if (hd < fmt_min_hd(f)) continue;
+            for (int kv_len : {128, 2048}) {
+                all_ok &= run_decode(f, hd, kv_len, 8, 2, rng);
+            }
+        }
+    }
+
+    printf("%s\n", all_ok ? "tiled-attn-formats: PASS" : "tiled-attn-formats: FAIL");
     return all_ok ? 0 : 1;
 }

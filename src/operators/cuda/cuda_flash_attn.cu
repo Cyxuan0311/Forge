@@ -319,9 +319,19 @@ void launch_flash_attention_gqa_vectorized(const float* Q, const float* K, const
 }
 
 // =========================================================================
-// GQA Decode kernel (HEAD_DIM <= 128)
-// Per-thread register arrays + warp-level reduction
-// SINGLE-PASS online softmax with float4 vectorized QK/V access
+// Streaming GQA Decode kernel (HEAD_DIM <= 128) — REFERENCE fast path.
+// (bench output column "legacy" == this kernel; not an obsolete impl.)
+// Per-thread register arrays + warp-level reduction; SINGLE-PASS online
+// softmax with float4 vectorized QK/V access. Each thread owns a strided
+// run of KV rows (j = tid; j < kv_len; j += block_size): warp-local
+// streaming with no cross-warp KV sharing; a single __syncthreads happens
+// only after the whole KV loop.
+//
+// Status (2026-09-05, RTX 4050 sm_89 + ptxas -v): REG 255 (cap) with real
+// spill (628B st / 388B ld) at ~12% theoretical occupancy, yet it is the
+// FASTEST decode here. On this workload decode is latency/instruction
+// limited, NOT occupancy/DRAM limited — do not rewrite to tiled staging
+// in the default path (see docs/optimization_plan_zh.md, Phase 2 收敛).
 // =========================================================================
 
 template <int HEAD_DIM, int NUM_WARPS>
