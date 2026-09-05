@@ -201,9 +201,24 @@ if(CUDAToolkit_FOUND)
 
   # Phase 2-B + 2-C: KV-tiled prefill across every KV format policy
   # (FP32/F16/Q8_0/FP8-E4M3/FP8-E5M2), contiguous and paged.
-  add_executable(forge-tiled-prefill-formats-test test_tiled_prefill_formats.cpp)
-  forge_link_native(forge-tiled-prefill-formats-test)
-  add_test(NAME tiled-prefill-formats COMMAND forge-tiled-prefill-formats-test)
+  # Phase 2-B + 2-C: KV-tiled prefill AND decode across every KV format policy
+  # (FP32/F16/Q4_0/Q8_0/FP8-E4M3/FP8-E5M2), contiguous and paged. Decode reuses
+  # the same tiled kernel (q_len == 1) and is checked against the legacy decode.
+  add_executable(forge-tiled-attn-formats-test test_tiled_prefill_formats.cpp)
+  forge_link_native(forge-tiled-attn-formats-test)
+  add_test(NAME tiled-attn-formats COMMAND forge-tiled-attn-formats-test)
+
+  # Phase 2-D: persistent per-(seq, layer) device page-table mirror
+  # (incremental upload + multi-sequence isolation + dirty re-upload).
+  add_executable(forge-kv-paged-mirror-test test_kv_paged_mirror.cpp)
+  forge_link_native(forge-kv-paged-mirror-test)
+  add_test(NAME kv-paged-mirror COMMAND forge-kv-paged-mirror-test)
+
+  # Phase 2-B + 2-C: throughput micro-benchmark (tiled vs legacy decode/prefill).
+  # Built like a test but NOT registered with CTest (long-running; run manually):
+  #   ./build/tests/forge-bench-tiled-attn
+  add_executable(forge-bench-tiled-attn bench_tiled_attn.cpp)
+  forge_link_native(forge-bench-tiled-attn)
 endif()
 
 # -----------------------------------------------------------------------------

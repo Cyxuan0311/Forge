@@ -221,6 +221,17 @@ struct SequencePageTable {
     std::vector<int32_t> page_ids;  // page IDs for this sequence (per-layer)
     int64_t logical_len = 0;        // total logical length
     int filled_in_last = 0;         // filled slots in the last page
+
+    // Phase 2-D: persistent per-(seq, layer) device mirror of page_ids.
+    // upload_seq_page_table syncs only the appended pages on the hot path
+    // (decode grows the table one page at a time), so per-token H2D traffic
+    // is O(new pages) instead of O(total pages). A prefix-changing operation
+    // (seq_remove/seq_share) sets d_dirty to force a full re-upload.
+    // Memory is owned by PagedKVStorage and freed on release()/reset()/dtor.
+    int32_t* d_mirror = nullptr;  // CUDA: persistent device page-id array
+    int d_cap = 0;                // allocated capacity (in int32 elements)
+    int d_synced = 0;             // number of elements already on the device
+    bool d_dirty = true;          // true => next upload must rewrite [0, n)
 };
 
 // Phase 6: per-layer page pool metadata.
@@ -363,11 +374,10 @@ private:
     std::vector<std::vector<void*>> d_value_page_ptrs_host_;
     std::vector<void**> d_key_page_ptrs_;
     std::vector<void**> d_value_page_ptrs_;
-    // Device staging buffer for the current sequence's page table. Realloc'd
-    // (grow-only) by upload_seq_page_table when the sequence needs more pages
-    // than the current capacity.
-    int32_t* d_seq_page_ids_ = nullptr;
-    int d_seq_page_ids_cap_ = 0;
+    // Phase 2-D: the per-sequence page tables are mirrored persistently on the
+    // device through SequencePageTable::{d_mirror,d_cap,d_synced,d_dirty} (one
+    // mirror per (seq, layer)). No shared cross-sequence staging buffer exists
+    // anymore, so concurrent sequences cannot overwrite each other.
 
     mutable std::mutex mutex_;
 };

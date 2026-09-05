@@ -13,6 +13,24 @@
 
 namespace forge {
 
+namespace {
+#ifdef USE_CUDA
+// Phase 2-D: free the persistent device page-table mirrors of one sequence.
+// Mirrors are owned by PagedKVStorage and never outlive a host table entry.
+void free_page_table_mirrors(std::vector<SequencePageTable>& tables) {
+    for (auto& t : tables) {
+        if (t.d_mirror) {
+            cudaFree(t.d_mirror);
+            t.d_mirror = nullptr;
+            t.d_cap = 0;
+            t.d_synced = 0;
+            t.d_dirty = true;
+        }
+    }
+}
+#endif
+}  // namespace
+
 // =========================================================================
 // ContiguousKVStorage
 // =========================================================================
@@ -142,8 +160,8 @@ PagedKVStorage::~PagedKVStorage() {
         if (l < (int)d_value_page_ptrs_.size() && d_value_page_ptrs_[l])
             cudaFree(d_value_page_ptrs_[l]);
     }
-    if (d_seq_page_ids_)
-        cudaFree(d_seq_page_ids_);
+    for (auto& kv : seq_tables_)
+        free_page_table_mirrors(kv.second);
 #endif
 }
 
@@ -257,6 +275,10 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
         }
     }
 
+#ifdef USE_CUDA
+    for (auto& kv : seq_tables_)
+        free_page_table_mirrors(kv.second);
+#endif
     seq_tables_.clear();
 
     // ---- Build CUDA page pointer tables (Phase 4) ----
@@ -274,11 +296,6 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
         for (int l = 0; l < (int)d_value_page_ptrs_.size(); ++l)
             if (d_value_page_ptrs_[l])
                 cudaFree(d_value_page_ptrs_[l]);
-        if (d_seq_page_ids_) {
-            cudaFree(d_seq_page_ids_);
-            d_seq_page_ids_ = nullptr;
-        }
-        d_seq_page_ids_cap_ = 0;
 
         d_key_page_ptrs_host_.assign(num_layers_, {});
         d_value_page_ptrs_host_.assign(num_layers_, {});
@@ -788,6 +805,7 @@ bool PagedKVStorage::seq_remove(int seq_id, int64_t p0, int64_t p1) {
         }
 
         table.page_ids = remaining_pages;
+        table.d_dirty = true;  // Phase 2-D: indexes shifted — full re-upload.
         // Recalculate logical_len
         if (table.page_ids.empty()) {
             table.logical_len = 0;
@@ -828,6 +846,7 @@ bool PagedKVStorage::seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1)
     for (int l = 0; l < num_layers_; ++l) {
         const auto& src_table = src_it->second[l];
         auto& dst_table = seq_tables_[dst_seq][l];
+        dst_table.d_dirty = true;  // Phase 2-D: table mutated — full re-upload.
 
         for (int p = first_page; p <= last_page && p < (int)src_table.page_ids.size(); ++p) {
             int page_id = src_table.page_ids[p];
@@ -882,6 +901,10 @@ void PagedKVStorage::release(int seq_id) {
         }
     }
 
+    // Release the persistent device mirrors, then drop the host tables.
+#ifdef USE_CUDA
+    free_page_table_mirrors(it->second);
+#endif
     seq_tables_.erase(it);
 }
 
@@ -941,6 +964,11 @@ int PagedKVStorage::num_free_pages() const {
 void PagedKVStorage::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Free the persistent device mirrors before dropping the host tables.
+#ifdef USE_CUDA
+    for (auto& kv : seq_tables_)
+        free_page_table_mirrors(kv.second);
+#endif
     // Clear all sequence tables
     seq_tables_.clear();
 
@@ -1236,22 +1264,41 @@ const int32_t* PagedKVStorage::upload_seq_page_table_unlocked(int layer, int seq
     auto it = seq_tables_.find(seq_id);
     if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
         return nullptr;
-    const auto& page_ids = it->second[layer].page_ids;
+    SequencePageTable& table = it->second[layer];
+    const auto& page_ids = table.page_ids;
     int n = (int)page_ids.size();
     if (n == 0)
         return nullptr;
 #ifdef USE_CUDA
     if (device_ != DeviceType::CUDA)
         return nullptr;
-    if (n > d_seq_page_ids_cap_) {
-        if (d_seq_page_ids_)
-            cudaFree(d_seq_page_ids_);
-        d_seq_page_ids_cap_ = n * 2;  // grow-only
-        cudaMalloc(&d_seq_page_ids_, (size_t)d_seq_page_ids_cap_ * sizeof(int32_t));
+    // Phase 2-D: keep a persistent per-(seq, layer) device mirror. Decode grows
+    // the table one page at a time, so the hot path copies only the appended
+    // tail (O(new pages)) instead of the whole table (O(total pages) per
+    // token). A full rewrite happens when the host table changed mid-array
+    // (d_dirty, e.g. seq_remove/seq_share) or the capacity must grow.
+    bool need_full = table.d_dirty || n > table.d_cap || n < table.d_synced;
+    if (need_full) {
+        if (n > table.d_cap) {
+            if (table.d_mirror)
+                cudaFree(table.d_mirror);
+            table.d_cap = std::max(16, n * 2);  // grow-only amortized O(1)
+            cudaMalloc(&table.d_mirror, (size_t)table.d_cap * sizeof(int32_t));
+        }
+        cudaMemcpy(table.d_mirror, page_ids.data(), (size_t)n * sizeof(int32_t),
+                   cudaMemcpyHostToDevice);
+        table.d_synced = n;
+        table.d_dirty = false;
+        return table.d_mirror;
     }
-    cudaMemcpy(d_seq_page_ids_, page_ids.data(), (size_t)n * sizeof(int32_t),
-               cudaMemcpyHostToDevice);
-    return d_seq_page_ids_;
+    // Pure append: copy only the pages added since the last sync.
+    int start = table.d_synced;
+    if (start < n) {
+        cudaMemcpy(table.d_mirror + start, page_ids.data() + start,
+                   (size_t)(n - start) * sizeof(int32_t), cudaMemcpyHostToDevice);
+        table.d_synced = n;
+    }
+    return table.d_mirror;
 #else
     return nullptr;
 #endif
