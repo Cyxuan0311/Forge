@@ -583,32 +583,20 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                                                         num_heads, head_dim, mask, true);
         break;
     }
+    // ---- Phase 2-C: FP32 contiguous prefill ----
+    // Vectorized is ~2x faster than the tiled FP32 prefill on this hardware, so
+    // only the quantized prefill paths use the tiled kernel: there it avoids
+    // materializing the KV cache (the real win — no FP32 read of the whole cache).
     case AttentionPath::CUDA_FP32_PREFILL: {
         TensorPtr k_sliced, v_sliced;
         get_kv_on_device(k_sliced, v_sliced);
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
-        // Phase 2-C: prefer the KV-tiled backend (no per-thread
-        // local_acc[HEAD_DIM]); Vectorized/Scalar remain as fallbacks. All
-        // three are numerically equivalent FP32 prefill implementations.
-        AttentionBackend backend = choose_attention_backend(problem);
-        if (backend == AttentionBackend::Tiled) {
-            cuda::launch_fused_flash_attention_gqa_prefill_fp32(
-                static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
-                static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
-                seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal);
-        } else if (backend == AttentionBackend::Vectorized) {
-            cuda::launch_flash_attention_gqa_vectorized(
-                static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
-                static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
-                seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal);
-        } else {
-            cuda::launch_flash_attention_gqa(
-                static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
-                static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
-                seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal);
-        }
+        cuda::launch_flash_attention_gqa_vectorized(
+            static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
+            static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
+            seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal, 0);
 #else
         attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
                                                             total_len, num_heads, num_kv_heads,
@@ -617,6 +605,8 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         break;
     }
     // ---- Phase 2-B: fused quantized prefill (KV stays quantized) ----
+    FORGE_QUANT_PREFILL_CASE(AttentionPath::CUDA_FUSED_Q4_0_PREFILL, KVCacheDType::Q4_0,
+                             launch_fused_flash_attention_gqa_prefill_q4_0, false)
     FORGE_QUANT_PREFILL_CASE(AttentionPath::CUDA_FUSED_F16_PREFILL, KVCacheDType::F16,
                              launch_fused_flash_attention_gqa_prefill_f16, false)
     FORGE_QUANT_PREFILL_CASE(AttentionPath::CUDA_FUSED_Q8_0_PREFILL, KVCacheDType::Q8_0,
@@ -627,6 +617,10 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                              launch_fused_flash_attention_gqa_prefill_fp8_e5m2, true)
 
     // ---- Phase 2-B: paged quantized prefill (rows via the page table) ----
+    FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_FP32_PREFILL, KVCacheDType::FP32,
+                             launch_paged_flash_attention_gqa_prefill_fp32)
+    FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_Q4_0_PREFILL, KVCacheDType::Q4_0,
+                             launch_paged_flash_attention_gqa_prefill_q4_0)
     FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_F16_PREFILL, KVCacheDType::F16,
                              launch_paged_flash_attention_gqa_prefill_f16)
     FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_Q8_0_PREFILL, KVCacheDType::Q8_0,

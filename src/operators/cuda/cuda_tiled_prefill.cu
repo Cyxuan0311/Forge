@@ -24,6 +24,16 @@
 //
 // KV format is a compile-time policy (Dequant), so the SAME template serves
 // FP32, F16, Q8_0 and FP8 (E4M3/E5M2), contiguous or paged (Phase 2-B).
+//
+// ===== EXPERIMENTAL STATUS (2026-09-05, bench_tiled_attn on RTX 4050) =====
+// Full-KV tiling measured SLOWER than the streaming/vectorized reference on
+// consumer GPUs: decode 0.25-0.60x, FP32 prefill ~0.44-0.49x, Q8_0 ~0.60x.
+// The register savings (REG 33-48 vs 255) and occupancy gain (~70% vs ~12%)
+// are outweighed by global->shared staging, extra barriers and reduced
+// per-warp work on a latency/instruction-limited workload. Performance
+// tuning is FROZEN. Do NOT route the common FP32/F16 path here by default.
+// Keep this kernel for paged/quantized prefill paths where avoiding
+// materialization is structurally required. Evidence: docs/optimization_plan_zh.md.
 // =========================================================================
 
 #include <cstdio>
@@ -92,6 +102,31 @@ struct DqQ8_0 {
         const float s = __half2float(reinterpret_cast<const __half&>(sb));
         const int8_t* qs = reinterpret_cast<const int8_t*>(bp + 2);
         return static_cast<float>(qs[i]) * s;
+    }
+};
+
+// Q4_0: 32-element blocks, each = fp16 d (2B) + 16B nibble-packed (4b/element),
+// values stored as unsigned 4-bit minus 8. Requires HEAD_DIM >= 32.
+struct DqQ4_0 {
+    static constexpr int kMinHeadDim = 32;
+    template <int HEAD_DIM>
+    __device__ __forceinline__ static size_t head_offset(int kv_h) {
+        return (size_t)kv_h * (HEAD_DIM / 32) * 18;
+    }
+    template <int HEAD_DIM>
+    __device__ __forceinline__ static float deq(const uint8_t* row, int d, int j, int kv_h,
+                                                int num_kv_heads, const float* scales) {
+        (void)j; (void)kv_h; (void)num_kv_heads; (void)scales;
+        const int blk = d >> 5;
+        const int i = d - (blk << 5);  // 0..31
+        const uint8_t* bp = row + blk * 18;
+        uint16_t sb;
+        memcpy(&sb, bp, sizeof(uint16_t));
+        const float s = __half2float(reinterpret_cast<const __half&>(sb));
+        // Engine-canonical Q4_0 layout (cuda_common.h::q4_unpack): byte i packs
+        // element i (low nibble) and element i+16 (high nibble).
+        const uint8_t nib = (i < 16) ? (bp[2 + i] & 0x0F) : (bp[2 + (i - 16)] >> 4);
+        return static_cast<float>(nib - 8) * s;
     }
 };
 
@@ -420,11 +455,16 @@ void launch_fused_flash_attention_gqa_prefill_fp32(const float* Q, const float* 
                           k_scales, v_scales, stream, TAG);                                    \
     }
 
+DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q4_0, DqQ4_0, "q4_0")
 DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_f16, DqF16, "f16")
 DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q8_0, DqQ8_0, "q8_0")
 DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e4m3, DqFp8<Fp8E4M3>, "fp8_e4m3")
 DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e5m2, DqFp8<Fp8E5M2>, "fp8_e5m2")
 
+// Paged FP32: previously the only paged KV layout that materialized; the tiled
+// kernel reads FP32 pages directly through the page table.
+DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp32, DqFp32, "fp32")
+DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_q4_0, DqQ4_0, "q4_0")
 DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_f16, DqF16, "f16")
 DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_q8_0, DqQ8_0, "q8_0")
 DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp8_e4m3, DqFp8<Fp8E4M3>, "fp8_e4m3")

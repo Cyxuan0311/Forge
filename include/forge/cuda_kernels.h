@@ -444,6 +444,7 @@ void launch_fused_flash_attention_gqa_prefill_fp32(const float* Q, const float* 
               const float* k_scales = nullptr, const float* v_scales = nullptr,                 \
               cudaStream_t stream = 0)
 
+FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q4_0);
 FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_f16);
 FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q8_0);
 FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e4m3);
@@ -458,6 +459,8 @@ FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e5m2);
               const float* k_scales = nullptr, const float* v_scales = nullptr,               \
               cudaStream_t stream = 0)
 
+FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp32);
+FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_q4_0);
 FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_f16);
 FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_q8_0);
 FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp8_e4m3);
