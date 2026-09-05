@@ -60,25 +60,48 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
         return AttentionPath::CUDA_FP32_DECODE;
     }
 
-    // GQA prefill (seq_len > 1): prefer fused FP8 KV when available.
+    // GQA prefill (seq_len > 1): prefer the fused quantized prefill kernel when
+    // the KV cache holds a symmetric quantized type we have a policy for.
+    // Paged KV resolves rows through the page table (no materialization).
     if (p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
-        switch (p.kv_type_k) {
-        case KVCacheDType::FP8_E4M3:
-            return AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL;
-        case KVCacheDType::FP8_E5M2:
-            return AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL;
-        default:
-            break;  // Unsupported symmetric type → FP32 prefill
+        if (p.paged) {
+            switch (p.kv_type_k) {
+            case KVCacheDType::F16:
+                return AttentionPath::CUDA_PAGED_F16_PREFILL;
+            case KVCacheDType::Q8_0:
+                return AttentionPath::CUDA_PAGED_Q8_0_PREFILL;
+            case KVCacheDType::FP8_E4M3:
+                return AttentionPath::CUDA_PAGED_FP8_E4M3_PREFILL;
+            case KVCacheDType::FP8_E5M2:
+                return AttentionPath::CUDA_PAGED_FP8_E5M2_PREFILL;
+            default:
+                break;  // Q4_0/Q4_K → FP32 materialize prefill
+            }
+        } else {
+            switch (p.kv_type_k) {
+            case KVCacheDType::F16:
+                return AttentionPath::CUDA_FUSED_F16_PREFILL;
+            case KVCacheDType::Q8_0:
+                return AttentionPath::CUDA_FUSED_Q8_0_PREFILL;
+            case KVCacheDType::FP8_E4M3:
+                return AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL;
+            case KVCacheDType::FP8_E5M2:
+                return AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL;
+            default:
+                break;  // Q4_0/Q4_K → FP32 materialize prefill
+            }
         }
     }
     return AttentionPath::CUDA_FP32_PREFILL;
 }
 
 AttentionBackend choose_attention_backend(const AttentionProblem& p) {
-    // Vectorized FP32 prefill requires head_dim % 4 == 0 for float4 K/V loads.
-    // All supported prefill head dims (16/32/64/72/96/128/256/512) satisfy this.
-    if (p.device == DeviceType::CUDA && p.seq_len > 1 && (p.head_dim % 4) == 0) {
-        return AttentionBackend::Vectorized;
+    // CUDA prefill uses the KV-tiled kernel (Phase 2-C): it drops the
+    // per-thread local_acc[HEAD_DIM] accumulator, which is the dominant
+    // register-pressure term for large head dims. The launch switch supports
+    // head_dim 16/32/64/72/96/128/256/512.
+    if (p.device == DeviceType::CUDA && p.seq_len > 1) {
+        return AttentionBackend::Tiled;
     }
     return AttentionBackend::Scalar;
 }
@@ -89,6 +112,8 @@ const char* attention_backend_name(AttentionBackend backend) {
         return "Scalar";
     case AttentionBackend::Vectorized:
         return "Vectorized";
+    case AttentionBackend::Tiled:
+        return "Tiled";
     case AttentionBackend::TensorCore:
         return "TensorCore";
     default:
@@ -118,10 +143,22 @@ const char* attention_path_name(AttentionPath path) {
         return "CUDA_FUSED_FP8_E4M3_DECODE";
     case AttentionPath::CUDA_FUSED_FP8_E5M2_DECODE:
         return "CUDA_FUSED_FP8_E5M2_DECODE";
+    case AttentionPath::CUDA_FUSED_F16_PREFILL:
+        return "CUDA_FUSED_F16_PREFILL";
+    case AttentionPath::CUDA_FUSED_Q8_0_PREFILL:
+        return "CUDA_FUSED_Q8_0_PREFILL";
     case AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL:
         return "CUDA_FUSED_FP8_E4M3_PREFILL";
     case AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL:
         return "CUDA_FUSED_FP8_E5M2_PREFILL";
+    case AttentionPath::CUDA_PAGED_F16_PREFILL:
+        return "CUDA_PAGED_F16_PREFILL";
+    case AttentionPath::CUDA_PAGED_Q8_0_PREFILL:
+        return "CUDA_PAGED_Q8_0_PREFILL";
+    case AttentionPath::CUDA_PAGED_FP8_E4M3_PREFILL:
+        return "CUDA_PAGED_FP8_E4M3_PREFILL";
+    case AttentionPath::CUDA_PAGED_FP8_E5M2_PREFILL:
+        return "CUDA_PAGED_FP8_E5M2_PREFILL";
     case AttentionPath::CUDA_PAGED_Q4_0_DECODE:
         return "CUDA_PAGED_Q4_0_DECODE";
     case AttentionPath::CUDA_PAGED_F16_DECODE:

@@ -36,9 +36,11 @@ enum class AttentionPath {
     CUDA_FUSED_FP8_E4M3_DECODE,  // CUDA GQA decode with FP8 E4M3 KV
     CUDA_FUSED_FP8_E5M2_DECODE,  // CUDA GQA decode with FP8 E5M2 KV
 
-    // CUDA fused FP8 prefill (Phase 2-B): KV held in FP8 (scaled, 1 byte/el),
-    // dequantized on-the-fly inside the kernel. Long-context win = no FP32
-    // materialization of the whole KV cache during prefill.
+    // CUDA fused quantized prefill (Phase 2-B): KV stays in its quantized form
+    // and is dequantized on the fly inside the kernel. Long-context win = no
+    // FP32 materialization of the whole KV cache during prefill.
+    CUDA_FUSED_F16_PREFILL,       // CUDA GQA prefill with F16 KV
+    CUDA_FUSED_Q8_0_PREFILL,      // CUDA GQA prefill with Q8_0 KV
     CUDA_FUSED_FP8_E4M3_PREFILL,  // CUDA GQA prefill with FP8 E4M3 KV
     CUDA_FUSED_FP8_E5M2_PREFILL,  // CUDA GQA prefill with FP8 E5M2 KV
 
@@ -50,6 +52,13 @@ enum class AttentionPath {
     CUDA_PAGED_Q8_0_DECODE,      // CUDA paged GQA decode with Q8_0 KV
     CUDA_PAGED_FP8_E4M3_DECODE,  // CUDA paged GQA decode with FP8 E4M3 KV
     CUDA_PAGED_FP8_E5M2_DECODE,  // CUDA paged GQA decode with FP8 E5M2 KV
+
+    // CUDA paged quantized prefill (Phase 2-B). FP32 paged KV falls back to
+    // CUDA_FP32_PREFILL (materialize then attend).
+    CUDA_PAGED_F16_PREFILL,       // CUDA paged GQA prefill with F16 KV
+    CUDA_PAGED_Q8_0_PREFILL,      // CUDA paged GQA prefill with Q8_0 KV
+    CUDA_PAGED_FP8_E4M3_PREFILL,  // CUDA paged GQA prefill with FP8 E4M3 KV
+    CUDA_PAGED_FP8_E5M2_PREFILL,  // CUDA paged GQA prefill with FP8 E5M2 KV
 
     // Fallback
     UNSUPPORTED,
@@ -65,9 +74,11 @@ enum class AttentionPath {
 // Phase 2-C introduces Vectorized for the CUDA FP32 prefill path.
 
 enum class AttentionBackend {
-    Scalar,
-    Vectorized,
-    TensorCore,
+    Scalar,      // thread-centric kernel (Q re-read from global per KV position)
+    Vectorized,  // Q tile in shared mem + float4 K/V loads
+    Tiled,       // KV-tiled: accumulator distributed over the head dim
+                 // (no per-thread local_acc[HEAD_DIM]) — Phase 2-C
+    TensorCore,  // reserved for a future MMA-tiled backend
 };
 
 // ---- Problem descriptor ----
