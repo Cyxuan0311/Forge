@@ -395,6 +395,15 @@ CUDA_PAGED_Q4_0_PREFILL, CUDA_PAGED_FP8_E4M3_PREFILL, ...
 优先级：先做 **FP8 prefill**（KV 已量化、dequant 便宜、收益最直接），
 再做 Q8_0 / Q4_0。
 
+**状态（已完成，2026-09-05）**：全部落地——`CUDA_FUSED_{Q4_0,F16,Q8_0,FP8_E4M3,FP8_E5M2}_PREFILL`
+与 `CUDA_PAGED_{FP32,Q4_0,F16,Q8_0,FP8_E4M3,FP8_E5M2}_PREFILL` 共 11 个 prefill 路径（枚举见
+`attention_selector.h:45-67`），selector 按 dtype×paged 全分派，executor 11 个 case 全接入
+（`attention_executor.cpp:608-631`），内核在 `cuda_tiled_prefill.cu`，paged 通过 device 端
+`page_ids` 直接遍历页表、全程无 FP32 物化。落地顺序与本段一致：先 FP8（提交 `da8c4fd`→`cdd65ac`），
+再 F16/Q8_0/Q4_0 与 paged（`a43f7ee`→`a83a743`）。Q4_K 无 fused policy：256 元素 super-block 与
+HEAD_DIM<256 的 per-head 边界不对齐，保持 FP32 materialize 回退（见 `attention_selector.h` 注释）。
+验收：`attn-fp8-prefill`、`tiled-attn-formats` 两个 ctest 全绿（总 25/25）。
+
 ### 2-C. 引入 AttentionBackend 分层
 
 ```cpp
@@ -415,10 +424,107 @@ Q tile 进 shared memory、K/V 用 float4 加载、warp 级归约，
 - `python -m pytest tests/test_forward.py tests/test_cross_validation.py` 全绿
 - `bench_inference.py` 记录 prefill tok/s 变化
 
+**状态（已完成 + 一处核心假设修正，2026-09-05）**：enum `AttentionBackend{Scalar,Vectorized,
+TensorCore}` 与 Vectorized kernel（Q tile 进 smem + float4 K/V，`cuda_flash_attn.cu:194`）就位，
+FP32 prefill 默认路由 Vectorized；parity 验收 `attn-backend-parity` 全绿。
+
+**实测推翻本节核心假设**（RTX 4050 Laptop, sm_89，`tests/bench_tiled_attn.cpp`）：
+真正消除 `local_acc[HEAD_DIM]` 的 KV-tiled kernel（`cuda_tiled_prefill.cu` 的
+`fused_attn_tiled_prefill_kernel`）在本机全面劣化：
+
+| 路径 | tiled/legacy 加速比 |
+|---|--:|
+| decode（FP32/F16/Q8_0, kv=2k–32k） | 0.22–0.56× |
+| FP32 prefill（q=512, kv=4k–64k） | 0.44–0.49× |
+| Q8_0 prefill（q=512，对比物化+vectorized） | ~0.60× |
+
+即「register pressure → occupancy → 性能」链条在本机不成立：legacy/vectorized 已无 spilling、
+访存延迟被充分隐藏，tiled 的 shared memory traffic / 同步 / 寻址成本超过了寄存器节约。
+**结论：`local_acc[HEAD_DIM]` 是实现细节而非性能指标；优化目标不是"消灭某个数组"，而是
+workload-aware 选择实测最快的执行策略。** 因此 Vectorized kernel 仍保留 `local_acc[HEAD_DIM]`
+（源码注释已自认 tiling deferred），`choose_attention_backend` 也被移除、后端选择内联进 executor。
+
+**决策**：`cuda_tiled_prefill.cu` 冻结性能调优、保留为 **experimental candidate**（不删除）——
+它是量化/分页 prefill 免物化的唯一路径，继续承担该职责并保证正确性；本机所有新 kernel 的
+采用一律以实测为准，不以资源占用指标为准。TensorCore 后端与数据驱动 dispatch 移交 Phase 3/4。
+
+**资源占用证据（`cuobjdump --dump-resource-usage` + `ptxas -v`，sm_89；本机无 NVGPU 计数器权限，
+无法跑 Nsight Compute，此项为可获取的最高证据等级）**——直接回答「spill / occupancy 是否瓶颈」：
+
+| kernel | REG | spill（ptxas -v） | 理论 CTA/SM | 实测 |
+|---|---|---:|---|---:|
+| legacy decode `<128,4>`（快路径） | 255（顶格） | **628B st / 388B ld** | ~2（~12%） | 有 spill 仍最快 |
+| vectorized `<128,128>`（快路径） | 186 | 0 | ~2（~12%） | FP32 prefill 2×快于 tiled |
+| tiled `fused_attn_tiled_prefill_kernel`（慢） | 33–48 | 0 | ~11（~70%） | 0.25–0.60× |
+
+结论比"无 spill + 高 occupancy 才快"更极端：**快路径 legacy decode 本身有真实 spill 且
+occupancy 仅 ~12%，依然最快**；tiled 把 occupancy 提升约 5× 反而让性能减半。三条路径共同
+指向：本 workload 是 latency/指令效率主导，occupancy 与 spill 都不是第一阶性能变量，寄存器节约
+换来的 tiling/staging/同步成本是净损失。
+
 ### 2-D. GPU 常驻 paged metadata
 
-按 `plan.md` 第 17 节，把 `indptr / indices / last_page_len / seq_lens`
-常驻 GPU，避免 CUDA Graph replay 时反复重建 host-side metadata。
+按 `plan.md` 第 17 节，把序列页表 metadata 常驻 GPU，消除 decode 热路径中
+每次全量 H2D 的上传，并避免共享 staging buffer 的多序列相互覆盖。
+
+**状态（✅ 已完成，2026-09-05）**：实现为 per-(seq, layer) 的常驻 device mirror。
+
+- `SequencePageTable` 新增 4 个字段（`d_mirror / d_cap / d_synced / d_dirty`），每个
+  (seq, layer) 拥有一块独立、持续存活的 device 页表，**不再有跨序列共享的 staging buffer**，
+  并发序列互不覆盖。
+- `upload_seq_page_table_unlocked` 热路径只做**增量追加**：decode 每次只长 1 页，故每 token
+  仅同步新增页（O(1)），不再 O(total pages) 线性增长；capacity 用 grow-only 翻倍（amortized
+  O(1)），超限时整体 realloc。
+- 前缀变化（`seq_remove` 中间删页 / `seq_share`）将对应镜像标 `d_dirty`，下一次上传整表重写，
+  保证 device 端与 host 权威表一致。
+- 生命周期闭环：`release()` / `reset()` / 析构统一 `cudaFree` 镜像，CPU 后端不受影响。
+
+**验收**：新增 `tests/test_kv_paged_mirror.cpp`（ctest `kv-paged-mirror`），以与 allocator 同规则
+的 host 仿真逐字节比对 device 镜像，覆盖①跨页增长、②容量 realloc、③双序列独立指针互不污染、
+④`seq_remove` 脏标记 + 释放页回收重用、⑤release/reset 清理；与 `kv-offload` / `kv-defrag` /
+`attn-fp8-prefill` / `tiled-attn-formats` 一并全绿。
+
+> **Phase 2 出口核对（2026-09-05）**：2-B ✅、2-C ✅（目标修正为 workload-aware dispatch；
+> TensorCore/autotune 移交 Phase 3/4）、2-D ✅（已实现并验收）。Phase 2 全部子项收口。
+
+---
+
+### Phase 2 正式收敛（2026-09-05）
+
+**命名规范（代码/文档统一）**：实测最快的 decode 路径不再叫 "legacy"（语义上易被误读为
+"待删除的旧实现"），统一定名为 **streaming decode**（kernel 真名 `flash_attn_gqa_decode_kernel`，
+bench 输出列保留历史标签 `legacy_ms` 指同一 kernel）。`cuda_tiled_prefill.cu` 全量 tiling
+定名为 **experimental**：性能调优冻结，只保留 paged/量化免物化职责。
+
+**措辞严格限定（防止结论越界）**：以下经验值仅对
+`consumer GPU（RTX 4050 sm_89）/ 当前 Forge attention kernel / 当前单请求 workload` 成立：
+
+1. `register pressure ↓ → occupancy ↑ → performance ↑` 在此不成立；REG 255 + 真实 spill +
+   ~12% occupancy 的 streaming decode 仍最快（3.1 ms @ 32K），而 REG 33–48 + ~70% occupancy
+   的 tiled 只有 0.25–0.60×。
+2. 由此导出 **Decode Hypothesis**：decode attention 是 **latency/instruction limited**，而非
+   occupancy 或 DRAM-bandwidth limited（实测仅 ~44% DRAM peak）。推论：(a) 保持直接 KV
+   streaming；(b) 避免 shared-memory staging；(c) 避免跨 warp 同步；(d) 只在**不引入额外
+   staging/sync** 的前提下压低寄存器；(e) 优化对象是 per-warp 工作量粒度与指令吞吐。
+3. **不扩展到其他条件**：B>8、长 prefill、多并发请求、数据中心 GPU（H100/B100）或大 M
+   上，tiled / 高 occupancy / TensorCore 可能反转；届时以实测为准。
+4. **Selector/Autotuner 铁律**：不得以 occupancy 或寄存器数作为 kernel 排序的 proxy，必须以
+   目标 workload 的实测 latency/throughput 为最终标准。
+
+**路线拆成两条互不污染 track**（不再叫笼统的 "attention optimization"）：
+- **Decode track**：Streaming → register sweet spot → per-warp work 粒度 → latency 优化。
+- **Prefill track**：Vectorized baseline（当前 2.1× tiled，已足够好）→ Q/K/V tile + Tensor Core
+  → 大 M 场景，**不再试图把 decode 取向的 tiled kernel 做快**。
+
+**Phase 4 搜索空间（killing `block_size` 单一维度）**：
+`{warps/CTA, KV chunk per warp, vector width, unroll factor, register budget (min CTA/SM), seq tile, cooperative mode}`。
+- **第一批实验 A–F**（针对 streaming decode）：A baseline；B reg −10%；C reg −20%；D unroll×2；
+  E unroll×4；F warp work ×2。观测量：latency、registers、spill、DRAM GB/s —— 只看**有无免费收益**
+  （255→~200 且不引入 sync/staging/spill）。
+- **第二批**：REG 255→~168 使 2 CTA→3 CTA 时，验证对象是"**第 3 个 CTA 带来的 latency hiding 是否
+  抵消压寄存器付出的指令成本**"——2 CTA vs 3 CTA 对比，不是 255 vs 168 regs 对比。
+- **DB 记录维度**：GPU arch / dtype / head_dim / q_len / kv_len / batch / paged + **objective**
+  `{MinLatency, MaxThroughput, MinP99}`（batch=1 → latency，B≥16 → throughput，serving → P99）。
 
 ---
 
@@ -499,6 +605,51 @@ KernelVariant select_kernel(const KernelProblem&);
 
 **验收**：新增 `tests/test_kernel_selector.cpp`，验证相同 problem 两次
 选择一致、缓存命中率可统计。
+
+### 4-C. Decode track 前置实验路线（P4-1 ~ P4-5）
+
+> **状态（2026-09-05）：计划已固化，暂缓执行**——只立项、不进行任何代码变更，开工以本次
+> 决策为准。与「Phase 2 正式收敛」节配套阅读（streaming decode = 快路径、Decode Hypothesis、
+> 双 track、首批 A–F 清单），该节是本路线的依据。
+
+Phase 4 先于统一 Selector 落地 attention decode 变体矩阵，顺序与验收：
+
+| 步骤 | 内容 | 验收 |
+|---|---|---|
+| P4-1 | streaming decode 变体矩阵 bench（首批 A–F 的最小可执行版） | 得到 reg 甜点曲线 |
+| P4-2 | 第二批 2 vs 3 CTA 判定实验 | 回答「第 3 个 CTA 是否值得」 |
+| P4-3 | 结果落 JSON DB（arch/dtype/seq/objective 键） | DB 可查询 |
+| P4-4 | `AttentionBackend` 纳入 StreamingDecode 变体名 + dispatch | 变体可路由 |
+| P4-5 | Prefill TensorCore track（独立，Phase 3 事件） | — |
+
+**P4-1 最小侵入方案（不破坏现有任何二进制）**：
+
+1. `flash_attn_gqa_decode_kernel` 增加第三模板参数 `int MIN_CTA = 0`，配合
+   `__launch_bounds__(NUM_WARPS * 32, MIN_CTA)`（0 = 无约束，现编译结果 **bit-identical**）。
+2. 现有 launcher 仅将 `<HD, NW>` 改为 `<HD, NW, 0>`，默认路径零变化。
+3. bench 新增 streaming 段：`MIN_CTA ∈ {2, 3, 4, 6}` × `kv_len ∈ {2048, 8192, 32768}`，
+   重跑 decode 直通路径；每个实例用 `ptxas -v` 记录 reg/spill。
+4. 判定只看两件事：**免费收益**（255 → ~200 且不新增 spill / sync / staging）与
+   **3 CTA 的 latency hiding 是否抵过压寄存器代价**。
+
+**P4-2 第二批：2 vs 3 CTA**——验证对象是「第 3 个 CTA 带来的 latency hiding 是否抵消压
+寄存器付出的指令成本」，比较 **2 CTA vs 3 CTA**（REG ~255 → ~168），而不是 255 vs 168 regs。
+
+**P4-3 JSON DB（先极简，再扩展）**：
+
+```json
+{ "sm89:fp32:decode:hd128": { "kv_2k": "streaming", "kv_32k": "streaming_lb3" } }
+```
+
+扩展键：GPU arch / dtype / head_dim / q_len / kv_len / batch / paged + **objective**
+（decode batch=1 → MinLatency；B≥16 → MaxThroughput；serving → MinP99）。
+
+**P4-4 变体名与 dispatch**——`AttentionBackend` 纳入 streaming 变体命名（如
+`StreamingDecode` / `StreamingDecodeLB3`）；selector 只按实测 DB 路由，不以
+occupancy/register 排序（收敛节铁律）。
+
+**P4-5 独立 track**——Prefill TensorCore 归 Phase 3 事件，不与 decode tuning 在同一个
+kernel 上混做。
 
 ---
 
