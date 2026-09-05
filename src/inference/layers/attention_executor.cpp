@@ -363,6 +363,73 @@ AttentionExecutor::QKVResult AttentionExecutor::project_qkv(const TensorPtr& x,
     return result;
 }
 
+// ---- Quantized / paged prefill dispatch helpers (Phase 2-B) ----
+// The eight prefill cases below differ only in the KV dtype, the launch entry
+// point and whether FP8 row scales are used, so they are generated from a macro.
+// Non-CUDA builds fall back to materializing K/V and running the FP32 GQA SDPA.
+#ifdef USE_CUDA
+#define FORGE_QUANT_PREFILL_CASE(ENUM_PATH, DTYPE, LAUNCH_FN, SCALED)                          \
+    case ENUM_PATH: {                                                                          \
+        attn_out = std::make_shared<Tensor>(                                                    \
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim},               \
+            DeviceType::CUDA);                                                                 \
+        {                                                                                      \
+            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);                                   \
+            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);                                 \
+            size_t q_row_size = KVCache::block_nbytes(DTYPE, num_kv_heads * head_dim);         \
+            const float* k_sc =                                                                \
+                (SCALED) ? static_cast<const float*>(kv_cache_.d_q_key_scale(layer_idx))       \
+                         : nullptr;                                                             \
+            const float* v_sc =                                                                \
+                (SCALED) ? static_cast<const float*>(kv_cache_.d_q_value_scale(layer_idx))     \
+                         : nullptr;                                                             \
+            cuda::LAUNCH_FN(static_cast<const float*>(q->data()), d_q_K, d_q_V,                \
+                            static_cast<float*>(attn_out->data()), seq_len, total_len,         \
+                            num_heads, num_kv_heads, head_dim, q_row_size, mask_data, causal,  \
+                            k_sc, v_sc, 0);                                                    \
+        }                                                                                      \
+        break;                                                                                 \
+    }
+#else
+#define FORGE_QUANT_PREFILL_CASE(ENUM_PATH, DTYPE, LAUNCH_FN, SCALED)                          \
+    case ENUM_PATH: {                                                                          \
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(                                   \
+            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx),     \
+            seq_len, total_len, num_heads, num_kv_heads, head_dim, mask, true);                \
+        break;                                                                                 \
+    }
+#endif
+
+#ifdef USE_CUDA
+#define FORGE_PAGED_PREFILL_CASE(ENUM_PATH, DTYPE, LAUNCH_FN)                                  \
+    case ENUM_PATH: {                                                                          \
+        attn_out = std::make_shared<Tensor>(                                                    \
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim},               \
+            DeviceType::CUDA);                                                                 \
+        {                                                                                      \
+            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);    \
+            size_t q_row_size = KVCache::block_nbytes(DTYPE, num_kv_heads * head_dim);         \
+            cuda::LAUNCH_FN(static_cast<const float*>(q->data()),                              \
+                            storage_->d_key_page_ptrs(layer_idx),                              \
+                            storage_->d_value_page_ptrs(layer_idx), d_page_ids,                \
+                            static_cast<float*>(attn_out->data()), seq_len, total_len,         \
+                            num_heads, num_kv_heads, head_dim, storage_->page_size(),          \
+                            q_row_size, mask_data, causal, nullptr, nullptr, 0);               \
+        }                                                                                      \
+        break;                                                                                 \
+    }
+#else
+#define FORGE_PAGED_PREFILL_CASE(ENUM_PATH, DTYPE, LAUNCH_FN)                                  \
+    case ENUM_PATH: {                                                                          \
+        TensorPtr k_paged, v_paged;                                                            \
+        get_kv_on_device(k_paged, v_paged);                                                    \
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(                                   \
+            q, k_paged, v_paged, seq_len, total_len, num_heads, num_kv_heads, head_dim, mask,  \
+            true);                                                                             \
+        break;                                                                                 \
+    }
+#endif
+
 TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, int layer_idx,
                                     int seq_len, DeviceType dev, const TensorPtr& mask, int seq_id,
                                     bool causal) {
@@ -467,16 +534,25 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         const auto& kv_cfg = kv_cache_.kv_config();
         problem.kv_type_k = kv_cfg.type_k;
         problem.kv_type_v = kv_cfg.type_v;
-    } else if (dev == DeviceType::CUDA && seq_len > 1 && !paged) {
-        // Prefill (Phase 2-B): FP8/quantized KV cache read directly by the fused
-        // prefill kernel — no FP32 materialization. Paged prefill keeps the
-        // FP32 materialize path for now.
-        void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
-        void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
-        problem.has_quantized_kv = (d_q_K != nullptr && d_q_V != nullptr);
-        const auto& kv_cfg = kv_cache_.kv_config();
-        problem.kv_type_k = kv_cfg.type_k;
-        problem.kv_type_v = kv_cfg.type_v;
+    } else if (dev == DeviceType::CUDA && seq_len > 1) {
+        // Prefill (Phase 2-B): quantized KV is read directly by the fused
+        // prefill kernel — no FP32 materialization. Paged KV resolves rows
+        // through the sequence page table; contiguous KV reads the cache's
+        // quantized device pointers.
+        if (paged) {
+            problem.paged = true;
+            problem.seq_id = seq_id;
+            problem.has_quantized_kv = true;
+            problem.kv_type_k = storage_->kv_type_k();
+            problem.kv_type_v = storage_->kv_type_v();
+        } else {
+            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
+            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
+            problem.has_quantized_kv = (d_q_K != nullptr && d_q_V != nullptr);
+            const auto& kv_cfg = kv_cache_.kv_config();
+            problem.kv_type_k = kv_cfg.type_k;
+            problem.kv_type_v = kv_cfg.type_v;
+        }
     }
 
     AttentionPath path = choose_attention_path(problem);
@@ -513,10 +589,16 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
-        // Phase 2-C: prefer the Vectorized backend (Q tile + float4 K/V) when
-        // supported; fall back to the Scalar kernel otherwise. Numerics identical.
+        // Phase 2-C: prefer the KV-tiled backend (no per-thread
+        // local_acc[HEAD_DIM]); Vectorized/Scalar remain as fallbacks. All
+        // three are numerically equivalent FP32 prefill implementations.
         AttentionBackend backend = choose_attention_backend(problem);
-        if (backend == AttentionBackend::Vectorized) {
+        if (backend == AttentionBackend::Tiled) {
+            cuda::launch_fused_flash_attention_gqa_prefill_fp32(
+                static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
+                static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
+                seq_len, total_len, num_heads, num_kv_heads, head_dim, mask_data, causal);
+        } else if (backend == AttentionBackend::Vectorized) {
             cuda::launch_flash_attention_gqa_vectorized(
                 static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
                 static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
@@ -534,52 +616,25 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
 #endif
         break;
     }
-    // ---- Phase 2-B: fused FP8 prefill (read quantized KV, no materialize) ----
-    case AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL:
-#ifdef USE_CUDA
-        attn_out = std::make_shared<Tensor>(
-            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
-        {
-            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
-            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
-            size_t q_row_size =
-                KVCache::block_nbytes(KVCacheDType::FP8_E4M3, num_kv_heads * head_dim);
-            const float* k_scales = static_cast<const float*>(kv_cache_.d_q_key_scale(layer_idx));
-            const float* v_scales = static_cast<const float*>(kv_cache_.d_q_value_scale(layer_idx));
-            cuda::launch_fused_flash_attention_gqa_prefill_fp8_e4m3(
-                static_cast<const float*>(q->data()), d_q_K, d_q_V,
-                static_cast<float*>(attn_out->data()), seq_len, total_len, num_heads, num_kv_heads,
-                head_dim, q_row_size, mask_data, causal, k_scales, v_scales, 0);
-        }
-#else
-        attn_out = ops::scaled_dot_product_attention_2d_gqa(
-            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx), seq_len,
-            total_len, num_heads, num_kv_heads, head_dim, mask, true);
-#endif
-        break;
+    // ---- Phase 2-B: fused quantized prefill (KV stays quantized) ----
+    FORGE_QUANT_PREFILL_CASE(AttentionPath::CUDA_FUSED_F16_PREFILL, KVCacheDType::F16,
+                             launch_fused_flash_attention_gqa_prefill_f16, false)
+    FORGE_QUANT_PREFILL_CASE(AttentionPath::CUDA_FUSED_Q8_0_PREFILL, KVCacheDType::Q8_0,
+                             launch_fused_flash_attention_gqa_prefill_q8_0, false)
+    FORGE_QUANT_PREFILL_CASE(AttentionPath::CUDA_FUSED_FP8_E4M3_PREFILL, KVCacheDType::FP8_E4M3,
+                             launch_fused_flash_attention_gqa_prefill_fp8_e4m3, true)
+    FORGE_QUANT_PREFILL_CASE(AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL, KVCacheDType::FP8_E5M2,
+                             launch_fused_flash_attention_gqa_prefill_fp8_e5m2, true)
 
-    case AttentionPath::CUDA_FUSED_FP8_E5M2_PREFILL:
-#ifdef USE_CUDA
-        attn_out = std::make_shared<Tensor>(
-            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
-        {
-            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
-            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
-            size_t q_row_size =
-                KVCache::block_nbytes(KVCacheDType::FP8_E5M2, num_kv_heads * head_dim);
-            const float* k_scales = static_cast<const float*>(kv_cache_.d_q_key_scale(layer_idx));
-            const float* v_scales = static_cast<const float*>(kv_cache_.d_q_value_scale(layer_idx));
-            cuda::launch_fused_flash_attention_gqa_prefill_fp8_e5m2(
-                static_cast<const float*>(q->data()), d_q_K, d_q_V,
-                static_cast<float*>(attn_out->data()), seq_len, total_len, num_heads, num_kv_heads,
-                head_dim, q_row_size, mask_data, causal, k_scales, v_scales, 0);
-        }
-#else
-        attn_out = ops::scaled_dot_product_attention_2d_gqa(
-            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx), seq_len,
-            total_len, num_heads, num_kv_heads, head_dim, mask, true);
-#endif
-        break;
+    // ---- Phase 2-B: paged quantized prefill (rows via the page table) ----
+    FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_F16_PREFILL, KVCacheDType::F16,
+                             launch_paged_flash_attention_gqa_prefill_f16)
+    FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_Q8_0_PREFILL, KVCacheDType::Q8_0,
+                             launch_paged_flash_attention_gqa_prefill_q8_0)
+    FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_FP8_E4M3_PREFILL, KVCacheDType::FP8_E4M3,
+                             launch_paged_flash_attention_gqa_prefill_fp8_e4m3)
+    FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_FP8_E5M2_PREFILL, KVCacheDType::FP8_E5M2,
+                             launch_paged_flash_attention_gqa_prefill_fp8_e5m2)
 
     case AttentionPath::CUDA_FP32_DECODE: {
         TensorPtr k_sliced, v_sliced;
