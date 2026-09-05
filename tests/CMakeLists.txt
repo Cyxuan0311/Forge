@@ -198,6 +198,12 @@ if(CUDAToolkit_FOUND)
   add_executable(forge-attn-fp8-prefill-test test_attention_fp8_prefill.cpp)
   forge_link_native(forge-attn-fp8-prefill-test)
   add_test(NAME attn-fp8-prefill COMMAND forge-attn-fp8-prefill-test)
+
+  # Phase 2-B + 2-C: KV-tiled prefill across every KV format policy
+  # (FP32/F16/Q8_0/FP8-E4M3/FP8-E5M2), contiguous and paged.
+  add_executable(forge-tiled-prefill-formats-test test_tiled_prefill_formats.cpp)
+  forge_link_native(forge-tiled-prefill-formats-test)
+  add_test(NAME tiled-prefill-formats COMMAND forge-tiled-prefill-formats-test)
 endif()
 
 # -----------------------------------------------------------------------------
