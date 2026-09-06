@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "forge/quant_traits.h"
+
 #include "forge/compute_graph.h"
 #include "forge/logger.h"
 #include "forge/types.h"
@@ -51,7 +53,11 @@ size_t MemoryPlanner::estimate_output_size(const GraphNode& node,
             auto weight = graph_inputs[w_idx];
             int64_t rows = first_input->shape()[0];
             int64_t cols = weight->shape()[0];
-            return static_cast<size_t>(rows * cols * sizeof(float));
+            // 6-A-6.2: size by the (first) input's element width, not hardcoded FP32 — an FP16
+            // chain must allocate an FP16-sized buffer (no FP32 promotion in the planner).
+            size_t es = first_input->numel() ? first_input->nbytes() / first_input->numel()
+                                             : sizeof(float);
+            return static_cast<size_t>(rows * cols * es);
         }
         return 0;
     }
@@ -60,7 +66,12 @@ size_t MemoryPlanner::estimate_output_size(const GraphNode& node,
         int num_heads = node.op_params[0];
         int head_dim = node.op_params[2];
         int64_t seq_len_q = first_input->shape()[0];
-        return static_cast<size_t>(seq_len_q * num_heads * head_dim * sizeof(float));
+        // 6-A-7: size by the (first) input's element width, not hardcoded FP32 —
+        // same 6-A-6.2口径 as MUL_MAT_TRANSB above. An FP16 attention chain must
+        // allocate an FP16-sized output (no FP32 promotion in the planner).
+        size_t es = first_input->numel() ? first_input->nbytes() / first_input->numel()
+                                         : sizeof(float);
+        return static_cast<size_t>(seq_len_q * num_heads * head_dim * es);
     }
 
     default:
@@ -257,6 +268,45 @@ void MemoryPlanner::plan(const ComputeGraph& graph, bool release_intermediates) 
         }
     }
 
+    // Phase 6-A-6.2: propagate output shapes/dtypes across the graph (topological order) so
+    // every node — not just the first — can be sized/typed by plan() above.
+    std::vector<std::vector<int64_t>> node_shapes(n_nodes);
+    std::vector<DataType> node_dtypes(n_nodes);
+    for (int i = 0; i < n_nodes; ++i) {
+        const auto& node = graph.node(i);
+        if (node.input_indices.empty())
+            continue;
+        auto resolve = [&](int ref, const std::vector<int64_t>*& shape, DataType& dt) {
+            shape = nullptr;
+            dt = DataType::FP32;
+            if (ref >= 0 && ref < static_cast<int>(graph.inputs().size()) && graph.inputs()[ref]) {
+                shape = &graph.inputs()[ref]->shape();
+                dt = graph.inputs()[ref]->dtype();
+                return;
+            }
+            int prod = -ref - 1;
+            if (prod >= 0 && prod < n_nodes && !node_shapes[prod].empty()) {
+                shape = &node_shapes[prod];
+                dt = node_dtypes[prod];
+            }
+        };
+        const std::vector<int64_t>* s0 = nullptr;
+        DataType dt0 = DataType::FP32;
+        resolve(node.input_indices[0], s0, dt0);
+        if (!s0)
+            continue;
+        std::vector<int64_t> out_shape = *s0;
+        if (node.op_type == OpType::MUL_MAT_TRANSB && node.input_indices.size() >= 2) {
+            const std::vector<int64_t>* ws = nullptr;
+            DataType wdt = DataType::FP32;
+            resolve(node.input_indices[1], ws, wdt);
+            if (ws && ws->size() >= 1)
+                out_shape = {(*s0)[0], (*ws)[0]};
+        }
+        node_shapes[i] = std::move(out_shape);
+        node_dtypes[i] = dt0;
+    }
+
     // Set lifetime_begin, estimate size, mark graph outputs
     for (int i = 0; i < n_nodes; ++i) {
         node_info[i].lifetime_begin = i;
@@ -267,8 +317,19 @@ void MemoryPlanner::plan(const ComputeGraph& graph, bool release_intermediates) 
             node_info[i].is_output = true;
         }
 
-        // Estimate logical size
-        node_info[i].size = estimate_output_size(graph.node(i), graph.inputs());
+        // Phase 6-A-6.2: propagate shapes/dtypes from graph inputs so downstream nodes
+        // (whose first input is another node's output, not a graph input) get a correctly
+        // sized AND correctly typed allocation. Without this, only the first node is sized
+        // and the rest of a chain is never given a dst-injection buffer (and an FP16 chain
+        // would otherwise be under-sized as FP32). `node_shapes`/`node_dtypes` are built in
+        // topological (index) order, which the graph builder guarantees.
+        if (!node_shapes[i].empty()) {
+            size_t n = 1;
+            for (auto d : node_shapes[i]) n *= static_cast<size_t>(d);
+            node_info[i].size = n * dtype_size(node_dtypes[i]);
+        } else {
+            node_info[i].size = estimate_output_size(graph.node(i), graph.inputs());
+        }
 
         // Compute backend-specific allocation size
         if (node_info[i].size > 0) {

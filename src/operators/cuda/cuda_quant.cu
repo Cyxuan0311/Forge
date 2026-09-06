@@ -453,6 +453,77 @@ void launch_dequant_q5_k_matrix(const void* q_data, float* out, int N, int K, cu
                                                                out, N, K);
 }
 
+// Phase 5-B: FP16 twin of the Q5_K matrix dequant (same 176 B block layout and
+// math as dequant_q5_k_matrix_kernel, but emitting __half for the whole-weight
+// dequant + cuBLAS FP16 TensorCore path). Mirror kept exact so the two can only
+// drift apart through a shared helper.
+__global__ void dequant_q5_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
+                                                __half* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int Q5_K_BLOCK_SIZE = 176;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int j_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * blocks_per_row * Q5_K_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q5_K_BLOCK_SIZE;
+
+    uint16_t d_bits, dmin_bits;
+    memcpy(&d_bits, block_ptr, 2);
+    memcpy(&dmin_bits, block_ptr + 2, 2);
+    float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+    float dmin = __half2float(reinterpret_cast<const __half&>(dmin_bits));
+    const uint8_t* scales = block_ptr + 4;
+    const uint8_t* qh = block_ptr + 16;
+    const uint8_t* ql = block_ptr + 48;
+
+    int group = j_in_block / 64;
+    int l_full = j_in_block % 64;
+    int l = l_full % 32;
+    int is = group * 2;
+
+    uint8_t sc, m_val;
+    if (l_full < 32) {
+        get_scale_min_k4(is, scales, &sc, &m_val);
+    } else {
+        get_scale_min_k4(is + 1, scales, &sc, &m_val);
+    }
+
+    float d1 = d * static_cast<float>(sc);
+    float m1 = dmin * static_cast<float>(m_val);
+
+    const uint8_t* ql_group = ql + group * 32;
+    uint8_t u_mask = (group == 0) ? 1 : (group == 1) ? 4 : (group == 2) ? 16 : 64;
+
+    int q_val;
+    if (l_full < 32) {
+        q_val = (ql_group[l] & 0xF) + ((qh[l] & u_mask) ? 16 : 0);
+    } else {
+        uint8_t u_mask2 = (group == 0) ? 2 : (group == 1) ? 8 : (group == 2) ? 32 : 128;
+        q_val = (ql_group[l] >> 4) + ((qh[l] & u_mask2) ? 16 : 0);
+    }
+
+    out[idx] = __float2half(d1 * static_cast<float>(q_val) - m1);
+}
+
+void launch_dequant_q5_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q5_k_matrix_fp16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), static_cast<__half*>(out), N, K);
+}
+
 // ---- Q6_K Matrix Dequantization ----
 
 __global__ void dequant_q6_k_matrix_kernel(const uint8_t* __restrict__ q_data,
@@ -1119,6 +1190,110 @@ void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M
 #endif
 }
 
+// ---- Phase 6-A-5: native FP16 × FP16 → FP16 GEMM ----
+// A / B / C are all __half. Storage is FP16; accumulation runs in FP32
+// (CUBLAS_COMPUTE_32F) on Tensor Cores, then the result is rounded back to FP16
+// for storage. This is the "native FP16 execution" matmul the runtime needs: an
+// FP16 weight that already lives as Tensor::FP16 flows straight into cuBLAS with
+// no FP32 detour (unlike launch_cublas_gemm_quant_fp16, which starts from a
+// quantized weight, or launch_cublas_gemm_fp16_fp32, which produces FP32 output).
+void launch_cublas_gemm_fp16(const __half* A, const __half* B, __half* C, int M, int K, int N,
+                             bool transB, cudaStream_t stream) {
+#if FORGE_USE_CUBLAS
+    cublasHandle_t handle = get_cublas_handle(stream);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    cublasGemmEx(handle, opB, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16F, transB ? K : N, A,
+                 CUDA_R_16F, K, &beta, C, CUDA_R_16F, N, CUBLAS_COMPUTE_32F,
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#else
+    (void)A;
+    (void)B;
+    (void)C;
+    (void)M;
+    (void)K;
+    (void)N;
+    (void)transB;
+    (void)stream;
+#endif
+}
+
+// ---- Phase 3: quantized B [N,K] → FP16 + cuBLAS TensorCore GEMM ----
+// Dequantizes the whole weight matrix into a private grow-only scratch buffer
+// (the same pattern as the A-side buffer inside launch_cublas_gemm_fp16_fp32
+// above) and runs the FP16 × FP16 → FP32 GEMM on Tensor Cores. The scratch only
+// grows when a larger shape shows up, so once a shape has been seen a repeated
+// prefill call never allocates — keeping this call safe inside a CUDA graph
+// capture for every shape it has already handled.
+bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q, float* C, int M,
+                                   int K, int N, bool transB, cudaStream_t stream) {
+#if FORGE_USE_CUBLAS
+    switch (dt) {
+    case DataType::Q4_0:
+    case DataType::Q4_K:
+    case DataType::Q6_K:
+    case DataType::Q8_0:
+    case DataType::Q5_K:  // Phase 5-B: FP16 whole-matrix dequant added
+        break;
+    default:
+        return false;
+    }
+
+    static void* b_fp16 = nullptr;
+    static size_t b_fp16_capacity = 0;
+    const size_t b_bytes = (size_t)N * K * sizeof(__half);
+    if (b_bytes > b_fp16_capacity) {
+        if (b_fp16)
+            cudaFree(b_fp16);
+        if (cudaMalloc(&b_fp16, b_bytes) != cudaSuccess) {
+            b_fp16 = nullptr;
+            b_fp16_capacity = 0;
+            return false;
+        }
+        b_fp16_capacity = b_bytes;
+    }
+    if (!b_fp16)
+        return false;
+
+    switch (dt) {
+    case DataType::Q4_0:
+        launch_dequant_q4_0_matrix_fp16(B_q, b_fp16, N, K, stream);
+        break;
+    case DataType::Q4_K:
+        launch_dequant_q4_k_matrix_fp16(B_q, b_fp16, N, K, stream);
+        break;
+    case DataType::Q6_K:
+        launch_dequant_q6_k_matrix_fp16(B_q, b_fp16, N, K, stream);
+        break;
+    case DataType::Q5_K:
+        launch_dequant_q5_k_matrix_fp16(B_q, b_fp16, N, K, stream);
+        break;
+    case DataType::Q8_0:
+        launch_dequant_q8_0_matrix_fp16(B_q, b_fp16, N, K, stream);
+        break;
+    default:
+        return false;  // unreachable (guarded above)
+    }
+    launch_cublas_gemm_fp16_fp32(A, b_fp16, C, M, K, N, transB, stream);
+    return true;
+#else
+    (void)dt;
+    (void)A;
+    (void)B_q;
+    (void)C;
+    (void)M;
+    (void)K;
+    (void)N;
+    (void)transB;
+    (void)stream;
+    return false;
+#endif
+}
+
 // =========================================================================
 // KV Cache quantization kernels: F16, Q8_0, Q4_K
 // =========================================================================
@@ -1435,6 +1610,47 @@ void launch_dequant_q8_0_matrix(const void* q_data, float* out, int num_rows, in
     int blocks = (total + threads - 1) / threads;
     dequant_q8_0_matrix_kernel<<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(q_data),
                                                                out, num_rows, row_len);
+}
+
+// ---- Q8_0 Matrix Dequantization to FP16 (Phase 3 Tensor Core path) ----
+// Block layout (same as dequant_q8_0_matrix_kernel): fp16 scale d (2B) +
+// signed int8 qs[32] (32B) per 32 elements, row-major over N rows of K columns.
+
+__global__ void dequant_q8_0_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
+                                                __half* __restrict__ out, int N, int K) {
+    const int Q8_0_BLOCK_SIZE = 34;
+    const int BLOCK_ELEMS = 32;
+    int num_blocks_row = (K + BLOCK_ELEMS - 1) / BLOCK_ELEMS;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / BLOCK_ELEMS;
+    int j = col % BLOCK_ELEMS;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * num_blocks_row * Q8_0_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + (size_t)bi * Q8_0_BLOCK_SIZE;
+
+    uint16_t scale_bits;
+    memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
+    float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
+
+    const int8_t* qs = reinterpret_cast<const int8_t*>(block_ptr + sizeof(uint16_t));
+    out[idx] = __float2half(static_cast<float>(qs[j]) * scale);
+}
+
+void launch_dequant_q8_0_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q8_0_matrix_fp16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), static_cast<__half*>(out), N, K);
 }
 
 // ---- Q4_K Quantize (FP32 → Q4_K) ----

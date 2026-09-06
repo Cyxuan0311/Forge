@@ -10,6 +10,7 @@
 #include "forge/cuda_kernels.h"
 #include "forge/engines/transformer_engine.h"
 #include "forge/inference/tensor_device_utils.h"
+#include "forge/kernel_selector.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 #include "forge/quant_traits.h"
@@ -61,9 +62,19 @@ TensorPtr build_router_input(const TensorPtr& attn_residual, const LayerWeights&
 }
 
 #ifdef USE_CUDA
-// 按 dtype 分派 MoE expert GEMV。不支持的 dtype 不做任何事, 与重构前一致。
+// 按 dtype 分派 MoE expert GEMV。支持集由统一 kernel selector 判定
+// (Q4_0/Q4_K/Q6_K/Q8_0 -> MOE_EXPERT_GEMV)；不支持的 dtype 不做任何事,
+// 与重构前一致。
 void moe_gemv(DataType dt, const float* x, const void* w, float* out, const int* d_indices,
               const float* d_weights, int K, int N, int n_expert, int n_expert_used, int seq_len) {
+    KernelProblem problem;
+    problem.domain = KernelDomain::MoE;
+    problem.dtype = dt;
+    problem.M = seq_len;
+    problem.N = N;
+    problem.K = K;
+    if (select_kernel(problem) == KernelVariant::UNSUPPORTED)
+        return;
     switch (dt) {
         case DataType::Q4_0:
             cuda::launch_moe_expert_gemv<DataType::Q4_0>(x, w, out, d_indices, d_weights, K, N,

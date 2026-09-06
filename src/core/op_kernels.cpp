@@ -1,7 +1,10 @@
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #include "forge/cuda_kernels.h"
+#include "forge/dtype_contract.h"
 #include "forge/op_dispatch.h"
 #include "forge/operators.h"
 
@@ -18,15 +21,19 @@ namespace {
 // These kernels write directly into dst->data(), eliminating graph-mode memcpy.
 
 // ---- ADD (dst injection) ----
-void add_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*) {
+// 6-A-6.4: stream forwarded to launch_* (default 0 = legacy stream).
+void add_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*,
+                    cudaStream_t stream) {
     auto a = inputs[0];
     auto b = inputs[1];
     int n = static_cast<int>(a->numel());
     if (a->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
+        require_dtype_supported("add_kernel_dst", OpType::ADD, a->dtype());
+        require_dtype_supported("add_kernel_dst", OpType::ADD, b->dtype());
         cuda::launch_add_bias(static_cast<const float*>(a->data()),
                               static_cast<const float*>(b->data()),
-                              static_cast<float*>(dst->data()), n);
+                              static_cast<float*>(dst->data()), n, stream);
 #endif
     } else {
         const float* a_data = static_cast<const float*>(a->data());
@@ -37,15 +44,18 @@ void add_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const i
 }
 
 // ---- MUL (dst injection) ----
-void mul_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*) {
+void mul_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*,
+                    cudaStream_t stream) {
     auto a = inputs[0];
     auto b = inputs[1];
     int n = static_cast<int>(a->numel());
     if (a->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
+        require_dtype_supported("mul_kernel_dst", OpType::MUL, a->dtype());
+        require_dtype_supported("mul_kernel_dst", OpType::MUL, b->dtype());
         cuda::launch_multiply(static_cast<const float*>(a->data()),
                               static_cast<const float*>(b->data()),
-                              static_cast<float*>(dst->data()), n);
+                              static_cast<float*>(dst->data()), n, stream);
 #endif
     } else {
         const float* a_data = static_cast<const float*>(a->data());
@@ -56,13 +66,30 @@ void mul_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const i
 }
 
 // ---- SILU (dst injection) ----
-void silu_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*) {
+void silu_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*,
+                     cudaStream_t stream) {
     auto x = inputs[0];
     int n = static_cast<int>(x->numel());
+    if (x->dtype() == DataType::FP16) {
+        const __half* x_h = reinterpret_cast<const __half*>(x->data());
+        __half* o_h = reinterpret_cast<__half*>(dst->data());
+        if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            cuda::launch_silu_fp16(x_h, o_h, n, stream);
+#endif
+        } else {
+            std::vector<float> xf(n), of(n);
+            for (int i = 0; i < n; ++i) xf[i] = __half2float(x_h[i]);
+            for (int i = 0; i < n; ++i) of[i] = xf[i] / (1.0f + std::exp(-xf[i]));
+            for (int i = 0; i < n; ++i) o_h[i] = __float2half(of[i]);
+        }
+        return;
+    }
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
+        require_dtype_supported("silu_kernel_dst", OpType::SILU, x->dtype());
         cuda::launch_silu(static_cast<const float*>(x->data()),
-                          static_cast<float*>(dst->data()), n);
+                          static_cast<float*>(dst->data()), n, stream);
 #endif
     } else {
         const float* x_data = static_cast<const float*>(x->data());
@@ -78,7 +105,7 @@ void silu_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const 
 // inputs[0] = x, inputs[1] = weight
 // params[0..1] = float eps
 void rms_norm_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst,
-                         const int32_t* params) {
+                         const int32_t* params, cudaStream_t stream) {
     auto x = inputs[0];
     auto weight = (inputs.size() > 1) ? inputs[1] : nullptr;
     float eps = 1e-6f;
@@ -89,16 +116,51 @@ void rms_norm_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst,
     int rows = static_cast<int>(x->shape()[0]);
     int cols = static_cast<int>(x->shape()[1]);
 
+    if (x->dtype() == DataType::FP16) {
+        const __half* x_h = reinterpret_cast<const __half*>(x->data());
+        const __half* w_h = weight ? reinterpret_cast<const __half*>(weight->data()) : nullptr;
+        __half* o_h = reinterpret_cast<__half*>(dst->data());
+        if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            if (weight) {
+                cuda::launch_rms_norm_fp16(x_h, w_h, o_h, rows, cols, eps, stream);
+            } else {
+                std::vector<__half> ones(cols, __half(1.0f));
+                cuda::launch_rms_norm_fp16(x_h, ones.data(), o_h, rows, cols, eps, stream);
+            }
+#endif
+        } else {
+            // CPU path is FP32-only by design: upcast locally, run the FP32 row kernel, store FP16.
+            std::vector<float> xf(cols), of(rows * cols);
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) xf[c] = __half2float(x_h[r * cols + c]);
+                const float* wrow = nullptr;
+                std::vector<float> wf;
+                if (weight) {
+                    wf.assign(cols, 0.0f);
+                    for (int c = 0; c < cols; ++c) wf[c] = __half2float(w_h[c]);
+                    wrow = wf.data();
+                }
+                forge::cpu::rms_norm_row_f32(xf.data(), wrow, of.data() + r * cols, cols, eps);
+            }
+            for (size_t k = 0; k < of.size(); ++k) o_h[k] = __float2half(of[k]);
+        }
+        return;
+    }
+
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
+        require_dtype_supported("rms_norm_kernel_dst", OpType::RMS_NORM, x->dtype());
         if (weight) {
+            require_dtype_supported("rms_norm_kernel_dst/weight", OpType::RMS_NORM,
+                                    weight->dtype());
             cuda::launch_rms_norm(static_cast<const float*>(x->data()),
                                   static_cast<const float*>(weight->data()),
-                                  static_cast<float*>(dst->data()), rows, cols, eps);
+                                  static_cast<float*>(dst->data()), rows, cols, eps, stream);
         } else {
             std::vector<float> ones(cols, 1.0f);
             cuda::launch_rms_norm(static_cast<const float*>(x->data()), ones.data(),
-                                  static_cast<float*>(dst->data()), rows, cols, eps);
+                                  static_cast<float*>(dst->data()), rows, cols, eps, stream);
         }
 #endif
     } else {
@@ -128,7 +190,9 @@ void rms_norm_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst,
 //   [6..7] = float rope_theta
 //   [8] = use_neox (0/1)
 //   [9] = device_type (0=CPU, 1=CUDA)
-void rope_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t* params) {
+// 6-A-6.4: stream forwarded. ROPE stays FP32-only (no FP16 branch — see 6-A-6.3 gate).
+void rope_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t* params,
+                     cudaStream_t stream) {
     auto x = inputs[0];
     if (!params)
         return;
@@ -148,11 +212,11 @@ void rope_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const 
         if (is_q) {
             cuda::launch_rope_gqa(static_cast<const float*>(x->data()), nullptr, nullptr,
                                   static_cast<float*>(dst->data()), num_h, 0, head_dim,
-                                  seq_len, start_pos, rope_theta);
+                                  seq_len, start_pos, rope_theta, stream);
         } else {
             cuda::launch_rope_gqa(nullptr, static_cast<const float*>(x->data()), nullptr,
                                   static_cast<float*>(dst->data()), 0, num_h, head_dim, seq_len,
-                                  start_pos, rope_theta);
+                                  start_pos, rope_theta, stream);
         }
 #endif
     } else {
@@ -180,13 +244,21 @@ void rope_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const 
 // ---- Legacy kernels (for ops not yet migrated to dst injection) ----
 
 // ---- MUL_MAT_TRANSB (legacy) ----
-TensorPtr mul_mat_transb_kernel(const std::vector<TensorPtr>& inputs, const int32_t*) {
+// 6-A-6.4: stream plumbed through to ops::matmul_transB (native FP16 cuBLAS
+// honors it). No dst injection here by design (see 6-A-6.4 scope: A).
+TensorPtr mul_mat_transb_kernel(const std::vector<TensorPtr>& inputs, const int32_t*,
+                                cudaStream_t stream) {
     TensorPtr bias = (inputs.size() > 2) ? inputs[2] : nullptr;
-    return ops::matmul_transB(inputs[0], inputs[1], bias);
+    return ops::matmul_transB(inputs[0], inputs[1], bias, stream);
 }
 
 // ---- FLASH_ATTN_GQA (legacy) ----
-TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int32_t* params) {
+// 6-A-7: native FP16 branch added (all-FP16 QKV, FP32 math, FP16 out, stream
+// honored from day one). FP32 path unchanged. Mixed dtypes / non-GQA CUDA /
+// CPU: unchanged behavior. Unsupported FP16 configs throw loudly — never
+// reinterpreted as float.
+TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int32_t* params,
+                                cudaStream_t stream) {
     auto q = inputs[0];
     auto k = inputs[1];
     auto v = inputs[2];
@@ -201,6 +273,51 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
 
     int seq_len_q = static_cast<int>(q->shape()[0]);
     int total_len = static_cast<int>(k->shape()[0]);
+
+    // 6-A-7 native FP16 decode: Q/K/V all FP16, GQA, seq_len_q == 1.
+    // Prefill (seq>1) FP16 lands in 7.2; mixed dtypes keep loud rejection.
+    if (dev == DeviceType::CUDA && q->dtype() == DataType::FP16) {
+        require_dtype_supported("flash_attn_gqa_kernel/q", OpType::FLASH_ATTN_GQA, q->dtype());
+        require_dtype_supported("flash_attn_gqa_kernel/k", OpType::FLASH_ATTN_GQA, k->dtype());
+        require_dtype_supported("flash_attn_gqa_kernel/v", OpType::FLASH_ATTN_GQA, v->dtype());
+        if (k->dtype() != DataType::FP16 || v->dtype() != DataType::FP16) {
+            throw std::runtime_error(
+                "flash_attn_gqa_kernel: native FP16 attention needs all-FP16 QKV.");
+        }
+        if (num_kv_heads >= num_heads) {
+            throw std::runtime_error(
+                "flash_attn_gqa_kernel: FP16 non-GQA (MHA) has no native kernel yet (6-A-7: "
+                "decode-first GQA only).");
+        }
+        if (head_dim != 16 && head_dim != 32 && head_dim != 64 && head_dim != 96 &&
+            head_dim != 128) {
+            throw std::runtime_error("flash_attn_gqa_kernel: FP16 attention unsupported head_dim=" +
+                                     std::to_string(head_dim) + " (6-A-7: 16/32/64/96/128 only).");
+        }
+        auto attn_out = std::make_shared<Tensor>(
+            DataType::FP16, std::vector<int64_t>{seq_len_q, num_heads * head_dim},
+            DeviceType::CUDA);
+#ifdef USE_CUDA
+        if (seq_len_q == 1) {
+            cuda::launch_flash_attention_gqa_decode_fp16(
+                reinterpret_cast<const __half*>(q->data()),
+                reinterpret_cast<const __half*>(k->data()),
+                reinterpret_cast<const __half*>(v->data()),
+                reinterpret_cast<__half*>(attn_out->data()), total_len, num_heads, num_kv_heads,
+                head_dim, nullptr, stream);
+        } else {
+            // 6-A-7.2: vectorized prefill (causal convention matches the FP32
+            // vectorized kernel: q_pos = kv_len - q_len + qi).
+            cuda::launch_flash_attention_gqa_prefill_fp16(
+                reinterpret_cast<const __half*>(q->data()),
+                reinterpret_cast<const __half*>(k->data()),
+                reinterpret_cast<const __half*>(v->data()),
+                reinterpret_cast<__half*>(attn_out->data()), seq_len_q, total_len, num_heads,
+                num_kv_heads, head_dim, nullptr, causal, stream);
+        }
+#endif
+        return attn_out;
+    }
 
     if (dev == DeviceType::CUDA && num_kv_heads < num_heads) {
         auto attn_out = std::make_shared<Tensor>(

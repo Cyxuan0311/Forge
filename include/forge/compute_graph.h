@@ -15,6 +15,9 @@
 #include "op_enum.h"
 #include "tensor.h"
 
+// 6-A-6.4: cudaStream_t for execute(). op_dispatch.h already provides the
+// type (with CPU-only fallback); no extra include needed here.
+
 namespace forge {
 
 struct GraphNode {
@@ -51,11 +54,15 @@ public:
                  std::function<TensorPtr(const std::vector<TensorPtr>&)> compute_fn,
                  DeviceType dev = DeviceType::CPU);
 
-    // Execute the full graph sequentially
-    TensorPtr execute();
+    // Execute the full graph sequentially.
+    // 6-A-6.4: stream defaults to 0 (legacy stream) — all existing callers
+    // keep zero behavior change. Only CUDA Graph capture passes a non-zero
+    // capture stream. No synchronization is performed inside: the caller
+    // synchronizes when it needs the results (stream plumbing != sync policy).
+    TensorPtr execute(cudaStream_t stream = 0);
 
     // Execute a single node by index
-    TensorPtr execute_node(int node_idx);
+    TensorPtr execute_node(int node_idx, cudaStream_t stream = 0);
 
     // Pre-allocate memory for all intermediate tensors using MemoryPlanner.
     // Must be called before execute(). Returns true on success.
@@ -112,6 +119,21 @@ public:
 
     TensorPtr last_output() const;
 
+    // ---- Phase 6-A-6: dtype flow trace ----
+    // Records the input/output dtypes of every executed node. Used to detect silent
+    // FP16 -> FP32 -> FP16 materialization: in a native-FP16 chain every record's
+    // output_dtype should stay FP16 (storage-preserving ops). Enable via FORGE_TRACE_DTYPE=1.
+    struct DTypeTraceRecord {
+        std::string name;
+        std::vector<DataType> input_dtypes;
+        DataType output_dtype = DataType::FP32;
+        bool dst_injected = false;  // true if the node wrote into a pre-allocated graph buffer
+        DeviceType device = DeviceType::CPU;
+    };
+    const std::vector<DTypeTraceRecord>& dtype_trace() const { return dtype_trace_; }
+    void clear_dtype_trace() { dtype_trace_.clear(); }
+    static bool trace_dtype_enabled();
+
 private:
     TensorPtr ensure_device(const TensorPtr& tensor, DeviceType target_dev);
     std::unordered_set<int> find_consumers(int node_idx) const;
@@ -137,6 +159,9 @@ private:
 
     // Scheduling plan (optional)
     std::unique_ptr<SchedulingPlan> schedule_;
+
+    // Phase 6-A-6: dtype flow trace (populated only when trace_dtype_enabled())
+    std::vector<DTypeTraceRecord> dtype_trace_;
 };
 
 class GraphBuilder {

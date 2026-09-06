@@ -47,7 +47,8 @@ if(CUDAToolkit_FOUND)
             cuda/cuda_moe.cu
             cuda/cuda_sampler.cu
             cuda/cuda_ssm.cu
-            cuda/cuda_mmq.cu)
+            cuda/cuda_mmq.cu
+            cuda/kernel_selector.cpp)
   target_compile_definitions(forge_ops PUBLIC USE_CUDA)
   set_target_properties(forge_ops PROPERTIES CUDA_ARCHITECTURES
                                              "${FORGE_CUDA_ARCH}")

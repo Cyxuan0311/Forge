@@ -11,6 +11,15 @@
 #include "tensor.h"
 #include "types.h"
 
+// 6-A-6.4: stream plumbing. Mirrors forge/cuda_kernels.h so this header is
+// safe to include with or without it, in CUDA or CPU-only builds.
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#else
+struct CUstream_st;
+typedef CUstream_st* cudaStream_t;
+#endif
+
 namespace forge {
 
 // Max size of fixed op params (matching ggml's GGML_MAX_OP_PARAMS)
@@ -29,16 +38,20 @@ struct CapabilityResult {
 };
 
 // ---- Phase 3: dst injection signature ----
-// New kernel signature: (inputs, dst, params) -> void
+// New kernel signature: (inputs, dst, params, stream) -> void
 // The kernel writes directly into dst->data(), no internal allocation.
 // This eliminates the graph-mode memcpy (compute_graph.cpp:186-214).
-using OpKernelFnDst =
-    std::function<void(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t* params)>;
+// 6-A-6.4: trailing stream added (default 0 = legacy stream). CPU kernels
+// ignore it; CUDA kernels forward it to launch_* (which already default to 0).
+using OpKernelFnDst = std::function<void(const std::vector<TensorPtr>& inputs, TensorPtr dst,
+                                         const int32_t* params, cudaStream_t stream)>;
 
-// Legacy kernel signature: (inputs, params) -> output tensor
+// Legacy kernel signature: (inputs, params, stream) -> output tensor
 // Kept for backward compatibility. Ops not yet migrated to dst injection use this.
-using OpKernelFn =
-    std::function<TensorPtr(const std::vector<TensorPtr>& inputs, const int32_t* params)>;
+// 6-A-6.4: trailing stream added (default 0). Legacy kernels that cannot honor
+// a non-zero stream document it and keep legacy-stream behavior.
+using OpKernelFn = std::function<TensorPtr(const std::vector<TensorPtr>& inputs,
+                                           const int32_t* params, cudaStream_t stream)>;
 
 // Per-op, per-device kernel registration
 class OpDispatch {
@@ -65,14 +78,18 @@ public:
                               const TensorPtr& dst) const;
 
     // Legacy execute: internally allocates dst, calls dst kernel if available
+    // 6-A-6.4: stream defaults to 0 (legacy stream) — all existing callers
+    // keep zero behavior change. Only graph capture passes a capture stream.
     TensorPtr execute(OpType op, DeviceType dev, const std::vector<TensorPtr>& inputs,
-                      const int32_t* params = nullptr) const;
+                      const int32_t* params = nullptr, cudaStream_t stream = 0) const;
 
     // Phase 3: execute with dst injection
     // If a dst kernel is registered, calls it directly (no allocation, no memcpy).
     // If only legacy kernel is registered, calls legacy kernel and copies result into dst.
+    // 6-A-6.4: same stream default as execute().
     void execute_dst(OpType op, DeviceType dev, const std::vector<TensorPtr>& inputs,
-                     TensorPtr dst, const int32_t* params = nullptr) const;
+                     TensorPtr dst, const int32_t* params = nullptr,
+                     cudaStream_t stream = 0) const;
 
     // Check if an op can be done in-place (output can reuse one input's memory)
     bool can_inplace(OpType op) const;

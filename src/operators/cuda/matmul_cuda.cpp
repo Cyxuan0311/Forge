@@ -1,90 +1,41 @@
-// Phase 4: CUDA dispatch for the matmul family.
-// Moved verbatim out of src/operators/cpu/matmul.cpp (commit 1: pure move, behaviour unchanged).
+// Phase 4: CUDA dispatch for the matmul family (launch side).
+// Policy decisions (GEMV / MMQ / TensorCore / MoE) live in the unified kernel
+// selector (forge/kernel_selector.{h,cpp}); this file only routes the selected
+// KernelVariant to the matching kernel launch.
+// Originally moved out of src/operators/cpu/matmul.cpp (commit 1: pure move).
 
 #include "matmul_cuda.h"
 
 #ifdef USE_CUDA
 
 #    include <algorithm>
+#    include <cstdlib>
 #    include <cstring>
+#    include <functional>
 #    include <stdexcept>
 
 #    include <cuda_runtime.h>
 
 #    include "forge/cuda_kernels.h"
 #    include "forge/cuda_mem_pool.h"
+#    include "forge/dtype_contract.h"
+#    include "forge/kernel_selector.h"
 #    include "forge/logger.h"
 #    include "forge/operator_elementwise.h"
 #    include "forge/operator_matmul.h"
 #    include "forge/quant_traits.h"
+#    include "matmul_dispatch.h"
 
 namespace forge {
 namespace ops {
 
 namespace {
 
-using DequantMatrixFn = void (*)(const void*, float*, int, int, cudaStream_t);
-
-// Device-side full-matrix dequantization kernels. nullptr means the dtype has no
-// CUDA dequant kernel.
-DequantMatrixFn device_dequant_matrix_fn(DataType dt) {
-    switch (dt) {
-    case DataType::Q4_0:
-        return cuda::launch_dequant_q4_0_matrix;
-    case DataType::Q4_1:
-        return cuda::launch_dequant_q4_1_matrix;
-    case DataType::Q4_K:
-        return cuda::launch_dequant_q4_k_matrix;
-    case DataType::Q5_0:
-        return cuda::launch_dequant_q5_0_matrix;
-    case DataType::Q5_1:
-        return cuda::launch_dequant_q5_1_matrix;
-    case DataType::Q2_K:
-        return cuda::launch_dequant_q2_k_matrix;
-    case DataType::Q3_K:
-        return cuda::launch_dequant_q3_k_matrix;
-    case DataType::Q5_K:
-        return cuda::launch_dequant_q5_k_matrix;
-    case DataType::Q6_K:
-        return cuda::launch_dequant_q6_k_matrix;
-    case DataType::Q8_0:
-        // num_rows/row_len signature is identical to (N, K).
-        return cuda::launch_dequant_q8_0_matrix;
-    case DataType::IQ2_S:
-        return cuda::launch_dequant_iq2_s_matrix;
-    case DataType::IQ2_XS:
-        return cuda::launch_dequant_iq2_xs_matrix;
-    case DataType::IQ2_XXS:
-        return cuda::launch_dequant_iq2_xxs_matrix;
-    case DataType::IQ3_S:
-        return cuda::launch_dequant_iq3_s_matrix;
-    case DataType::IQ4_NL:
-        return cuda::launch_dequant_iq4_nl_matrix;
-    default:
-        return nullptr;
-    }
-}
-
-cuda::GemvFn device_gemv_fn(DataType dt) {
-    int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 21)
-        return nullptr;
-    return cuda::gemv_dispatch[idx];
-}
-
-cuda::GemvBatchFn device_gemv_batch_fn(DataType dt) {
-    int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 21)
-        return nullptr;
-    return cuda::gemv_batch_dispatch[idx];
-}
-
-cuda::MmqFn device_mmq_fn(DataType dt) {
-    int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 20)
-        return nullptr;
-    return cuda::mmq_dispatch[idx];
-}
+using internal::DequantMatrixFn;
+using internal::lookup_dequant_matrix;
+using internal::lookup_gemv;
+using internal::lookup_gemv_batch;
+using internal::lookup_mmq;
 
 // Phase 4 hard rule: when CUDA cannot handle the request, report a capability failure
 // with the reason. Never silently fall back to the host (no D2H/H2D staging).
@@ -125,6 +76,205 @@ DeviceScratch dequant_b_on_device(DequantMatrixFn fn, const TensorPtr& b, int N,
     fn(b->data(), scr.as_float(), N, K, 0);
     return scr;
 }
+
+// M == 1 (decode) single-row dispatch. The unified selector picks the variant;
+// each case launches. A null lookup after a non-UNSUPPORTED variant cannot
+// normally happen (the selector checks the same tables) and is treated as a
+// capability failure for defence in depth.
+void gemv_dispatch_row(const float* a_data, const TensorPtr& b, float* o_row, int K, int N_cols,
+                       const char* op_name) {
+    const DataType dt = b->dtype();
+
+    KernelProblem problem;
+    problem.domain = KernelDomain::MatMul;
+    problem.dtype = dt;
+    problem.M = 1;
+    problem.N = N_cols;
+    problem.K = K;
+
+    switch (select_kernel(problem)) {
+    case KernelVariant::GEMV_Q8_1: {
+        // Dedicated single-row quantized GEMV (Q8_1 + dp4a).
+        auto gemv = lookup_gemv(dt);
+        if (!gemv)
+            capability_failure(op_name, dt, 1, K, N_cols);
+        gemv(a_data, b->data(), o_row, K, N_cols, 0);
+        return;
+    }
+    case KernelVariant::GEMV_BATCH: {
+        // No dedicated M == 1 kernel: reuse the batched GEMV (on-the-fly
+        // dequant) with M == 1 before dequantizing the whole weight to FP32.
+        auto gemv_batch = lookup_gemv_batch(dt);
+        if (!gemv_batch)
+            capability_failure(op_name, dt, 1, K, N_cols);
+        gemv_batch(a_data, b->data(), o_row, 1, K, N_cols, 0);
+        return;
+    }
+    case KernelVariant::GEMV_DEQUANT_TRANSB: {
+        auto dequant_matrix = lookup_dequant_matrix(dt);
+        if (!dequant_matrix)
+            capability_failure(op_name, dt, 1, K, N_cols);
+        auto b_scratch = dequant_b_on_device(dequant_matrix, b, N_cols, K);
+        cuda::launch_gemv_transB(a_data, b_scratch.as_float(), o_row, K, N_cols);
+        return;
+    }
+    case KernelVariant::GEMV_FP32_TRANSB:
+        cuda::launch_gemv_transB(a_data, static_cast<const float*>(b->data()), o_row, K, N_cols);
+        return;
+    case KernelVariant::GEMV_FP32_CUBLAS:
+        // FP32: use cuBLAS for large N (output_proj), custom GEMV for small N.
+        cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_row, 1, K,
+                                  N_cols, true);
+        return;
+    case KernelVariant::UNSUPPORTED:
+    default:
+        capability_failure(op_name, dt, 1, K, N_cols);
+    }
+}
+
+// True when a benchmark env override pins the prefill path (mirrors the
+// selector's env_prefill_forced). Autotune must never overturn an explicit
+// FORGE_MATMUL_PATH / FORGE_FORCE_TC / FORGE_FORCE_MMQ regression switch.
+bool prefill_override_env_active() {
+    const char* env = std::getenv("FORGE_MATMUL_PATH");
+    if (env && (std::strcmp(env, "mmq") == 0 || std::strcmp(env, "dp4a") == 0 ||
+                std::strcmp(env, "tc") == 0))
+        return true;
+    const char* ftc = std::getenv("FORGE_FORCE_TC");
+    if (ftc && ftc[0] == '1')
+        return true;
+    const char* fmq = std::getenv("FORGE_FORCE_MMQ");
+    return fmq && fmq[0] == '1';
+}
+
+// FORGE_AUTOTUNE=1 (opt-in): one-shot real-tensor comparison of the MMQ (dp4a)
+// and TensorCore candidates, on a cache miss only, for the measurable prefill
+// slice (quantized Q4_0/Q4_K/Q5_K/Q6_K/Q8_0, M > 1, sm80+; Q5_K joined in Phase
+// 5-B with its FP16 whole-matrix dequant). Times min-of-3 runs of
+// each candidate on the actual inputs/outputs (TensorCore timing includes the
+// whole-weight FP16 dequant it pays in real use), records the winner into the
+// selector cache and returns it. Later calls with the same signature launch the
+// cached winner directly. Off by default: opt-in experiments only.
+KernelVariant autotune_prefill(const KernelProblem& problem, const float* a_data,
+                               const TensorPtr& b, float* o_data, int M, int K, int N) {
+    const DataType dt = b->dtype();
+    auto mmq = lookup_mmq(dt);
+    if (!mmq)
+        return select_kernel(problem);  // unreachable on the eligible slice; be safe
+
+    // Probe the TensorCore candidate first (FP16 whole-matrix dequant + cuBLAS
+    // FP16 GEMM). If it is unavailable there is no competition.
+    const bool tc_ok = cuda::launch_cublas_gemm_quant_fp16(dt, a_data, b->data(), o_data, M, K, N,
+                                                           /*transB=*/true, 0);
+    if (!tc_ok) {
+        kernel_cache_record(problem, KernelVariant::MMQ);
+        return KernelVariant::MMQ;
+    }
+
+    cudaEvent_t t0 = nullptr;
+    cudaEvent_t t1 = nullptr;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+
+    auto best_ms = [&](const std::function<void()>& run) -> float {
+        float best = 1e30f;
+        for (int i = 0; i < 3; ++i) {
+            cudaEventRecord(t0, 0);
+            run();
+            cudaEventRecord(t1, 0);
+            cudaEventSynchronize(t1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, t0, t1);
+            best = std::min(best, ms);
+        }
+        return best;
+    };
+    const float mmq_ms = best_ms([&] { mmq(a_data, b->data(), o_data, M, K, N, 0); });
+    const float tc_ms = best_ms([&] {
+        cuda::launch_cublas_gemm_quant_fp16(dt, a_data, b->data(), o_data, M, K, N, true, 0);
+    });
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+
+    const KernelVariant best =
+        (mmq_ms <= tc_ms) ? KernelVariant::MMQ : KernelVariant::MMQ_TENSORCORE;
+    kernel_cache_record(problem, best);
+    return best;
+}
+
+// M > 1 (prefill / speculative verification) dispatch.
+void matmul_multi_row(const float* a_data, const TensorPtr& b, float* o_data, int M, int K, int N) {
+    const DataType dt = b->dtype();
+
+    KernelProblem problem;
+    problem.domain = KernelDomain::MatMul;
+    problem.dtype = dt;
+    problem.M = M;
+    problem.N = N;
+    problem.K = K;
+
+    // Phase 4-B: measured-dispatch cache + opt-in autotuner. With
+    // FORGE_AUTOTUNE=1 the first encounter of a cacheable signature measures
+    // MMQ vs TensorCore on the real tensors and records the winner, replacing
+    // the M>=128 heuristic for that signature thereafter.
+    bool cache_hit = false;
+    KernelVariant variant = select_kernel_cached(problem, &cache_hit);
+    const char* autotune_env = std::getenv("FORGE_AUTOTUNE");
+    const bool autotune = autotune_env && autotune_env[0] == '1';
+    if (autotune && !prefill_override_env_active() && !cache_hit &&
+        kernel_autotune_eligible(problem)) {
+        variant = autotune_prefill(problem, a_data, b, o_data, M, K, N);
+    }
+
+    switch (variant) {
+    case KernelVariant::MMQ_TENSORCORE:
+        // Phase 3 (Tensor Core): dequantize the whole B to FP16 once and run a
+        // cuBLAS FP16 GEMM with FP32 accumulate. The launcher returns false (and
+        // launches nothing) whenever the dtype/arch/cuBLAS combination is not
+        // available, in which case we fall through to the verified SIMT kernels
+        // below (identical to the pre-Phase-4 TC probe + DP4A fall-through).
+        if (cuda::launch_cublas_gemm_quant_fp16(dt, a_data, b->data(), o_data, M, K, N,
+                                                /*transB=*/true, 0)) {
+            return;
+        }
+        [[fallthrough]];
+    case KernelVariant::MMQ: {
+        // MMQ tiled kernel: weight scales/mins decode once per tile and are
+        // reused across all M rows (dp4a int8 dot), giving sub-linear cost in
+        // M. The batched-GEMV fallback re-reads every weight row once per
+        // activation row (cost proportional to M).
+        auto mmq = lookup_mmq(dt);
+        if (!mmq)
+            capability_failure("matmul_transB", dt, M, K, N);
+        mmq(a_data, b->data(), o_data, M, K, N, 0);
+        return;
+    }
+    case KernelVariant::MATMUL_BATCH_GEMV: {
+        auto gemv_batch = lookup_gemv_batch(dt);
+        if (!gemv_batch)
+            capability_failure("matmul_transB", dt, M, K, N);
+        gemv_batch(a_data, b->data(), o_data, M, K, N, 0);
+        return;
+    }
+    case KernelVariant::MATMUL_DEQUANT_CUBLAS: {
+        // No batched GEMV kernel: dequantize on device, then cuBLAS.
+        auto dequant_matrix = lookup_dequant_matrix(dt);
+        if (!dequant_matrix)
+            capability_failure("matmul_transB", dt, M, K, N);
+        auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
+        cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
+        return;
+    }
+    case KernelVariant::MATMUL_CUBLAS:
+        cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M, K, N,
+                                  true);
+        return;
+    case KernelVariant::UNSUPPORTED:
+    default:
+        capability_failure("matmul_transB", dt, M, K, N);
+    }
+}
+
 }  // namespace
 
 void cuda_apply_bias(const TensorPtr& out, const TensorPtr& bias, int M, int N) {
@@ -150,7 +300,7 @@ void cuda_apply_bias(const TensorPtr& out, const TensorPtr& bias, int M, int N) 
 }
 
 TensorPtr cuda_dequantize_matrix(const TensorPtr& b, int rows, int cols) {
-    auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
+    auto dequant_matrix = lookup_dequant_matrix(b->dtype());
     if (!dequant_matrix)
         capability_failure("dequantize_matrix", b->dtype(), 0, cols, rows);
     auto b_fp32 = std::make_shared<Tensor>(DataType::FP32, b->shape(), DeviceType::CUDA);
@@ -160,6 +310,11 @@ TensorPtr cuda_dequantize_matrix(const TensorPtr& b, int rows, int cols) {
 
 void cuda_matmul(const TensorPtr& a, const TensorPtr& b_fp32, const TensorPtr& out, int M, int K,
                  int N) {
+    // Phase 6-A-1: explicit dtype contract at the CUDA matmul boundary.
+    require_dtype_supported("cuda_matmul/a", OpType::MUL_MAT, a->dtype());
+    require_dtype_supported("cuda_matmul/b", OpType::MUL_MAT, b_fp32->dtype());
+    require_dtype_supported("cuda_matmul/out", OpType::MUL_MAT, out->dtype());
+
     for (int m = 0; m < M; ++m) {
         cuda::launch_gemv(static_cast<const float*>(a->data()) + m * K,
                           static_cast<const float*>(b_fp32->data()),
@@ -168,111 +323,47 @@ void cuda_matmul(const TensorPtr& a, const TensorPtr& b_fp32, const TensorPtr& o
 }
 
 void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& out, int M, int K,
-                        int N) {
+                        int N, cudaStream_t stream) {
+    // Phase 6-A-1: an FP16 weight used to fall through to the FP32 path and be
+    // read as float (6-A-0 #8) — silently wrong, not a crash. Reject instead.
+    require_dtype_supported("cuda_matmul_transB/a", OpType::MUL_MAT_TRANSB, a->dtype());
+    require_dtype_supported("cuda_matmul_transB/b", OpType::MUL_MAT_TRANSB, b->dtype());
+    require_dtype_supported("cuda_matmul_transB/out", OpType::MUL_MAT_TRANSB, out->dtype());
+
+    // Phase 6-A-5: native FP16 storage -> FP16 storage GEMM (FP32 accumulate).
+    // Triggered only when A and B are both FP16; the op allocates an FP16 out for
+    // this branch. Everything else (FP32 / quantized) keeps the existing path, so
+    // Phase 5 is untouched. BF16 has no kernel yet (lands in 6-B) -- it passes this
+    // gate (op is "lowp-aware") but is rejected here loudly.
+    if (a->dtype() == DataType::FP16 && b->dtype() == DataType::FP16) {
+        if (out->dtype() != DataType::FP16) {
+            throw std::runtime_error(
+                "cuda_matmul_transB: FP16 A/B require an FP16 out (6-A-5 native path).");
+        }
+        cuda::launch_cublas_gemm_fp16(static_cast<const __half*>(a->data()),
+                                      static_cast<const __half*>(b->data()),
+                                      static_cast<__half*>(out->data()), M, K, N,
+                                      /*transB=*/true, stream);
+        return;
+    }
+
     const float* a_data = static_cast<const float*>(a->data());
     float* o_data = static_cast<float*>(out->data());
-    const bool quantized = is_quantized_type(b->dtype());
 
-    if (M > 1) {
-        // Multi-row batch (prefill / speculative verification): prefer the
-        // MMQ tiled kernel — weight scales/mins decode once per tile and are
-        // reused across all M rows (dp4a int8 dot), giving sub-linear cost in
-        // M. The batched-GEMV fallback re-reads every weight row once per
-        // activation row (cost proportional to M).
-        //
-        // Whitelist: dtypes whose MMQ kernels pass the reference suite
-        // (tests/test_mmq_reference.cpp). Q3_K has a known residual defect
-        // and stays on the verified batched-GEMV path.
-        // All six quantized dtypes now pass tests/test_mmq_reference.cpp.
-        auto mmq = device_mmq_fn(b->dtype());
-        if (mmq && quantized) {
-            mmq(a_data, b->data(), o_data, M, K, N, 0);
-        } else {
-            auto gemv_batch = device_gemv_batch_fn(b->dtype());
-            if (gemv_batch) {
-                gemv_batch(a_data, b->data(), o_data, M, K, N, 0);
-            } else if (quantized) {
-                // No batched GEMV kernel: dequantize on device, then cuBLAS
-                auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
-                if (!dequant_matrix)
-                    capability_failure("matmul_transB", b->dtype(), M, K, N);
-                auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
-                cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
-            } else {
-                cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data,
-                                          M, K, N, true);
-            }
-        }
-    } else {
-        // M == 1: single GEMV — use dispatch table for supported types
-        auto gemv = device_gemv_fn(b->dtype());
-        if (gemv) {
-            gemv(a_data, b->data(), o_data, K, N, 0);
-        } else if (quantized) {
-            // No dedicated M=1 kernel: fall back to the batched GEMV (on-the-fly
-            // dequant) with M=1 before dequantizing the whole weight to FP32.
-            auto gemv_batch = device_gemv_batch_fn(b->dtype());
-            if (gemv_batch) {
-                gemv_batch(a_data, b->data(), o_data, 1, K, N, 0);
-            } else {
-                auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
-                if (!dequant_matrix)
-                    capability_failure("matmul_transB", b->dtype(), M, K, N);
-                auto b_scratch = dequant_b_on_device(dequant_matrix, b, N, K);
-                cuda::launch_gemv_transB(a_data, b_scratch.as_float(), o_data, K, N);
-            }
-        } else {
-            // FP32: use cuBLAS for large N (output_proj), custom GEMV for small N
-            if (N > 4096) {
-                cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M, K,
-                                          N, true);
-            } else {
-                cuda::launch_gemv_transB(a_data, static_cast<const float*>(b->data()), o_data, K, N);
-            }
-        }
-    }
-}
-
-// Single-row (M == 1, decode) GEMV dispatched by weight dtype, written directly
-// into the caller-provided contiguous output slice `o_slice` (size [1, N_cols]).
-// Mirrors the M == 1 branch of cuda_matmul_transB but avoids allocating an
-// intermediate tensor.
-static void gemv_into_slice(const float* a_data, const TensorPtr& b, float* o_slice, int K,
-                            int N_cols) {
-    const bool quantized = is_quantized_type(b->dtype());
-
-    auto gemv = device_gemv_fn(b->dtype());
-    if (gemv) {
-        gemv(a_data, b->data(), o_slice, K, N_cols, 0);
-        return;
-    }
-    if (quantized) {
-        // No dedicated M == 1 kernel: reuse the batched GEMV (on-the-fly
-        // dequant) with M == 1, or dequantize the weight to FP32 and GEMV.
-        auto gemv_batch = device_gemv_batch_fn(b->dtype());
-        if (gemv_batch) {
-            gemv_batch(a_data, b->data(), o_slice, 1, K, N_cols, 0);
-            return;
-        }
-        auto dequant_matrix = device_dequant_matrix_fn(b->dtype());
-        if (!dequant_matrix)
-            capability_failure("matmul_transB_dual", b->dtype(), 1, K, N_cols);
-        auto b_scratch = dequant_b_on_device(dequant_matrix, b, N_cols, K);
-        cuda::launch_gemv_transB(a_data, b_scratch.as_float(), o_slice, K, N_cols);
-        return;
-    }
-    // FP32: cuBLAS for large N (output_proj), custom GEMV otherwise.
-    if (N_cols > 4096) {
-        cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_slice, 1, K,
-                                  N_cols, true);
-    } else {
-        cuda::launch_gemv_transB(a_data, static_cast<const float*>(b->data()), o_slice, K,
-                                 N_cols);
-    }
+    if (M > 1)
+        matmul_multi_row(a_data, b, o_data, M, K, N);
+    else
+        gemv_dispatch_row(a_data, b, o_data, K, N, "matmul_transB");
 }
 
 void cuda_matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const TensorPtr& b2,
                              const TensorPtr& out, int M, int K, int N1, int N2) {
+    // Phase 6-A-1: same contract as cuda_matmul_transB.
+    require_dtype_supported("cuda_matmul_transB_dual/a", OpType::MUL_MAT_TRANSB, a->dtype());
+    require_dtype_supported("cuda_matmul_transB_dual/b1", OpType::MUL_MAT_TRANSB, b1->dtype());
+    require_dtype_supported("cuda_matmul_transB_dual/b2", OpType::MUL_MAT_TRANSB, b2->dtype());
+    require_dtype_supported("cuda_matmul_transB_dual/out", OpType::MUL_MAT_TRANSB, out->dtype());
+
     (void)K;
     const int N = N1 + N2;
     float* o_data = static_cast<float*>(out->data());
@@ -282,8 +373,8 @@ void cuda_matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const Tens
         // Decode: write b1 into the first N1 columns and b2 into the last N2
         // columns of `out` directly. No intermediate tensor allocation and no
         // device-to-device interleave copies.
-        gemv_into_slice(a_data, b1, o_data, K, N1);
-        gemv_into_slice(a_data, b2, o_data + N1, K, N2);
+        gemv_dispatch_row(a_data, b1, o_data, K, N1, "matmul_transB_dual");
+        gemv_dispatch_row(a_data, b2, o_data + N1, K, N2, "matmul_transB_dual");
         return;
     }
 

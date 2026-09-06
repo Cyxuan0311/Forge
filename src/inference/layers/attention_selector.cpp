@@ -19,6 +19,14 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
         return AttentionPath::CUDA_GENERIC_MHA;
     }
 
+    // 6-A-7: native-FP16 QKV (contiguous FP16 tensors, no paged/quantized KV).
+    // Locked rule: q FP16 selects the F16 path by seq_len; q FP32 keeps every
+    // existing branch below untouched (no dtype-if inside CUDA_FP32_* cases).
+    if (p.q_dtype == DataType::FP16) {
+        return (p.seq_len == 1) ? AttentionPath::CUDA_F16_DECODE
+                                : AttentionPath::CUDA_F16_PREFILL;
+    }
+
     // GQA decode (seq_len == 1): prefer fused quantized KV if available
     if (p.seq_len == 1) {
         // Paged KV cache (Phase 4): traverse the page table directly.
@@ -124,6 +132,10 @@ const char* attention_path_name(AttentionPath path) {
         return "CUDA_FP32_PREFILL";
     case AttentionPath::CUDA_FP32_DECODE:
         return "CUDA_FP32_DECODE";
+    case AttentionPath::CUDA_F16_PREFILL:
+        return "CUDA_F16_PREFILL";
+    case AttentionPath::CUDA_F16_DECODE:
+        return "CUDA_F16_DECODE";
     case AttentionPath::CUDA_GENERIC_MHA:
         return "CUDA_GENERIC_MHA";
     case AttentionPath::CUDA_FUSED_Q4_0_DECODE:

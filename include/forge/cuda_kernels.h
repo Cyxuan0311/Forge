@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cuda_fp16.h>
+
 #include "forge/types.h"
 
 struct CUstream_st;
@@ -23,16 +25,37 @@ void launch_rms_norm(const float* x, const float* weight, float* out, int rows, 
 void launch_rms_norm_unweighted(const float* x, float* out, int rows, int cols, float eps,
                                 cudaStream_t stream = 0);
 
-void launch_rms_norm_fp16(const void* x, const void* weight, void* out, int rows, int cols,
+// Phase 6-A-2: real native FP16 RMSNorm (FP16 storage/arithmetic, FP32
+// reduction). Gated at the operator boundary by forge/dtype_contract.h
+// (op_supports_lowp / RMS_NORM).
+void launch_rms_norm_fp16(const __half* x, const __half* weight, __half* out, int rows, int cols,
                           float eps, cudaStream_t stream = 0);
+
+// Phase 6-A-2: unweighted native FP16 RMSNorm (out = x * rsqrt(mean(x^2)+eps)).
+void launch_rms_norm_unweighted_fp16(const __half* x, __half* out, int rows, int cols, float eps,
+                                     cudaStream_t stream = 0);
 
 void launch_silu(const float* x, float* out, int n, cudaStream_t stream = 0);
 
-void launch_silu_fp16(const void* x, void* out, int n, cudaStream_t stream = 0);
+// Phase 6-A-3: real native FP16 SiLU (FP16 storage, FP32 sigmoid/exp compute,
+// FP16 output). Gated at the operator boundary by forge/dtype_contract.h
+// (op_supports_lowp / SILU).
+void launch_silu_fp16(const __half* x, __half* out, int n, cudaStream_t stream = 0);
 
 void launch_gelu(const float* x, float* out, int n, cudaStream_t stream = 0);
 
 void launch_gelu_tanh(const float* x, float* out, int n, cudaStream_t stream = 0);
+
+// Phase 6-A-4: real native FP16 activation family (FP16 storage, FP32
+// transcendental compute, FP16 output) -- mirrors the 6-A-2/6-A-3 policy. Each
+// op's gate is op_supports_lowp (whitelisted in forge/dtype_contract.h). The
+// gated variants (silu_multiply / gelu_multiply) reuse the SILU / GELU gate.
+void launch_gelu_fp16(const __half* x, __half* out, int n, cudaStream_t stream = 0);
+void launch_gelu_tanh_fp16(const __half* x, __half* out, int n, cudaStream_t stream = 0);
+void launch_silu_multiply_fp16(const __half* gate, const __half* up, __half* out, int n,
+                               cudaStream_t stream = 0);
+void launch_gelu_multiply_fp16(const __half* gate, const __half* up, __half* out, int n,
+                               cudaStream_t stream = 0);
 
 void launch_gelu_multiply(const float* gate, const float* up, float* out, int n,
                           cudaStream_t stream = 0);
@@ -226,6 +249,22 @@ void launch_flash_attention_gqa_decode(const float* Q, const float* K, const flo
                                        int kv_len, int num_heads, int num_kv_heads, int head_dim,
                                        const float* mask_row = nullptr, cudaStream_t stream = 0);
 
+// 6-A-7: native FP16 GQA decode (__half storage, FP32 QK^T/softmax/PV, __half
+// output). HD 16/32/64/96/128; larger dims rejected host-side, never fallback.
+void launch_flash_attention_gqa_decode_fp16(const __half* Q, const __half* K, const __half* V,
+                                            __half* O, int kv_len, int num_heads,
+                                            int num_kv_heads, int head_dim,
+                                            const __half* mask_row_or_null = nullptr,
+                                            cudaStream_t stream = 0);
+
+// 6-A-7.2: native FP16 vectorized GQA prefill (same dtype contract as decode).
+// HD 16/32/64/96/128; larger dims rejected host-side, never fallback.
+void launch_flash_attention_gqa_prefill_fp16(const __half* Q, const __half* K, const __half* V,
+                                             __half* O, int q_len, int kv_len, int num_heads,
+                                             int num_kv_heads, int head_dim,
+                                             const __half* mask_or_null = nullptr,
+                                             bool causal = true, cudaStream_t stream = 0);
+
 void launch_quantize_q4_0(const float* data, void* q_data, int n, cudaStream_t stream = 0);
 
 void launch_quantize_q4_0_matrix(const float* data, void* q_data, int num_rows, int row_len,
@@ -283,6 +322,10 @@ void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K
 
 void launch_dequant_q6_k_matrix_fp16(const void* q_data, void* out, int N, int K,
                                      cudaStream_t stream = 0);
+void launch_dequant_q5_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream = 0);
+void launch_dequant_q8_0_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream = 0);
 
 void launch_dequant_q4_1_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
@@ -292,6 +335,22 @@ void launch_cublas_sgemm(const float* A, const float* B, float* C, int M, int K,
 
 void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M, int K, int N,
                                   bool transB, cudaStream_t stream = 0);
+
+// Phase 6-A-5: native FP16 × FP16 → FP16 GEMM (FP32 accumulate on Tensor Cores).
+// Storage FP16 in/out, FP32 reduction -- matches the 6-A-2..6-A-4 activation
+// policy. Used by the native FP16 matmul route (MUL_MAT_TRANSB) so a weight that
+// already lives as Tensor::FP16 flows into cuBLAS without an FP32 detour.
+void launch_cublas_gemm_fp16(const __half* A, const __half* B, __half* C, int M, int K, int N,
+                             bool transB, cudaStream_t stream = 0);
+
+// Phase 3/5 (Tensor Core): dequantize the whole quantized B [N, K] matrix to
+// FP16 and run the FP16 cuBLAS GEMM (FP32 accumulate) on Tensor Cores.
+// Supported for every dtype with an FP16 matrix dequant
+// (Q4_0/Q4_K/Q5_K/Q6_K/Q8_0; Q5_K added in Phase 5-B). Returns false when dt
+// has no FP16 dequant path or when built without FORGE_USE_CUBLAS (in which
+// case nothing is launched), so callers can fall back to their SIMT path.
+bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q, float* C, int M,
+                                   int K, int N, bool transB, cudaStream_t stream);
 
 void launch_gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K, bool transB,
                        cudaStream_t stream = 0);

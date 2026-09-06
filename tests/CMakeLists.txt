@@ -143,6 +143,20 @@ target_include_directories(
                                      ${PROJECT_SOURCE_DIR}/src/operators)
 add_test(NAME generic-kernels COMMAND forge-generic-kernels-test)
 
+# Phase 6-A-1: ComputeDTypePolicy + dtype contract (explicit reject instead of
+# silently reinterpreting FP16/BF16 as float). Host logic only, no kernels.
+# Compiles the small quant_traits support sources directly so the executable
+# stays fast to build instead of linking the full library set.
+add_executable(
+  forge-dtype-contract-test
+  test_dtype_contract.cpp
+  ${PROJECT_SOURCE_DIR}/src/operators/cpu/quant_traits.cpp
+  ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp
+  ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/quant_tables.cpp)
+target_include_directories(forge-dtype-contract-test
+                           PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME dtype-contract COMMAND forge-dtype-contract-test)
+
 # Q3_K MMQ decode bisect -- a host-only mechanical debugging tool (not a
 # normal ctest assertion suite). Built on demand, not registered with CTest.
 add_executable(
@@ -159,12 +173,66 @@ target_include_directories(
 # The binary skips gracefully at runtime when no GPU is available.
 # -----------------------------------------------------------------------------
 if(CUDAToolkit_FOUND)
-  add_executable(
-    forge-mmq-ref-test
-    test_mmq_reference.cpp
-    ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
+  add_executable(forge-mmq-ref-test
+                 test_mmq_reference.cpp
+                 ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
   forge_link_native(forge-mmq-ref-test)
   add_test(NAME mmq-ref COMMAND forge-mmq-ref-test)
+
+  # Phase 4: unified kernel selector policy + measured-dispatch cache. Host
+  # logic only (links the CUDA libraries for the dispatch-table lookups).
+  add_executable(forge-kernel-selector-test test_kernel_selector.cpp)
+  forge_link_native(forge-kernel-selector-test)
+  add_test(NAME kernel-selector COMMAND forge-kernel-selector-test)
+
+  # Phase 6-A-2: native FP16 RMSNorm correctness (FP32 reference parity) +
+  # micro-bench (FP16 vs FP32 kernel). Skips gracefully when no GPU present.
+  add_executable(forge-rms-norm-fp16-test test_rms_norm_fp16.cpp)
+  forge_link_native(forge-rms-norm-fp16-test)
+  add_test(NAME rms-norm-fp16 COMMAND forge-rms-norm-fp16-test)
+
+  # Phase 6-A-3: native FP16 SiLU correctness (FP32 reference parity) +
+  # micro-bench (FP16 vs FP32 kernel, two workload regimes). Skips gracefully
+  # when no GPU present.
+  add_executable(forge-silu-fp16-test test_silu_fp16.cpp)
+  forge_link_native(forge-silu-fp16-test)
+  add_test(NAME silu-fp16 COMMAND forge-silu-fp16-test)
+
+  # Phase 6-A-4: native FP16 activation family (GELU / GELU-tanh / gated SiLU-GeGLU)
+  # correctness (FP32 reference parity) + micro-bench (FP16 vs FP32, two regimes).
+  # Skips gracefully when no GPU present.
+  add_executable(forge-activation-fp16-test test_activation_fp16.cpp)
+  forge_link_native(forge-activation-fp16-test)
+  add_test(NAME activation-fp16 COMMAND forge-activation-fp16-test)
+
+  # Phase 6-A-5: native FP16 Matmul (6-A-5.1 direct launch + 6-A-5.2 ops route +
+  # 6-A-5.3 real FP16 compute chain RMSNorm->Matmul->SiLU). FP16 storage in/out,
+  # FP32 accumulate; checks the no-implicit-FP32 dtype invariant end-to-end.
+  add_executable(forge-matmul-fp16-test test_matmul_fp16.cpp)
+  forge_link_native(forge-matmul-fp16-test)
+  add_test(NAME matmul-fp16 COMMAND forge-matmul-fp16-test)
+
+  add_executable(forge-matmul-fp16-chain-test test_matmul_fp16_chain.cpp)
+  forge_link_native(forge-matmul-fp16-chain-test)
+  add_test(NAME matmul-fp16-chain COMMAND forge-matmul-fp16-chain-test)
+
+  # Phase 6-A-6: native FP16 Graph / Binding integration. Runs the SAME operator
+  # chain (RMSNorm -> Matmul -> SiLU) through ComputeGraph instead of standalone
+  # calls: graph builder / planner / dst injection must not promote FP16 to FP32
+  # (checked with the dtype trace), and CUDA Graph capture/replay must keep the
+  # FP16 buffer address/size stable. Skips gracefully when no GPU present.
+  add_executable(forge-graph-fp16-test test_graph_fp16.cpp)
+  forge_link_native(forge-graph-fp16-test)
+  add_test(NAME graph-fp16 COMMAND forge-graph-fp16-test)
+
+  # Phase 6-A-7.1: native FP16 attention decode (FP16 QKV storage, FP32 QK^T /
+  # online-softmax / PV, FP16 out). Direct-launch parity vs CPU FP32 ref +
+  # FP32-kernel self-consistency, dtype hard asserts, ordinary-vs-capture
+  # stream bitwise equality, ComputeGraph node capture/replay, selector unit
+  # test, loud failure on unsupported head_dim. Skips gracefully when no GPU.
+  add_executable(forge-attn-fp16-test test_attention_fp16.cpp)
+  forge_link_native(forge-attn-fp16-test)
+  add_test(NAME attn-fp16 COMMAND forge-attn-fp16-test)
 
   # Q8_0 quantize/dequantize round-trip + per-block scale validation.
   add_executable(forge-q8-roundtrip-test test_q8_roundtrip.cu)
@@ -266,6 +334,12 @@ if(FORGE_BUILD_BENCHMARKS)
   foreach(bench IN ITEMS ffn_q2k moe_multigemv moe_real output_proj_q6k
                          prefill_gemm cpu_decode)
     add_executable(forge-bench-${bench} bench_${bench}.cpp)
+    # bench_cpu_decode.cpp includes arch headers by repo-relative path
+    # ("src/operators/cpu/arch/x86/fused.h"); give it the source root.
+    if(bench STREQUAL "cpu_decode")
+      target_include_directories(forge-bench-cpu_decode
+                                 PRIVATE ${PROJECT_SOURCE_DIR})
+    endif()
     forge_link_native(forge-bench-${bench})
   endforeach()
 endif()

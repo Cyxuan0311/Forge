@@ -248,6 +248,24 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mmq(
     return d4 * (sumi * ds8f.x - (8 * VDR_Q4_0_Q8_1_MMQ / MMQ_QI4_0) * ds8f.y);
 }
 
+// ---- Q8_0 × Q8_1_mmq (DS4 layout) ----
+// Q8_0: raw signed int8 values (32 per block) stored as 8 plain ints.
+// Q8_1_mmq DS4: 4 half2 (d, s) pairs. Unlike Q4_0 there is no value bias, so
+// the dot is a straight 8-way dp4a and ds.y (the activation sum) is unused —
+// the same arithmetic as the decode-path vec_dot_q8_0_q8_1.
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1_mmq(
+    const int* __restrict__ v, const int* __restrict__ u,
+    const float& d, const half2* __restrict__ ds8)
+{
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < MMQ_QI8_0; ++i) {
+        sumi = forge_dp4a(v[i], u[i], sumi);
+    }
+    const float2 ds8f = __half22float2(*ds8);
+    return d * (sumi * ds8f.x);
+}
+
 // ---- Q6_K × Q8_1_mmq (D4 layout) ----
 // Q6_K: unpacked 6-bit values (via __vsubss4), int8 scales, float d
 // Q8_1_mmq D4: 4 float scales
@@ -662,6 +680,71 @@ static __device__ __forceinline__ void load_tiles_q4_0(
     }
 }
 
+// ---- Q8_0 load tiles ----
+// Q8_0 block (34 B): one fp16 scale + 32 raw int8 qs. One kb iteration covers
+// a 256-element window = EIGHT 34-byte blocks, pairing with activation chunks
+// 2*kb / 2*kb+1 like the other types. Row stride is 34 B and qs starts 2 B
+// into the block (2-byte aligned), so qs reads go through byte-assembled
+// get_int_b2 (a plain int* load here is a misaligned-address fault).
+// Layout produced:
+//   x_qs[i*65 + txi]          : raw int8 packed 4-per-int, txi = 8*kbx + kqsx
+//   x_df[i*8 + i/8 + kbxd]    : one fp32 d per block (padded dm region)
+template <int I, int nwarps>
+static __device__ __forceinline__ void load_tiles_q8_0(
+    const uint8_t* __restrict__ q_weight, int* __restrict__ x_tile,
+    int n_start, int kbx0, int K, int N, int num_blocks_row)
+{
+    constexpr auto txs = mmq_txs_q8_0<I>();
+    int*   x_qs = x_tile;
+    float* x_df = (float*)(x_qs + txs.qs);
+
+    constexpr int warp_size = 32;
+    const int lane = threadIdx.x;
+
+    // 8 ints per 32-elem block -> 64 ints per 256-elem window row; with 32
+    // lanes per row each lane stores two consecutive ints.
+    constexpr int qs_per_block = MMQ_QI8_0;                     // 8
+    constexpr int qs_per_row = 8 * MMQ_QI8_0;                   // 64
+    constexpr int qs_per_row_stride = qs_per_row + 1;           // padded 65
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+        if (i >= I) break;
+        int n = n_start + i;
+        if (n >= N) i = min(i, N - n_start - 1);
+
+        const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 34;
+
+#pragma unroll
+        for (int t = 0; t < qs_per_row / warp_size; ++t) {
+            const int txi = lane + t * warp_size;
+            const int kbx  = txi / qs_per_block;   // block within the window (0..7)
+            const int kqsx = txi % qs_per_block;   // int within the block's qs[32]
+
+            const uint8_t* blk = w_row + (size_t)(kbx0 * 8 + kbx) * 34 + 2;
+            x_qs[i * qs_per_row_stride + txi] = get_int_b2(blk, kqsx);
+        }
+    }
+
+    // One float scale per Q8_0 block (8 per window row, one per 32 values)
+    constexpr int blocks_per_tile_x_row = 8;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;   // 4
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = (i0 + threadIdx.y * rows_per_warp + lane / blocks_per_tile_x_row) % I;
+        int n = n_start + min(i, N - n_start - 1);
+
+        const uint8_t* w_row = q_weight + (size_t)n * num_blocks_row * 34;
+
+        const int kbxd = lane % blocks_per_tile_x_row;
+        const uint8_t* blk = w_row + (size_t)(kbx0 * 8 + kbxd) * 34;
+        uint16_t d_bits;
+        memcpy(&d_bits, blk, sizeof(uint16_t));
+        const float d = __half2float(reinterpret_cast<const __half&>(d_bits));
+        x_df[i * blocks_per_tile_x_row + i / qs_per_block + kbxd] = d;
+    }
+}
+
 // ---- Q6_K load tiles ----
 // Q6_K block (210 bytes): ql[128] + qh[64] + scales[16] + d[2]
 // Shared memory layout (dp4a):
@@ -828,6 +911,7 @@ __global__ void mul_mat_q_kernel(
                          (DT == DataType::Q4_K)  ? mmq_txs_q4_k<I>() :
                          (DT == DataType::Q5_K)  ? mmq_txs_q5_k<I>() :
                          (DT == DataType::Q4_0)  ? mmq_txs_q4_0<I>() :
+                         (DT == DataType::Q8_0)  ? mmq_txs_q8_0<I>() :
                          (DT == DataType::Q6_K)  ? mmq_txs_q6_k<I>() :
                                                     mmq_txs_q2_k<I>();
     constexpr int tile_x_ints = txs.qs + txs.dm + txs.sc;
@@ -861,6 +945,8 @@ __global__ void mul_mat_q_kernel(
             load_tiles_q5_K<I, nwarps>(q_weight, tile_x, n_start, kb, K, N, num_blocks_row);
         } else if (DT == DataType::Q4_0) {
             load_tiles_q4_0<I, nwarps>(q_weight, tile_x, n_start, kb, K, N, num_blocks_row);
+        } else if (DT == DataType::Q8_0) {
+            load_tiles_q8_0<I, nwarps>(q_weight, tile_x, n_start, kb, K, N, num_blocks_row);
         } else if (DT == DataType::Q6_K) {
             load_tiles_q6_K<I, nwarps>(q_weight, tile_x, n_start, kb, K, N, num_blocks_row);
         } else {
@@ -1059,6 +1145,45 @@ __global__ void mul_mat_q_kernel(
                                 u,
                                 x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 +
                                      k0 / (MMQ_QR4_0 * MMQ_QI4_0)],
+                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                    }
+                }
+            }
+        }
+        // For Q8_0 (DS4 layout, raw int8): same tile structure as Q4_0 but
+        // values are plain int8 -> one 8-int dp4a per 32-elem block and no
+        // bias/sum term (decode-identical arithmetic).
+        else if (DT == DataType::Q8_0) {
+            constexpr auto txs_q80 = mmq_txs_q8_0<I>();
+            const int*   x_qs = tile_x;
+            const float* x_df = (const float*)(x_qs + txs_q80.qs);
+
+            const half2* y_ds = (const half2*)tile_y;
+            const int*   y_qs = (const int*)(y_ds + 4);
+
+            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QI8_0) {
+                const int k0 = k01;  // window int offset = 8 * window block
+#pragma unroll
+                for (int j0 = 0; j0 < J; j0 += nwarps) {
+                    int j = j0 + warp;
+                    if (m_start + j >= M) continue;
+
+#pragma unroll
+                    for (int i0 = 0; i0 < I; i0 += warp_size) {
+                        int i = i0 + lane;
+                        if (n_start + i >= N) continue;
+
+                        int u[MMQ_QI8_0];
+#pragma unroll
+                        for (int l = 0; l < MMQ_QI8_0; ++l) {
+                            u[l] = y_qs[j * MMQ_TILE_Y_K + k01 + l];
+                        }
+
+                        sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
+                            vec_dot_q8_0_q8_1_mmq(
+                                &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0],
+                                u,
+                                x_df[i * 8 + i / MMQ_QI8_0 + k0 / MMQ_QI8_0],
                                 &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
                     }
                 }
@@ -1323,6 +1448,43 @@ __global__ void mul_mat_q_kernel(
                     }
                 }
             }
+        } else if (DT == DataType::Q8_0) {
+            // Second half of the 256-element window: weight ints start at
+            // MMQ_TILE_NE_K (= 128 elements = 32 ints), same dot as above.
+            constexpr auto txs_q80 = mmq_txs_q8_0<I>();
+            const int*   x_qs = tile_x;
+            const float* x_df = (const float*)(x_qs + txs_q80.qs);
+
+            const half2* y_ds = (const half2*)tile_y;
+            const int*   y_qs = (const int*)(y_ds + 4);
+
+            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QI8_0) {
+                const int k0 = MMQ_TILE_NE_K + k01;
+#pragma unroll
+                for (int j0 = 0; j0 < J; j0 += nwarps) {
+                    int j = j0 + warp;
+                    if (m_start + j >= M) continue;
+
+#pragma unroll
+                    for (int i0 = 0; i0 < I; i0 += warp_size) {
+                        int i = i0 + lane;
+                        if (n_start + i >= N) continue;
+
+                        int u[MMQ_QI8_0];
+#pragma unroll
+                        for (int l = 0; l < MMQ_QI8_0; ++l) {
+                            u[l] = y_qs[j * MMQ_TILE_Y_K + k01 + l];
+                        }
+
+                        sum[(j0 / nwarps) * (I / warp_size) + i0 / warp_size] +=
+                            vec_dot_q8_0_q8_1_mmq(
+                                &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0],
+                                u,
+                                x_df[i * 8 + i / MMQ_QI8_0 + k0 / MMQ_QI8_0],
+                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                    }
+                }
+            }
         } else if (DT == DataType::Q6_K) {
             constexpr auto txs_q6k = mmq_txs_q6_k<I>();
             const int*   x_qs = tile_x;
@@ -1582,6 +1744,41 @@ void launch_mmq_q4_0(const float* x, const void* q_weight, float* out,
             out, M, K, N, num_blocks_row, K_padded);
 }
 
+void launch_mmq_q8_0(const float* x, const void* q_weight, float* out,
+                      int M, int K, int N, cudaStream_t stream) {
+    constexpr int I = MMQ_I_Q8_0;
+    constexpr int J = MMQ_J_Q8_0;
+
+    int K_padded = (K + MMQ_QK8_1_MMQ - 1) / MMQ_QK8_1_MMQ * MMQ_QK8_1_MMQ;
+    // q8_0 rows are strided by 32-element blocks (34 B each), not by
+    // super-blocks: the row stride must count true blocks or every weight
+    // row overlaps its neighbours (same as the q4_0 launch).
+    int num_blocks_row = (K + 31) / 32;
+    int num_mmq_blocks_per_row = K_padded / MMQ_QK8_1_MMQ;
+
+    // Pre-quantize activations (DS4 layout for Q8_0)
+    size_t q8_bytes = (size_t)M * num_mmq_blocks_per_row * sizeof(block_q8_1_mmq);
+    void* q8_buf = mmq_scratch().ensure(q8_bytes);
+    launch_quantize_q8_1_mmq(x, q8_buf, K, M, MMQ_Q8_1_DS_LAYOUT_DS4, stream);
+
+    constexpr auto txs = mmq_txs_q8_0<I>();
+    constexpr int tile_x_ints = txs.qs + txs.dm + txs.sc;
+    constexpr int tile_y_ints = J * MMQ_TILE_Y_K;
+    constexpr int smem_ints = tile_x_ints + tile_y_ints;
+    constexpr int smem_bytes = smem_ints * sizeof(int);
+
+    int n_tiles = (N + I - 1) / I;
+    int m_tiles = (M + J - 1) / J;
+    dim3 grid(n_tiles, m_tiles);
+    dim3 block(32, MMQ_NWARPS);
+
+    mul_mat_q_kernel<DataType::Q8_0, I, J>
+        <<<grid, block, smem_bytes, stream>>>(
+            static_cast<const uint8_t*>(q_weight),
+            static_cast<const int*>(q8_buf),
+            out, M, K, N, num_blocks_row, K_padded);
+}
+
 void launch_mmq_q6_k(const float* x, const void* q_weight, float* out,
                       int M, int K, int N, cudaStream_t stream) {
     constexpr int I = MMQ_I_Q6_K;
@@ -1660,7 +1857,7 @@ extern const MmqFn mmq_dispatch[20] = {
     /* Q4_K=4  */ launch_mmq_q4_k,
     /* INT8=5  */ nullptr,
     /* INT32=6 */ nullptr,
-    /* Q8_0=7  */ nullptr,
+    /* Q8_0=7  */ launch_mmq_q8_0,
     /* Q5_0=8  */ nullptr,
     /* Q5_1=9  */ nullptr,
     /* Q2_K=10 */ launch_mmq_q2_k,

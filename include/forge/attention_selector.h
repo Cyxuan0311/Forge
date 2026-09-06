@@ -29,6 +29,12 @@ enum class AttentionPath {
     CUDA_FP32_DECODE,   // CUDA GQA decode  (q_len == 1, FP32 KV)
     CUDA_GENERIC_MHA,   // CUDA non-GQA (uses generic ops)
 
+    // CUDA native-FP16 paths (6-A-7): Q/K/V all FP16 contiguous tensors,
+    // FP32 QK^T/softmax/PV, FP16 output. Distinct from CUDA_FUSED_F16_*
+    // (those are Q-FP32 + KV-F16 with on-the-fly dequant).
+    CUDA_F16_PREFILL,  // CUDA GQA prefill, all-FP16 QKV (q_len > 1)
+    CUDA_F16_DECODE,   // CUDA GQA decode, all-FP16 QKV  (q_len == 1)
+
     // CUDA fused paths (K/V in quantized format, dequantized on-the-fly)
     CUDA_FUSED_Q4_0_DECODE,      // CUDA GQA decode with Q4_0 KV
     CUDA_FUSED_F16_DECODE,       // CUDA GQA decode with F16 KV
@@ -104,6 +110,11 @@ struct AttentionProblem {
     // a contiguous tensor. seq_id selects which sequence's page table to use.
     bool paged = false;
     int seq_id = -1;
+
+    // 6-A-7: Q dtype drives native-FP16 path selection. FP16 Q (+FP16 K/V,
+    // enforced by the executor/dispatch layer) selects CUDA_F16_*; FP32 keeps
+    // the existing paths. Pure input to choose_attention_path (testable).
+    DataType q_dtype = DataType::FP32;
 };
 
 // ---- Selector function ----

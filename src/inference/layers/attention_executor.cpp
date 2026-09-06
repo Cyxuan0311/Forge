@@ -1,6 +1,8 @@
 #include "forge/inference/layers/attention_executor.h"
 
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #include "cpu/simd.h"
 #include "forge/attention_selector.h"
@@ -432,7 +434,7 @@ AttentionExecutor::QKVResult AttentionExecutor::project_qkv(const TensorPtr& x,
 
 TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, int layer_idx,
                                     int seq_len, DeviceType dev, const TensorPtr& mask, int seq_id,
-                                    bool causal) {
+                                    bool causal, cudaStream_t stream) {
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
     int head_dim = cfg.head_dim;
@@ -517,6 +519,7 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     problem.num_heads = num_heads;
     problem.num_kv_heads = num_kv_heads;
     problem.head_dim = head_dim;
+    problem.q_dtype = q->dtype();  // 6-A-7: drives CUDA_F16_* selection
 
     // Quantized KV state for path selection.
     // - Paged CUDA decode: KV lives in pages; the storage reports the dtype.
@@ -640,6 +643,89 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
             static_cast<const float*>(q->data()), static_cast<const float*>(k_sliced->data()),
             static_cast<const float*>(v_sliced->data()), static_cast<float*>(attn_out->data()),
             total_len, num_heads, num_kv_heads, head_dim, mask_row, 0);
+#else
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
+                                                            total_len, num_heads, num_kv_heads,
+                                                            head_dim, mask, causal);
+#endif
+        break;
+    }
+    // ---- 6-A-7: native-FP16 decode (all-FP16 QKV, FP32 math, FP16 out) ----
+    // Locked rule: selected only when q is FP16 (selector). K/V must also be
+    // FP16 here — no silent reinterpret and no implicit conversion. FP16 KV
+    // cache integration is post-7.1; until then a non-FP16 KV throws loudly.
+    case AttentionPath::CUDA_F16_DECODE: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
+#ifdef USE_CUDA
+        if (!k_sliced || !v_sliced || k_sliced->dtype() != DataType::FP16 ||
+            v_sliced->dtype() != DataType::FP16) {
+            throw std::runtime_error(
+                "AttentionExecutor::CUDA_F16_DECODE requires FP16 K/V (native FP16 "
+                "attention needs all-FP16 QKV; FP16 KV-cache integration is post-7.1).");
+        }
+        if (head_dim != 16 && head_dim != 32 && head_dim != 64 && head_dim != 96 &&
+            head_dim != 128) {
+            throw std::runtime_error("AttentionExecutor::CUDA_F16_DECODE: unsupported head_dim=" +
+                                     std::to_string(head_dim) + " (6-A-7: 16/32/64/96/128 only).");
+        }
+        const __half* mask_row_fp16 = nullptr;
+        if (mask) {
+            if (mask_on_dev->dtype() != DataType::FP16) {
+                throw std::runtime_error(
+                    "AttentionExecutor::CUDA_F16_DECODE requires an FP16 mask (or none).");
+            }
+            mask_row_fp16 = reinterpret_cast<const __half*>(mask_on_dev->data());
+        }
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP16, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        cuda::launch_flash_attention_gqa_decode_fp16(
+            reinterpret_cast<const __half*>(q->data()),
+            reinterpret_cast<const __half*>(k_sliced->data()),
+            reinterpret_cast<const __half*>(v_sliced->data()),
+            reinterpret_cast<__half*>(attn_out->data()), total_len, num_heads, num_kv_heads,
+            head_dim, mask_row_fp16, stream);
+#else
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
+                                                            total_len, num_heads, num_kv_heads,
+                                                            head_dim, mask, causal);
+#endif
+        break;
+    }
+    // ---- 6-A-7.2: native-FP16 prefill (same dtype contract as decode) ----
+    // Mirror of the vectorized FP32 prefill: Q tile in smem, strided KV loop,
+    // local_acc kept. K/V must be FP16 (loud otherwise); mask FP16 or absent.
+    case AttentionPath::CUDA_F16_PREFILL: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
+#ifdef USE_CUDA
+        if (!k_sliced || !v_sliced || k_sliced->dtype() != DataType::FP16 ||
+            v_sliced->dtype() != DataType::FP16) {
+            throw std::runtime_error(
+                "AttentionExecutor::CUDA_F16_PREFILL requires FP16 K/V (native FP16 "
+                "attention needs all-FP16 QKV; FP16 KV-cache integration is post-7.1).");
+        }
+        if (head_dim != 16 && head_dim != 32 && head_dim != 64 && head_dim != 96 &&
+            head_dim != 128) {
+            throw std::runtime_error("AttentionExecutor::CUDA_F16_PREFILL: unsupported head_dim=" +
+                                     std::to_string(head_dim) + " (6-A-7: 16/32/64/96/128 only).");
+        }
+        const __half* mask_fp16 = nullptr;
+        if (mask) {
+            if (mask_on_dev->dtype() != DataType::FP16) {
+                throw std::runtime_error(
+                    "AttentionExecutor::CUDA_F16_PREFILL requires an FP16 mask (or none).");
+            }
+            mask_fp16 = reinterpret_cast<const __half*>(mask_on_dev->data());
+        }
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP16, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        cuda::launch_flash_attention_gqa_prefill_fp16(
+            reinterpret_cast<const __half*>(q->data()),
+            reinterpret_cast<const __half*>(k_sliced->data()),
+            reinterpret_cast<const __half*>(v_sliced->data()),
+            reinterpret_cast<__half*>(attn_out->data()), seq_len, total_len, num_heads,
+            num_kv_heads, head_dim, mask_fp16, causal, stream);
 #else
         attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
                                                             total_len, num_heads, num_kv_heads,

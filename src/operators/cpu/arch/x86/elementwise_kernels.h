@@ -48,6 +48,10 @@ static inline void silu_mul_f32_vec(const float* gate, const float* up, float* o
 
         // Cephes-style exp: exp(x) = 2^(x/ln2)
         __m256 x = _mm256_mul_ps(neg_gv, _mm256_set1_ps(1.4426950408889634f));  // 1/ln2
+        // Clamp to the FP32-exp range so large activations don't overflow the
+        // 8-bit exponent field (which would yield garbage silu for |gate|>~61).
+        x = _mm256_min_ps(x, _mm256_set1_ps(88.3762626647949f));
+        x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f));
         __m256i emm0 = _mm256_cvttps_epi32(x);
         __m256 z = _mm256_cvtepi32_ps(emm0);
         __m256 mask = _mm256_cmp_ps(x, z, _MM_CMPINT_LT);

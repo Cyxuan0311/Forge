@@ -583,7 +583,8 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
     return out;
 }
 
-TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias) {
+TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias,
+                        cudaStream_t stream) {
     if (a->ndim() != 2 || b->ndim() != 2)
         throw std::runtime_error("matmul_transB expects 2D tensors");
 
@@ -596,6 +597,24 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                                  " K2=" + std::to_string(K2) + " b_shape=[" +
                                  std::to_string(b->shape()[0]) + "," +
                                  std::to_string(b->shape()[1]) + "]");
+
+    // Phase 6-A-5: native FP16 matmul. A and B both FP16 -> native cuBLAS
+    // FP16 x FP16 -> FP16 GEMM (FP32 accumulate); output dtype follows the inputs
+    // so the chain stays FP16 end-to-end. BF16 still has no kernel (lands in 6-B).
+    if (a->device() == DeviceType::CUDA && a->dtype() == DataType::FP16 &&
+        b->dtype() == DataType::FP16) {
+        if (bias) {
+            throw std::runtime_error("matmul_transB (CUDA FP16): bias is not supported in the "
+                                     "native FP16 path yet (6-A-5 scope: FP16 weight + FP16 "
+                                     "activation).");
+        }
+        auto out = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{M, N},
+                                            DeviceType::CUDA);
+#ifdef USE_CUDA
+        cuda_matmul_transB(a, b, out, M, K, N, stream);
+#endif
+        return out;
+    }
 
     auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N}, a->device());
 

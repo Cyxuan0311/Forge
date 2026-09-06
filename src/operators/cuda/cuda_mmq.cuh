@@ -35,6 +35,8 @@ namespace cuda {
 #define MMQ_J_Q5K  32
 #define MMQ_I_Q4_0 64
 #define MMQ_J_Q4_0 32
+#define MMQ_I_Q8_0 64
+#define MMQ_J_Q8_0 32
 #define MMQ_I_Q6_K 64
 #define MMQ_J_Q6_K 32
 #define MMQ_I_Q2_K 64
@@ -51,6 +53,11 @@ namespace cuda {
 // Q4_0-specific MMQ constants (32-element blocks, not 256 like K-types)
 #define MMQ_QR4_0  2   // QR = QK / (4*QI), Q4_0: 32/(4*4) = 2
 #define MMQ_QI4_0  4   // ints per Q4_0 scale group (32 elements / 4 bits per value per int = 4)
+
+// Q8_0-specific MMQ constants: 32-element blocks, one fp16 scale + 32 raw
+// int8 values (34 B/block). Values are stored as plain 4B ints (8 int8 per
+// int), so unlike Q4_0 there is no unpacking and no bias term in the dot.
+#define MMQ_QI8_0  8   // ints per Q8_0 scale group (32 int8 elements / 4 per int = 8)
 
 // tile_y stride: padded to avoid bank conflicts
 // Each tile_y row = MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32 + 4 = 36 ints
@@ -121,6 +128,17 @@ static __host__ __device__ constexpr tile_x_sizes mmq_txs_q4_0() {
                         0};
 }
 
+// Q8_0: qs = I*(2*MMQ_TILE_NE_K + 1), dm = I*(2*MMQ_TILE_NE_K/QI8_0) + I/2, sc = 0
+//   (raw int8 values -> 2 ints per Q4_0-equivalent slot: a 256-element kb
+//    window is 64 ints vs Q4_0's 32; one float scale per 32-element block,
+//    same 8-per-window density, pad i/QI8_0 like Q4_0 pads i/QI4_0)
+template <int I>
+static __host__ __device__ constexpr tile_x_sizes mmq_txs_q8_0() {
+    return tile_x_sizes{I * (2 * MMQ_TILE_NE_K + 1),
+                        I * (2 * MMQ_TILE_NE_K / MMQ_QI8_0) + I / 2,
+                        0};
+}
+
 // Q6_K: qs = I*(2*MMQ_TILE_NE_K + 1), dm = I*MMQ_TILE_NE_K/QI6_K, sc = I*(MMQ_TILE_NE_K/8) + I/8
 //   (6-bit unpacked values in two arrays, float d, int8 scales)
 template <int I>
@@ -157,6 +175,11 @@ static constexpr int mmq_tile_x_bytes_q5_k() {
 template <int I>
 static constexpr int mmq_tile_x_bytes_q4_0() {
     constexpr auto txs = mmq_txs_q4_0<I>();
+    return (txs.qs + txs.dm + txs.sc) * 4;
+}
+template <int I>
+static constexpr int mmq_tile_x_bytes_q8_0() {
+    constexpr auto txs = mmq_txs_q8_0<I>();
     return (txs.qs + txs.dm + txs.sc) * 4;
 }
 template <int I>

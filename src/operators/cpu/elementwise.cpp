@@ -10,6 +10,7 @@
 #include "forge/operator_activation.h"
 #include "forge/operator_elementwise.h"
 #include "forge/perf_profiler.h"
+#include "forge/dtype_contract.h"
 
 #include "cpu/simd.h"
 
@@ -61,16 +62,35 @@ TensorPtr multiply(const TensorPtr& a, const TensorPtr& b) {
 }
 
 TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
-    auto out = std::make_shared<Tensor>(DataType::FP32, gate->shape(), gate->device());
+    // Gated activation: SiLU(gate) * up. Output dtype follows gate (== up dtype).
+    // SILU is whitelisted in the dtype contract (6-A-3); BF16 still rejected loudly.
+    DataType dt = gate->dtype();
+    auto out = std::make_shared<Tensor>(dt, gate->shape(), gate->device());
     int n = static_cast<int>(gate->numel());
 
     if (gate->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        cuda::launch_silu_multiply(static_cast<const float*>(gate->data()),
-                                   static_cast<const float*>(up->data()),
-                                   static_cast<float*>(out->data()), n);
+        require_dtype_supported("ops::silu_multiply/gate", OpType::SILU, dt);
+        if (dt == DataType::FP16) {
+            cuda::launch_silu_multiply_fp16(static_cast<const __half*>(gate->data()),
+                                            static_cast<const __half*>(up->data()),
+                                            static_cast<__half*>(out->data()), n);
+        } else if (dt == DataType::FP32) {
+            cuda::launch_silu_multiply(static_cast<const float*>(gate->data()),
+                                       static_cast<const float*>(up->data()),
+                                       static_cast<float*>(out->data()), n);
+        } else {
+            throw std::runtime_error(
+                std::string("ops::silu_multiply (CUDA): dtype '") + dtype_name(dt) +
+                "' has no native kernel. Phase 6-A-4 adds FP16 only; BF16 arrives with 6-B.");
+        }
 #endif
     } else {
+        if (dt != DataType::FP32) {
+            throw std::runtime_error(
+                std::string("ops::silu_multiply (CPU): FP32 only; got dtype '") + dtype_name(dt) +
+                "'. Use the CUDA device for native FP16 SiLU-gate (Phase 6-A-4).");
+        }
         PERF_SCOPE("silu_multiply/cpu");
         const float* g_data = static_cast<const float*>(gate->data());
         const float* u_data = static_cast<const float*>(up->data());
@@ -81,17 +101,37 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
 }
 
 TensorPtr gelu_multiply(const TensorPtr& gate, const TensorPtr& up) {
-    auto out = std::make_shared<Tensor>(DataType::FP32, gate->shape(), gate->device());
+    // Gated activation: GELU(gate) * up (GeGLU). Output dtype follows gate.
+    // GELU is whitelisted in the dtype contract (6-A-4); BF16 rejected loudly.
+    DataType dt = gate->dtype();
+    auto out = std::make_shared<Tensor>(dt, gate->shape(), gate->device());
     int n = static_cast<int>(gate->numel());
 
     if (gate->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        auto gelu_gate = gelu(gate);
-        cuda::launch_multiply(static_cast<const float*>(gelu_gate->data()),
-                              static_cast<const float*>(up->data()),
-                              static_cast<float*>(out->data()), n);
+        require_dtype_supported("ops::gelu_multiply/gate", OpType::GELU, dt);
+        if (dt == DataType::FP16) {
+            cuda::launch_gelu_multiply_fp16(static_cast<const __half*>(gate->data()),
+                                            static_cast<const __half*>(up->data()),
+                                            static_cast<__half*>(out->data()), n);
+        } else if (dt == DataType::FP32) {
+            // FP32 path keeps the original two-kernel form (gelu then multiply).
+            auto gelu_gate = gelu(gate);
+            cuda::launch_multiply(static_cast<const float*>(gelu_gate->data()),
+                                  static_cast<const float*>(up->data()),
+                                  static_cast<float*>(out->data()), n);
+        } else {
+            throw std::runtime_error(
+                std::string("ops::gelu_multiply (CUDA): dtype '") + dtype_name(dt) +
+                "' has no native kernel. Phase 6-A-4 adds FP16 only; BF16 arrives with 6-B.");
+        }
 #endif
     } else {
+        if (dt != DataType::FP32) {
+            throw std::runtime_error(
+                std::string("ops::gelu_multiply (CPU): FP32 only; got dtype '") + dtype_name(dt) +
+                "'. Use the CUDA device for native FP16 GeGLU (Phase 6-A-4).");
+        }
         PERF_SCOPE("gelu_multiply/cpu");
         const float* g_data = static_cast<const float*>(gate->data());
         const float* u_data = static_cast<const float*>(up->data());
@@ -147,31 +187,37 @@ static void register_elementwise_ops() {
     auto& dispatch = OpDispatch::instance();
 
     // ADD: inputs[0] = a, inputs[1] = b
+    // 6-A-6.4: legacy kernels keep legacy-stream behavior; stream ignored.
     dispatch.register_kernel(OpType::ADD, DeviceType::CPU,
-                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*,
+                                cudaStream_t) -> TensorPtr {
                                  return ops::add(inputs[0], inputs[1]);
                              });
 
     dispatch.register_kernel(OpType::ADD, DeviceType::CUDA,
-                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*,
+                                cudaStream_t) -> TensorPtr {
                                  return ops::add(inputs[0], inputs[1]);
                              });
 
     // MUL: inputs[0] = a, inputs[1] = b
     dispatch.register_kernel(OpType::MUL, DeviceType::CPU,
-                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*,
+                                cudaStream_t) -> TensorPtr {
                                  return ops::multiply(inputs[0], inputs[1]);
                              });
 
     dispatch.register_kernel(OpType::MUL, DeviceType::CUDA,
-                             [](const std::vector<TensorPtr>& inputs, const int32_t*) -> TensorPtr {
+                             [](const std::vector<TensorPtr>& inputs, const int32_t*,
+                                cudaStream_t) -> TensorPtr {
                                  return ops::multiply(inputs[0], inputs[1]);
                              });
 
     // SOFT_MAX: inputs[0] = x, op_params[0] = float temperature (bit-cast)
     dispatch.register_kernel(
         OpType::SOFT_MAX, DeviceType::CPU,
-        [](const std::vector<TensorPtr>& inputs, const int32_t* params) -> TensorPtr {
+        [](const std::vector<TensorPtr>& inputs, const int32_t* params,
+           cudaStream_t) -> TensorPtr {
             float temp = 1.0f;
             if (params)
                 std::memcpy(&temp, params, sizeof(temp));

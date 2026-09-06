@@ -118,7 +118,7 @@ CapabilityResult OpDispatch::supports(OpType op, DeviceType dev,
 }
 
 TensorPtr OpDispatch::execute(OpType op, DeviceType dev, const std::vector<TensorPtr>& inputs,
-                              const int32_t* params) const {
+                              const int32_t* params, cudaStream_t stream) const {
     Key key(op, dev);
 
     // Prefer dst kernel: allocate output internally, then call dst kernel
@@ -134,11 +134,11 @@ TensorPtr OpDispatch::execute(OpType op, DeviceType dev, const std::vector<Tenso
             // Cannot infer shape without inputs — fall through to legacy
             auto legacy_it = kernels_.find(key);
             if (legacy_it != kernels_.end()) {
-                return legacy_it->second(inputs, params);
+                return legacy_it->second(inputs, params, stream);
             }
             return nullptr;
         }
-        dst_it->second(inputs, dst, params);
+        dst_it->second(inputs, dst, params, stream);
         return dst;
     }
 
@@ -150,24 +150,27 @@ TensorPtr OpDispatch::execute(OpType op, DeviceType dev, const std::vector<Tenso
                   device_type_name(dev) + " (cross-device fallback disabled)");
         return nullptr;
     }
-    return it->second(inputs, params);
+    return it->second(inputs, params, stream);
 }
 
 void OpDispatch::execute_dst(OpType op, DeviceType dev, const std::vector<TensorPtr>& inputs,
-                             TensorPtr dst, const int32_t* params) const {
+                             TensorPtr dst, const int32_t* params, cudaStream_t stream) const {
     Key key(op, dev);
 
     // Prefer dst kernel — direct write, no allocation, no memcpy
     auto dst_it = dst_kernels_.find(key);
     if (dst_it != dst_kernels_.end()) {
-        dst_it->second(inputs, dst, params);
+        dst_it->second(inputs, dst, params, stream);
         return;
     }
 
-    // Fall back to legacy kernel: execute, then copy result into dst
+    // Fall back to legacy kernel: execute, then copy result into dst.
+    // NOTE (6-A-6.4): Tensor::copy_from issues on the legacy stream; the graph
+    // legacy path in ComputeGraph::execute uses stream-ordered cudaMemcpyAsync
+    // instead, so capture goes through there, not through this fallback.
     auto it = kernels_.find(key);
     if (it != kernels_.end()) {
-        TensorPtr result = it->second(inputs, params);
+        TensorPtr result = it->second(inputs, params, stream);
         if (result && dst) {
             dst->copy_from(*result);
         }

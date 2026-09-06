@@ -11,6 +11,14 @@
 #include "forge/kv_storage.h"
 #include "forge/model.h"
 
+// 6-A-7: stream plumbing (mirrors forge/op_dispatch.h).
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#else
+struct CUstream_st;
+typedef CUstream_st* cudaStream_t;
+#endif
+
 namespace forge {
 
 class AttentionExecutor {
@@ -29,9 +37,11 @@ public:
     // Attention。K/V 从 KV cache 读取, 传入的 q 已经过 RoPE。
     // mask: 可选 [q_len, kv_len] additive bias。
     // seq_id: 当前序列 id (paged CUDA decode 用 per-seq page table; -1 = legacy)
+    // 6-A-7: stream defaults to 0 (legacy stream). Native-FP16 kernels honor a
+    // non-zero stream from day one; FP32 legacy launches keep stream 0.
     TensorPtr attend(const TensorPtr& q, const ModelConfig& cfg, int layer_idx, int seq_len,
                      DeviceType dev, const TensorPtr& mask = nullptr, int seq_id = -1,
-                     bool causal = true);
+                     bool causal = true, cudaStream_t stream = 0);
 
     // GQA 的 KV head 复制。DeepSeek/Qwen3.5 的非 flash-attention 路径需要显式展开,
     // 因此放在这里共享, 不再由 TransformerEngine 提供 protected helper。

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "forge/types.h"
+
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
@@ -42,6 +44,16 @@ void launch_dequant_q4_k_matrix_fp16(const void* q_data, void* out, int N, int K
 
 void launch_dequant_q6_k_matrix_fp16(const void* q_data, void* out, int N, int K,
                                       cudaStream_t stream = 0);
+void launch_dequant_q8_0_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream = 0);
+
+// Phase 3 (Tensor Core): dequantize the whole quantized B [N, K] matrix to FP16
+// and run the FP16 cuBLAS GEMM (FP32 accumulate) on Tensor Cores. Supported for
+// every dtype with an FP16 matrix dequant (Q4_0/Q4_K/Q6_K/Q8_0). Returns false
+// when dt has no FP16 dequant path or when built without FORGE_USE_CUBLAS (in
+// which case nothing is launched), so callers can fall back to their SIMT path.
+bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q, float* C, int M,
+                                   int K, int N, bool transB, cudaStream_t stream);
 
 }  // namespace cuda
 }  // namespace forge

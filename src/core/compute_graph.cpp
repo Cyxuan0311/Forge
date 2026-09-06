@@ -1,6 +1,7 @@
 #include "forge/compute_graph.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "forge/backend.h"
@@ -25,6 +26,30 @@ const char* device_name(DeviceType dev) {
     }
 }
 }  // namespace
+
+namespace {
+bool dtype_trace_env_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = std::getenv("FORGE_TRACE_DTYPE");
+        cached = (e && std::atoi(e) != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Storage-preserving ops: output dtype follows the (first) input dtype.
+// Attention / exotic ops would differ, but those aren't FP16-native yet (6-A-7).
+DataType infer_output_dtype(OpType op, const std::vector<TensorPtr>& inputs) {
+    (void)op;
+    if (!inputs.empty() && inputs[0])
+        return inputs[0]->dtype();
+    return DataType::FP32;
+}
+}  // namespace
+
+bool ComputeGraph::trace_dtype_enabled() {
+    return dtype_trace_env_enabled();
+}
 
 int ComputeGraph::add_input(const TensorPtr& tensor) {
     int idx = static_cast<int>(inputs_.size());
@@ -172,7 +197,7 @@ void ComputeGraph::release_graph() {
     graph_allocated_ = false;
 }
 
-TensorPtr ComputeGraph::execute() {
+TensorPtr ComputeGraph::execute(cudaStream_t stream) {
     std::vector<int> ref_count(nodes_.size(), 0);
     for (const auto& node : nodes_) {
         for (int idx : node.input_indices) {
@@ -190,6 +215,9 @@ TensorPtr ComputeGraph::execute() {
         allocate_graph();
     }
 
+    if (trace_dtype_enabled())
+        dtype_trace_.clear();
+
     // Apply scheduling plan on every execute (handles reset + re-execute)
     if (schedule_ && schedule_->valid) {
         int n_plan = static_cast<int>(nodes_.size());
@@ -203,6 +231,7 @@ TensorPtr ComputeGraph::execute() {
 
     for (int i = 0; i < static_cast<int>(nodes_.size()); ++i) {
         auto& node = nodes_[i];
+        bool use_dst = false;
 
         if (node.op_type == OpType::NONE && !node.compute_fn)
             continue;
@@ -244,20 +273,35 @@ TensorPtr ComputeGraph::execute() {
                 buf_map = &node_buffer_map_[i];
             }
 
-            if (has_dst && alloc && alloc->size > 0 && buf_map) {
-                // Construct dst view into pre-allocated per-backend buffer
+            // 6-A-6.3: dst injection must NOT silently materialize FP32. A few dst kernels are
+            // FP32-only (ADD/MUL/ROPE); routing an FP16 chain through them would mis-cast the
+            // buffer and run FP32 kernels. We only inject when the dst kernel can emit the right
+            // dtype: either FP32 inputs, or an FP16-capable dst op (RMS_NORM / SILU).
+            bool inputs_fp16 = !node.resolved_inputs.empty() &&
+                               node.resolved_inputs[0]->dtype() == DataType::FP16;
+            bool dst_fp16_capable =
+                (node.op_type == OpType::RMS_NORM || node.op_type == OpType::SILU);
+            use_dst = has_dst && alloc && alloc->size > 0 && buf_map &&
+                      (!inputs_fp16 || dst_fp16_capable);
+
+            if (use_dst) {
+                // Construct dst view into the pre-allocated per-backend buffer, with the
+                // operator's REAL output dtype (storage-preserving: follows the input dtype,
+                // never forced to FP32).
                 void* planned_ptr =
                     static_cast<char*>(buf_map->buffer->data()) + buf_map->offset;
                 DeviceType buf_dev = buf_map->buffer->device();
+                DataType out_dtype = infer_output_dtype(node.op_type, node.resolved_inputs);
                 auto dst = std::make_shared<Tensor>(Tensor::from_buffer(
-                    planned_ptr, DataType::FP32, node.resolved_inputs[0]->shape(), buf_dev, false));
+                    planned_ptr, out_dtype, node.resolved_inputs[0]->shape(), buf_dev, false));
                 OpDispatch::instance().execute_dst(node.op_type, node.device, node.resolved_inputs,
-                                                   dst, node.op_params);
+                                                   dst, node.op_params, stream);
                 node.output = dst;
             } else {
                 // Legacy path: execute (allocates internally), then copy to graph buffer
                 node.output = OpDispatch::instance().execute(node.op_type, node.device,
-                                                             node.resolved_inputs, node.op_params);
+                                                             node.resolved_inputs, node.op_params,
+                                                             stream);
 
                 // Copy to pre-allocated per-backend buffer and free temp memory
                 if (node.output && buf_map) {
@@ -273,8 +317,10 @@ TensorPtr ComputeGraph::execute() {
                             }
 #ifdef USE_CUDA
                             else if (node.output->device() == DeviceType::CUDA) {
+                                // 6-A-6.4: D2D copy on the execution stream so
+                                // stream capture records it (was: legacy stream).
                                 cudaMemcpyAsync(planned_ptr, node.output->data(), copy_size,
-                                                cudaMemcpyDeviceToDevice);
+                                                cudaMemcpyDeviceToDevice, stream);
                             }
 #endif
                             void* old_data = node.output->replace_data(planned_ptr, copy_size);
@@ -299,6 +345,20 @@ TensorPtr ComputeGraph::execute() {
             peak_memory_ += node.output->nbytes();
         }
 
+        // Phase 6-A-6: record dtype flow (catches silent FP16 -> FP32 materialization)
+        if (trace_dtype_enabled()) {
+            DTypeTraceRecord rec;
+            rec.name = node.name;
+            rec.device = node.device;
+            rec.dst_injected = use_dst;
+            rec.output_dtype = node.output
+                                   ? node.output->dtype()
+                                   : infer_output_dtype(node.op_type, node.resolved_inputs);
+            for (auto& t : node.resolved_inputs)
+                rec.input_dtypes.push_back(t ? t->dtype() : DataType::FP32);
+            dtype_trace_.push_back(std::move(rec));
+        }
+
         // Release intermediates
         if (release_intermediates_) {
             for (int idx : node.input_indices) {
@@ -317,7 +377,7 @@ TensorPtr ComputeGraph::execute() {
     return last_output();
 }
 
-TensorPtr ComputeGraph::execute_node(int node_idx) {
+TensorPtr ComputeGraph::execute_node(int node_idx, cudaStream_t stream) {
     if (node_idx < 0 || node_idx >= static_cast<int>(nodes_.size()))
         return nullptr;
 
@@ -347,7 +407,7 @@ TensorPtr ComputeGraph::execute_node(int node_idx) {
         node.output = node.compute_fn(node.resolved_inputs);
     } else if (node.op_type != OpType::NONE) {
         node.output = OpDispatch::instance().execute(node.op_type, node.device,
-                                                     node.resolved_inputs, node.op_params);
+                                                     node.resolved_inputs, node.op_params, stream);
     }
 
     return node.output;

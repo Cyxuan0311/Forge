@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include "forge/tensor.h"
 
 #ifdef USE_CUDA
@@ -21,8 +23,11 @@ TensorPtr cuda_dequantize_matrix(const TensorPtr& b, int rows, int cols);
 void cuda_matmul(const TensorPtr& a, const TensorPtr& b_fp32, const TensorPtr& out, int M, int K,
                  int N);
 
+// 6-A-6.4: stream defaults to 0. The FP16 native branch forwards it to
+// launch_cublas_gemm_fp16; other branches keep legacy-stream behavior
+// (FP32 capture = known limitation, see 6-A-6.4 docs).
 void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& out, int M, int K,
-                        int N);
+                        int N, cudaStream_t stream = 0);
 
 void cuda_matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const TensorPtr& b2,
                              const TensorPtr& out, int M, int K, int N1, int N2);

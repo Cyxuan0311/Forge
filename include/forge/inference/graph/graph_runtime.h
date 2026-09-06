@@ -30,6 +30,8 @@ class Qwen35RecurrentMemory;
 class GraphRuntime {
 public:
     GraphRuntime() : runtime_state_(std::make_shared<GraphRuntimeState>()) {}
+    // 6-A-6.4: destroys the owned capture stream (if created).
+    ~GraphRuntime();
 
     void set_builder(std::shared_ptr<LayerGraphBuilder> builder) {
         builder_ = std::move(builder);
@@ -80,6 +82,13 @@ private:
     // Phase 10: CUDA Graph runner (lazy-created when enabled)
 #ifdef USE_CUDA
     std::unique_ptr<CudaGraphRunner> cuda_graph_runner_;
+    // 6-A-6.4: single execution/capture stream, owned by GraphRuntime lifetime.
+    // Created lazily on first CUDA Graph use; valid across capture ->
+    // instantiate -> replay; destroyed in ~GraphRuntime only. Never destroyed
+    // between capture and replay. No sync policy change: execute() stays async,
+    // callers synchronize when they need results.
+    cudaStream_t capture_stream_ = nullptr;
+    cudaStream_t capture_stream();
 #endif
 };
 

@@ -134,6 +134,39 @@ void gen_q4_0(uint8_t* p, std::mt19937& g) {          // 18 B: d qs[16]
     fill_random(p + 2, 16, g);
 }
 
+void gen_q8_0(uint8_t* p, std::mt19937& g) {          // 34 B: d qs(int8)[32]
+    put_f16(p + 0, urand(g, kDMin, kDMax));
+    fill_random(p + 2, 32, g);  // read back as signed int8 by dequantizer and kernel
+}
+
+// Phase 3 (Tensor Core) adapters: MmqFn-shaped wrappers around the
+// whole-matrix dequant-to-FP16 + cuBLAS FP16 GEMM launcher.
+static void launch_tc_q4_0(const float* a, const void* w, float* o, int M, int K, int N,
+                           cudaStream_t s) {
+    forge::cuda::launch_cublas_gemm_quant_fp16(forge::DataType::Q4_0, a, w, o, M, K, N,
+                                               /*transB=*/true, s);
+}
+static void launch_tc_q4_k(const float* a, const void* w, float* o, int M, int K, int N,
+                           cudaStream_t s) {
+    forge::cuda::launch_cublas_gemm_quant_fp16(forge::DataType::Q4_K, a, w, o, M, K, N,
+                                               /*transB=*/true, s);
+}
+static void launch_tc_q8_0(const float* a, const void* w, float* o, int M, int K, int N,
+                           cudaStream_t s) {
+    forge::cuda::launch_cublas_gemm_quant_fp16(forge::DataType::Q8_0, a, w, o, M, K, N,
+                                               /*transB=*/true, s);
+}
+static void launch_tc_q6_k(const float* a, const void* w, float* o, int M, int K, int N,
+                           cudaStream_t s) {
+    forge::cuda::launch_cublas_gemm_quant_fp16(forge::DataType::Q6_K, a, w, o, M, K, N,
+                                               /*transB=*/true, s);
+}
+static void launch_tc_q5_k(const float* a, const void* w, float* o, int M, int K, int N,
+                           cudaStream_t s) {
+    forge::cuda::launch_cublas_gemm_quant_fp16(forge::DataType::Q5_K, a, w, o, M, K, N,
+                                               /*transB=*/true, s);
+}
+
 // ---- per-dtype descriptors -------------------------------------------------
 
 struct DtypeSpec {
@@ -143,15 +176,36 @@ struct DtypeSpec {
     void (*gen)(uint8_t*, std::mt19937&);
     void (*dequant_row)(const uint8_t*, float*, int, int);   // forge::ops golden
     MmqFn launch;                                            // forge::cuda kernel
+    double tol;          // normalized (over global_max) tolerance
 };
 
 const DtypeSpec kSpecs[] = {
-    {"Q4_K", 144, 256, gen_q4_k, forge::ops::dequantize_q4_k_row, forge::cuda::launch_mmq_q4_k},
-    {"Q6_K", 210, 256, gen_q6_k, forge::ops::dequantize_q6_k_row, forge::cuda::launch_mmq_q6_k},
-    {"Q5_K", 176, 256, gen_q5_k, forge::ops::dequantize_q5_k_row, forge::cuda::launch_mmq_q5_k},
-    {"Q2_K", 84, 256, gen_q2_k, forge::ops::dequantize_q2_k_row, forge::cuda::launch_mmq_q2_k},
-    {"Q3_K", 110, 256, gen_q3_k, forge::ops::dequantize_q3_k_row, forge::cuda::launch_mmq_q3_k},
-    {"Q4_0", 18, 32, gen_q4_0, forge::ops::dequantize_q4_0_row, forge::cuda::launch_mmq_q4_0},
+    {"Q4_K", 144, 256, gen_q4_k, forge::ops::dequantize_q4_k_row, forge::cuda::launch_mmq_q4_k,
+     0.05},
+    {"Q6_K", 210, 256, gen_q6_k, forge::ops::dequantize_q6_k_row, forge::cuda::launch_mmq_q6_k,
+     0.05},
+    {"Q5_K", 176, 256, gen_q5_k, forge::ops::dequantize_q5_k_row, forge::cuda::launch_mmq_q5_k,
+     0.05},
+    {"Q2_K", 84, 256, gen_q2_k, forge::ops::dequantize_q2_k_row, forge::cuda::launch_mmq_q2_k,
+     0.05},
+    {"Q3_K", 110, 256, gen_q3_k, forge::ops::dequantize_q3_k_row, forge::cuda::launch_mmq_q3_k,
+     0.05},
+    {"Q4_0", 18, 32, gen_q4_0, forge::ops::dequantize_q4_0_row, forge::cuda::launch_mmq_q4_0,
+     0.05},
+};
+
+// Phase 3/5 Tensor Core path (dequant-to-FP16 + cuBLAS FP16 GEMM, FP32
+// accumulate). FP16 carries ~2^-11 per-element rounding vs the FP64 golden, so
+// the tolerance is tighter than MMQ's (activation-int8 noise) but still far
+// below the O(1) signature of structural defects. Q8_0's real MMQ arrived with
+// Phase 3.5 (it is covered in the MMQ suite via cuda_mmq); this TC suite covers
+// every dtype with an FP16 whole-matrix dequant (Phase 5 folded Q6_K in).
+const DtypeSpec kTcSpecs[] = {
+    {"Q4_0/T", 18, 32, gen_q4_0, forge::ops::dequantize_q4_0_row, launch_tc_q4_0, 0.01},
+    {"Q4_K/T", 144, 256, gen_q4_k, forge::ops::dequantize_q4_k_row, launch_tc_q4_k, 0.01},
+    {"Q6_K/T", 210, 256, gen_q6_k, forge::ops::dequantize_q6_k_row, launch_tc_q6_k, 0.01},
+    {"Q5_K/T", 176, 256, gen_q5_k, forge::ops::dequantize_q5_k_row, launch_tc_q5_k, 0.01},
+    {"Q8_0/T", 34, 32, gen_q8_0, forge::ops::dequantize_q8_0_row, launch_tc_q8_0, 0.01},
 };
 
 // ---- helpers ----------------------------------------------------------------
@@ -257,9 +311,10 @@ bool run_case(const DtypeSpec& spec, int M, int K, int N, std::mt19937& rng,
     *deterministic =
         std::memcmp(out.data(), out2.data(), out.size() * sizeof(float)) == 0;
 
-    // Tolerance: activation-int8 noise stays well under 1e-2 relative to the
-    // matrix max; structural corruption lands at O(1).
-    constexpr double kRelTol = 0.05;
+    // Tolerance (normalized over the matrix max): MMQ activation-int8 noise and
+    // FP16 TC rounding both stay far below their tolerances on random data while
+    // structural corruption lands at O(1). spec.tol encodes per-path slack.
+    const double kRelTol = spec.tol;
     *worst_rel = 0.0;
     size_t worst_idx = 0;
     for (size_t i = 0; i < out.size(); ++i) {
@@ -271,7 +326,7 @@ bool run_case(const DtypeSpec& spec, int M, int K, int N, std::mt19937& rng,
     }
     if (*worst_rel > kRelTol) {
         char buf[160];
-        std::snprintf(buf, sizeof buf, "rel err %.3e > %.0e", *worst_rel, kRelTol);
+        std::snprintf(buf, sizeof buf, "rel err %.3e > tol %.0e", *worst_rel, kRelTol);
         *err = buf;
         if (std::getenv("FORGE_MMQ_DEBUG")) {
             const size_t wm = worst_idx / N, wn = worst_idx % N;
@@ -314,40 +369,37 @@ int main() {
     if (const char* s = std::getenv("FORGE_MMQ_SEED")) seed = static_cast<unsigned>(std::atoi(s));
     std::mt19937 rng(seed);
 
-    // FORGE_MMQ_STRICT=1 currently changes nothing (no known-issue dtypes),
-    // kept as a hook for future waivers.
-    const bool strict = std::getenv("FORGE_MMQ_STRICT") != nullptr;
-    auto known_issue = [](const char*) { return false; };
-    (void)strict;
-
-    for (const auto& spec : kSpecs) {
-        int dtype_fails = 0;
-        double dtype_worst = 0.0;
-        const bool waived = !strict && known_issue(spec.name);
-        for (const auto& sh : shapes) {
-            ++checks;
-            double rel = 0.0;
-            bool det = false;
-            std::string err;
-            const bool ok = run_case(spec, sh.M, sh.K, sh.N, rng, &rel, &det, &err);
-            dtype_worst = std::max(dtype_worst, rel);
-            if (!ok) {
-                if (!waived) {
+    // MMQ (dp4a) suite, then the Phase 3 TensorCore suite (dequant-to-FP16 +
+    // cuBLAS FP16 GEMM) over the same shapes.
+    const size_t nshapes = sizeof(shapes) / sizeof(shapes[0]);
+    auto run_suite = [&](const char* label, const DtypeSpec* specs, size_t nspecs) {
+        for (size_t si = 0; si < nspecs; ++si) {
+            const DtypeSpec& spec = specs[si];
+            int dtype_fails = 0;
+            double dtype_worst = 0.0;
+            for (const auto& sh : shapes) {
+                ++checks;
+                double rel = 0.0;
+                bool det = false;
+                std::string err;
+                const bool ok = run_case(spec, sh.M, sh.K, sh.N, rng, &rel, &det, &err);
+                dtype_worst = std::max(dtype_worst, rel);
+                if (!ok) {
                     ++failures;
-                    std::printf("FAIL %-5s M=%-3d K=%-5d N=%-4d : %s\n", spec.name, sh.M, sh.K,
-                                sh.N, err.c_str());
+                    ++dtype_fails;
+                    std::printf("FAIL %s %-7s M=%-3d K=%-5d N=%-4d : %s\n", label, spec.name,
+                                sh.M, sh.K, sh.N, err.c_str());
                 }
-                ++dtype_fails;
             }
+            std::printf("%s %-7s %s (%zu/%zu cases, worst rel %.3e)\n", label, spec.name,
+                        dtype_fails == 0 ? "ok   " : "FAILED", nshapes - dtype_fails, nshapes,
+                        dtype_worst);
         }
-        const char* status =
-            dtype_fails == 0 ? "ok   " : (waived ? "KNOWN-ISSUE" : "FAILED");
-        std::printf("%-5s %s (%d/%zu cases, worst rel %.3e)%s\n", spec.name, status,
-                    static_cast<int>(sizeof(shapes) / sizeof(shapes[0]) - dtype_fails),
-                    sizeof(shapes) / sizeof(shapes[0]), dtype_worst,
-                    waived ? "  [excluded from dispatch whitelist]" : "");
-    }
+    };
 
-    std::printf("\n=== mmq-ref: %d/%d cases passed ===\n", checks - failures, checks);
+    run_suite("MMQ", kSpecs, sizeof(kSpecs) / sizeof(kSpecs[0]));
+    run_suite("TC ", kTcSpecs, sizeof(kTcSpecs) / sizeof(kTcSpecs[0]));
+
+    std::printf("\n=== mmq/TC ref: %d/%d cases passed ===\n", checks - failures, checks);
     return failures > 0 ? 1 : 0;
 }

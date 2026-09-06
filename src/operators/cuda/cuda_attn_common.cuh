@@ -9,6 +9,8 @@
 
 #include <cmath>
 
+#include <cuda_fp16.h>
+
 namespace forge {
 namespace cuda {
 
@@ -78,6 +80,49 @@ __device__ __forceinline__ void cross_warp_merge_and_write(
     float inv_sum = 1.0f / (global_sum + 1e-30f);
     for (int d = lane; d < HEAD_DIM; d += 32) {
         O[h * HEAD_DIM + d] = global_acc[d] * inv_sum;
+    }
+}
+
+// 6-A-7: FP16-output overload. Merge math stays FP32 (identical to above);
+// only the final store converts (__float2half). The FP32 overload above is
+// untouched — overload resolution picks this one for __half* O.
+template <int HEAD_DIM, int NUM_WARPS>
+__device__ __forceinline__ void cross_warp_merge_and_write(
+    const float* __restrict__ s_warp_max,
+    const float* __restrict__ s_warp_sum,
+    const float* __restrict__ s_warp_acc,
+    __half* __restrict__ O,
+    int h,  // head index for output writing
+    int lane) {
+
+    // Only warp 0 does the final merge
+    if (threadIdx.x >> 5 != 0) return;
+
+    // Find global max across warps
+    float global_max = -1e30f;
+    for (int w = 0; w < NUM_WARPS; ++w) {
+        global_max = fmaxf(global_max, s_warp_max[w]);
+    }
+
+    // Merge sum and acc with LSE correction
+    float global_sum = 0.0f;
+    float global_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) global_acc[d] = 0.0f;
+
+    for (int w = 0; w < NUM_WARPS; ++w) {
+        float corr = expf(s_warp_max[w] - global_max);
+        global_sum += s_warp_sum[w] * corr;
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            global_acc[d] += s_warp_acc[w * HEAD_DIM + d] * corr;
+        }
+    }
+
+    // Write output (FP32 -> FP16 store)
+    float inv_sum = 1.0f / (global_sum + 1e-30f);
+    for (int d = lane; d < HEAD_DIM; d += 32) {
+        O[h * HEAD_DIM + d] = __float2half(global_acc[d] * inv_sum);
     }
 }
 

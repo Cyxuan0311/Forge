@@ -1,5 +1,7 @@
 #include <cmath>
 
+#include <cuda_fp16.h>
+
 #include "cuda_elementwise.h"
 
 namespace forge {
@@ -61,6 +63,42 @@ void launch_gelu_multiply(const float* gate, const float* up, float* out, int n,
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     gelu_multiply_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n);
+}
+
+// Phase 6-A-4: real native FP16 gated activations (FP16 storage, FP32 compute of
+// silu/gelu, FP16 output). gate reuses the SILU / GELU dtype-contract gate.
+__global__ void silu_multiply_kernel_fp16(const __half* gate, const __half* up, __half* out,
+                                          int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float v = __half2float(gate[idx]);
+        float silu_v = v / (1.0f + expf(-v));
+        out[idx] = __float2half(silu_v * __half2float(up[idx]));
+    }
+}
+
+void launch_silu_multiply_fp16(const __half* gate, const __half* up, __half* out, int n,
+                               cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    silu_multiply_kernel_fp16<<<blocks, threads, 0, stream>>>(gate, up, out, n);
+}
+
+__global__ void gelu_multiply_kernel_fp16(const __half* gate, const __half* up, __half* out,
+                                          int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float v = __half2float(gate[idx]);
+        float gelu_v = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
+        out[idx] = __float2half(gelu_v * __half2float(up[idx]));
+    }
+}
+
+void launch_gelu_multiply_fp16(const __half* gate, const __half* up, __half* out, int n,
+                               cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    gelu_multiply_kernel_fp16<<<blocks, threads, 0, stream>>>(gate, up, out, n);
 }
 
 __global__ void scale_kernel(float* data, float s, int n) {

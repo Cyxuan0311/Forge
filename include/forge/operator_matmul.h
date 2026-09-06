@@ -2,11 +2,22 @@
 
 #include "tensor.h"
 
+// 6-A-6.4: stream plumbing (mirrors forge/op_dispatch.h).
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#else
+struct CUstream_st;
+typedef CUstream_st* cudaStream_t;
+#endif
+
 namespace forge {
 namespace ops {
 
 TensorPtr matmul(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias = nullptr);
-TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias = nullptr);
+// 6-A-6.4: stream defaults to 0 (legacy stream). Only the CUDA FP16 native
+// path honors a non-zero stream today; all other dtypes keep legacy behavior.
+TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias = nullptr,
+                        cudaStream_t stream = 0);
 TensorPtr matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const TensorPtr& b2);
 TensorPtr ffn_up_fused(const TensorPtr& input, const TensorPtr& w1, const TensorPtr& w3,
                        int intermediate_dim);

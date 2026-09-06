@@ -5,7 +5,37 @@
 #include "forge/backend_scheduler.h"
 #include "forge/logger.h"
 
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#endif
+
 namespace forge {
+
+#ifdef USE_CUDA
+GraphRuntime::~GraphRuntime() {
+    // 6-A-6.4: capture stream dies with GraphRuntime, never between
+    // capture and replay.
+    if (capture_stream_) {
+        cudaStreamDestroy(capture_stream_);
+        capture_stream_ = nullptr;
+    }
+}
+
+// Lazily create (once) the owned capture stream.
+cudaStream_t GraphRuntime::capture_stream() {
+    if (!capture_stream_) {
+        cudaError_t err = cudaStreamCreate(&capture_stream_);
+        if (err != cudaSuccess) {
+            LOG_ERROR("GraphRuntime: cudaStreamCreate failed: " +
+                      std::string(cudaGetErrorString(err)));
+            capture_stream_ = nullptr;
+        }
+    }
+    return capture_stream_;
+}
+#else
+GraphRuntime::~GraphRuntime() = default;
+#endif
 
 void GraphRuntime::inject_runtime(const ForwardRequest& req) {
     runtime_state_->start_pos = req.start_pos;
@@ -103,9 +133,17 @@ TensorPtr GraphRuntime::run(const TensorPtr& hidden, const ForwardRequest& req,
 
 #ifdef USE_CUDA
     if (cuda_graph_runner_ && cuda_graph_runner_->enabled() && !key.is_prefill) {
-        // Try replay or capture. The execute_fn wraps graph_->execute().
-        used_cuda_graph = cuda_graph_runner_->try_replay_or_capture(
-            *graph_, [this]() { graph_->execute(); }, /*stream=*/0);
+        // 6-A-6.4: capture/replay on the owned capture stream; the execute_fn
+        // forwards the same stream so every kernel + D2D copy is capturable.
+        // Falls back to stream 0 if stream creation failed.
+        cudaStream_t cs = capture_stream();
+        if (cs) {
+            used_cuda_graph = cuda_graph_runner_->try_replay_or_capture(
+                *graph_, [this, cs]() { graph_->execute(cs); }, cs);
+        } else {
+            used_cuda_graph = cuda_graph_runner_->try_replay_or_capture(
+                *graph_, [this]() { graph_->execute(); }, /*stream=*/0);
+        }
     }
 #endif
 
