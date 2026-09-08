@@ -28,11 +28,14 @@ bool trace_enabled_cached() {
 
 }  // namespace
 
-bool fp8_scale_trace_enabled() { return trace_enabled_cached(); }
+bool fp8_scale_trace_enabled() {
+    return trace_enabled_cached();
+}
 
 Fp8ScaleDebugInfo fp8_scale_debug_info(const TensorPtr& t, bool used_registry_fallback) {
     Fp8ScaleDebugInfo info;
-    if (!t) return info;
+    if (!t)
+        return info;
 
     info.has_sidecar = t->has_fp8_scale();
     info.tensor_data = t->data();
@@ -51,7 +54,8 @@ Fp8ScaleDebugInfo fp8_scale_debug_info(const TensorPtr& t, bool used_registry_fa
 }
 
 void fp8_scale_trace(const char* where, const TensorPtr& t, bool used_registry_fallback) {
-    if (!trace_enabled_cached()) return;
+    if (!trace_enabled_cached())
+        return;
     const Fp8ScaleDebugInfo info = fp8_scale_debug_info(t, used_registry_fallback);
     const std::string dt = t ? dtype_name(t->dtype()) : std::string("null");
     std::printf(

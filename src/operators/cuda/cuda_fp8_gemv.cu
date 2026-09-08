@@ -26,13 +26,13 @@
 // returns false on pre-Ada GPUs.
 // =========================================================================
 
-#include "forge/fp8_gemv.h"
-#include "forge/fp8_gemm.h"  // Fp8W8A8Scales
-#include "forge/fp8_utils.h"  // fp8_e4m3_to_fp32
-
 #include <cuda_runtime.h>
 
 #include <cstdio>
+
+#include "forge/fp8_gemm.h"  // Fp8W8A8Scales
+#include "forge/fp8_gemv.h"
+#include "forge/fp8_utils.h"  // fp8_e4m3_to_fp32
 
 namespace forge {
 namespace cuda {
@@ -46,8 +46,10 @@ const float* get_device_decode_lut() {
     static float* d_lut = nullptr;
     if (d_lut == nullptr) {
         float host[256];
-        for (int i = 0; i < 256; ++i) host[i] = fp8_e4m3_to_fp32(static_cast<uint8_t>(i));
-        if (cudaMalloc(&d_lut, sizeof(host)) != cudaSuccess) return nullptr;
+        for (int i = 0; i < 256; ++i)
+            host[i] = fp8_e4m3_to_fp32(static_cast<uint8_t>(i));
+        if (cudaMalloc(&d_lut, sizeof(host)) != cudaSuccess)
+            return nullptr;
         if (cudaMemcpy(d_lut, host, sizeof(host), cudaMemcpyHostToDevice) != cudaSuccess) {
             cudaFree(d_lut);
             d_lut = nullptr;
@@ -73,16 +75,17 @@ bool fp8_gemv_supported() {
 // each warp step reads one coalesced 32B sector of the row.
 __global__ void gemv_fp8_e4m3(float* __restrict__ D, const uint8_t* __restrict__ A,
                               const uint8_t* __restrict__ W, int K, int N,
-                              const float* __restrict__ scale_a,
-                              const float* __restrict__ scale_w,
+                              const float* __restrict__ scale_a, const float* __restrict__ scale_w,
                               const float* __restrict__ lut) {
     extern __shared__ __align__(16) char smem[];
     float* LUT = reinterpret_cast<float*>(smem);
     uint8_t* Ash = reinterpret_cast<uint8_t*>(smem + 256 * sizeof(float));
     const int tid = threadIdx.x;
 
-    for (int i = tid; i < 256; i += blockDim.x) LUT[i] = lut[i];
-    for (int k = tid; k < K; k += blockDim.x) Ash[k] = A[k];
+    for (int i = tid; i < 256; i += blockDim.x)
+        LUT[i] = lut[i];
+    for (int k = tid; k < K; k += blockDim.x)
+        Ash[k] = A[k];
     __syncthreads();
 
     // 6-C-5.2: the product is formed ON DEVICE from the two per-tensor scale
@@ -92,7 +95,8 @@ __global__ void gemv_fp8_e4m3(float* __restrict__ D, const uint8_t* __restrict__
     const float s = (*scale_a) * (*scale_w);
 
     const int warp = blockIdx.x * (blockDim.x / 32) + (tid >> 5);
-    if (warp >= N) return;
+    if (warp >= N)
+        return;
     const int lane = tid & 31;
 
     const uint8_t* row = W + (size_t)warp * K;
@@ -107,18 +111,22 @@ __global__ void gemv_fp8_e4m3(float* __restrict__ D, const uint8_t* __restrict__
     acc += __shfl_down_sync(0xffffffffu, acc, 4);
     acc += __shfl_down_sync(0xffffffffu, acc, 2);
     acc += __shfl_down_sync(0xffffffffu, acc, 1);
-    if (lane == 0) D[warp] = acc * s;
+    if (lane == 0)
+        D[warp] = acc * s;
 }
 
 }  // namespace
 
-bool launch_fp8_gemv_e4m3_fp32(const uint8_t* A_fp8, const uint8_t* B_fp8, float* D_fp32,
-                               int K, int N, const Fp8W8A8Scales& sc, cudaStream_t stream) {
-    if (!fp8_gemv_supported()) return false;
-    if (!sc.scale_a || !sc.scale_w) return false;
+bool launch_fp8_gemv_e4m3_fp32(const uint8_t* A_fp8, const uint8_t* B_fp8, float* D_fp32, int K,
+                               int N, const Fp8W8A8Scales& sc, cudaStream_t stream) {
+    if (!fp8_gemv_supported())
+        return false;
+    if (!sc.scale_a || !sc.scale_w)
+        return false;
 
     const float* lut = get_device_decode_lut();
-    if (!lut) return false;
+    if (!lut)
+        return false;
 
     // 6-C-5.2/5.4: the scales are consumed ON DEVICE. No cudaMalloc, no D2H, no H2D
     // per call -- both scalars are stable, Tensor-owned, graph-visible addresses.
@@ -127,8 +135,8 @@ bool launch_fp8_gemv_e4m3_fp32(const uint8_t* A_fp8, const uint8_t* B_fp8, float
     const int grid = (N + warps_per_block - 1) / warps_per_block;
     const size_t shm = 256 * sizeof(float) + static_cast<size_t>(K);
 
-    gemv_fp8_e4m3<<<grid, BDIM, shm, stream>>>(D_fp32, A_fp8, B_fp8, K, N, sc.scale_a,
-                                               sc.scale_w, lut);
+    gemv_fp8_e4m3<<<grid, BDIM, shm, stream>>>(D_fp32, A_fp8, B_fp8, K, N, sc.scale_a, sc.scale_w,
+                                               lut);
     return cudaGetLastError() == cudaSuccess;
 }
 

@@ -7,13 +7,13 @@
 // from Tensor::fp8_scale_device_slot().
 // =========================================================================
 
-#include "forge/fp8_quant.h"
-#include "forge/fp8_utils.h"
-
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <stdexcept>
+
+#include "forge/fp8_quant.h"
+#include "forge/fp8_utils.h"
 
 namespace forge {
 
@@ -28,9 +28,10 @@ float* amax_partials_scratch(int blocks) {
     static float* buf = nullptr;
     static int cap = 0;
     if (blocks > cap) {
-        if (buf) cudaFree(buf);
-        if (cudaMalloc(reinterpret_cast<void**>(&buf), static_cast<size_t>(blocks) *
-                                                           sizeof(float)) != cudaSuccess) {
+        if (buf)
+            cudaFree(buf);
+        if (cudaMalloc(reinterpret_cast<void**>(&buf),
+                       static_cast<size_t>(blocks) * sizeof(float)) != cudaSuccess) {
             buf = nullptr;
             cap = 0;
             return nullptr;
@@ -58,7 +59,8 @@ __global__ void fp8_amax_partial_kernel(const float* __restrict__ x, int n,
     float bad = 0.f;
     for (int i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x) {
         float v = x[i];
-        if (RELU) v = fmaxf(v, 0.f);
+        if (RELU)
+            v = fmaxf(v, 0.f);
         if (!isfinite(v))
             bad = 1.f;
         else
@@ -119,7 +121,8 @@ __global__ void fp8_amax_finalize_kernel(const float* __restrict__ partials, int
         } else {
             scale = amax / kFp8E4M3Max;
         }
-        if (amax_out) *amax_out = amax;
+        if (amax_out)
+            *amax_out = amax;
         *scale_out = scale;
     }
 }
@@ -131,30 +134,34 @@ template <bool RELU>
 __global__ void fp8_quantize_scaled_kernel(const float* __restrict__ x, uint8_t* __restrict__ q,
                                            int n, const float* __restrict__ scale) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    if (i >= n)
+        return;
     const float s = *scale;
     float v = x[i];
-    if (RELU) v = fmaxf(v, 0.f);
+    if (RELU)
+        v = fmaxf(v, 0.f);
     q[i] = fp32_to_fp8_e4m3(v / s);
 }
 
 }  // namespace
 
 Fp8AmaxStatus fp8_amax_status(float amax) {
-    if (!std::isfinite(amax)) return Fp8AmaxStatus::NonFinite;
-    if (amax <= 0.f) return Fp8AmaxStatus::Zero;
+    if (!std::isfinite(amax))
+        return Fp8AmaxStatus::NonFinite;
+    if (amax <= 0.f)
+        return Fp8AmaxStatus::Zero;
     return Fp8AmaxStatus::Ok;
 }
 
 float fp8_w8a8_scale_from_amax(float amax) {
     switch (fp8_amax_status(amax)) {
-        case Fp8AmaxStatus::Ok:
-            return amax / kFp8E4M3Max;
-        case Fp8AmaxStatus::Zero:
-            return 1.f;
-        case Fp8AmaxStatus::NonFinite:
-        default:
-            return NAN;
+    case Fp8AmaxStatus::Ok:
+        return amax / kFp8E4M3Max;
+    case Fp8AmaxStatus::Zero:
+        return 1.f;
+    case Fp8AmaxStatus::NonFinite:
+    default:
+        return NAN;
     }
 }
 
@@ -171,24 +178,21 @@ void quantize_fp8_e4m3_impl(const float* x, uint8_t* q, int n, float* scale_dev,
 
     const int qblocks = (n + kBlock - 1) / kBlock;
     if (apply_relu) {
-        fp8_amax_partial_kernel<true>
-            <<<pblocks, kBlock, 0, stream>>>(x, n, partials);
+        fp8_amax_partial_kernel<true><<<pblocks, kBlock, 0, stream>>>(x, n, partials);
         fp8_amax_finalize_kernel<<<1, kBlock, 0, stream>>>(partials, pblocks, scale_dev,
                                                            /*amax_out=*/nullptr);
-        fp8_quantize_scaled_kernel<true>
-            <<<qblocks, kBlock, 0, stream>>>(x, q, n, scale_dev);
+        fp8_quantize_scaled_kernel<true><<<qblocks, kBlock, 0, stream>>>(x, q, n, scale_dev);
     } else {
-        fp8_amax_partial_kernel<false>
-            <<<pblocks, kBlock, 0, stream>>>(x, n, partials);
+        fp8_amax_partial_kernel<false><<<pblocks, kBlock, 0, stream>>>(x, n, partials);
         fp8_amax_finalize_kernel<<<1, kBlock, 0, stream>>>(partials, pblocks, scale_dev,
                                                            /*amax_out=*/nullptr);
-        fp8_quantize_scaled_kernel<false>
-            <<<qblocks, kBlock, 0, stream>>>(x, q, n, scale_dev);
+        fp8_quantize_scaled_kernel<false><<<qblocks, kBlock, 0, stream>>>(x, q, n, scale_dev);
     }
 }
 
 TensorPtr quantize_fp8_e4m3_w8a8(const TensorPtr& src, cudaStream_t stream) {
-    if (!src) throw std::invalid_argument("quantize_fp8_e4m3_w8a8: null source tensor");
+    if (!src)
+        throw std::invalid_argument("quantize_fp8_e4m3_w8a8: null source tensor");
     if (src->dtype() != DataType::FP32)
         throw std::invalid_argument("quantize_fp8_e4m3_w8a8: source must be FP32");
     if (src->numel() <= 0)
@@ -210,7 +214,8 @@ TensorPtr quantize_fp8_e4m3_w8a8(const TensorPtr& src, cudaStream_t stream) {
 }
 
 TensorPtr quantize_fp8_e4m3_output(const TensorPtr& src, cudaStream_t stream) {
-    if (!src) throw std::invalid_argument("quantize_fp8_e4m3_output: null source tensor");
+    if (!src)
+        throw std::invalid_argument("quantize_fp8_e4m3_output: null source tensor");
     if (src->dtype() != DataType::FP32)
         throw std::invalid_argument("quantize_fp8_e4m3_output: source must be FP32");
     if (src->numel() <= 0)
@@ -227,8 +232,8 @@ TensorPtr quantize_fp8_e4m3_output(const TensorPtr& src, cudaStream_t stream) {
     return out;
 }
 
-void quantize_fp8_e4m3_output_into(const TensorPtr& src, const TensorPtr& dst,
-                                   cudaStream_t stream, bool apply_relu) {
+void quantize_fp8_e4m3_output_into(const TensorPtr& src, const TensorPtr& dst, cudaStream_t stream,
+                                   bool apply_relu) {
     if (!src || !dst)
         throw std::invalid_argument("quantize_fp8_e4m3_output_into: null tensor");
     if (src->dtype() != DataType::FP32)

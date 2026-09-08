@@ -8,12 +8,12 @@ namespace forge {
 namespace cuda {
 
 bool launch_fp8_gemm_e4m3_fp32(const uint8_t*, const uint8_t*, float*, int, int, int,
-                                const Fp8W8A8Scales&, cudaStream_t) {
+                               const Fp8W8A8Scales&, cudaStream_t) {
     return false;
 }
 
 bool launch_fp8_gemm_e4m3_fp8out(const uint8_t*, const uint8_t*, uint8_t*, int, int, int,
-                                  const Fp8W8A8Scales&, cudaStream_t) {
+                                 const Fp8W8A8Scales&, cudaStream_t) {
     return false;
 }
 
