@@ -34,9 +34,8 @@ namespace cuda {
 // W8A8 FP8 E4M3 GEMV (M == 1) -> FP32 output:
 //   D = (s_a * s_w) * (decode(A_fp8)^T * decode(W_fp8))
 // Returns false (and launches nothing) on pre-Ada devices.
-bool launch_fp8_gemv_e4m3_fp32(const uint8_t* A_fp8, const uint8_t* B_fp8, float* D_fp32,
-                                int K, int N, const Fp8W8A8Scales& sc,
-                                cudaStream_t stream = 0);
+bool launch_fp8_gemv_e4m3_fp32(const uint8_t* A_fp8, const uint8_t* B_fp8, float* D_fp32, int K,
+                               int N, const Fp8W8A8Scales& sc, cudaStream_t stream = 0);
 
 }  // namespace cuda
 }  // namespace forge

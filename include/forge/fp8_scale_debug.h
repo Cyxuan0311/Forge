@@ -23,12 +23,12 @@ namespace forge {
 
 // Provenance snapshot for ONE tensor's FP8 scale.
 struct Fp8ScaleDebugInfo {
-    bool has_sidecar = false;          // Tensor sidecar is set (6-C-5)
-    bool has_device_scale = false;     // device mirror allocated (6-C-5.2)
+    bool has_sidecar = false;       // Tensor sidecar is set (6-C-5)
+    bool has_device_scale = false;  // device mirror allocated (6-C-5.2)
     // 6-C-5.7: the legacy host registry is deleted, so this is always false for a
     // production consumer (kept only so the gate counter semantics stay visible).
     bool used_registry_fallback = false;
-    const void* tensor_data = nullptr;     // identity of the tensor's data buffer
+    const void* tensor_data = nullptr;       // identity of the tensor's data buffer
     const void* device_scale_ptr = nullptr;  // stable device address (graph-visible)
     float host_scale = 0.f;
 };
