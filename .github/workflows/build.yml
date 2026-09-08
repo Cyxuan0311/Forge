@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.20
@@ -128,6 +130,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.20

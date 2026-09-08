@@ -13,7 +13,8 @@ add_library(
   cpu/elementwise.cpp
   cpu/attention.cpp
   cpu/common/dequant.cpp
-  cpu/common/quant_tables.cpp)   # 6-C-5.7: interim FP8 scale registry (fp8_scale_registry.cpp) deleted
+  cpu/common/quant_tables.cpp
+)# 6-C-5.7: interim FP8 scale registry (fp8_scale_registry.cpp) deleted
 
 # Architecture-specific sources and compile definitions (see
 # cpu_arch_split_plan.md §3.2)
@@ -62,7 +63,10 @@ if(CUDAToolkit_FOUND)
   set(FORGE_FP8_CUTLASS_FOUND FALSE)
   if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/cutlass/include")
     foreach(_arch ${FORGE_CUDA_ARCH})
-      if(_arch EQUAL 89 OR _arch EQUAL 90 OR _arch EQUAL 91 OR _arch EQUAL 92)
+      if(_arch EQUAL 89
+         OR _arch EQUAL 90
+         OR _arch EQUAL 91
+         OR _arch EQUAL 92)
         set(FORGE_FP8_CUTLASS_FOUND TRUE)
       endif()
     endforeach()
@@ -71,7 +75,8 @@ if(CUDAToolkit_FOUND)
     target_sources(forge_ops PRIVATE cuda/cuda_fp8_gemm.cu)
     set_source_files_properties(
       ${CMAKE_CURRENT_SOURCE_DIR}/cuda/cuda_fp8_gemm.cu
-      PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/cutlass/include")
+      PROPERTIES INCLUDE_DIRECTORIES
+                 "${CMAKE_SOURCE_DIR}/third_party/cutlass/include")
   else()
     target_sources(forge_ops PRIVATE cuda/cuda_fp8_gemm_stub.cu)
   endif()
