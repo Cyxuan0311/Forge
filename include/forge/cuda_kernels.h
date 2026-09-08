@@ -3,8 +3,17 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+// CUDA scalar types (__half / __nv_bfloat16) referenced by the launch
+// declarations below come from the CUDA toolkit headers on CUDA builds. On
+// CPU-only builds (no toolkit) a host-side software fallback with identical
+// names/layout/rounding is used instead -- fixes the macOS/Windows/ppc64le CI
+// "cuda_bf16.h not found" compile failure.
+#if defined(__CUDACC__) || defined(USE_CUDA)
+#    include <cuda_bf16.h>
+#    include <cuda_fp16.h>
+#else
+#    include "forge/fp16_compat.h"
+#endif
 
 #include "forge/types.h"
 
