@@ -18,27 +18,26 @@
 //
 // M=1 (decode / GEMV) is deliberately OUT OF SCOPE here -> 6-C-4.2.
 
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <vector>
-#include <random>
-#include <functional>
-#include <algorithm>
-
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-#include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <random>
+#include <vector>
 
 #include "cutlass/cutlass.h"
+#include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/epilogue/thread/linear_combination_generic_with_scaling.h"
+#include "cutlass/gemm/device/gemm_universal_with_absmax.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/layout/matrix.h"
-#include "cutlass/gemm/device/gemm_universal_with_absmax.h"
-#include "cutlass/epilogue/thread/linear_combination_generic_with_scaling.h"
-#include "cutlass/epilogue/thread/activation.h"
-
 #include "forge/fp8_utils.h"
 
 using namespace forge;
@@ -62,33 +61,29 @@ static int const kStages = 3;
 static int const kAlignmentA = 16;
 static int const kAlignmentB = 16;
 
-using EpilogueOutputOp = cutlass::epilogue::thread::
-    LinearCombinationGenericWithScalingAndAbsMax<cutlass::epilogue::thread::Identity,
-                                                 ElementOutput, ElementAuxOutput, 8,
-                                                 ElementAccumulator, ElementAccumulator>;
+using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombinationGenericWithScalingAndAbsMax<
+    cutlass::epilogue::thread::Identity, ElementOutput, ElementAuxOutput, 8, ElementAccumulator,
+    ElementAccumulator>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalWithAbsMax<
     ElementA, LayoutA, ElementB, LayoutB, ElementOutput, LayoutC, ElementAccumulator,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
-    cutlass::gemm::GemmShape<128, 64, 128>, cutlass::gemm::GemmShape<64, 32, 128>,
-    cutlass::gemm::GemmShape<16, 8, 32>, EpilogueOutputOp,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages, kAlignmentA,
-    kAlignmentB, cutlass::arch::OpMultiplyAdd>;
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89, cutlass::gemm::GemmShape<128, 64, 128>,
+    cutlass::gemm::GemmShape<64, 32, 128>, cutlass::gemm::GemmShape<16, 8, 32>, EpilogueOutputOp,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages, kAlignmentA, kAlignmentB,
+    cutlass::arch::OpMultiplyAdd>;
 
 // Same mainloop, but FP8 (E4M3) output epilogue - used to check that the FP8
 // packing path does NOT repeat the gated-activation packing bug.
 using ElementOutputF8 = cutlass::float_e4m3_t;
-using EpilogueOutputOpF8 = cutlass::epilogue::thread::
-    LinearCombinationGenericWithScalingAndAbsMax<cutlass::epilogue::thread::Identity,
-                                                 ElementOutputF8, ElementOutputF8, 8,
-                                                 ElementAccumulator, ElementAccumulator>;
+using EpilogueOutputOpF8 = cutlass::epilogue::thread::LinearCombinationGenericWithScalingAndAbsMax<
+    cutlass::epilogue::thread::Identity, ElementOutputF8, ElementOutputF8, 8, ElementAccumulator,
+    ElementAccumulator>;
 using GemmF8 = cutlass::gemm::device::GemmUniversalWithAbsMax<
     ElementA, LayoutA, ElementB, LayoutB, ElementOutputF8, LayoutC, ElementAccumulator,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
-    cutlass::gemm::GemmShape<128, 64, 128>, cutlass::gemm::GemmShape<64, 32, 128>,
-    cutlass::gemm::GemmShape<16, 8, 32>, EpilogueOutputOpF8,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages, kAlignmentA,
-    kAlignmentB, cutlass::arch::OpMultiplyAdd>;
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89, cutlass::gemm::GemmShape<128, 64, 128>,
+    cutlass::gemm::GemmShape<64, 32, 128>, cutlass::gemm::GemmShape<16, 8, 32>, EpilogueOutputOpF8,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages, kAlignmentA, kAlignmentB,
+    cutlass::arch::OpMultiplyAdd>;
 
 // --------------------------------------------------------------------------
 // Route B: hand-written FP8 Tensor Core GEMM (Forge fallback / reference)
@@ -102,19 +97,19 @@ using GemmF8 = cutlass::gemm::device::GemmUniversalWithAbsMax<
 //              (so B must be K-contiguous per column => column-major (k + n*K))
 //   D (16x8) : d0,d1 -> C[row][col], C[row][col+1]       row = lane/4
 //              d2,d3 -> C[row+8][col], C[row+8][col+1]   col = (lane%4)*2
-__global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,   // MxK row-major
-                                const uint8_t* __restrict__ B,   // KxN col-major (k + n*K)
+__global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,  // MxK row-major
+                                const uint8_t* __restrict__ B,  // KxN col-major (k + n*K)
                                 float* __restrict__ C, int M, int N, int K, float alpha) {
     const int lane = threadIdx.x & 31;
     const int warpId = threadIdx.x >> 5;
-    const int wm = warpId >> 1;   // 0..3  (TILE_M = 64)
-    const int wn = warpId & 1;    // 0..1  (TILE_N = 16)
+    const int wm = warpId >> 1;  // 0..3  (TILE_M = 64)
+    const int wn = warpId & 1;   // 0..1  (TILE_N = 16)
     const int gRow = blockIdx.y * 64 + wm * 16;
     const int gCol = blockIdx.x * 16 + wn * 8;
 
-    const int ra = lane >> 2;          // A row within the 16-row MMA tile (0..7)
-    const int kA = (lane & 3) * 4;     // A k offset (0,4,8,12)
-    const int kB = (lane >> 3) * 4;    // B k offset (0,4,8,12) -- B uses lane/8
+    const int ra = lane >> 2;        // A row within the 16-row MMA tile (0..7)
+    const int kA = (lane & 3) * 4;   // A k offset (0,4,8,12)
+    const int kB = (lane >> 3) * 4;  // B k offset (0,4,8,12) -- B uses lane/8
     const int row0 = gRow + ra;
     const int row1 = gRow + ra + 8;
     const int col0 = gCol + (lane & 3) * 2;
@@ -140,8 +135,8 @@ __global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,   // MxK row-majo
             "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
             : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]),
-              "f"(c[2]), "f"(c[3]));
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]),
+              "f"(c[3]));
     }
 
     if (col0 + 1 < N) {
@@ -160,7 +155,8 @@ __global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,   // MxK row-majo
 __global__ void f32_to_half_kernel(const float* __restrict__ src, __half* __restrict__ dst,
                                    size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half(src[i]);
+    if (i < n)
+        dst[i] = __float2half(src[i]);
 }
 
 // --------------------------------------------------------------------------
@@ -172,8 +168,8 @@ struct Sample {
 };
 
 // Golden element from the DECODED fp8 operands (FP32 accumulation).
-static float golden_scalar(const std::vector<uint8_t>& Af, const std::vector<uint8_t>& Bf,
-                           int i, int j, int K, int N) {
+static float golden_scalar(const std::vector<uint8_t>& Af, const std::vector<uint8_t>& Bf, int i,
+                           int j, int K, int N) {
     float acc = 0.f;
     const uint8_t* Arow = Af.data() + (size_t)i * K;
     for (int k = 0; k < K; ++k)
@@ -189,20 +185,23 @@ static float bench_cuda(std::function<cudaError_t()> kernel, int iters, cudaStre
     cudaError_t warm = kernel();
     cudaDeviceSynchronize();
     if (warm != cudaSuccess) {
-        if (ok) *ok = false;
+        if (ok)
+            *ok = false;
         cudaEventDestroy(s);
         cudaEventDestroy(e);
         return 0.f;
     }
     cudaEventRecord(s, stream);
-    for (int i = 0; i < iters; ++i) kernel();
+    for (int i = 0; i < iters; ++i)
+        kernel();
     cudaEventRecord(e, stream);
     cudaEventSynchronize(e);
     float ms = 0;
     cudaEventElapsedTime(&ms, s, e);
     cudaEventDestroy(s);
     cudaEventDestroy(e);
-    if (ok) *ok = true;
+    if (ok)
+        *ok = true;
     return ms / iters;
 }
 
@@ -233,7 +232,8 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     // CUTLASS: A row-major (M,K) = Af ; B column-major (K,N): B[k + n*K]
     std::vector<uint8_t> Bcol((size_t)K * N);
     for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n) Bcol[(size_t)k + (size_t)n * K] = Bf[(size_t)k * N + n];
+        for (int n = 0; n < N; ++n)
+            Bcol[(size_t)k + (size_t)n * K] = Bf[(size_t)k * N + n];
 
     uint8_t *dA, *dBcol;
     cudaMalloc(&dA, (size_t)M * K);
@@ -253,10 +253,14 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     // => D(fp32) == FP32 accumulator == A_fp8 @ B_fp8  (no scale fusion)
     float hOne = 1.f, hZero = 0.f;
     float *dScaleA, *dScaleB, *dScaleC, *dScaleD, *dScaleAux, *dAbsMaxAux, *dAbsMaxD;
-    cudaMalloc(&dScaleA, 4); cudaMalloc(&dScaleB, 4); cudaMalloc(&dScaleC, 4);
-    cudaMalloc(&dScaleD, 4); cudaMalloc(&dScaleAux, 4);
-    cudaMalloc(&dAbsMaxAux, 4); cudaMalloc(&dAbsMaxD, 4);
-    cudaMemcpy(dScaleA, &s_a, 4, cudaMemcpyHostToDevice);   // per-tensor tensor sidecar
+    cudaMalloc(&dScaleA, 4);
+    cudaMalloc(&dScaleB, 4);
+    cudaMalloc(&dScaleC, 4);
+    cudaMalloc(&dScaleD, 4);
+    cudaMalloc(&dScaleAux, 4);
+    cudaMalloc(&dAbsMaxAux, 4);
+    cudaMalloc(&dAbsMaxD, 4);
+    cudaMemcpy(dScaleA, &s_a, 4, cudaMemcpyHostToDevice);  // per-tensor tensor sidecar
     cudaMemcpy(dScaleB, &s_w, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dScaleC, &hOne, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dScaleD, &hOne, 4, cudaMemcpyHostToDevice);
@@ -278,22 +282,26 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     typename Gemm::EpilogueOutputOp::Params epilogue_params{
         activation_params, dScaleA, dScaleB, dScaleC, dScaleD, dScaleAux, dAbsMaxAux, dAbsMaxD};
 
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K},                                   // problem size
-        1,                                           // batch
-        epilogue_params,
-        dA, dBcol, dSrcC, dCcut, dAux, dBias,
-        (int64_t)((size_t)M * K),                    // batch stride A
-        (int64_t)((size_t)K * N),                    // batch stride B
-        (int64_t)szC,                                // batch stride C
-        (int64_t)szC,                                // batch stride D
-        M,                                           // batch stride vector
-        (int64_t)K,                                  // lda  (A row-major MxK)
-        (int64_t)K,                                  // ldb  (B col-major KxN)
-        (int64_t)N,                                  // ldc
-        (int64_t)N,                                  // ldd
-        (int64_t)0};                                 // ld_vector (must be 0)
+    typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                  {M, N, K},  // problem size
+                                  1,          // batch
+                                  epilogue_params,
+                                  dA,
+                                  dBcol,
+                                  dSrcC,
+                                  dCcut,
+                                  dAux,
+                                  dBias,
+                                  (int64_t)((size_t)M * K),  // batch stride A
+                                  (int64_t)((size_t)K * N),  // batch stride B
+                                  (int64_t)szC,              // batch stride C
+                                  (int64_t)szC,              // batch stride D
+                                  M,                         // batch stride vector
+                                  (int64_t)K,                // lda  (A row-major MxK)
+                                  (int64_t)K,                // ldb  (B col-major KxN)
+                                  (int64_t)N,                // ldc
+                                  (int64_t)N,                // ldd
+                                  (int64_t)0};               // ld_vector (must be 0)
 
     Gemm gemm_op;
     cutlass::Status status = gemm_op.can_implement(args);
@@ -303,13 +311,16 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     void* wsPtr = nullptr;
     if (okCut) {
         wsBytes = Gemm::get_workspace_size(args);
-        if (wsBytes) cudaMalloc(&wsPtr, wsBytes);
+        if (wsBytes)
+            cudaMalloc(&wsPtr, wsBytes);
         status = gemm_op.initialize(args, wsPtr);
         okCut = (status == cutlass::Status::kSuccess);
         if (okCut) {
-            msCut = bench_cuda([&]() -> cudaError_t {
-                return gemm_op() == cutlass::Status::kSuccess ? cudaSuccess : cudaErrorUnknown;
-            }, iters, stream, &okCut);
+            msCut = bench_cuda(
+                [&]() -> cudaError_t {
+                    return gemm_op() == cutlass::Status::kSuccess ? cudaSuccess : cudaErrorUnknown;
+                },
+                iters, stream, &okCut);
         }
     }
     double errCut = -1;
@@ -320,8 +331,7 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
         const double sw = (double)s_a * (double)s_w;
         errCut = 0;
         for (const auto& s : samples)
-            errCut = std::max(errCut,
-                              (double)fabs(hC[(size_t)s.i * N + s.j] - s.ref * sw));
+            errCut = std::max(errCut, (double)fabs(hC[(size_t)s.i * N + s.j] - s.ref * sw));
     }
 
     // ---------------- Route B (hand-written MMA) ----------------
@@ -332,10 +342,12 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     if (M >= 16) {
         dim3 block(8 * 32);
         dim3 grid((N + 15) / 16, (M + 63) / 64);
-        msB = bench_cuda([&]() -> cudaError_t {
-            fp8_gemm_kernel<<<grid, block, 0, stream>>>(dA, dBcol, dCb, M, N, K, 1.f);
-            return cudaGetLastError();
-        }, iters, stream, &okB);
+        msB = bench_cuda(
+            [&]() -> cudaError_t {
+                fp8_gemm_kernel<<<grid, block, 0, stream>>>(dA, dBcol, dCb, M, N, K, 1.f);
+                return cudaGetLastError();
+            },
+            iters, stream, &okB);
         if (okB) {
             std::vector<float> hC(szC);
             cudaMemcpy(hC.data(), dCb, szC * sizeof(float), cudaMemcpyDeviceToHost);
@@ -357,8 +369,10 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
 
     // FP32 operands (decode fp8 -> fp32) on device; also the source for FP16.
     std::vector<float> Af32((size_t)M * K), Bf32((size_t)K * N);
-    for (size_t t = 0; t < Af32.size(); ++t) Af32[t] = fp8_e4m3_to_fp32(Af[t]);
-    for (size_t t = 0; t < Bf32.size(); ++t) Bf32[t] = fp8_e4m3_to_fp32(Bf[t]);
+    for (size_t t = 0; t < Af32.size(); ++t)
+        Af32[t] = fp8_e4m3_to_fp32(Af[t]);
+    for (size_t t = 0; t < Bf32.size(); ++t)
+        Bf32[t] = fp8_e4m3_to_fp32(Bf[t]);
     float *dAf32, *dBf32;
     cudaMalloc(&dAf32, Af32.size() * 4);
     cudaMalloc(&dBf32, Bf32.size() * 4);
@@ -370,10 +384,10 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     cudaMalloc(&dAh, Af32.size() * 2);
     cudaMalloc(&dBh, Bf32.size() * 2);
     const int tpb = 256;
-    f32_to_half_kernel<<<((unsigned)Af32.size() + tpb - 1) / tpb, tpb, 0, stream>>>(
-        dAf32, dAh, Af32.size());
-    f32_to_half_kernel<<<((unsigned)Bf32.size() + tpb - 1) / tpb, tpb, 0, stream>>>(
-        dBf32, dBh, Bf32.size());
+    f32_to_half_kernel<<<((unsigned)Af32.size() + tpb - 1) / tpb, tpb, 0, stream>>>(dAf32, dAh,
+                                                                                    Af32.size());
+    f32_to_half_kernel<<<((unsigned)Bf32.size() + tpb - 1) / tpb, tpb, 0, stream>>>(dBf32, dBh,
+                                                                                    Bf32.size());
     cudaStreamSynchronize(stream);
 
     cublasLtMatmulDesc_t descH;
@@ -386,12 +400,14 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     cublasLtMatrixLayoutSetAttribute(AdH, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
     cublasLtMatrixLayoutSetAttribute(BdH, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
     bool okH = true;
-    float msH = bench_cuda([&]() -> cudaError_t {
-        return cublasLtMatmul(lt, descH, &one, dAh, AdH, dBh, BdH, &beta, dCfp16, CdL, dCfp16,
-                              CdL, nullptr, workspace, 1 << 22, stream) == CUBLAS_STATUS_SUCCESS
-                   ? cudaSuccess
-                   : cudaErrorUnknown;
-    }, iters, stream, &okH);
+    float msH = bench_cuda(
+        [&]() -> cudaError_t {
+            return cublasLtMatmul(lt, descH, &one, dAh, AdH, dBh, BdH, &beta, dCfp16, CdL, dCfp16,
+                                  CdL, nullptr, workspace, 1 << 22, stream) == CUBLAS_STATUS_SUCCESS
+                       ? cudaSuccess
+                       : cudaErrorUnknown;
+        },
+        iters, stream, &okH);
     double errH = -1;
     if (okH) {
         std::vector<float> hC(szC);
@@ -410,12 +426,15 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
     cublasLtMatrixLayoutSetAttribute(AdF, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
     cublasLtMatrixLayoutSetAttribute(BdF, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
     bool okF = true;
-    float msF = bench_cuda([&]() -> cudaError_t {
-        return cublasLtMatmul(lt, descF, &one, dAf32, AdF, dBf32, BdF, &beta, dCfp32, CdL, dCfp32,
-                              CdL, nullptr, workspace, 1 << 22, stream) == CUBLAS_STATUS_SUCCESS
-                   ? cudaSuccess
-                   : cudaErrorUnknown;
-    }, iters, stream, &okF);
+    float msF = bench_cuda(
+        [&]() -> cudaError_t {
+            return cublasLtMatmul(lt, descF, &one, dAf32, AdF, dBf32, BdF, &beta, dCfp32, CdL,
+                                  dCfp32, CdL, nullptr, workspace, 1 << 22,
+                                  stream) == CUBLAS_STATUS_SUCCESS
+                       ? cudaSuccess
+                       : cudaErrorUnknown;
+        },
+        iters, stream, &okF);
     double errF = -1;
     if (okF) {
         std::vector<float> hC(szC);
@@ -432,34 +451,47 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
         };
         for (int s = 0; s < 3; ++s) {
             int i = samples[s].i, j = samples[s].j;
-            printf("    [dbg] (%d,%d) ref=%10.4f  fp32=%10.4f  fp16=%10.4f"
-                   "  route_b=%10.4f  cutlass=%10.4f\n",
-                   i, j, samples[s].ref, at(dCfp32, i, j), at(dCfp16, i, j), at(dCb, i, j),
-                   at(dCcut, i, j));
+            printf(
+                "    [dbg] (%d,%d) ref=%10.4f  fp32=%10.4f  fp16=%10.4f"
+                "  route_b=%10.4f  cutlass=%10.4f\n",
+                i, j, samples[s].ref, at(dCfp32, i, j), at(dCfp16, i, j), at(dCb, i, j),
+                at(dCcut, i, j));
         }
-        printf("    [dbg] A fp8[0]=%3u -> f32=%9.4f | B fp8[0]=%3u -> f32=%9.4f\n",
-               (unsigned)Af[0], fp8_e4m3_to_fp32(Af[0]), (unsigned)Bf[0],
-               fp8_e4m3_to_fp32(Bf[0]));
+        printf("    [dbg] A fp8[0]=%3u -> f32=%9.4f | B fp8[0]=%3u -> f32=%9.4f\n", (unsigned)Af[0],
+               fp8_e4m3_to_fp32(Af[0]), (unsigned)Bf[0], fp8_e4m3_to_fp32(Bf[0]));
     }
 
     // ---------------- report ----------------
-    printf("  M=%4d | FP32 %6.2f TF %7.1f GB/s e=%.1e | FP16 %6.2f TF %7.1f GB/s e=%.1e"
-           " | ROUTE_B %6.2f TF %7.1f GB/s e=%.1e | CUTLASS %6.2f TF %7.1f GB/s e=%.1e ws=%zu\n",
-           M,
-           okF ? tflops(msF) : 0.0, okF ? gbps(msF, 4) : 0.0, errF,
-           okH ? tflops(msH) : 0.0, okH ? gbps(msH, 2) : 0.0, errH,
-           okB ? tflops(msB) : 0.0, okB ? gbps(msB, 1) : 0.0, errB,
-           okCut ? tflops(msCut) : 0.0, okCut ? gbps(msCut, 1) : 0.0, errCut, wsBytes);
+    printf(
+        "  M=%4d | FP32 %6.2f TF %7.1f GB/s e=%.1e | FP16 %6.2f TF %7.1f GB/s e=%.1e"
+        " | ROUTE_B %6.2f TF %7.1f GB/s e=%.1e | CUTLASS %6.2f TF %7.1f GB/s e=%.1e ws=%zu\n",
+        M, okF ? tflops(msF) : 0.0, okF ? gbps(msF, 4) : 0.0, errF, okH ? tflops(msH) : 0.0,
+        okH ? gbps(msH, 2) : 0.0, errH, okB ? tflops(msB) : 0.0, okB ? gbps(msB, 1) : 0.0, errB,
+        okCut ? tflops(msCut) : 0.0, okCut ? gbps(msCut, 1) : 0.0, errCut, wsBytes);
 
-    cudaFree(dA); cudaFree(dBcol);
-    cudaFree(dCcut); cudaFree(dCb); cudaFree(dCfp16); cudaFree(dCfp32);
-    cudaFree(dScaleA); cudaFree(dScaleB); cudaFree(dScaleC); cudaFree(dScaleD);
-    cudaFree(dScaleAux); cudaFree(dAbsMaxAux); cudaFree(dAbsMaxD);
-    cudaFree(dSrcC); cudaFree(dAux); cudaFree(dBias);
-    cudaFree(dAh); cudaFree(dBh);
-    cudaFree(dAf32); cudaFree(dBf32);
+    cudaFree(dA);
+    cudaFree(dBcol);
+    cudaFree(dCcut);
+    cudaFree(dCb);
+    cudaFree(dCfp16);
+    cudaFree(dCfp32);
+    cudaFree(dScaleA);
+    cudaFree(dScaleB);
+    cudaFree(dScaleC);
+    cudaFree(dScaleD);
+    cudaFree(dScaleAux);
+    cudaFree(dAbsMaxAux);
+    cudaFree(dAbsMaxD);
+    cudaFree(dSrcC);
+    cudaFree(dAux);
+    cudaFree(dBias);
+    cudaFree(dAh);
+    cudaFree(dBh);
+    cudaFree(dAf32);
+    cudaFree(dBf32);
     cudaFree(workspace);
-    if (wsPtr) cudaFree(wsPtr);
+    if (wsPtr)
+        cudaFree(wsPtr);
     cudaStreamDestroy(stream);
 }
 
@@ -478,41 +510,44 @@ static void run_one(int M, int N, int K, int iters, const std::vector<uint8_t>& 
 // ==========================================================================
 
 template <typename GemmT>
-static bool gemm_setup_run(GemmT& op, int M, int N, int K, const uint8_t* dA,
-                           const uint8_t* dBcol,
+static bool gemm_setup_run(GemmT& op, int M, int N, int K, const uint8_t* dA, const uint8_t* dBcol,
                            typename GemmT::EpilogueOutputOp::ElementOutput* dD,
                            typename GemmT::EpilogueOutputOp::ElementAuxOutput* dAux,
                            const float* dSrcC, float* dBias,  // ptr_Vector is void* (non-const)
-                           float* dScaleA,
-                           float* dScaleB, float* dScaleC, float* dScaleD, float* dScaleAux,
-                           float* dAbsMaxAux, float* dAbsMaxD, cudaStream_t stream) {
+                           float* dScaleA, float* dScaleB, float* dScaleC, float* dScaleD,
+                           float* dScaleAux, float* dAbsMaxAux, float* dAbsMaxD,
+                           cudaStream_t stream) {
     typename GemmT::EpilogueOutputOp::Params::ActivationParams ap{1.f, 0.f};
-    typename GemmT::EpilogueOutputOp::Params ep{ap,     dScaleA,   dScaleB,   dScaleC,
+    typename GemmT::EpilogueOutputOp::Params ep{ap,      dScaleA,   dScaleB,    dScaleC,
                                                 dScaleD, dScaleAux, dAbsMaxAux, dAbsMaxD};
     size_t sz = (size_t)M * N;
     // Parenthesised init + all 21 ctor params (ldr = ld_vector must be 0, ldaux = N)
     // to avoid brace-init narrowing and the two-overload ambiguity.
     typename GemmT::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K}, 1, ep, dA,
                                    dBcol, dSrcC, dD, dAux, dBias,
-                                   (int64_t)((size_t)M * K),    // batch_stride_A
-                                   (int64_t)((size_t)K * N),    // batch_stride_B
-                                   (int64_t)sz,                 // batch_stride_C
-                                   (int64_t)sz,                 // batch_stride_D
-                                   (int64_t)M,                  // batch_stride_Vector
-                                   (int64_t)K,                  // lda
-                                   (int64_t)K,                  // ldb
-                                   (int64_t)N,                  // ldc
-                                   (int64_t)N,                  // ldd
-                                   (int64_t)0,                  // ldr (ld_vector, must be 0)
-                                   (int64_t)N);                 // ldaux
-    if (op.can_implement(args) != cutlass::Status::kSuccess) return false;
+                                   (int64_t)((size_t)M * K),  // batch_stride_A
+                                   (int64_t)((size_t)K * N),  // batch_stride_B
+                                   (int64_t)sz,               // batch_stride_C
+                                   (int64_t)sz,               // batch_stride_D
+                                   (int64_t)M,                // batch_stride_Vector
+                                   (int64_t)K,                // lda
+                                   (int64_t)K,                // ldb
+                                   (int64_t)N,                // ldc
+                                   (int64_t)N,                // ldd
+                                   (int64_t)0,                // ldr (ld_vector, must be 0)
+                                   (int64_t)N);               // ldaux
+    if (op.can_implement(args) != cutlass::Status::kSuccess)
+        return false;
     size_t wsBytes = GemmT::get_workspace_size(args);
     void* ws = nullptr;
-    if (wsBytes) cudaMalloc(&ws, wsBytes);
+    if (wsBytes)
+        cudaMalloc(&ws, wsBytes);
     bool ok = op.initialize(args, ws, stream) == cutlass::Status::kSuccess;
-    if (ok) ok = op(stream) == cutlass::Status::kSuccess;
+    if (ok)
+        ok = op(stream) == cutlass::Status::kSuccess;
     cudaDeviceSynchronize();
-    if (ws) cudaFree(ws);
+    if (ws)
+        cudaFree(ws);
     return ok;
 }
 
@@ -534,7 +569,9 @@ struct ScaleCase {
 //      graph for every distinct tensor scale - unacceptable.)
 // ==========================================================================
 
-static inline float out_f(float v) { return v; }
+static inline float out_f(float v) {
+    return v;
+}
 static inline float out_f(cutlass::float_e4m3_t v) {
     return fp8_e4m3_to_fp32(reinterpret_cast<const uint8_t&>(v));
 }
@@ -569,8 +606,13 @@ static void run_graph_case(const char* tag, const char* outName, int M, int N, i
     cudaMemset(dBias, 0, (size_t)N * 4);
 
     float *dSA, *dSW, *dSC, *dSD, *dSAux, *dAMAux, *dAMD;
-    cudaMalloc(&dSA, 4); cudaMalloc(&dSW, 4); cudaMalloc(&dSC, 4); cudaMalloc(&dSD, 4);
-    cudaMalloc(&dSAux, 4); cudaMalloc(&dAMAux, 4); cudaMalloc(&dAMD, 4);
+    cudaMalloc(&dSA, 4);
+    cudaMalloc(&dSW, 4);
+    cudaMalloc(&dSC, 4);
+    cudaMalloc(&dSD, 4);
+    cudaMalloc(&dSAux, 4);
+    cudaMalloc(&dAMAux, 4);
+    cudaMalloc(&dAMD, 4);
     float one = 1.f, zero = 0.f;
     cudaMemcpy(dSA, &s_a, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dSW, &s_w, 4, cudaMemcpyHostToDevice);
@@ -581,19 +623,19 @@ static void run_graph_case(const char* tag, const char* outName, int M, int N, i
     cudaMemcpy(dAMD, &zero, 4, cudaMemcpyHostToDevice);
 
     typename GemmT::EpilogueOutputOp::Params::ActivationParams ap{1.f, 0.f};
-    typename GemmT::EpilogueOutputOp::Params ep{ap,   dSA,   dSW,    dSC,
-                                                dSD, dSAux, dAMAux, dAMD};
-    typename GemmT::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K}, 1, ep, dA,
-                                   dBcol, dSrcC, dOut, dAux, dBias, (int64_t)Af.size(),
-                                   (int64_t)Bcol.size(), (int64_t)sz, (int64_t)sz, (int64_t)M,
-                                   (int64_t)K, (int64_t)K, (int64_t)N, (int64_t)N, (int64_t)0,
-                                   (int64_t)N);
+    typename GemmT::EpilogueOutputOp::Params ep{ap, dSA, dSW, dSC, dSD, dSAux, dAMAux, dAMD};
+    typename GemmT::Arguments args(
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K}, 1, ep, dA, dBcol, dSrcC, dOut, dAux,
+        dBias, (int64_t)Af.size(), (int64_t)Bcol.size(), (int64_t)sz, (int64_t)sz, (int64_t)M,
+        (int64_t)K, (int64_t)K, (int64_t)N, (int64_t)N, (int64_t)0, (int64_t)N);
     GemmT op;
     bool initOk = (op.can_implement(args) == cutlass::Status::kSuccess);
     size_t wsBytes = GemmT::get_workspace_size(args);
     void* ws = nullptr;
-    if (wsBytes) cudaMalloc(&ws, wsBytes);
-    if (initOk) initOk = (op.initialize(args, ws, stream) == cutlass::Status::kSuccess);
+    if (wsBytes)
+        cudaMalloc(&ws, wsBytes);
+    if (initOk)
+        initOk = (op.initialize(args, ws, stream) == cutlass::Status::kSuccess);
 
     std::vector<OutT> hEager(sz), hR(sz), hPrev(sz), hMut(sz), hEager2(sz);
     bool capOk = false, allEq = true, stable = true, mutMatch = false, mutChanged = false;
@@ -605,7 +647,8 @@ static void run_graph_case(const char* tag, const char* outName, int M, int N, i
         cudaMemcpy(hEager.data(), dOut, obytes, cudaMemcpyDeviceToHost);
         if (amaxOut) {
             float mx = 0;
-            for (size_t t = 0; t < sz; ++t) mx = std::max(mx, fabsf(out_f(hEager[t])));
+            for (size_t t = 0; t < sz; ++t)
+                mx = std::max(mx, fabsf(out_f(hEager[t])));
             *amaxOut = mx;
         }
 
@@ -614,8 +657,8 @@ static void run_graph_case(const char* tag, const char* outName, int M, int N, i
         cudaError_t e1 = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
         cutlass::Status st = op(stream);
         cudaError_t e2 = cudaStreamEndCapture(stream, &graph);
-        capOk = (e1 == cudaSuccess) && (st == cutlass::Status::kSuccess) &&
-                (e2 == cudaSuccess) && (graph != nullptr);
+        capOk = (e1 == cudaSuccess) && (st == cutlass::Status::kSuccess) && (e2 == cudaSuccess) &&
+                (graph != nullptr);
         size_t nNodes = 0;
         if (capOk) {
             cudaGraphGetNodes(graph, nullptr, &nNodes);  // NULL dst returns count
@@ -639,8 +682,10 @@ static void run_graph_case(const char* tag, const char* outName, int M, int N, i
                 cudaGraphLaunch(exec, stream);
                 cudaStreamSynchronize(stream);
                 cudaMemcpy(hR.data(), dOut, obytes, cudaMemcpyDeviceToHost);
-                if (memcmp(hR.data(), hEager.data(), obytes) != 0) allEq = false;
-                if (i > 0 && memcmp(hR.data(), hPrev.data(), obytes) != 0) stable = false;
+                if (memcmp(hR.data(), hEager.data(), obytes) != 0)
+                    allEq = false;
+                if (i > 0 && memcmp(hR.data(), hPrev.data(), obytes) != 0)
+                    stable = false;
                 hPrev = hR;
             }
             // ---- scale mutation: same graphExec, new DEVICE scale contents ----
@@ -660,20 +705,31 @@ static void run_graph_case(const char* tag, const char* outName, int M, int N, i
 
             cudaGraphExecDestroy(exec);
         }
-        if (graph) cudaGraphDestroy(graph);
+        if (graph)
+            cudaGraphDestroy(graph);
     }
 
-    printf("  %-9s %-5s ws=%zu | capture=%s | replay==eager=%s | stable=%s"
-           " | scale_mut(match=%s changed=%s)%s\n",
-           tag, outName, wsBytes, capOk ? "OK" : "FAIL", allEq ? "YES" : "NO",
-           stable ? "YES" : "NO", mutMatch ? "YES" : "NO", mutChanged ? "YES" : "NO",
-           initOk ? "" : " [INIT_FAIL]");
+    printf(
+        "  %-9s %-5s ws=%zu | capture=%s | replay==eager=%s | stable=%s"
+        " | scale_mut(match=%s changed=%s)%s\n",
+        tag, outName, wsBytes, capOk ? "OK" : "FAIL", allEq ? "YES" : "NO", stable ? "YES" : "NO",
+        mutMatch ? "YES" : "NO", mutChanged ? "YES" : "NO", initOk ? "" : " [INIT_FAIL]");
 
-    cudaFree(dA); cudaFree(dBcol); cudaFree(dOut); cudaFree(dAux);
-    cudaFree(dSrcC); cudaFree(dBias);
-    cudaFree(dSA); cudaFree(dSW); cudaFree(dSC); cudaFree(dSD); cudaFree(dSAux);
-    cudaFree(dAMAux); cudaFree(dAMD);
-    if (ws) cudaFree(ws);
+    cudaFree(dA);
+    cudaFree(dBcol);
+    cudaFree(dOut);
+    cudaFree(dAux);
+    cudaFree(dSrcC);
+    cudaFree(dBias);
+    cudaFree(dSA);
+    cudaFree(dSW);
+    cudaFree(dSC);
+    cudaFree(dSD);
+    cudaFree(dSAux);
+    cudaFree(dAMAux);
+    cudaFree(dAMD);
+    if (ws)
+        cudaFree(ws);
     cudaStreamDestroy(stream);
 }
 
@@ -681,7 +737,8 @@ static void run_graph_case(const char* tag, const char* outName, int M, int N, i
 // subnormal quantum 2^-9.
 static float e4m3_ulp(float v) {
     float a = fabsf(v);
-    if (a < exp2f(-6.0f)) return exp2f(-9.0f);
+    if (a < exp2f(-6.0f))
+        return exp2f(-9.0f);
     int e = (int)floorf(log2f(a));
     return exp2f((float)e - 3.0f);
 }
@@ -691,26 +748,38 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
     std::vector<float> Ar((size_t)M * K), Wr((size_t)K * N);
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> u(-1.f, 1.f);
-    for (auto& v : Ar) v = u(rng);
-    for (auto& v : Wr) v = u(rng);
+    for (auto& v : Ar)
+        v = u(rng);
+    for (auto& v : Wr)
+        v = u(rng);
     float mxA = 0, mxW = 0;
-    for (auto v : Ar) mxA = std::max(mxA, fabsf(v));
-    for (auto v : Wr) mxW = std::max(mxW, fabsf(v));
-    for (auto& v : Ar) v *= (c.amax_a / mxA);
-    for (auto& v : Wr) v *= (c.amax_w / mxW);
-    mxA = 0; mxW = 0;
-    for (auto v : Ar) mxA = std::max(mxA, fabsf(v));
-    for (auto v : Wr) mxW = std::max(mxW, fabsf(v));
+    for (auto v : Ar)
+        mxA = std::max(mxA, fabsf(v));
+    for (auto v : Wr)
+        mxW = std::max(mxW, fabsf(v));
+    for (auto& v : Ar)
+        v *= (c.amax_a / mxA);
+    for (auto& v : Wr)
+        v *= (c.amax_w / mxW);
+    mxA = 0;
+    mxW = 0;
+    for (auto v : Ar)
+        mxA = std::max(mxA, fabsf(v));
+    for (auto v : Wr)
+        mxW = std::max(mxW, fabsf(v));
     const float s_a = mxA / 240.0f;  // frozen contract
     const float s_w = mxW / 240.0f;
 
     // 2) quantize: q = fp8_encode(x / scale)
     std::vector<uint8_t> Af((size_t)M * K), Bf((size_t)K * N);
-    for (size_t t = 0; t < Af.size(); ++t) Af[t] = fp32_to_fp8_e4m3(Ar[t] / s_a);
-    for (size_t t = 0; t < Bf.size(); ++t) Bf[t] = fp32_to_fp8_e4m3(Wr[t] / s_w);
+    for (size_t t = 0; t < Af.size(); ++t)
+        Af[t] = fp32_to_fp8_e4m3(Ar[t] / s_a);
+    for (size_t t = 0; t < Bf.size(); ++t)
+        Bf[t] = fp32_to_fp8_e4m3(Wr[t] / s_w);
     std::vector<uint8_t> Bcol((size_t)K * N);
     for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n) Bcol[(size_t)k + (size_t)n * K] = Bf[(size_t)k * N + n];
+        for (int n = 0; n < N; ++n)
+            Bcol[(size_t)k + (size_t)n * K] = Bf[(size_t)k * N + n];
 
     // 3) sampled goldens: (a) scaled fp8 golden, (b) true real fp32 matmul
     const int NS = 1024;
@@ -720,7 +789,8 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
     std::uniform_int_distribution<int> diM(0, M - 1), diN(0, N - 1);
     for (int s = 0; s < NS; ++s) {
         int i = diM(srg), j = diN(srg);
-        si[s] = i; sj[s] = j;
+        si[s] = i;
+        sj[s] = j;
         const float* arow = Ar.data() + (size_t)i * K;
         const uint8_t* afrow = Af.data() + (size_t)i * K;
         float raw = 0, real = 0;
@@ -757,9 +827,15 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
 
     float one = 1.f, zero = 0.f;
     float *dSA, *dSW, *dSC, *dSD, *dSAux, *dAMAux, *dAMD, *dSA1, *dSW1;
-    cudaMalloc(&dSA, 4); cudaMalloc(&dSW, 4); cudaMalloc(&dSC, 4);
-    cudaMalloc(&dSD, 4); cudaMalloc(&dSAux, 4); cudaMalloc(&dAMAux, 4); cudaMalloc(&dAMD, 4);
-    cudaMalloc(&dSA1, 4); cudaMalloc(&dSW1, 4);
+    cudaMalloc(&dSA, 4);
+    cudaMalloc(&dSW, 4);
+    cudaMalloc(&dSC, 4);
+    cudaMalloc(&dSD, 4);
+    cudaMalloc(&dSAux, 4);
+    cudaMalloc(&dAMAux, 4);
+    cudaMalloc(&dAMD, 4);
+    cudaMalloc(&dSA1, 4);
+    cudaMalloc(&dSW1, 4);
     cudaMemcpy(dSA, &s_a, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dSW, &s_w, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dSA1, &one, 4, cudaMemcpyHostToDevice);
@@ -771,11 +847,11 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
     cudaMemcpy(dAMD, &zero, 4, cudaMemcpyHostToDevice);
 
     Gemm gF;
-    bool okF = gemm_setup_run(gF, M, N, K, dA, dBcol, dDfused, dAuxF, dSrcC, dBias, dSA, dSW,
-                              dSC, dSD, dSAux, dAMAux, dAMD, stream);
+    bool okF = gemm_setup_run(gF, M, N, K, dA, dBcol, dDfused, dAuxF, dSrcC, dBias, dSA, dSW, dSC,
+                              dSD, dSAux, dAMAux, dAMD, stream);
     Gemm gR;
-    bool okR = gemm_setup_run(gR, M, N, K, dA, dBcol, dDraw, dAuxF, dSrcC, dBias, dSA1, dSW1,
-                              dSC, dSD, dSAux, dAMAux, dAMD, stream);
+    bool okR = gemm_setup_run(gR, M, N, K, dA, dBcol, dDraw, dAuxF, dSrcC, dBias, dSA1, dSW1, dSC,
+                              dSD, dSAux, dAMAux, dAMD, stream);
 
     std::vector<float> hFused(sz), hRaw(sz);
     cudaMemcpy(hFused.data(), dDfused, sz * 4, cudaMemcpyDeviceToHost);
@@ -784,7 +860,8 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
     // Output scale: bring D into the E4M3 legal range before the FP8 epilogue,
     // otherwise the FP8 output simply saturates at 240 and the test is vacuous.
     float amaxD = 0;
-    for (size_t t = 0; t < sz; ++t) amaxD = std::max(amaxD, fabsf(hFused[t]));
+    for (size_t t = 0; t < sz; ++t)
+        amaxD = std::max(amaxD, fabsf(hFused[t]));
     const float s_d = (amaxD > 0.f) ? (240.0f / amaxD) : 1.f;
     cudaMemcpy(dSD, &s_d, 4, cudaMemcpyHostToDevice);
 
@@ -806,7 +883,8 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
     for (int s = 0; s < NS; ++s) {
         size_t idx = (size_t)si[s] * N + sj[s];
         float f = hFused[idx];
-        if (!std::isfinite(f)) ++nonFinite;
+        if (!std::isfinite(f))
+            ++nonFinite;
         eGolden = std::max(eGolden, (double)fabsf(f - gScaled[s]));
         eReal = std::max(eReal, (double)fabsf(f - gReal[s]));
         eRawScaled = std::max(eRawScaled, (double)fabsf(f - hRaw[idx] * sw));
@@ -818,7 +896,8 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
             float ev = fp8_e4m3_to_fp32(expect);
             double ratio = (double)fabsf(dv - ev) / (double)e4m3_ulp(ev);
             maxUlp = std::max(maxUlp, ratio);
-            if (ratio > 1.5) ++badFar;
+            if (ratio > 1.5)
+                ++badFar;
         }
         eF8 = std::max(eF8, (double)fabsf(fp8_e4m3_to_fp32(hF8[idx]) - f * s_d));
     }
@@ -827,17 +906,31 @@ static void run_scale_case(int M, int N, int K, const ScaleCase& c, unsigned see
     const double rS = refGolden > 0 ? eRawScaled / refGolden : 0.0;
     const double rF = eF8 / 240.0;
 
-    printf("  %-9s s_a=%.3e s_w=%.3e s_d=%.3e | golden abs=%.2e rel=%.2e"
-           " | real rel=%.2e | raw*sw rel=%.2e | fp8 bad=%4d/%d maxULP=%.2f far=%d"
-           " | nonfin=%d%s%s%s\n",
-           c.name, s_a, s_w, s_d, eGolden, rG, rR, rS, badBit, NS, maxUlp, badFar, nonFinite,
-           okF ? "" : " [FUSED_FAIL]", okR ? "" : " [RAW_FAIL]", ok8 ? "" : " [F8_FAIL]");
+    printf(
+        "  %-9s s_a=%.3e s_w=%.3e s_d=%.3e | golden abs=%.2e rel=%.2e"
+        " | real rel=%.2e | raw*sw rel=%.2e | fp8 bad=%4d/%d maxULP=%.2f far=%d"
+        " | nonfin=%d%s%s%s\n",
+        c.name, s_a, s_w, s_d, eGolden, rG, rR, rS, badBit, NS, maxUlp, badFar, nonFinite,
+        okF ? "" : " [FUSED_FAIL]", okR ? "" : " [RAW_FAIL]", ok8 ? "" : " [F8_FAIL]");
 
-    cudaFree(dA); cudaFree(dBcol);
-    cudaFree(dSrcC); cudaFree(dBias); cudaFree(dAuxF); cudaFree(dDfused); cudaFree(dDraw);
-    cudaFree(dDf8); cudaFree(dAuxF8);
-    cudaFree(dSA); cudaFree(dSW); cudaFree(dSC); cudaFree(dSD); cudaFree(dSAux);
-    cudaFree(dAMAux); cudaFree(dAMD); cudaFree(dSA1); cudaFree(dSW1);
+    cudaFree(dA);
+    cudaFree(dBcol);
+    cudaFree(dSrcC);
+    cudaFree(dBias);
+    cudaFree(dAuxF);
+    cudaFree(dDfused);
+    cudaFree(dDraw);
+    cudaFree(dDf8);
+    cudaFree(dAuxF8);
+    cudaFree(dSA);
+    cudaFree(dSW);
+    cudaFree(dSC);
+    cudaFree(dSD);
+    cudaFree(dSAux);
+    cudaFree(dAMAux);
+    cudaFree(dAMD);
+    cudaFree(dSA1);
+    cudaFree(dSW1);
     cudaStreamDestroy(stream);
 }
 
@@ -866,16 +959,18 @@ int main() {
             {"tiny", 1e-4f, 1e-4f},
             {"huge", 1e4f, 1e4f},
         };
-        for (auto& c : cases) run_scale_case(M, N, K, c, 4242);
+        for (auto& c : cases)
+            run_scale_case(M, N, K, c, 4242);
     }
 
     // ---- 6-C-4.1c graph capture / replay ----
     {
         const int M = 256, N = 4096, K = 4096;
-        printf("\n=== 6-C-4.1c graph capture/replay "
-               "(eager -> capture -> replay x3 -> scale mutation) ===\n");
-        printf("  M=%d N=%d K=%d | FP32: D=GEMM*sa*sw | FP8: q=encode(D*s_d), s_d=240/amax(D)\n",
-               M, N, K);
+        printf(
+            "\n=== 6-C-4.1c graph capture/replay "
+            "(eager -> capture -> replay x3 -> scale mutation) ===\n");
+        printf("  M=%d N=%d K=%d | FP32: D=GEMM*sa*sw | FP8: q=encode(D*s_d), s_d=240/amax(D)\n", M,
+               N, K);
         ScaleCase cases[] = {
             {"scale==1", 240.0f, 240.0f},
             {"normal", 8.0f, 16.0f},
@@ -887,20 +982,31 @@ int main() {
             std::vector<float> Ar((size_t)M * K), Wr((size_t)K * N);
             std::mt19937 rng(4242);
             std::uniform_real_distribution<float> u(-1.f, 1.f);
-            for (auto& v : Ar) v = u(rng);
-            for (auto& v : Wr) v = u(rng);
+            for (auto& v : Ar)
+                v = u(rng);
+            for (auto& v : Wr)
+                v = u(rng);
             float mxA = 0, mxW = 0;
-            for (auto v : Ar) mxA = std::max(mxA, fabsf(v));
-            for (auto v : Wr) mxW = std::max(mxW, fabsf(v));
-            for (auto& v : Ar) v *= (c.amax_a / mxA);
-            for (auto& v : Wr) v *= (c.amax_w / mxW);
-            mxA = 0; mxW = 0;
-            for (auto v : Ar) mxA = std::max(mxA, fabsf(v));
-            for (auto v : Wr) mxW = std::max(mxW, fabsf(v));
+            for (auto v : Ar)
+                mxA = std::max(mxA, fabsf(v));
+            for (auto v : Wr)
+                mxW = std::max(mxW, fabsf(v));
+            for (auto& v : Ar)
+                v *= (c.amax_a / mxA);
+            for (auto& v : Wr)
+                v *= (c.amax_w / mxW);
+            mxA = 0;
+            mxW = 0;
+            for (auto v : Ar)
+                mxA = std::max(mxA, fabsf(v));
+            for (auto v : Wr)
+                mxW = std::max(mxW, fabsf(v));
             const float s_a = mxA / 240.0f, s_w = mxW / 240.0f;
             std::vector<uint8_t> Af((size_t)M * K), Bf((size_t)K * N);
-            for (size_t t = 0; t < Af.size(); ++t) Af[t] = fp32_to_fp8_e4m3(Ar[t] / s_a);
-            for (size_t t = 0; t < Bf.size(); ++t) Bf[t] = fp32_to_fp8_e4m3(Wr[t] / s_w);
+            for (size_t t = 0; t < Af.size(); ++t)
+                Af[t] = fp32_to_fp8_e4m3(Ar[t] / s_a);
+            for (size_t t = 0; t < Bf.size(); ++t)
+                Bf[t] = fp32_to_fp8_e4m3(Wr[t] / s_w);
             std::vector<uint8_t> Bcol((size_t)K * N);
             for (int k = 0; k < K; ++k)
                 for (int n = 0; n < N; ++n)
@@ -924,15 +1030,17 @@ int main() {
         const int N = nk.first, K = nk.second;
         const int Mpad = 1024;
         std::vector<uint8_t> Af((size_t)Mpad * K), Bf((size_t)K * N);
-        for (size_t t = 0; t < Af.size(); ++t) Af[t] = fp32_to_fp8_e4m3(dist(rng));
-        for (size_t t = 0; t < Bf.size(); ++t) Bf[t] = fp32_to_fp8_e4m3(dist(rng));
+        for (size_t t = 0; t < Af.size(); ++t)
+            Af[t] = fp32_to_fp8_e4m3(dist(rng));
+        for (size_t t = 0; t < Bf.size(); ++t)
+            Bf[t] = fp32_to_fp8_e4m3(dist(rng));
 
         // (1,1) = no-fusion baseline ; (0.02,0.03) = realistic amax/240 per-tensor
         // scales, to confirm scale fusion costs nothing in throughput.
         const std::pair<float, float> scaleCfg[] = {{1.f, 1.f}, {0.02f, 0.03f}};
         for (auto& sc : scaleCfg) {
-            printf("\n=== N=%d K=%d  s_a=%g s_w=%g (golden = decoded FP8, FP32 acc) ===\n", N,
-                   K, sc.first, sc.second);
+            printf("\n=== N=%d K=%d  s_a=%g s_w=%g (golden = decoded FP8, FP32 acc) ===\n", N, K,
+                   sc.first, sc.second);
             std::mt19937 srg(98765);
             for (int M : Ms) {
                 // Sampled golden: O(S*K) instead of O(M*N*K)
@@ -947,8 +1055,7 @@ int main() {
                 // Use Af's first M rows only
                 std::vector<uint8_t> AfM((size_t)M * K);
                 std::memcpy(AfM.data(), Af.data(), (size_t)M * K);
-                run_one(M, N, K, M <= 128 ? 100 : 20, AfM, Bf, samples, lt, sc.first,
-                        sc.second);
+                run_one(M, N, K, M <= 128 ? 100 : 20, AfM, Bf, samples, lt, sc.first, sc.second);
             }
         }
     }

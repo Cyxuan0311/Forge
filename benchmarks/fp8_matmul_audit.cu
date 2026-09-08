@@ -18,19 +18,19 @@
 // The custom FP8 MMA kernel is guarded for __CUDA_ARCH__ >= 890 (sm_86 has no
 // FP8 Tensor Core); this audit only ever runs on sm_89.
 
+#include <cublas_v2.h>
+#include <cublasLt.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
-#include <vector>
-#include <random>
 #include <functional>
-
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
-#include <cuda_fp8.h>
-#include <cuda_fp16.h>
+#include <random>
+#include <vector>
 
 #include "forge/fp8_utils.h"
 
@@ -47,21 +47,24 @@ static float bench_cuda(const char* name, int iters, cudaStream_t stream,
     cudaError_t warm = kernel();
     cudaDeviceSynchronize();
     if (warm != cudaSuccess) {
-        if (ok) *ok = false;
+        if (ok)
+            *ok = false;
         printf("  [launch error in %s: %s]\n", name, cudaGetErrorString(warm));
         cudaEventDestroy(s);
         cudaEventDestroy(e);
         return 0.f;
     }
     cudaEventRecord(s, stream);
-    for (int i = 0; i < iters; ++i) kernel();
+    for (int i = 0; i < iters; ++i)
+        kernel();
     cudaEventRecord(e, stream);
     cudaEventSynchronize(e);
     float ms = 0;
     cudaEventElapsedTime(&ms, s, e);
     cudaEventDestroy(s);
     cudaEventDestroy(e);
-    if (ok) *ok = true;
+    if (ok)
+        *ok = true;
     return ms / iters;
 }
 
@@ -76,9 +79,8 @@ struct Sample {
     float ref;
 };
 
-static float ref_scalar(const std::vector<uint8_t>& Af,
-                        const std::vector<uint8_t>& Bf, int i, int j, int K, int N,
-                        float alpha) {
+static float ref_scalar(const std::vector<uint8_t>& Af, const std::vector<uint8_t>& Bf, int i,
+                        int j, int K, int N, float alpha) {
     float acc = 0.f;
     const uint8_t* Arow = Af.data() + (size_t)i * K;
     const uint8_t* Bcol = Bf.data() + (size_t)j;  // B is KxN row-major
@@ -100,13 +102,12 @@ static float ref_scalar(const std::vector<uint8_t>& Af,
 //   A 16x32 per lane: row = lane%16, K-seg = (lane/16)*16 + {0..15}; 4 regs x4 e4m3.
 //   B  8x32 per lane: col = gCol + lane%8, K-seg = (lane/8)*8 + {0..7}; 2 regs x4 e4m3.
 //   D 16x8 f32 per lane: 4 regs, cols = gCol + (lane/16)*4 + {0..3}.
-__global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,
-                                const uint8_t* __restrict__ B, float* __restrict__ C, int M,
-                                int N, int K, float alpha) {
+__global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+                                float* __restrict__ C, int M, int N, int K, float alpha) {
     const int lane = threadIdx.x & 31;
     const int warpId = threadIdx.x >> 5;
-    const int wm = warpId >> 1;   // 0..3  (TILE_M = 64)
-    const int wn = warpId & 1;    // 0..1  (TILE_N = 16)
+    const int wm = warpId >> 1;  // 0..3  (TILE_M = 64)
+    const int wn = warpId & 1;   // 0..1  (TILE_N = 16)
     const int gRow = blockIdx.y * 64 + wm * 16;
     const int gCol = blockIdx.x * 16 + wn * 8;
     const int r = gRow + (lane & 15);
@@ -119,7 +120,8 @@ __global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,
     const int bK = (lane >> 3) & 31;  // (lane/8)*8 -> 0/8/16/24
 
     for (int k = 0; k < K; k += 32) {
-        if (r >= M) continue;
+        if (r >= M)
+            continue;
         uint32_t ra[4], rb[2];
         __builtin_memcpy(&ra[0], Arow + k + aK + 0, 4);
         __builtin_memcpy(&ra[1], Arow + k + aK + 4, 4);
@@ -132,8 +134,8 @@ __global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,
             "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
             : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-            : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[0]), "r"(rb[1]),
-              "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+            : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[0]), "r"(rb[1]), "f"(c[0]),
+              "f"(c[1]), "f"(c[2]), "f"(c[3]));
     }
 
     if (r < M) {
@@ -141,7 +143,8 @@ __global__ void fp8_gemm_kernel(const uint8_t* __restrict__ A,
         int col0 = gCol + (lane >> 4) * 4;
 #pragma unroll
         for (int t = 0; t < 4; ++t)
-            if (col0 + t < N) Cptr[t] = d[t] * alpha;
+            if (col0 + t < N)
+                Cptr[t] = d[t] * alpha;
     }
 }
 
@@ -177,10 +180,9 @@ static void unpack_col32(std::vector<float>& dst, const float* src, int m, int n
             dst[(size_t)r * n + c] = src[(size_t)c * ld + r];
 }
 
-
 static void run_one(const Problem& p, float s_a, float s_w, int iters,
-                     const std::vector<uint8_t>& Af, const std::vector<uint8_t>& Bf,
-                     const std::vector<Sample>& samples) {
+                    const std::vector<uint8_t>& Af, const std::vector<uint8_t>& Bf,
+                    const std::vector<Sample>& samples) {
     const int M = p.M, N = p.N, K = p.K;
     const float alpha = s_a * s_w;
     const double flops = 2.0 * M * N * K;
@@ -188,7 +190,7 @@ static void run_one(const Problem& p, float s_a, float s_w, int iters,
     const double bytesC = (double)((size_t)M * K + (size_t)K * N) * 2 + (size_t)M * N * 4;
 
     uint8_t *dA, *dB;
-    float *dC;
+    float* dC;
     cudaMalloc(&dA, (size_t)M * K);
     cudaMalloc(&dB, (size_t)K * N);
     cudaMalloc(&dC, (size_t)M * N * sizeof(float));
@@ -221,7 +223,7 @@ static void run_one(const Problem& p, float s_a, float s_w, int iters,
     cudaMemcpy(dA32, Af32.data(), Af32.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dBc, Bfc.data(), Bfc.size(), cudaMemcpyHostToDevice);
     size_t szC32 = (size_t)ldC * N;
-    float *dC32;
+    float* dC32;
     cudaMalloc(&dC32, szC32 * sizeof(float));
 
     cublasLtMatmulDesc_t descA;
@@ -230,22 +232,24 @@ static void run_one(const Problem& p, float s_a, float s_w, int iters,
     cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
     float hScaleA = s_a, hScaleB = s_w, hScaleD = 1.f;
     float *dScaleA, *dScaleB, *dScaleD;
-    cudaMalloc(&dScaleA, 4); cudaMalloc(&dScaleB, 4); cudaMalloc(&dScaleD, 4);
+    cudaMalloc(&dScaleA, 4);
+    cudaMalloc(&dScaleB, 4);
+    cudaMalloc(&dScaleD, 4);
     cudaMemcpy(dScaleA, &hScaleA, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dScaleB, &hScaleB, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dScaleD, &hScaleD, 4, cudaMemcpyHostToDevice);
-    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-                                   &dScaleA, sizeof(dScaleA));
-    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                                   &dScaleB, sizeof(dScaleB));
-    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER,
-                                   &dScaleD, sizeof(dScaleD));
+    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &dScaleA,
+                                   sizeof(dScaleA));
+    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &dScaleB,
+                                   sizeof(dScaleB));
+    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &dScaleD,
+                                   sizeof(dScaleD));
     float hScaleC = 0.f;  // beta=0 -> C input unused, but FP8 desc needs the pointer
-    float *dScaleC;
+    float* dScaleC;
     cudaMalloc(&dScaleC, 4);
     cudaMemcpy(dScaleC, &hScaleC, 4, cudaMemcpyHostToDevice);
-    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_C_SCALE_POINTER,
-                                   &dScaleC, sizeof(dScaleC));
+    cublasLtMatmulDescSetAttribute(descA, CUBLASLT_MATMUL_DESC_C_SCALE_POINTER, &dScaleC,
+                                   sizeof(dScaleC));
     cublasLtOrder_t col32 = CUBLASLT_ORDER_COL32;
     cublasLtOrder_t col = CUBLASLT_ORDER_COL;
     cublasLtMatrixLayout_t AdA, BdA, CdA;
@@ -263,20 +267,20 @@ static void run_one(const Problem& p, float s_a, float s_w, int iters,
     cublasLtMatmulPreference_t prefA;
     cublasLtMatmulPreferenceCreate(&prefA);
     size_t wsBytes = 1 << 22;
-    cublasLtMatmulPreferenceSetAttribute(prefA, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                         &wsBytes, sizeof(wsBytes));
+    cublasLtMatmulPreferenceSetAttribute(prefA, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsBytes,
+                                         sizeof(wsBytes));
     int returned = 0;
-    cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(lt, descA, AdA, BdA, CdA, CdA, prefA, 1,
-                                                        &resA, &returned);
+    cublasStatus_t hst =
+        cublasLtMatmulAlgoGetHeuristic(lt, descA, AdA, BdA, CdA, CdA, prefA, 1, &resA, &returned);
     cublasLtMatmulPreferenceDestroy(prefA);
     if (hst != CUBLAS_STATUS_SUCCESS || returned == 0) {
         printf("  [heuristic status=%d returned=%d -> no FP8 algo]\n", (int)hst, returned);
         okA = false;
     }
     auto runA = [&]() -> cudaError_t {
-        cublasStatus_t st = cublasLtMatmul(lt, descA, &alphaA, dA32, AdA, dBc, BdA, &beta, dC32,
-                                           CdA, dC32, CdA, returned ? &resA.algo : nullptr,
-                                           workspace, 1 << 22, stream);
+        cublasStatus_t st =
+            cublasLtMatmul(lt, descA, &alphaA, dA32, AdA, dBc, BdA, &beta, dC32, CdA, dC32, CdA,
+                           returned ? &resA.algo : nullptr, workspace, 1 << 22, stream);
         if (st != CUBLAS_STATUS_SUCCESS) {
             printf("  [cublasLt FP8 error status=%d]\n", (int)st);
             return cudaErrorUnknown;
@@ -319,8 +323,8 @@ static void run_one(const Problem& p, float s_a, float s_w, int iters,
     float one = 1.f;
     bool okC = true;
     auto runC = [&]() -> cudaError_t {
-        cublasStatus_t st = cublasLtMatmul(lt, descC, &one, dAh, AdC, dBh, BdC, &beta, dC,
-                                           CdC, dC, CdC, nullptr, workspace, 1 << 22, stream);
+        cublasStatus_t st = cublasLtMatmul(lt, descC, &one, dAh, AdC, dBh, BdC, &beta, dC, CdC, dC,
+                                           CdC, nullptr, workspace, 1 << 22, stream);
         return st == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cudaErrorUnknown;
     };
     float msC = bench_cuda("C", iters, stream, runC, &okC);
@@ -354,20 +358,29 @@ static void run_one(const Problem& p, float s_a, float s_w, int iters,
         }
     }
 
-    printf("  M=%5d N=%5d K=%5d | A(FP8) %6.2f TFLOPs %6.1f GB/s par=%.2e"
-           " | C(FP16) %6.2f TFLOPs %6.1f GB/s par=%.2e",
-           M, N, K, flops / (msA / 1000.0) / 1e12, bytesA / (msA / 1000.0) / 1e9, maxAbsA,
-           flops / (msC / 1000.0) / 1e12, bytesC / (msC / 1000.0) / 1e9, maxAbsC);
+    printf(
+        "  M=%5d N=%5d K=%5d | A(FP8) %6.2f TFLOPs %6.1f GB/s par=%.2e"
+        " | C(FP16) %6.2f TFLOPs %6.1f GB/s par=%.2e",
+        M, N, K, flops / (msA / 1000.0) / 1e12, bytesA / (msA / 1000.0) / 1e9, maxAbsA,
+        flops / (msC / 1000.0) / 1e12, bytesC / (msC / 1000.0) / 1e9, maxAbsC);
     if (ranB && okB)
         printf(" | B(mma) %6.2f TFLOPs %6.1f GB/s par=%.2e\n", flops / (msB / 1000.0) / 1e12,
                bytesA / (msB / 1000.0) / 1e9, maxAbsB);
     else
         printf(" | B(mma) n/a (M<16 or launch err)\n");
 
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-    cudaFree(dAh); cudaFree(dBh);
-    cudaFree(dA32); cudaFree(dBc); cudaFree(dC32);
-    cudaFree(dScaleA); cudaFree(dScaleB); cudaFree(dScaleC); cudaFree(dScaleD);
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    cudaFree(dAh);
+    cudaFree(dBh);
+    cudaFree(dA32);
+    cudaFree(dBc);
+    cudaFree(dC32);
+    cudaFree(dScaleA);
+    cudaFree(dScaleB);
+    cudaFree(dScaleC);
+    cudaFree(dScaleD);
     cudaFree(workspace);
     cublasLtDestroy(lt);
     cudaStreamDestroy(stream);
@@ -390,8 +403,10 @@ int main() {
         int N = nk.first, K = nk.second;
         int Mpad = 1024;  // max M tested; allocated once, reused per M
         std::vector<uint8_t> Af((size_t)Mpad * K), Bf((size_t)K * N);
-        for (size_t t = 0; t < Af.size(); ++t) Af[t] = fp32_to_fp8_e4m3(dist(rng));
-        for (size_t t = 0; t < Bf.size(); ++t) Bf[t] = fp32_to_fp8_e4m3(dist(rng));
+        for (size_t t = 0; t < Af.size(); ++t)
+            Af[t] = fp32_to_fp8_e4m3(dist(rng));
+        for (size_t t = 0; t < Bf.size(); ++t)
+            Bf[t] = fp32_to_fp8_e4m3(dist(rng));
         std::mt19937 srg(98765);
         const int NSAMP = 2048;
         printf("\n=== N=%d K=%d (per-tensor s_a=%.2f s_w=%.2f) ===\n", N, K, s_a, s_w);
