@@ -1,6 +1,0 @@
-===== output_proj_q6k =====
-Q6_K output_proj decode bench: [128256, 4096], threads=16
-memcpy ceiling :   20.006 ms     21.54 GB/s
-pure vectorized read :   11.333 ms     38.02 GB/s
-REAL output_proj:    8.262 ms     52.16 GB/s
-real/memcpy = 0.413
