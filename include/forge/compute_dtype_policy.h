@@ -49,4 +49,28 @@ inline bool is_fp32_policy(const ComputeDTypePolicy& p) {
            p.kv == DataType::FP32;
 }
 
+// Phase 6-B-5: the BF16 native-execution policy. Weight/activation tensors are
+// stored BF16; GEMM/reduction kernels still accumulate in FP32
+// (CUBLAS_COMPUTE_32F / FP32 online softmax discipline); RMSNorm reduces in
+// FP32 (norm_compute decoupled from activation, per the 6-A-2 rule).
+// Phase 6-B-6.7: kv is BF16 -- the all-BF16 decode kernel reads BF16 KV
+// directly (BF16 authoritative KV, converted once at the cache boundary).
+// This factory is representational today (no selector consumes it yet); it
+// names the configuration the 6-B-2..6-B-6.7 kernels actually implement.
+inline ComputeDTypePolicy bf16_policy() {
+    ComputeDTypePolicy p;
+    p.weight = DataType::BF16;
+    p.activation = DataType::BF16;
+    p.accumulator = DataType::FP32;
+    p.norm_compute = DataType::FP32;
+    p.kv = DataType::BF16;
+    return p;
+}
+
+inline bool is_bf16_policy(const ComputeDTypePolicy& p) {
+    return p.weight == DataType::BF16 && p.activation == DataType::BF16 &&
+           p.accumulator == DataType::FP32 && p.norm_compute == DataType::FP32 &&
+           p.kv == DataType::BF16;
+}
+
 }  // namespace forge

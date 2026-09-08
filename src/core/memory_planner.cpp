@@ -196,26 +196,38 @@ void MemoryPlanner::release_region(size_t offset, size_t size) {
     free_regions_.insert(it, {offset, size});
 }
 
-// ---- Verify the allocation plan: no overlaps, no out-of-bounds ----
+// ---- Verify the allocation plan: no LIVE overlaps, no out-of-bounds ----
+// 6-A-8: lifetime-aware. Two allocations may legally share the same memory
+// region when their lifetimes do not intersect -- that reuse is the whole
+// point of lifetime-based planning. The previous static interval check flagged
+// any offset reuse as "overlap" (false positive on every graph big enough to
+// reuse a freed block). Overlap is an error only when both buffers are
+// simultaneously live: max(lifetime_begin) <= min(lifetime_end).
 bool MemoryPlanner::verify_plan() const {
-    // Collect all allocations with non-zero size
-    std::vector<std::pair<size_t, size_t>> intervals;
-    for (const auto& alloc : allocations_) {
-        if (alloc.alloc_size > 0) {
-            intervals.push_back({alloc.offset, alloc.offset + alloc.alloc_size});
-        }
-    }
-
-    // Sort by start offset
-    std::sort(intervals.begin(), intervals.end());
-
-    // Check for overlaps
-    for (size_t i = 1; i < intervals.size(); ++i) {
-        if (intervals[i].first < intervals[i - 1].second) {
-            LOG_ERROR("MemoryPlanner: overlap detected at offset " +
-                      std::to_string(intervals[i].first) + " (prev ends at " +
-                      std::to_string(intervals[i - 1].second) + ")");
-            return false;
+    for (size_t i = 0; i < allocations_.size(); ++i) {
+        const auto& a = allocations_[i];
+        if (a.alloc_size == 0)
+            continue;
+        for (size_t j = i + 1; j < allocations_.size(); ++j) {
+            const auto& b = allocations_[j];
+            if (b.alloc_size == 0)
+                continue;
+            bool live_together = std::max(a.lifetime_begin, b.lifetime_begin) <=
+                                 std::min(a.lifetime_end, b.lifetime_end);
+            if (!live_together)
+                continue;
+            if (a.offset < b.offset + b.alloc_size && b.offset < a.offset + a.alloc_size) {
+                LOG_ERROR("MemoryPlanner: LIVE overlap between node " +
+                          std::to_string(a.node_idx) + " [" +
+                          std::to_string(a.lifetime_begin) + "," +
+                          std::to_string(a.lifetime_end) + "] @+" +
+                          std::to_string(a.offset) + "(" + std::to_string(a.alloc_size) +
+                          "B) and node " + std::to_string(b.node_idx) + " [" +
+                          std::to_string(b.lifetime_begin) + "," +
+                          std::to_string(b.lifetime_end) + "] @+" +
+                          std::to_string(b.offset) + "(" + std::to_string(b.alloc_size) + "B)");
+                return false;
+            }
         }
     }
 

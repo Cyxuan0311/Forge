@@ -153,6 +153,11 @@ int effective_sm_arch(const KernelProblem& p) {
     return p.sm_arch > 0 ? p.sm_arch : detect_sm_arch();
 }
 
+// 6-C-4.1d: W8A8 FP8 GEMM (CUTLASS) requires Ada FP8 Tensor Cores (sm_89+).
+static bool fp8_gemm_supported() {
+    return detect_sm_arch() >= 89;
+}
+
 // Phase 5-C: per-dtype conservative static thresholds (current-profile
 // heuristic, not a universal theory) for the K=4096 / N=128256 (llama-3) shape
 // on RTX 4050 sm_89. Measured MMQ->TensorCore crossover bands (interleaved
@@ -195,6 +200,13 @@ int tc_min_m(DataType dt) {
 // M == 1 single-row GEMV selection. Env overrides never apply to decode (the
 // pre-Phase-4 M == 1 branch never consulted FORGE_MATMUL_PATH etc.).
 KernelVariant select_gemv(const KernelProblem& p) {
+    // 6-C-4.2/4.3: FP8 E4M3 decode (M == 1) -> hand-written GEMV. M > 1 FP8 stays
+    // on the CUTLASS GEMM path (select_matmul never sends M == 1 here), so FP8
+    // never enters CUTLASS GEMM at M == 1.
+    if (p.dtype == DataType::FP8_E4M3) {
+        return fp8_gemm_supported() ? KernelVariant::MATMUL_FP8_E4M3_GEMV
+                                    : KernelVariant::UNSUPPORTED;
+    }
     if (lookup_gemv(p.dtype))
         return KernelVariant::GEMV_Q8_1;
     if (is_quantized_type(p.dtype)) {
@@ -257,6 +269,12 @@ bool prefer_tensor_core(int M, DataType dt) {
 KernelVariant select_matmul(const KernelProblem& p) {
     if (p.M <= 1)
         return select_gemv(p);
+    // 6-C-4.1d: W8A8 FP8 E4M3 GEMM (CUTLASS, Ada). M == 1 GEMV is 6-C-4.2.
+    if (p.dtype == DataType::FP8_E4M3) {
+        if (fp8_gemm_supported())
+            return KernelVariant::MATMUL_FP8_E4M3;
+        return KernelVariant::UNSUPPORTED;
+    }
     // M > 1 (prefill / MMQ).
     if (!is_quantized_type(p.dtype))
         return KernelVariant::MATMUL_CUBLAS;

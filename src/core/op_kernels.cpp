@@ -5,6 +5,7 @@
 
 #include "forge/cuda_kernels.h"
 #include "forge/dtype_contract.h"
+#include "forge/fp8_utils.h"
 #include "forge/op_dispatch.h"
 #include "forge/operators.h"
 
@@ -22,11 +23,67 @@ namespace {
 
 // ---- ADD (dst injection) ----
 // 6-A-6.4: stream forwarded to launch_* (default 0 = legacy stream).
+// 6-A-8.0: native FP16 branch (FP16 storage, FP32 per-element compute, FP16
+// out) -- the residual node of the end-to-end FP16 loop.
 void add_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*,
                     cudaStream_t stream) {
     auto a = inputs[0];
     auto b = inputs[1];
     int n = static_cast<int>(a->numel());
+    // 6-B-5: ADD is retired from require_no_bf16 -- it owns a real
+    // __nv_bfloat16 kernel. The BF16 branch below runs before any gate/reject
+    // so BF16 never reaches a float* cast.
+    if (a->dtype() == DataType::BF16) {
+        if (b->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                std::string("add_kernel_dst: BF16 a needs a BF16 b, got '") +
+                dtype_name(b->dtype()) + "' (mixed dtypes fail loudly).");
+        }
+        const __nv_bfloat16* a_h = reinterpret_cast<const __nv_bfloat16*>(a->data());
+        const __nv_bfloat16* b_h = reinterpret_cast<const __nv_bfloat16*>(b->data());
+        __nv_bfloat16* o_h = reinterpret_cast<__nv_bfloat16*>(dst->data());
+        if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            require_dtype_supported("add_kernel_dst", OpType::ADD, a->dtype());
+            require_dtype_supported("add_kernel_dst", OpType::ADD, b->dtype());
+            cuda::launch_add_bf16(a_h, b_h, o_h, n, stream);
+#endif
+        } else {
+            // CPU path is FP32-only by design: upcast locally, add in FP32, store BF16.
+            for (int i = 0; i < n; ++i) {
+                o_h[i] = __float2bfloat16(__bfloat162float(a_h[i]) + __bfloat162float(b_h[i]));
+            }
+        }
+        return;
+    }
+    // 6-B-1: remaining non-FP16/BF16 dtypes -- reject BF16 before the FP16
+    // branch or any float* cast below. (ADD no longer reaches this line with
+    // BF16; the branch above returns first.)
+    require_no_bf16("add_kernel_dst", OpType::ADD, a->dtype());
+    require_no_bf16("add_kernel_dst", OpType::ADD, b->dtype());
+    // 6-C-1: FP8 has no kernel on any ADD path (CUDA fallback is covered by
+    // require_dtype_supported via the op_supports_fp8 ledger; this gate covers
+    // the bare CPU fallback below).
+    require_no_fp8("add_kernel_dst", OpType::ADD, a->dtype());
+    require_no_fp8("add_kernel_dst", OpType::ADD, b->dtype());
+    if (a->dtype() == DataType::FP16) {
+        const __half* a_h = reinterpret_cast<const __half*>(a->data());
+        const __half* b_h = reinterpret_cast<const __half*>(b->data());
+        __half* o_h = reinterpret_cast<__half*>(dst->data());
+        if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            require_dtype_supported("add_kernel_dst", OpType::ADD, a->dtype());
+            require_dtype_supported("add_kernel_dst", OpType::ADD, b->dtype());
+            cuda::launch_add_fp16(a_h, b_h, o_h, n, stream);
+#endif
+        } else {
+            // CPU path is FP32-only by design: upcast locally, add in FP32, store FP16.
+            for (int i = 0; i < n; ++i) {
+                o_h[i] = __float2half(__half2float(a_h[i]) + __half2float(b_h[i]));
+            }
+        }
+        return;
+    }
     if (a->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         require_dtype_supported("add_kernel_dst", OpType::ADD, a->dtype());
@@ -44,11 +101,65 @@ void add_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const i
 }
 
 // ---- MUL (dst injection) ----
+// 6-A-8.0: native FP16 branch (FP16 storage, FP32 per-element compute, FP16
+// out) -- the gate*up node of the end-to-end FP16 loop.
 void mul_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const int32_t*,
                     cudaStream_t stream) {
     auto a = inputs[0];
     auto b = inputs[1];
     int n = static_cast<int>(a->numel());
+    // 6-B-5: MUL is retired from require_no_bf16 -- it owns a real
+    // __nv_bfloat16 kernel. The BF16 branch below runs before any gate/reject
+    // so BF16 never reaches a float* cast.
+    if (a->dtype() == DataType::BF16) {
+        if (b->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                std::string("mul_kernel_dst: BF16 a needs a BF16 b, got '") +
+                dtype_name(b->dtype()) + "' (mixed dtypes fail loudly).");
+        }
+        const __nv_bfloat16* a_h = reinterpret_cast<const __nv_bfloat16*>(a->data());
+        const __nv_bfloat16* b_h = reinterpret_cast<const __nv_bfloat16*>(b->data());
+        __nv_bfloat16* o_h = reinterpret_cast<__nv_bfloat16*>(dst->data());
+        if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            require_dtype_supported("mul_kernel_dst", OpType::MUL, a->dtype());
+            require_dtype_supported("mul_kernel_dst", OpType::MUL, b->dtype());
+            cuda::launch_multiply_bf16(a_h, b_h, o_h, n, stream);
+#endif
+        } else {
+            // CPU path is FP32-only by design: upcast locally, multiply in FP32, store BF16.
+            for (int i = 0; i < n; ++i) {
+                o_h[i] = __float2bfloat16(__bfloat162float(a_h[i]) * __bfloat162float(b_h[i]));
+            }
+        }
+        return;
+    }
+    // 6-B-1: remaining non-FP16/BF16 dtypes -- reject BF16 before the FP16
+    // branch or any float* cast below. (MUL no longer reaches this line with
+    // BF16; the branch above returns first.)
+    require_no_bf16("mul_kernel_dst", OpType::MUL, a->dtype());
+    require_no_bf16("mul_kernel_dst", OpType::MUL, b->dtype());
+    // 6-C-1: FP8 gate -- mirrors ADD (covers the bare CPU fallback below).
+    require_no_fp8("mul_kernel_dst", OpType::MUL, a->dtype());
+    require_no_fp8("mul_kernel_dst", OpType::MUL, b->dtype());
+    if (a->dtype() == DataType::FP16) {
+        const __half* a_h = reinterpret_cast<const __half*>(a->data());
+        const __half* b_h = reinterpret_cast<const __half*>(b->data());
+        __half* o_h = reinterpret_cast<__half*>(dst->data());
+        if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            require_dtype_supported("mul_kernel_dst", OpType::MUL, a->dtype());
+            require_dtype_supported("mul_kernel_dst", OpType::MUL, b->dtype());
+            cuda::launch_multiply_fp16(a_h, b_h, o_h, n, stream);
+#endif
+        } else {
+            // CPU path is FP32-only by design: upcast locally, multiply in FP32, store FP16.
+            for (int i = 0; i < n; ++i) {
+                o_h[i] = __float2half(__half2float(a_h[i]) * __half2float(b_h[i]));
+            }
+        }
+        return;
+    }
     if (a->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         require_dtype_supported("mul_kernel_dst", OpType::MUL, a->dtype());
@@ -70,6 +181,53 @@ void silu_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const 
                      cudaStream_t stream) {
     auto x = inputs[0];
     int n = static_cast<int>(x->numel());
+    // 6-B-3: SILU is retired from require_no_bf16 -- it owns a real
+    // __nv_bfloat16 kernel. The BF16 branch below runs before any gate/reject
+    // so BF16 never reaches a float* cast.
+    if (x->dtype() == DataType::BF16) {
+        const __nv_bfloat16* x_h = reinterpret_cast<const __nv_bfloat16*>(x->data());
+        __nv_bfloat16* o_h = reinterpret_cast<__nv_bfloat16*>(dst->data());
+        if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            require_dtype_supported("silu_kernel_dst", OpType::SILU, x->dtype());
+            cuda::launch_silu_bf16(x_h, o_h, n, stream);
+#endif
+        } else {
+            // CPU path is FP32-only by design: upcast locally, compute in FP32, store BF16.
+            for (int i = 0; i < n; ++i) {
+                float v = __bfloat162float(x_h[i]);
+                o_h[i] = __float2bfloat16(v / (1.0f + std::exp(-v)));
+            }
+        }
+        return;
+    }
+    // 6-B-1: remaining non-FP16/BF16 dtypes -- reject BF16 before the FP16
+    // branch or any float* cast below. (SILU no longer reaches this line with
+    // BF16; the branch above returns first.)
+    require_no_bf16("silu_kernel_dst", OpType::SILU, x->dtype());
+    // 6-C-3: native FP8 dst branch -- FP8 x routes to the real FP8 SiLU kernel
+    // (SILU retired from the op_supports_fp8 ledger in 6-C-3). Mixed dtypes fall
+    // through to require_no_fp8 below and fail loudly.
+    if (x->dtype() == DataType::FP8_E4M3) {
+        const uint8_t* x_p = static_cast<const uint8_t*>(x->data());
+        uint8_t* o_p = static_cast<uint8_t*>(dst->data());
+        if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            require_dtype_supported("silu_kernel_dst", OpType::SILU, x->dtype());
+            cuda::launch_silu_fp8(x_p, o_p, n, stream);
+#endif
+        } else {
+            // CPU: decode FP8, FP32 SiLU, encode FP8 (FP8 is a real native dtype
+            // path here, mirroring the 6-C-2 RMSNorm CPU FP8 decode/encode).
+            for (int i = 0; i < n; ++i) {
+                float v = fp8_e4m3_to_fp32(x_p[i]);
+                o_p[i] = fp32_to_fp8_e4m3(v / (1.0f + std::exp(-v)));
+            }
+        }
+        return;
+    }
+    // 6-C-1: FP8 gate -- mirrors ADD/MUL (covers the bare CPU fallback below).
+    require_no_fp8("silu_kernel_dst", OpType::SILU, x->dtype());
     if (x->dtype() == DataType::FP16) {
         const __half* x_h = reinterpret_cast<const __half*>(x->data());
         __half* o_h = reinterpret_cast<__half*>(dst->data());
@@ -116,6 +274,105 @@ void rms_norm_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst,
     int rows = static_cast<int>(x->shape()[0]);
     int cols = static_cast<int>(x->shape()[1]);
 
+    // 6-B-2: RMS_NORM is retired from require_no_bf16 -- it owns a real
+    // __nv_bfloat16 kernel (BF16 storage, FP32 reduction). The BF16 branch
+    // below runs before any gate/reject so BF16 never reaches a float* cast.
+    if (x->dtype() == DataType::BF16) {
+        const __nv_bfloat16* x_h = reinterpret_cast<const __nv_bfloat16*>(x->data());
+        const __nv_bfloat16* w_h =
+            weight ? reinterpret_cast<const __nv_bfloat16*>(weight->data()) : nullptr;
+        __nv_bfloat16* o_h = reinterpret_cast<__nv_bfloat16*>(dst->data());
+        if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            require_dtype_supported("rms_norm_kernel_dst", OpType::RMS_NORM, x->dtype());
+            if (weight) {
+                require_dtype_supported("rms_norm_kernel_dst/weight", OpType::RMS_NORM,
+                                        weight->dtype());
+                if (weight->dtype() != DataType::BF16) {
+                    throw std::runtime_error(
+                        std::string("rms_norm_kernel_dst: BF16 x needs a BF16 weight, got '") +
+                        dtype_name(weight->dtype()) + "' (mixed dtypes fail loudly).");
+                }
+                cuda::launch_rms_norm_bf16(x_h, w_h, o_h, rows, cols, eps, stream);
+            } else {
+                cuda::launch_rms_norm_unweighted_bf16(x_h, o_h, rows, cols, eps, stream);
+            }
+#endif
+        } else {
+            // CPU path is FP32-only by design: upcast locally, run the FP32 row kernel, store BF16.
+            std::vector<float> xf(cols), of(rows * cols);
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) xf[c] = __bfloat162float(x_h[r * cols + c]);
+                const float* wrow = nullptr;
+                std::vector<float> wf;
+                if (weight) {
+                    if (weight->dtype() != DataType::BF16) {
+                        throw std::runtime_error(
+                            std::string("rms_norm_kernel_dst (CPU): BF16 x needs a BF16 weight, got '") +
+                            dtype_name(weight->dtype()) + "'.");
+                    }
+                    wf.assign(cols, 0.0f);
+                    for (int c = 0; c < cols; ++c) wf[c] = __bfloat162float(w_h[c]);
+                    wrow = wf.data();
+                }
+                forge::cpu::rms_norm_row_f32(xf.data(), wrow, of.data() + r * cols, cols, eps);
+            }
+            for (size_t k = 0; k < of.size(); ++k) o_h[k] = __float2bfloat16(of[k]);
+        }
+        return;
+    }
+    // 6-B-1: remaining non-FP16/BF16 dtypes (and BF16 for non-retired ops) --
+    // reject BF16 before the FP16 branch or any float* cast below. (RMS_NORM no
+    // longer reaches this line with BF16; the branch above returns first.)
+    require_no_bf16("rms_norm_kernel_dst", OpType::RMS_NORM, x->dtype());
+    if (weight) {
+        require_no_bf16("rms_norm_kernel_dst/weight", OpType::RMS_NORM, weight->dtype());
+    }
+    // 6-C-2: native FP8 dst branch -- FP8 x + FP8 weight (or unweighted) route
+    // to the real FP8 kernel (RMS_NORM retired from the op_supports_fp8
+    // ledger). Mixed FP8/FP32 falls through to require_no_fp8 below and fails
+    // loudly (no silent re-cast of the weight as uint8_t).
+    if (x->dtype() == DataType::FP8_E4M3 &&
+        (!weight || weight->dtype() == DataType::FP8_E4M3)) {
+        const uint8_t* x_p = static_cast<const uint8_t*>(x->data());
+        uint8_t* o_p = static_cast<uint8_t*>(dst->data());
+        if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            if (weight) {
+                cuda::launch_rms_norm_fp8(x_p, static_cast<const uint8_t*>(weight->data()),
+                                          o_p, rows, cols, eps, stream);
+            } else {
+                cuda::launch_rms_norm_unweighted_fp8(x_p, o_p, rows, cols, eps, stream);
+            }
+#endif
+        } else {
+            // CPU: FP32-only row kernel -- decode FP8, FP32 row norm, encode FP8.
+            std::vector<float> xf(cols), of(static_cast<size_t>(rows) * cols);
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    xf[c] = fp8_e4m3_to_fp32(x_p[static_cast<size_t>(r) * cols + c]);
+                }
+                const float* wrow = nullptr;
+                std::vector<float> wf;
+                if (weight) {
+                    const uint8_t* w_p = static_cast<const uint8_t*>(weight->data());
+                    wf.assign(cols, 0.0f);
+                    for (int c = 0; c < cols; ++c) wf[c] = fp8_e4m3_to_fp32(w_p[c]);
+                    wrow = wf.data();
+                }
+                forge::cpu::rms_norm_row_f32(xf.data(), wrow,
+                                             of.data() + static_cast<size_t>(r) * cols, cols,
+                                             eps);
+            }
+            for (size_t k = 0; k < of.size(); ++k) o_p[k] = fp32_to_fp8_e4m3(of[k]);
+        }
+        return;
+    }
+    // 6-C-1: FP8 gate -- mirrors ADD/MUL (covers the bare CPU fallback below).
+    require_no_fp8("rms_norm_kernel_dst", OpType::RMS_NORM, x->dtype());
+    if (weight) {
+        require_no_fp8("rms_norm_kernel_dst/weight", OpType::RMS_NORM, weight->dtype());
+    }
     if (x->dtype() == DataType::FP16) {
         const __half* x_h = reinterpret_cast<const __half*>(x->data());
         const __half* w_h = weight ? reinterpret_cast<const __half*>(weight->data()) : nullptr;
@@ -197,6 +454,18 @@ void rope_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const 
     if (!params)
         return;
 
+    // 6-B-1 (P1): ROPE is FP32-only with no lowp branch -- any non-FP32 dtype
+    // (including BF16) must fail loudly instead of being read as float below.
+    // ROPE stays out of op_supports_lowp (not whitelisted); the gate + BF16
+    // check together give the same loud behavior as the audited ops.
+    require_dtype_supported("rope_kernel_dst", OpType::ROPE, x->dtype());
+    require_no_bf16("rope_kernel_dst", OpType::ROPE, x->dtype());
+    if (x->dtype() != DataType::FP32) {
+        throw std::runtime_error(
+            std::string("rope_kernel_dst: dtype '") + dtype_name(x->dtype()) +
+            "' has no native kernel. ROPE is FP32-only; BF16 arrives with 6-B.");
+    }
+
     int is_q = params[0];
     int num_h = params[1];
     int head_dim = params[2];
@@ -274,6 +543,72 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
     int seq_len_q = static_cast<int>(q->shape()[0]);
     int total_len = static_cast<int>(k->shape()[0]);
 
+    // 6-B-6 native BF16-Q decode: Q BF16, K/V FP32 (authoritative KV store),
+    // GQA, seq_len_q == 1. 6-B-6.7 extends K/V to BF16 (authoritative BF16 KV):
+    // the K/V dtype selects the kernel (FP32 -> bf16q launch, BF16 -> bf16
+    // launch); mixed or other K/V dtypes keep loud rejection. 6-B-7.0 unlocks
+    // BF16 prefill (all-BF16 QKV vectorized kernel) for the E2E closed loop.
+    // Placed before the FP32 GQA branch so BF16 Q never reaches the
+    // require_no_bf16 rejects below (retired call site).
+    if (dev == DeviceType::CUDA && q->dtype() == DataType::BF16) {
+        require_dtype_supported("flash_attn_gqa_kernel/q", OpType::FLASH_ATTN_GQA, q->dtype());
+        require_dtype_supported("flash_attn_gqa_kernel/k", OpType::FLASH_ATTN_GQA, k->dtype());
+        require_dtype_supported("flash_attn_gqa_kernel/v", OpType::FLASH_ATTN_GQA, v->dtype());
+        const bool kv_fp32 = (k->dtype() == DataType::FP32 && v->dtype() == DataType::FP32);
+        const bool kv_bf16 = (k->dtype() == DataType::BF16 && v->dtype() == DataType::BF16);
+        if (!kv_fp32 && !kv_bf16) {
+            throw std::runtime_error(
+                "flash_attn_gqa_kernel: native BF16 decode needs all-FP32 or all-BF16 K/V, got '" +
+                dtype_name(k->dtype()) + "' / '" + dtype_name(v->dtype()) +
+                "' (mixed K/V fail loudly).");
+        }
+        if (num_kv_heads >= num_heads) {
+            throw std::runtime_error(
+                "flash_attn_gqa_kernel: BF16 non-GQA (MHA) has no native kernel yet (6-B-6: "
+                "decode-first GQA only).");
+        }
+        if (head_dim != 16 && head_dim != 32 && head_dim != 64 && head_dim != 96 &&
+            head_dim != 128) {
+            throw std::runtime_error("flash_attn_gqa_kernel: BF16 attention unsupported head_dim=" +
+                                     std::to_string(head_dim) + " (6-B-6: 16/32/64/96/128 only).");
+        }
+        auto attn_out = std::make_shared<Tensor>(
+            DataType::BF16, std::vector<int64_t>{seq_len_q, num_heads * head_dim},
+            DeviceType::CUDA);
+#ifdef USE_CUDA
+        if (seq_len_q != 1) {
+            // 6-B-7.0: native BF16 prefill (E2E unlock). Prefill requires
+            // all-BF16 QKV (no FP32-KV prefill kernel exists); the vectorized
+            // kernel shares the decode causal convention.
+            if (!kv_bf16) {
+                throw std::runtime_error(
+                    "flash_attn_gqa_kernel: native BF16 prefill needs all-BF16 QKV "
+                    "(FP32-KV prefill has no kernel; decode accepts FP32 K/V).");
+            }
+            cuda::launch_flash_attention_gqa_prefill_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q->data()),
+                reinterpret_cast<const __nv_bfloat16*>(k->data()),
+                reinterpret_cast<const __nv_bfloat16*>(v->data()),
+                reinterpret_cast<__nv_bfloat16*>(attn_out->data()), seq_len_q, total_len,
+                num_heads, num_kv_heads, head_dim, nullptr, causal, stream);
+        } else if (kv_bf16) {
+            cuda::launch_flash_attention_gqa_decode_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q->data()),
+                reinterpret_cast<const __nv_bfloat16*>(k->data()),
+                reinterpret_cast<const __nv_bfloat16*>(v->data()),
+                reinterpret_cast<__nv_bfloat16*>(attn_out->data()), total_len, num_heads,
+                num_kv_heads, head_dim, nullptr, stream);
+        } else {
+            cuda::launch_flash_attention_gqa_decode_bf16q(
+                reinterpret_cast<const __nv_bfloat16*>(q->data()),
+                static_cast<const float*>(k->data()), static_cast<const float*>(v->data()),
+                reinterpret_cast<__nv_bfloat16*>(attn_out->data()), total_len, num_heads,
+                num_kv_heads, head_dim, nullptr, stream);
+        }
+#endif
+        return attn_out;
+    }
+
     // 6-A-7 native FP16 decode: Q/K/V all FP16, GQA, seq_len_q == 1.
     // Prefill (seq>1) FP16 lands in 7.2; mixed dtypes keep loud rejection.
     if (dev == DeviceType::CUDA && q->dtype() == DataType::FP16) {
@@ -320,6 +655,12 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
     }
 
     if (dev == DeviceType::CUDA && num_kv_heads < num_heads) {
+        // 6-B-1: the FP32 GQA branch below reads Q/K/V as float* -- BF16 has no
+        // kernel, so reject loudly here (the FP16 branch above is guarded by
+        // q->dtype() == FP16; BF16 QKV would otherwise fall through silently).
+        require_no_bf16("flash_attn_gqa_kernel/q", OpType::FLASH_ATTN_GQA, q->dtype());
+        require_no_bf16("flash_attn_gqa_kernel/k", OpType::FLASH_ATTN_GQA, k->dtype());
+        require_no_bf16("flash_attn_gqa_kernel/v", OpType::FLASH_ATTN_GQA, v->dtype());
         auto attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len_q, num_heads * head_dim},
             DeviceType::CUDA);
@@ -340,9 +681,17 @@ TensorPtr flash_attn_gqa_kernel(const std::vector<TensorPtr>& inputs, const int3
         }
         return attn_out;
     } else if (dev == DeviceType::CUDA) {
+        // 6-B-1: non-GQA FP32 fallback -- BF16 has no kernel, reject loudly.
+        require_no_bf16("flash_attn_gqa_kernel/q", OpType::FLASH_ATTN_GQA, q->dtype());
+        require_no_bf16("flash_attn_gqa_kernel/k", OpType::FLASH_ATTN_GQA, k->dtype());
+        require_no_bf16("flash_attn_gqa_kernel/v", OpType::FLASH_ATTN_GQA, v->dtype());
         return ops::scaled_dot_product_attention_2d(q, k, v, seq_len_q, total_len, num_heads,
                                                     head_dim, nullptr, causal);
     } else {
+        // 6-B-1: CPU path reads float* below -- BF16 has no kernel, reject loudly.
+        require_no_bf16("flash_attn_gqa_kernel/q", OpType::FLASH_ATTN_GQA, q->dtype());
+        require_no_bf16("flash_attn_gqa_kernel/k", OpType::FLASH_ATTN_GQA, k->dtype());
+        require_no_bf16("flash_attn_gqa_kernel/v", OpType::FLASH_ATTN_GQA, v->dtype());
         TensorPtr k_expanded, v_expanded;
         if (num_kv_heads < num_heads) {
             int kv_groups = num_heads / num_kv_heads;

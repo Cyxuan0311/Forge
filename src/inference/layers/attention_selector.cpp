@@ -27,6 +27,17 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
                                 : AttentionPath::CUDA_F16_PREFILL;
     }
 
+    // 6-B-6: native BF16-Q decode (decode-first). q BF16 + seq_len == 1 selects
+    // the BF16 path; K/V legitimacy sinks to the executor and op_kernels
+    // layers, mirroring the F16 rule above.
+    // 6-B-7.0: BF16 prefill unlocked (all-BF16 QKV vectorized kernel) so the
+    // E2E closed loop can run prefill natively. K/V legitimacy still sinks
+    // downstream (FP32 or BF16 accepted in decode; prefill requires all-BF16).
+    if (p.q_dtype == DataType::BF16) {
+        return (p.seq_len == 1) ? AttentionPath::CUDA_BF16_DECODE
+                                : AttentionPath::CUDA_BF16_PREFILL;
+    }
+
     // GQA decode (seq_len == 1): prefer fused quantized KV if available
     if (p.seq_len == 1) {
         // Paged KV cache (Phase 4): traverse the page table directly.
@@ -136,6 +147,10 @@ const char* attention_path_name(AttentionPath path) {
         return "CUDA_F16_PREFILL";
     case AttentionPath::CUDA_F16_DECODE:
         return "CUDA_F16_DECODE";
+    case AttentionPath::CUDA_BF16_DECODE:
+        return "CUDA_BF16_DECODE";
+    case AttentionPath::CUDA_BF16_PREFILL:
+        return "CUDA_BF16_PREFILL";
     case AttentionPath::CUDA_GENERIC_MHA:
         return "CUDA_GENERIC_MHA";
     case AttentionPath::CUDA_FUSED_Q4_0_DECODE:

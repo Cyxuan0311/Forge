@@ -59,6 +59,7 @@ enum class KernelVariant {
     GEMV_DEQUANT_TRANSB, // quantized dtype without any GEMV: dequant whole B to FP32 scratch, then GEMV
     GEMV_FP32_TRANSB,    // FP32 weight, custom FP32 GEMV (small N)
     GEMV_FP32_CUBLAS,    // FP32 weight, cuBLAS (large N, output_proj)
+    MATMUL_FP8_E4M3_GEMV, // 6-C-4.2/4.3: W8A8 FP8 E4M3 GEMV (M==1 decode, hand-written, no CUTLASS)
 
     // MatMul, M > 1 (prefill / MMQ)
     MMQ,                     // tiled int8 dp4a kernel (legacy default path)
@@ -66,6 +67,7 @@ enum class KernelVariant {
     MATMUL_BATCH_GEMV,       // quantized dtype without an MMQ kernel: batched GEMV
     MATMUL_DEQUANT_CUBLAS,   // quantized dtype without MMQ/batched GEMV: FP32 dequant scratch + cuBLAS
     MATMUL_CUBLAS,           // FP32 weight, direct cuBLAS SGEMM
+    MATMUL_FP8_E4M3,         // 6-C-4.1d: W8A8 FP8 E4M3 GEMM (CUTLASS, Ada)
 
     // MoE
     MOE_EXPERT_GEMV,  // grouped expert quantized GEMV (Q8_1 + dp4a)
@@ -116,6 +118,10 @@ inline const char* kernel_variant_name(KernelVariant variant) {
         return "MATMUL_DEQUANT_CUBLAS";
     case KernelVariant::MATMUL_CUBLAS:
         return "MATMUL_CUBLAS";
+    case KernelVariant::MATMUL_FP8_E4M3:
+        return "MATMUL_FP8_E4M3";
+    case KernelVariant::MATMUL_FP8_E4M3_GEMV:
+        return "MATMUL_FP8_E4M3_GEMV";
     case KernelVariant::MOE_EXPERT_GEMV:
         return "MOE_EXPERT_GEMV";
     case KernelVariant::UNSUPPORTED:

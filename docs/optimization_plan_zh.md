@@ -1366,9 +1366,9 @@ FP16/BF16 对 audited op 集全部抛错且消息含 op 名与 "has no native ke
 - 6-A-6 graph / binding 集成 ⏳（本轮部分交付）—— dst 注入去 FP32 硬编码 + planner 保留 FP16 dtype
   + 真实 FP16 图链逐位一致 + dtype trace；CUDA Graph capture/replay 需先补流贯通；
 - 6-A-7 FP16 attention —— FlashAttention / scaled_dot_product 的数值路径 FP16 化（仅改数值 dtype，不改 attention 选择架构）；
-- 6-A-8 端到端 FP16 验证 —— 全链路跑通 + 精度/带宽 regress。
+- 6-A-8 端到端 FP16 验证 ✅（本轮）—— 全链路跑通 + 三项验收（dtype trace / parity / CUDA Graph）。
 
-**Phase 6-A 进度（截至 6-A-5 封版）**
+**Phase 6-A 进度（截至 6-A-8 封版，Phase 6-A correctness 全部交付）**
 
 | 步骤 | 内容 | 状态 |
 |---|---|---|
@@ -1378,9 +1378,9 @@ FP16/BF16 对 audited op 集全部抛错且消息含 op 名与 "has no native ke
 | 6-A-3 | Native FP16 SiLU | ✅（2026-09-05） |
 | 6-A-4 | Native FP16 activation family | ✅（2026-09-05） |
 | 6-A-5 | Native FP16 Matmul | ✅（2026-09-06，封版） |
-| 6-A-6 | Graph / Binding 集成 | ⏳ 部分（6-A-6.1/2/3/5/6 ✅；6-A-6.4 受限于流贯通） |
-| 6-A-7 | Native FP16 Attention | ⏸ |
-| 6-A-8 | End-to-end FP16 验证 | ⏸ |
+| 6-A-6 | Graph / Binding 集成 | ✅（2026-09-06，6-A-6.1..6.6 全部交付，流贯通由 6-A-7 补齐） |
+| 6-A-7 | Native FP16 Attention | ✅ **Phase 1 COMPLETE / FROZEN**（2026-09-06） |
+| 6-A-8 | End-to-end FP16 验证 | ✅ **COMPLETE / FROZEN**（2026-09-06，correctness baseline 冻结，Phase 2 解锁） |
 
 **边界（6-A 边界重申，依重编号路线更新）**：对标 6-A-0 中性层——QK/RoPE 维持 FP32（既定设计）
 直到 6-A-7 明确覆盖（6-A-4 仅覆盖 activation family：GELU / GELU-tanh / gated SiLU·GeGLU，
@@ -1754,10 +1754,869 @@ FP32 PV → FP16 输出`。scale 约定与 FP32 核一致（`cuda_flash_attn.cu:
 （executor 遇到非 FP16 KV 时 loud 失败，见代码注释）、CPU FP16 SIMD、第三套 dispatch
 （attention 仍走 `AttentionSelector`，matmul 仍走 `KernelSelector`）。
 
+**封版记录（2026-09-06）：6-A-7 Phase 1 = COMPLETE / FROZEN**
+
+```text
+6-A-7 Phase 1 -- Native FP16 Attention
+STATUS: COMPLETE / FROZEN
+
+├── Decode              ✅  (flash_attn_gqa_decode_kernel_fp16)
+├── Prefill             ✅  (flash_attn_gqa_kernel_vectorized_fp16)
+├── FP32 accumulation   ✅  (QK^T / online-softmax / PV 全 FP32)
+├── FP16 output         ✅  (dtype 硬断言，非仅数值)
+├── Selector            ✅  (CUDA_F16_DECODE / CUDA_F16_PREFILL, q_dtype 驱动)
+├── Stream plumbing     ✅  (FP16 核第一天即 honor stream, A/B 流逐位)
+├── CUDA Graph          ✅  (节点级 capture/replay 逐位一致)
+├── Contract            ✅  (FLASH_ATTN_GQA 白名单, 唯一扩展点)
+├── Planner             ✅  (attention 尺寸按首输入元素宽度)
+└── CTest 35/35         ✅  (新增 attn-fp16)
+```
+
+Deferred（Phase 2 性能项，未混入本轮 correctness）：
+- FP16 KV-cache、paged FP16 attention、`__half2`、TensorCore/MMA、performance tuning。
+
+**下一拍 = 6-A-8 端到端 FP16 validation（已立项）**：6-A-8 全绿前 Phase 2（性能）不开工；
+Phase 2 顺序锁死 FP16 baseline → `__half2` → TensorCore，Decode / Prefill 分开测，
+第一轮只回答 "FP16 baseline vs FP32 path 增益"，第二轮才比 half2/TensorCore vs baseline。
+
+#### 6-A-8 End-to-end FP16 验证（2026-09-06，本轮交付 ✅ COMPLETE / FROZEN）
+
+> 目标：证明完整 inference 闭链（RMSNorm → QKV → Attention → residual → gated FFN →
+> next layer → logits）在真实 ComputeGraph 执行下不发生 `FP16→FP32→FP16` 隐式回退或
+> dtype contract 断裂。最小闭环 = 2 层 llama 式图（D=256, nh=8, nkv=2, hd=64, FF=512,
+> V=128），prefill（q_len=16）与 decode（q_len=1, K/V 直接消费 KV-cache 输入）两种 dispatch
+> 模式，FP16 与 FP32 跑**同一拓扑**（同一组 float 模型值驱动两种 dtype 物化，差异只来自
+> FP16 存储/计算）。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `tests/test_e2e_fp16.cpp`（新） | CTest `e2e-fp16`：8.0 = 新 elementwise FP16 核的 native ⇄ FP32 reference 链式验证；8.1 = 2 层闭环三项验收（下） |
+| `src/operators/cuda/cuda_elementwise.cu` | 6-A-8.0：`add_fp16_kernel` / `multiply_fp16_kernel` + `launch_add_fp16` / `launch_multiply_fp16`（FP16 存储、逐元素 FP32 计算、FP16 输出、honor stream） |
+| `include/forge/cuda_kernels.h` | 声明上述两个 launch |
+| `src/core/op_kernels.cpp` | `add_kernel_dst` / `mul_kernel_dst` 加 FP16 分支（CUDA 走 native 核，CPU 本地 upcast→FP32 运算→FP16 存储）；contract 断言 `ADD`/`MUL` |
+| `include/forge/dtype_contract.h` | 白名单加 `ADD` / `MUL`（residual 与 gated FFN 的主链入口；6-A-8.0 唯一扩展） |
+| `src/core/memory_planner.cpp` | **修复** `verify_plan()` 假阳性：overlap 检查只对 lifetime 重叠（`max(begin) <= min(end)`）的分配生效——e2e 图的 buffer 复用触发了大量误报 |
+| `src/operators/cuda/cuda_common.h` | **修复** cuBLAS 死流 segfault：`get_cublas_handle()` 每次调用都 `cublasSetStream`（含 stream==0）——旧 `if (stream)` 守卫让 handle 绑死在已销毁的 capture 流上，后续 decode matmul 在死流上 launch（`cuLaunchKernel` 内 segfault） |
+| `tests/test_dtype_contract.cpp` / `tests/test_matmul_fp16.cpp` | `ADD`/`MUL` accepted 断言同步 |
+| `tests/CMakeLists.txt` | 注册 `forge-e2e-fp16-test` → CTest `e2e-fp16` |
+
+**三项验收（实测，固定阈值已写死进测试）**
+
+1. **dtype trace（`FORGE_TRACE_DTYPE=1`）**：prefill **28/28 节点** FP16 in/out（无隐式回退），
+   decode **24/24**；dst 注入 13/28、13/24（全部 rms/residual/silu/gate_up 走 planner buffer，
+   非 legacy allocate+copy 绕路）。
+2. **FP16 vs FP32 parity（同一拓扑、同一模型值）**，阈值固定
+   `max_abs<0.05 / max_rel<0.05(guard |ref|>=0.15) / cosine>=0.999 / top8 agree>=7`：
+
+   | 模式 | max_abs | max_rel | cosine | top8 |
+   |---|---|---|---|---|
+   | prefill | 2.275e-04 | 1.194e-03 | 0.9999998 | 8/8 |
+   | decode  | 1.498e-04 | 7.701e-04 | 0.9999998 | 8/8 |
+
+   guard 非空转有断言（`max|ref|` 0.207 / 0.187 ≥ 0.15）。实测较阈值有 ~2 个数量级余量。
+3. **CUDA Graph 真链路**：ordinary → capture → replay×3，两模式输出逐位一致，
+   logits buffer 地址/尺寸稳定（prefill 4096 B / decode 256 B，均为 FP16 宽度）。
+
+8.0 链式验证：`add_fp16` / `mul_fp16` max_abs≈1e-3（FP16 输出舍入量级），A/B 流逐位一致。
+
+decode 拓扑说明：q 来自当前 token（`wq` 投影），K/V 直接以 `k_cache`/`v_cache` 图输入
+（kv_len=16）进入 attention——真实 decode 的 cache 消费语义，不从单 token 重算 K/V；
+FP32/FP16 decode 核均 attend 全部 `total_len`（causal 语义一致）。
+
+**验收（回归）**：CTest **36/36 全过**（6-A-7 后为 35/35，新增 `e2e-fp16`）。
+
+非目标（明确未做）：真实模型加载（GGUF/sampler/argmax）、RoPE（维持 FP32，既定设计）、
+FP16 KV-cache 集成（cache 以现成 FP16 张量喂入，不测 cache 写入路径）、>2 层 / 真实
+模型尺寸、任何性能测量（Phase 2 开工后按铁律做）。
+
+**封版记录（2026-09-06）：6-A-8 = COMPLETE / FROZEN —— Phase 6-A correctness baseline 冻结，
+Phase 2（性能）解锁。** Phase 2 顺序不变：FP16 baseline → `__half2` → TensorCore，
+Decode / Prefill 分开测，第一轮只回答 FP16 baseline vs FP32 path 增益。
+
+#### Phase 2 第一轮（2026-09-06，FP16 baseline vs FP32 path ✅ 实测完成）
+
+> 回答唯一问题：**Native FP16 baseline 到底比现有 FP32 path 快多少？**
+> 方法铁律：只看真实 kernel 计时（cudaEvent 包络 back-to-back launch），不用
+> occupancy/register/理论吞吐排名；Decode / Prefill 分开测；每个 op 按 workload
+> 分类（small=launch-bound / large=bandwidth-bound）。RMSNorm / SiLU / matmul 的
+> 对照已在各自 6-A 交付中实测记录，本轮不重复。
+
+**新增**
+
+| 文件 | 改动 |
+|---|---|
+| `tests/bench_fp16_baseline.cpp`（新） | Phase 2 第一轮基准：attention decode / prefill（FP16 核 vs FP32 核，kv/q sweep）+ 6-A-8.0 elementwise ADD/MUL（两 regime）。可执行 `forge-bench-fp16-baseline`，不进 CTest（沿用 tiled-attn 约定） |
+| `tests/CMakeLists.txt` | 注册 `forge-bench-fp16-baseline`（构建但手动运行） |
+
+**实测（RTX 4050 Laptop，cudaEvent，warmup 后多 iter 平均）**
+
+attention decode（q_len=1，GQA nh=8 nkv=2 hd=64，FP16 decode 核 vs FP32 decode 核）：
+
+| kv_len | FP16 ms/tok | FP32 ms/tok | speedup |
+|---|---|---|---|
+| 128（launch-bound） | 0.0132 | 0.0131 | **0.99x** |
+| 512 | 0.0148 | 0.0194 | **1.31x** |
+| 2048（bandwidth-bound） | 0.0249 | 0.0439 | **1.76x** |
+
+attention prefill（q=kv causal，FP16 vectorized vs FP32 vectorized）：
+
+| q_len | FP16 ms | FP32 ms | speedup |
+|---|---|---|---|
+| 64（小） | 0.0685 | 0.0744 | **1.09x** |
+| 256 | 0.3639 | 0.4545 | **1.25x** |
+| 1024（大） | 2.8612 | 4.0039 | **1.40x** |
+
+elementwise（6-A-8.0，FP16 vs FP32，traffic = 2 读 + 1 写）：
+
+| op | n | FP16 | FP32 | speedup |
+|---|---|---|---|---|
+| add / mul | 4096（launch-bound） | ~0.0066 ms | ~0.0064 ms | **~0.97x** |
+| add | 16M（bandwidth-bound） | 0.5503 ms / 182.9 GB/s | 1.1672 ms / 172.5 GB/s | **2.12x** |
+| mul | 16M（bandwidth-bound） | 0.5579 ms / 180.4 GB/s | 1.1692 ms / 172.2 GB/s | **2.10x** |
+
+**第一轮结论**：
+
+1. **增益来自带宽，不来自算力**：workload 越接近 bandwidth-bound，FP16 增益越大
+   （decode 长上下文 1.76x、elementwise 2.1x≈字节数减半的理论比 2.0x 一致）；
+   launch-bound 区（kv=128、n=4096、q=64）FP16 ≈ 持平（0.97–1.09x），不亏。
+2. **decode 增益随 kv 增长**（0.99x → 1.31x → 1.76x）：KV-cache streaming 是 decode
+   主导成本，FP16 KV 减半读取字节直接兑现；512 点处于 launch/bandwidth 过渡带，
+   运行间波动（1.31–1.68x）属正常。
+3. **prefill 增益温和**（1.09x → 1.40x，随 q 增大）：vectorized FP32 核本身效率较高，
+   FP16 的收益主要在 K/V 读取减半；QK^T/PV 仍是 FP32 计算（既定数值策略）。
+4. **基线已冻结**：以上数字即 `__half2` / TensorCore 候选（第二轮）必须击败的基线；
+   launch-bound 区无收益 → 候选优化应聚焦 bandwidth-bound 区（half2 向量化 K/V 加载、
+   TensorCore MMA），预期增益上限 = 进一步减少的访存 + 计算单元切换收益。
+
+**验收（回归）**：CTest **36/36 全过**（本轮未改任何库代码，仅新增 bench）。
+
+#### Phase 2 第二轮（2026-09-06，Decode `__half2` candidate ✅ 实测完成 —— 负结果，归档）
+
+> 回答唯一问题：**`__half2` candidate 是否真的比冻结 baseline 快？**
+> 答案：**否。全部 regime ≈1.00x，candidate 未胜出；production path 维持 6-A-7 baseline 不变。**
+> TensorCore/MMA 候选未开工。
+
+**candidate 设计（契约内，不破 FP32 math）**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_flash_attn.cu`（+`flash_attn_gqa_decode_kernel_fp16_h2`） | 候选核：`__half22float2` 成对转换（替代 8× 标量 cvt）+ V 行 16B 加载前置（与 QK 计算重叠访存延迟）。**明确不用 HFMA2**——half2 乘积会引入 FP16 舍入，破坏 6-A-7 锁定的「QK^T/softmax/PV 全 FP32」契约 |
+| 同上（+`launch_flash_attention_gqa_decode_fp16_h2`） | bench/test 专用入口；**不接 selector/dispatch**，production path 不动 |
+| `include/forge/cuda_kernels.h` | 候选声明（注明 bench-only 与不逐位原因） |
+| `tests/test_attention_fp16.cpp`（+`check_decode_h2_candidate`） | 三闸门：① candidate legacy/capture stream A/B **逐位**；② vs baseline `max_abs<1e-3`（≤1 FP16 输出 ULP）；③ vs CPU FP32 ref parity。模板覆盖 hd∈{16,32,64,128}、kv∈{128,512,2048} |
+| `tests/bench_fp16_baseline.cpp`（+`bench_decode_h2`） | A/B 段：同配置 candidate vs baseline，**best-of-5 交替测量**（内层口径不变：warmup+cudaEvent+mean） |
+
+**实测（RTX 4050 Laptop，best-of-5 交替）**
+
+| kv_len | baseline ms/tok | h2 candidate ms/tok | h2 vs baseline |
+|---|---|---|---|
+| 128（launch-bound） | 0.0088 | 0.0089 | **0.991x** |
+| 512（transition） | 0.0110 | 0.0112 | **0.988x** |
+| 2048（bandwidth-bound） | 0.0250 | 0.0250 | **1.001x** |
+
+复跑第二次：0.993x / 0.988x / 0.998x —— 稳定中性。
+
+**两个实测发现（比数字更有价值）**：
+
+1. **顺序测量的时钟态伪影**：最早一次 A/B（顺序各测一次）给出 kv=512 = 1.394x 的「大胜」，
+   复跑掉到 1.08x；改 best-of-5 **交替**测量后稳定在 0.988x。原因：顺序测量时两个核落在
+   不同 clock/thermal 态。**教训固化：凡 A/B 必须交替 + best-of-N，单次顺序测量不作为结论依据**
+   （round 1 的 kv=512 = 1.31x 同样受此影响偏乐观，结论方向不变但幅度应以本轮协议为准）。
+2. **逐位一致假设被证伪**：candidate 与 baseline 求和顺序文本相同，但 nvcc 的 FMA 收缩决策
+   依赖操作数来源（baseline 直读 global，candidate 读 hoisted `v8[]` 寄存器数组），两次编译
+   收缩选择不同（如 2×FMUL+FADD vs FFMA），单元素出现 1 FP16 ULP 差（实测最大 4.8e-7）。
+   因此正确性闸门定为「≤1 ULP（1e-3）+ stream A/B 逐位」，而非跨编译逐位。
+
+**第二轮结论**：
+
+1. 契约内（FP32 math）的 `__half2` 指令级杠杆已在 decode 上穷尽：cvt 成对化与加载前置均无
+   稳定增益——decode 在大 kv 处带宽饱和（round 1 已证）、小 kv 处 launch 主导、过渡区也无
+   稳定赢面。**decode FP16 路径视为到达带宽地板，收口。**
+2. 剩余理论杠杆只有两个，都不针对 decode：HFMA2（需契约变更，需用户拍板）与 TensorCore/MMA
+   （本质是算力换 bandwidth 的 prefill 杠杆）。decode 不因它们受益（字节已到 FP16 下限）。
+3. candidate 归档为 measured dead end：代码保留（bench/test 专用入口），不进 production。
+
+**验收（回归）**：CTest **36/36 全过**（attn-fp16 含新增 candidate 闸门）。
+
+**下一拍 = Phase 2 第三轮**：TensorCore/MMA candidate，目标 prefill（compute 密集侧）；
+decode 不再投入。若 prefill 实测同样接近带宽地板，则 Phase 2 可以提前收口——FP16 的收益
+已由存储流量减半全部兑现。
+
+#### Phase 2 第三轮（2026-09-06，Prefill TensorCore/wmma candidate ✅ 实测完成 —— 稳定正收益）
+
+> 回答唯一问题：**wmma candidate 是否真的比冻结 baseline 快？**
+> 答案：**是。全 regime 稳定正收益（q=64 ≈2.5–2.8x、q=256 ≈1.45x、q=1024 ≈1.09x），
+> 两次独立运行可重复；production path 是否切换待用户拍板（见轮末决策点）。**
+
+**candidate 设计（含一项契约 amendment）**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_flash_attn.cu`（+`flash_attn_gqa_kernel_mma_fp16`） | wmma 候选核：`16x16x16 f16` 操作数 + `f32` accumulator；Br=32（2 warp × 16 q 行）/ Bc=32 KV tile；Q fragment 跨 KV 循环驻留寄存器；在线 softmax 全 FP32（max/exp/sum/重缩放），P 以 f16 存 smem 供 PV wmma 使用 |
+| 同上（+`launch_flash_attention_gqa_prefill_mma_fp16`） | bench/test 专用入口；**不接 selector/dispatch**，production path 不动；仅 HEAD_DIM=64 |
+| `include/forge/cuda_kernels.h` | 候选声明（注明 P-f16 契约 amendment 与 bench-only） |
+| `tests/test_attention_fp16.cpp`（+`check_prefill_mma_candidate`） | 三闸门：① candidate stream A/B **逐位**；② vs baseline `max_abs<5e-3`；③ vs CPU FP32 ref `max_abs<1e-2`。覆盖 q∈{16,64,48,64}×kv∈{64,64,80,128}（含 q/kv 尾部非对齐、kv>q） |
+| `tests/bench_fp16_baseline.cpp`（+`bench_prefill_mma`） | candidate vs baseline，**best-of-5 交替测量**（沿用第二轮固化的协议） |
+
+**契约 amendment（本轮唯一新增舍入）**：TensorCore 要求 PV 的 P 操作数为 f16（baseline
+中 P 一直是 FP32 计算后直接参与加权）。QK^T 乘积仍精确（11+11 mantissa < 24），softmax
+全 FP32，PV accumulate 全 FP32；唯一新增舍入是 P→f16 一次量化，量级 ≤2^-11 相对误差，
+实测被 vs-baseline 闸门（5e-3）覆盖。**该 amendment 只存在于 candidate；production
+baseline 契约不变，切换与否随 promote 决策一并生效。**
+
+**实测（RTX 4050 Laptop，best-of-5 交替）**
+
+| q=kv（causal，nh=8 nkv=2 hd=64） | baseline ms | mma candidate ms | mma vs baseline |
+|---|---|---|---|
+| 64（launch/occupancy 主导） | 0.0508 | 0.0184 | **2.766x** |
+| 256（transition） | 0.2544 | 0.1744 | **1.459x** |
+| 1024（大 workload） | 2.1603 | 1.9801 | **1.091x** |
+
+复跑第二次：2.494x / 1.450x / 1.089x —— 两次独立运行同一水平，**确认非时钟态伪影**
+（对比第二轮 1.394x→0.99x 的塌缩模式，本轮没有出现）。
+
+**实测解读**：
+1. 小 q 处收益最大的主因不是 MMA 吞吐本身，而是**grid 形态改变**：baseline「1 block/q 行」
+   在 q=64 时只有 64×8 个 block、每 block 串行扫全 KV；candidate 改为 q-tile（Br=32）后
+   并行度与 KV 内并行都更均衡，加上 wmma 替换标量 QK/PV 点积。
+2. q=1024 处收益收敛到 ~1.09x：candidate 配置（Br=32/Bc=32/2 warp/64 thread）偏小，
+   smem 与 wmma 利用率未饱和；有明确续作空间（更大 tile、4 warp、hd 分片），但那属于
+   「promote 之后再调」的性能迭代，不在本轮。
+3. correctness 侧：max_abs vs baseline 最大 4.883e-04（闸门 5e-3）、vs FP32 ref 最大
+   4.898e-04（闸门 1e-2），stream A/B 逐位一致 4/4（含尾部非对齐）。
+
+**验收（回归）**：CTest **36/36 全过**（attn-fp16 含新增 candidate 闸门）。
+
+**决策点（待用户拍板）**：
+- 方案 A（promote）：把 wmma prefill 接入 selector（如 `CUDA_F16_PREFILL` 增加 mma 路径
+  或 workload-aware 切换点），按 6-A-7 相同验收链（selector parity + graph capture/replay
+  + e2e）重跑封版。
+- 方案 B（先续作性能迭代）：promote 前先把 Br/Bc/warp 数调优（预期把 q=1024 从 1.09x
+  拉开），一次性以更强配置进 production。
+- 两案共同前提：P-f16 amendment 随 promote 生效；decode path 不受影响（维持 6-A-7 baseline）。
+
+> **用户拍板（2026-09-07）：方案 B。** Round 4 = MMA Prefill tile/config autotuning；
+> Round 4 结束后再决定 promote。固定 hd=64/wmma/FP16 QKV/FP32 acc/P→FP16 amendment；
+> 只扫 Br∈{32,64} × Bc∈{16,32,64} × warps∈{2,4}；不做 ldmatrix / cp.async / softmax
+> redesign / FP16 KV / decode MMA / selector promotion。promote 门槛：最佳配置
+> q=64>1.10x、q=256>1.10x、q=1024>1.05x 且 correctness/graph 全绿，否则归档。
+
+#### Phase 2 第四轮（2026-09-07，MMA Prefill tile/config scan ✅ 实测完成 —— 门槛全过，promote 成立）
+
+> 回答 Round 4 唯一问题：**q=1024 的 1.09x 是 TensorCore 的上限，还是 tile 配置的上限？**
+> 答案：**是配置的上限（叠加一个 dynamic-smem 实现伪影），不是 TensorCore 的上限。**
+> 最佳单一配置 `Br=64 / Bc=16 / 4 warps` 全档 2.44x / 2.35x / **1.45x**，两次扫描复现；
+> 用户设定的 promote 三门槛全过 → **promote 成立**（接入 selector 为下一拍，待启动确认）。
+
+**改动表**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_flash_attn.cu` | ① kernel 主体参数化为 `mma_prefill_body<HD,BR,BC,NW>`（`__device__ __forceinline__`，warp 拥有 BR/NW 行、M_FRAGS 个 16 行 fragment；softmax lane 覆盖 BC/2 列；staging 泛化为 TPR_Q/TPR_K）；② 两个 wrapper：`flash_attn_gqa_kernel_mma_fp16`（static smem，≤48KB）与 `_dyn`（extern carve，>48KB 才用）；③ `launch_flash_attention_gqa_prefill_mma_cfg` 显式 config 入口（9 合法组合，非法组合 loud 失败）；④ 原 round-3 入口保持 (32,32,2) 语义不变（实测数值逐位一致） |
+| `include/forge/cuda_kernels.h` | cfg 入口声明（注明扫描集与 Br=32&4w 排除原因：wmma M=16 要求每 warp ≥16 行） |
+| `tests/test_attention_fp16.cpp` | `check_prefill_mma_cfg_scan`：round-3 三闸门（stream A/B 逐位 + vs baseline 5e-3 + vs ref 1e-2）× 9 config × 4 shape（含 q/kv 尾部非对齐、kv>q），每 config 输出聚合最差值 |
+| `tests/bench_fp16_baseline.cpp` | `bench_prefill_mma_scan`：9 config × q∈{64,256,1024}，每 config 内部 baseline/candidate **严格交替 best-of-5**（协议不变），输出全表 + 每 q 最佳 |
+
+**Round 4 关键发现（比数字更重要）：dynamic smem 实现税 ≈20-25%**
+
+第一版重构把所有 config 统一改走 dynamic smem（为支持 (64,64) 的 66-68KB），结果
+`(32,32,2)` 在 q=1024 只测得 0.898x——与 Round 3 的 1.091x 矛盾（baseline 仅漂移 ~3%，
+纯时钟态解释不了 25% 的 candidate 端劣化）。修复：主体抽成 device body，≤48KB 的 config
+全部走 static smem（编译期已知共享地址），仅 (64,64) 两个 config 付 dynamic 税。修复后
+`(32,32,2)` 立即回到 1.092x（R3 = 1.091x，完全吻合）。
+
+**教训固化：同一 kernel 的 static vs dynamic smem 不是零成本别名，bench kernel 禁止
+为了实现便利统一改走 dynamic smem；需要 >48KB 时必须把 static/dynamic 作为被测变量
+分开呈现。**
+
+**扫描实测（RTX 4050 Laptop，best-of-5 交替，两次独立运行）**
+
+q=64（launch/occupancy 主导，最佳 = 小 tile 多 block）：
+
+| config | run1 | run2 |
+|---|---|---|
+| **Br=32 Bc=16 w=2** | **2.880x** | **2.898x** |
+| Br=32 Bc=32 w=2（R3 shape） | 2.733x | 2.724x |
+| Br=64 Bc=16 w=4 | 2.428x | 2.440x |
+
+q=256（最佳 = 4 warp 小 Bc）：
+
+| config | run1 | run2 |
+|---|---|---|
+| **Br=64 Bc=16 w=4** | **2.343x** | **2.348x** |
+| Br=64 Bc=32 w=2 | 2.073x | 2.101x |
+| Br=32 Bc=32 w=2（R3 shape） | 1.403x | 1.428x |
+
+q=1024（最佳同为 Br=64 Bc=16 w=4）：
+
+| config | run1 | run2 |
+|---|---|---|
+| **Br=64 Bc=16 w=4** | **1.451x** | **1.449x** |
+| Br=32 Bc=16 w=2 | 1.269x | 1.226x |
+| Br=64 Bc=32 w=2 | 1.203x | 1.185x |
+| Br=32 Bc=32 w=2（R3 shape） | 1.092x | 1.095x |
+| Br=64 Bc=64 w=2（dynamic） | 0.677x | 0.658x |
+
+解读：
+1. **单一配置 `Br=64/Bc=16/4w` 即可通过全部 promote 门槛**：2.43/2.44x（>1.10）、
+   2.34/2.35x（>1.10）、1.45/1.45x（>1.05）。无需 workload-aware 多配置切换即可 promote；
+   若 selector 想做 workload-aware，小 q 段（q≤64）`(32,16,2)` 略优（2.88 vs 2.44），
+   但差异不值得双配置复杂度，第一版 promote 用单一 config。
+2. **Bc=16 出人意料地强**：Bc 大（32/64）反而伤——更大的 smem tile 换来的 MMA 复用
+   抵不过在线 softmax 的 serial 依赖链变长（每 tile 的 max/exp/P-store 批量更大）与
+   occupancy 下降。(64,64,2) 全档最差（0.66-0.69x），smem 66KB → 1 block/SM。
+3. **4 warp 轴只在大 q 有意义**：q=64 时 (64,16,4) 2.44x < (32,16,2) 2.88x（block 数
+   减半伤并行度）；q≥256 后 4 warp 全面胜出。
+4. (64,64,4) 的 correctness 误差 2.5e-3 仍是全组最大（闸门 5e-3/1e-2 内），源于 Bc=64
+   的更长在线 softmax 链，非 bug。
+
+**验收（回归）**：CTest **36/36 全过**；9 config correctness 三闸门全绿
+（最差 vs ref 2.544e-03 / vs baseline 2.533e-03，均来自 (64,64,4)；stream A/B 逐位 9/9）。
+
+**promote 判定（按用户门槛）**：`Br=64/Bc=16/4w` = 2.44x / 2.35x / 1.45x，
+q=64>1.10 ✓、q=256>1.10 ✓、q=1024>1.05 ✓、correctness/graph 全绿 ✓ → **promote 成立**。
+P-f16 amendment 随 promote 生效。
+
+**非目标（明确未做）**：ldmatrix 手写化、cp.async、fused softmax redesign、FP16 KV-cache、
+decode MMA、selector promotion（= 下一拍 Round 5）、workload-aware 多配置 selector。
+
+**下一拍 = Phase 2 第五轮（Round 5）：promote `Br=64/Bc=16/4w` 到 production path**——
+接入 selector（prefill FP16 路径），按 6-A-7 验收链重跑（selector parity + dtype trace +
+CUDA Graph capture/replay + e2e-fp16），P-f16 amendment 写入 dtype contract 文档后封版。
+
+#### Phase 2 第五轮（2026-09-07，MMA Prefill promote ✅ 实测完成 —— COMPLETE / FROZEN）
+
+**目标**：把 Round 4 扫描胜者 `Br=64/Bc=16/4w` 接入 production path，重跑 6-A-7 验收链，
+写入 P-f16 amendment，封版。
+
+**改动表**：
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_flash_attn.cu` | 原向量化 FP16 prefill 抽为显式入口 `launch_flash_attention_gqa_prefill_fp16_vectorized`（冻结基线，可 A/B 可回退）；生产入口 `launch_flash_attention_gqa_prefill_fp16` 改为条件分发：`hd==64 && causal && mask==nullptr` → `launch_mma_prefill_cfg_impl<64,64,16,4>`，其余 scope 一律 fallback 向量化 kernel（行为与 6-A-7.2 完全一致） |
+| `include/forge/cuda_kernels.h`、`src/operators/cuda/cuda_flash_attn.h` | 新增 `_vectorized` 显式入口声明；更新 round-3/4 入口注释（"NOT wired" 已过时） |
+| `include/forge/dtype_contract.h` | P-f16 amendment 写入 6-A-7 注释块：PV 的 P 操作数存 f16（≤2^-11 相对误差/元素），QK^T f16*f16 在 f32 精确、softmax/PV 累加仍 f32；仅限 hd=64 causal 无 mask scope |
+| `tests/test_attention_fp16.cpp` | round-3/4 基准臂改用显式 `_vectorized` 入口（保持 A/B 语义纯净）；新增 `check_prefill_production_routing`：生产入口 hd=64 输出与显式 cfg 入口 (64,16,4) **逐位一致**，hd=128 输出与显式向量化入口**逐位一致**（含 q/kv 尾部 shape 48/80） |
+| `tests/bench_fp16_baseline.cpp` | 全部基线臂改用显式 `_vectorized` 入口 |
+
+**接入面说明**：selector 决策不变（`CUDA_F16_PREFILL`），executor 与 `op_kernels.cpp`
+graph 路径都调用同一生产入口，因此 eager、CUDA Graph capture/replay、e2e 三链自动走
+MMA kernel，无需改动 dispatch 层；mask/非 causal/其他 head_dim 自动回落冻结基线。
+
+**实测数据（Round 5 时点复跑，best-of-5 交替 A/B，同一协议）**：
+
+| q=kv | (64,16,4) vs 向量化基线 | 门槛 | 判定 |
+|---|---|---|---|
+| 64 | 1.964x | >1.10x | ✓ |
+| 256 | 2.312x | >1.10x | ✓ |
+| 1024 | 1.476x | >1.05x | ✓ |
+
+复跑备注：q=64 档本轮 best 为 (32,16,2)=2.879x（Round 4 为 2.44x），小 q 档对时钟态敏感、
+波动可见；(64,16,4) 全档 ≥1.4x 稳过门槛，维持单一 production 配置不做 workload-aware
+多配置（非目标）。
+
+**验收结果（全部实测）**：
+- `attn-fp16`：PASS。selector 单测 OK；decode A==B 全绿；round-3/4 gates 全绿
+  （(64,16,4)：vs ref 4.883e-04 / vs baseline 4.883e-04 / streamA==B=1）；
+  production routing 两条逐位断言通过；`check_prefill`（现走生产入口→MMA）
+  max_abs=9.228e-05 < 1e-2；`check_graph_node_prefill` eager/capture/replay 逐位 OK
+  （capture/replay 现经生产入口 → wmma kernel）。
+- `e2e-fp16`：PASS。dtype trace 主链无隐式回退；FP16 vs FP32 logits parity 固定阈值内；
+  全图 CUDA Graph ordinary→capture→replay 逐位稳定（prefill/decode 两模式）。
+- CTest：**36/36 通过**（含 attn-fp16、e2e-fp16、dtype-contract、graph-fp16、matmul-fp16 全家）。
+
+**非目标（明确未做）**：ldmatrix 手写化、cp.async、fused softmax redesign、FP16 KV-cache、
+decode MMA、workload-aware 多配置 selector、Br=32/Bc=16 按档分派。
+
+**封版声明**：Phase 2（Round 1–5）COMPLETE / FROZEN。
+- Round 1（FP16 baseline vs FP32）：promote，6-A-7。
+- Round 2（decode `__half2`）：负结果归档，维持 6-A-7 baseline。
+- Round 3（wmma prefill Br=32/Bc=32/2w）：正结果，未接 production（被 Round 4/5 取代）。
+- Round 4（tile 扫描）：胜者 (64,16,4)，promote 判定成立。
+- Round 5（promote）：生产入口接入 (64,16,4) + P-f16 amendment 入档，验收链全绿。
+
+**Deferred（后续候选，未排期）**：q=64 档 (32,16,2) 的 workload-aware 分派、更大 tile/
+hd 分片续作、FP16 KV-cache、paged FP16 attention、half2 decode 收口结论沿用 Round 2。
+
 ### 6-B. Native BF16 Execution
 
 紧随 6-A 的第二步。BF16 枚举已存在但实际是 `BF16 → load → FP32`（`types.h:15` 注释即
 自认）：真正要做的是
+
+#### Phase 6-B-0（2026-09-07，BF16 提升点源码审计 ✅ 只审计未改码）
+
+**方法**：`DataType::BF16` / `GgmlDType::BF16` 全量出现点（include+src 共 40 处）逐一定性；
+辅以 `CUDA_R_16BF` / `CUBLAS_COMPUTE_32F` 基建查证与 `static_cast<const float*>` 误读面扫描。
+**结论先行：与 6-A-0 时期形态一致——"表面支持 BF16"，唯一正常入口（GGUF 加载）在
+load time 就转成 FP32，运行时链路从不真正见到 BF16；且存在 3 组「BF16 可达 → 当 FP32
+静默读」的 P0 漏洞，与 6-A-0 #8/#10 同型。**
+
+**链路审计表**（用户指定覆盖面）：
+
+| # | 层 / 文件 | BF16 现状（实测） | 定性 |
+|---|---|---|---|
+| 1 | `types.h:25` | `BF16 = 15`，注释自认 "converted to FP32 at load time" | 事实声明 |
+| 2 | `quant_traits.cpp:52`（DataTypeTraits） | name="bf16"、size=2 ✓（Tensor nbytes 分配正确）、dequant=nullptr | 基础无害 |
+| 3 | `compute_dtype_policy.h` | 仅 `fp32_policy()` 工厂；无 BF16 policy 组合 | 6-B-1 缺口 |
+| 4 | `dtype_contract.h:31-33,58-79` | `is_native_execution_dtype` 排除 BF16 ✓；但 `op_supports_lowp` 白名单 8 算子（RMS_NORM/SILU/GELU×2/MUL_MAT_TRANSB/FLASH_ATTN_GQA/ADD/MUL）**对 BF16 同样放行**——gate 只区分 "FP32/量化 vs lowp"，不区分 FP16/BF16 | **风险源头** |
+| 5 | `gguf_model.cpp:485-496`（graph/binding 上游） | BF16 权重 load time 手工位左移 16 位转 FP32 tensor，运行时不可见 BF16 | 唯一正常消费点 |
+| 6 | Python bindings `core_types.cpp:27,278` | `DataType.BF16` 已导出 + `Tensor.from_buffer(dtype, shape, device)` 接受任意 dtype → **Python 可直接注入 BF16 CUDA tensor** | 可达性证据 |
+| 7 | matmul `matmul_cuda.cpp:325-357`（cuda_matmul_transB/_dual） | **注释声称 BF16 "rejected here loudly"，实际代码不存在该拒绝**：gate(L329) 放行 → `a==FP16&&b==FP16` 不命中 → L350 `static_cast<const float*>` 静默读。注释与代码不符 | **P0** |
+| 8 | RMSNorm graph 路径 `op_kernels.cpp:147-209`（rms_norm_kernel_dst） | `if FP16{...} else: require_dtype_supported（BF16 放行）→ launch_rms_norm(float*)` 静默读。注：eager `ops::rms_norm`（norm.cpp:79）是 loud throw ✓——**graph dst-injection 路径绕过了 ops 层的 loud 兜底** | **P0** |
+| 9 | activation graph 路径 `op_kernels.cpp:109-142`（silu_kernel_dst） | 同上：gate 放行 BF16 → `launch_silu(float*)` 静默读。eager `ops::silu`（activation.cpp:38）loud ✓ | **P0** |
+| 10 | elementwise graph 路径 `op_kernels.cpp:27-106`（add/mul_kernel_dst） | 同上：6-A-8.0 白名单放行 BF16 → `launch_add_bias/launch_multiply(float*)` 静默读。eager ops 层 loud ✓ | **P0** |
+| 11 | attention `op_kernels.cpp:300-380`（flash_attn_gqa_kernel） | FP16 分支有 `q->dtype()==FP16` 守卫 ✓；FP32 GQA 分支（L361-380）**无 dtype 检查**，BF16 QKV → `static_cast<const float*>` 静默读 | **P0** |
+| 12 | attention executor `attention_executor.cpp:593-608,636-650` | selector（attention_selector.cpp:25-28）只认 `q_dtype==FP16`，BF16 落默认 `CUDA_FP32_PREFILL/DECODE` → `static_cast<const float*>(q->data())` 无检查 | **P0** |
+| 13 | ROPE `op_kernels.cpp:234-260`（rope_kernel_dst） | **完全无 gate、无 FP16/BF16 分支**，任意非 FP32 dtype 静默读（ROPE 不在白名单但也无人调用 require） | P1 |
+| 14 | CPU attention `attention.cpp:43-132` | `static_cast<const float*>` 无检查（CPU 侧 BF16 同样可静默误读；CPU 其余算子均 FP32-only+loud ✓） | P1 |
+| 15 | GEMV/MMQ 表 `cuda_gemv_instances.cu:78,102`、`cuda_mmq.cu:1868` | BF16 槽位 = nullptr（与未实现 IQ 槽位同型，null 即失败） | 绿 |
+| 16 | KV cache `kv_cache.h:11-18` | `KVCacheDType` 枚举无 BF16 成员；`parse_kv_dtype`/kv_policy 无 "bf16" 串 | 绿（不存在即无法误用） |
+| 17 | cuBLAS 基建 `cuda_quant.cu:1143-1212` | 仅 `CUDA_R_16F/32F` + `CUBLAS_COMPUTE_32F`；**全仓无 `CUDA_R_16BF`、无 `__nv_bfloat16`**（`cuda_bf16.h` 未 include） | 6-B-4 从零建 |
+| 18 | CUDA Graph runner / dtype trace | dtype-agnostic（capture/replay 与 trace 不检查 dtype）——风险不在 runner，全部落在 #8-#12 的 kernel/gate 层 | 中性 |
+| 19 | 测试 `test_dtype_contract.cpp:121` | 仅测 `is_native_execution_dtype(BF16)==false`；**无「BF16 到达任一白名单算子 → 期望 throw」的端到端测试** | 6-B-1 缺口 |
+
+**核心判定**：
+
+1. gate（`op_supports_lowp`）与 routing 的分工假设失效——6-A 注释多处声称 "BF16 …
+   rejected downstream by the CUDA dtype routing"，但 dst-injection 路径的 downstream
+   没有 BF16 throw（#8-#10），matmul 的 "rejected loudly" 注释根本没有对应代码（#7）。
+   gate 放行 + FP32 fallback 无二次校验 = 静默误读，与 6-A-0 #8/#10 同型。
+2. 正常模型加载路径不可达（#5 load time 转换），但 contract 承诺的是 **operator 边界
+   loud 失败**；#6 证明 BF16 tensor 可从 Python/C++ 直接注入 → 漏洞真实可达。
+3. 6-B 基建零存量：无 bf16 头、无 CUDA_R_16BF、无任何 bf16 kernel；但 6-A 的全部
+   基建（policy/contract/trace/cuBLAS gemv_fp16 范式/验收链）可镜像复用。
+
+**6-B-1 的正确动作（不是写 kernel）**：
+
+```text
+1. dtype_contract.h: is_native_execution_dtype / op_supports_lowp 不动，
+   新增显式 "BF16 尚无 kernel" 拒绝点（或在 gate 内区分 FP16/BF16）。
+2. 修 P0 四处：matmul_cuda (#7)、dst-injection ADD/MUL/SILU/RMS_NORM (#8-#10)、
+   flash_attn_gqa_kernel FP32 分支 (#11)、attention_executor FP32 路径 (#12) ——
+   gate 之后、float* cast 之前对 BF16 loud throw。
+3. 修 P1 两处：ROPE gate 缺失 (#13)、CPU attention (#14)。
+4. test_dtype_contract 补端到端用例：BF16 tensor → 每个白名单算子 → 期望 throw。
+5. 全绿后（CTest 36/36）才进入 6-B-2 native BF16 RMSNorm。
+```
+
+**验收原则（沿用 6-A 纪律，不变）**：BF16 storage → native operator → FP32
+accumulation/reduction → BF16 out；`activation dtype ≠ reduction dtype`、
+`storage precision ≠ accumulator precision`；每个 native kernel 保留
+「native BF16 ⇄ FP32 reference（reference 用相同 BF16 解码输入）」链式验证，
+隔离算法错误与 BF16 存储舍入。
+
+#### 6-B-1 contract hardening（2026-09-07，本轮交付 ✅）
+
+> 按 6-B-0 审计的处方执行：**不实现任何 BF16 native kernel**，只把
+> "BF16 可达 → FP32 静默误读"全部封死，并把 contract 行为锁进测试。
+> 与 6-A-1 完全一致的纪律：**先封 contract，再增加能力。**
+
+**设计（两层分工，`op_supports_lowp` 语义不动）**：gate 只区分
+"FP32/量化 vs lowp"，不区分 FP16/BF16——8 个白名单算子对 BF16 全部放行。
+新增第二层显式 BF16 闸门 `throw_bf16_unsupported` / `require_no_bf16`
+（`dtype_contract.h`），每个 P0/P1 落点在 gate 之后、`float*` cast 之前调用。
+非 BF16 dtype 上为 no-op（FP16/FP32/量化零行为变化）；6-B-2 起每落地一个
+`__nv_bfloat16` kernel 即逐 op 退役对应闸门。
+
+**落点（全部"gate 之后、cast 之前"）**
+
+| ID | 文件 | 改动 |
+|---|---|---|
+| P0-1 | `src/operators/cuda/matmul_cuda.cpp` | `cuda_matmul_transB`（a/b/out）+ `_dual`（a/b1/b2/out）加 `require_no_bf16`；修正"rejected loudly"注释（此前无对应代码） |
+| P0-2/3/4 | `src/core/op_kernels.cpp` | `add/mul_kernel_dst`（a+b）、`silu_kernel_dst`（x）、`rms_norm_kernel_dst`（x+weight）在 FP16 分流前加 `require_no_bf16`；eager `ops::add/multiply`（`elementwise.cpp`，此前零 gate）补 gate + BF16 拒绝 + 非 FP32 显式 throw |
+| P0-5 | `src/core/op_kernels.cpp` + `src/inference/layers/attention_executor.cpp` | `flash_attn_gqa_kernel` 的 FP32 GQA / MHA / CPU 三分支入口加 `require_no_bf16(q/k/v)`；executor 的 `CUDA_FP32_PREFILL/DECODE` 在 `get_kv_on_device` 后加 `require_no_bf16(q/k/v)`（含 CPU `#else` 回退，守卫在 `#ifdef` 之外） |
+| P1-1 | `src/core/op_kernels.cpp` + `src/core/compute_graph.cpp` | `rope_kernel_dst` 入口加 `require_dtype_supported(ROPE)` + `require_no_bf16` + 非 FP32 显式 throw（ROPE 不进白名单，维持 FP32-only）；dst 准入闸 `inputs_fp16` 扩展为"FP16 或 BF16 均禁入 FP32-only dst kernel"（纵深，kernel 内 throw 为第二道） |
+| P1-2 | `src/operators/cpu/attention.cpp` | `scaled_dot_product_attention` / `_2d` / `_2d_gqa` 入口加 `require_no_bf16(q/k/v[/mask])`——同时覆盖 executor 的 `CPU_MHA/CPU_GQA/CUDA_GENERIC_MHA` 三路径（均经此 funnel）；FP16-on-CPU 维持现状（6-B-1 范围外，已记录） |
+
+**测试**
+
+- `tests/test_dtype_contract.cpp` 新增 `test_bf16_gate`（host-only）：12 个 op（8 白名单 + MUL_MAT/ROPE/SOFT_MAX/EMBEDDING）的 BF16 必 throw（消息含 op 名 + "bf16"），FP32/FP16/量化必 no-op；两层分工不变式（白名单对 BF16"gate 放行 + BF16 闸门拒绝"，6-B-2 起逐 op 更新）。
+- 临时 smoke（验证后移除，未入库）：BF16 CUDA tensor 直注 `mul_mat_transB` / graph ADD/RMS_NORM/SILU/ROPE / CPU `sdpa_2d_gqa` 六点全部 loud throw 且消息含 "bf16"；FP32 graph ADD 正常——**不存在 BF16 → float\* 静默 fallback**。
+- CTest **36/36 全绿**（RTX 4050 Laptop，含 `dtype-contract` 与全部 FP16 全家；FP16/FP32/Q4/Q5/Q6/Q8 零回归）。
+
+**验收对照**
+
+```text
+1. P0/P1 所有可达 BF16 路径均 loud reject ............ ✅（上表 5 行）
+2. 不存在 BF16 → float* 静默 fallback ................ ✅（smoke 六点 + cast 前必有 require 审查清单）
+3. test_dtype_contract 覆盖新增拒绝面 ................ ✅（test_bf16_gate）
+4. FP16 / FP32 / Q4/Q5/Q6/Q8 既有行为零回归 ......... ✅（闸门非 BF16 no-op + CTest 36/36）
+5. CTest 全绿 ........................................ ✅（36/36）
+6. docs 写入 6-B-1 delivered/frozen 记录 ............. ✅（本节）
+```
+
+**封版声明**：6-B-1 = DELIVERED / FROZEN——本轮未新增任何 kernel、未改任何非 BF16 数值路径。下一拍 6-B-2（native BF16 RMSNorm，镜像 6-A-2：BF16 存储 + FP32 reduction）解锁。
+
+#### 6-B-2 native BF16 RMSNorm（2026-09-07，本轮交付 ✅）
+
+> 6-B 首个真实 `__nv_bfloat16` kernel。严格镜像 6-A-2 的验证纪律而非实现细节：
+> **BF16 存储/算术 + FP32 reduction**（`norm_compute=FP32` 不变，零 policy 改动），数值稳定性不牺牲。
+> RMS_NORM 是 6-B-1 `require_no_bf16` 的首个退役 op（调用点退役，闸门函数本身语义不动）。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_rms_norm.{cu,h}` | 新增 `rms_norm_kernel_bf16` + `launch_rms_norm_bf16`（加权）与 `rms_norm_unweighted_kernel_bf16` + `launch_rms_norm_unweighted_bf16`（无权重）。逐行镜像 FP16 版，仅 `__half/__half2float/__float2half` → `__nv_bfloat16/__bfloat162float/__float2bfloat16`；reduction 全 FP32 |
+| `include/forge/cuda_kernels.h` | 声明上两个 launch（`#include <cuda_bf16.h>`）；注释写明 RMS_NORM 已从 `require_no_bf16` 退役 |
+| `src/operators/cpu/norm.cpp` | `ops::rms_norm` 新增 `bf16_path`（BF16+BF16 weight → native；混合 dtype 落原 `else` loud throw，消息升级为 FP16/BF16 双路径口径）；CPU eager 保持 FP32-only loud |
+| `src/core/op_kernels.cpp` | `rms_norm_kernel_dst` 在 `require_no_bf16` **之前**插入 BF16 分流（CUDA 走新 launch 并 honor stream，混合 weight 显式 throw；CPU 本地 upcast→FP32 row kernel→BF16 存储，镜像 FP16 分支） |
+| `src/core/compute_graph.cpp` | 准入闸 `dst_bf16_capable = (op==RMS_NORM)`——BF16 输入仅对 RMS_NORM 放行注入，其余 op 保持 6-B-1 阻断 |
+| `tests/test_dtype_contract.cpp` | 新增 `bf16_retired_ops` 台账 + `test_bf16_retirement`（退役 op 必属白名单；本轮恰为 RMS_NORM 一家）。`test_bf16_gate` 本体不动——退役是调用点属性，闸门函数继续对 12 op 全 throw |
+| `tests/test_rms_norm_bf16.cpp`（新） | CTest `rms-norm-bf16`：FP32 reference 对照（hidden=4096/8192 × rows∈{1,32,128,512} + 无权重 + 混合 dtype loud）+ 单节点 graph smoke（dtype 跟随 + 与 eager 逐位一致）+ 微基准（三臂两 regime），无 GPU 优雅 SKIP |
+
+**正确性（FP32 reference 对照：输入/权重先编码为 BF16 再喂 kernel，reference 用同一解码值，残差仅来自 BF16 输出存储舍入）**
+
+| 配置 | max_abs_err | max_rel_err |
+|---|---|---|
+| hidden=4096/8192, rows=1..512（加权） | ~3.9e-3 | ~3.9e-3 |
+| hidden=4096, rows=64（无权重） | ~3.9e-3 | — |
+| 混合 BF16×FP32 | loud reject ✅ | — |
+
+误差约为 FP16 版（~5e-4）的 8×——恰为 7-bit vs 10-bit mantissa 的理论比（2³），证实残差确为存储舍入而非算法偏差；阈值沿用 0.02/0.05（结构错误给 O(1) 垃圾，照样拦截）。
+
+**单节点 graph smoke**：`dtype=bf16`，与 eager `max_abs_vs_eager=0.0`（逐位一致）——dst 注入 + 规划器 + 退役闸门未引入任何数值差异。
+
+**微基准（kernel-only，两 regime，不预设收益）**
+
+| 配置 | 类别 | BF16 | FP16（sanity） | FP32 |
+|---|---|---|---|---|
+| hidden=4096, rows=1 | launch-bound | 0.0080 ms | 0.0094 ms | 0.0093 ms |
+| hidden=8192, rows=512 | bandwidth-bound | 0.0859 ms / 196 GB/s | 0.0841 ms / 200 GB/s | 0.2257 ms / 149 GB/s |
+
+结论与 6-A-2 封版原则 #3 同构：small hidden 均 launch-bound（无差异）；large hidden 进 memory-efficiency 区间，BF16 约 **2.6×**（流量减半），且与 FP16 **逐位同字节数即同性能**（0.086 vs 0.084 ms）——收益来自带宽而非算力，`__nv_bfloat16` 转换指令零可测开销。
+
+**验收**：CTest **37/37 全过**（新增 `rms-norm-bf16`；`dtype-contract` 含新退役台账；FP16 全家无回归）。
+
+**封版声明**：6-B-2 = DELIVERED / FROZEN。退役协议已验证成立（调用点退役 + 台账锁 + native 测试为可执行证明），6-B-3（BF16 activation）起逐 op 复用同一流程。
+
+#### 6-B-3 native BF16 activation family（2026-09-07，本轮交付 ✅）
+
+> 镜像 6-A-3/6-A-4：`silu` / `gelu` / `gelu_tanh`（unary）+ `silu_multiply` /
+> `gelu_multiply`（gated，主链真实入口：LLaMA/Qwen/DeepSeek 用 SiLU-gated、Gemma4 用
+> GeGLU）。计算模型与 6-B-2 同构：BF16 存储 + FP32 超越函数计算 + BF16 输出。
+> 退役 SILU + GELU + GELU_TANH 三个 `require_no_bf16` 调用点族（gated 变体复用
+> SILU/GELU 闸门，无新枚举——与 6-A-4 一致）。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_activation.cu` | 新增 `silu/gelu/gelu_tanh_kernel_bf16` + `launch_*_bf16`（逐行镜像 `_fp16` 版，仅三处转换函数替换；256 线程 block 不变） |
+| `src/operators/cuda/cuda_elementwise.cu` | 新增 `silu_multiply/gelu_multiply_kernel_bf16` + `launch_*_bf16`（fused 单 kernel，镜像 FP16 分支——FP32 的"gelu 再 multiply"两 kernel 形态不动） |
+| `include/forge/cuda_kernels.h` | 声明上 5 个 launch |
+| `src/operators/cpu/activation.cpp` | `silu/gelu/gelu_tanh` 加 BF16 分支；`else` 消息升级为 FP16/BF16 双路径口径；CPU 保持 FP32-only |
+| `src/operators/cpu/elementwise.cpp` | `silu_multiply/gelu_multiply` 加 BF16 分支（含 `up` 非 BF16 混合显式 throw）；`else` 消息同步升级 |
+| `src/core/op_kernels.cpp` | `silu_kernel_dst` 在 `require_no_bf16` 之前插 BF16 分流（CUDA 走新 launch 并 honor stream；CPU 本地 upcast→FP32→BF16） |
+| `src/core/compute_graph.cpp` | `dst_bf16_capable` 从 `(RMS_NORM)` 扩为 `(RMS_NORM \|\| SILU)`；GELU/GELU_TANH 无 dst kernel（恒走 legacy → W2 分支），闸门不动 |
+| `tests/test_dtype_contract.cpp` | `bf16_retired_ops` 追加 SILU/GELU/GELU_TANH（size 断言 1→4）；`test_bf16_gate` 本体不动 |
+| `tests/test_activation_bf16.cpp`（新） | CTest `activation-bf16`：5 算子 FP32 reference 对照 + 输出 dtype 硬断言 + 混合 loud 抽查 + 单节点 SILU graph smoke + 三臂两 regime  bench，无 GPU SKIP |
+
+**正确性（FP32 reference 对照：输入先编码为 BF16 再喂 kernel，reference 用同一解码值）**
+
+| 配置 | max_abs | max_rel |
+|---|---|---|
+| silu / gelu / gelu_tanh（unary, n=8k/2M） | ~7.8e-3 | ~3.8e-3 |
+| silu_multiply / gelu_multiply（gated） | ~3.1e-2 | ~3.9e-3 |
+| 混合 BF16 gate × FP32 up | loud reject ✅ | — |
+| 单节点 graph smoke（SILU） | 与 eager 逐位一致（0.0） | dtype=bf16 ✅ |
+
+解读：unary 误差 ≈ FP16 版（~1e-3）的 8×（mantissa 差 3 bit）；gated 的 max_rel **恰落在 BF16 epsilon 2⁻⁸ 上**，max_abs 3.1e-2 = 该量级输出（|out|≤16，1 BF16 ULP=0.0625）的 0.5 ULP——纯输出存储舍入。gated 阈值据此记为 0.05（~0.8 ULP，结构错误给 O(1) 仍被拦截），unary 沿用 0.02/0.05。
+
+**微基准（kernel-only，三臂两 regime，不预设收益）**
+
+| 配置 | 类别 | BF16 | FP16（sanity） | FP32 |
+|---|---|---|---|---|
+| silu n=4096 | launch-bound | ~0.007 ms | ~0.007 ms | ~0.007 ms |
+| silu n=4M | bandwidth-bound | 0.0645 ms / 260 GB/s | 0.0644 ms / 260 GB/s | 0.2122 ms / 158 GB/s（**3.3×**） |
+| silu_multiply n=4096 | launch-bound | ~0.007 ms | ~0.007 ms | ~0.006 ms |
+| silu_multiply n=4M | bandwidth-bound | 0.0967 ms / 260 GB/s | 0.1088 ms / 231 GB/s | 0.2799 ms / 180 GB/s（**2.9×**） |
+
+结论与 6-A-4 一致：small n 均 launch-bound（BF16 不更快）；large n 进 memory-efficiency 区间（~3×）。两个实测注记：① BF16 与 FP16 全程 byte-parity，转换指令零可测开销；② launch-bound 档运行间抖动 ±70%（首臂时钟态，Phase 2 Round 2 同类伪影已归档），单次小 n 数字不作结论；③ 大 n 须让 FP32 工作集 spill 出 L2（本机 n=2M 时 FP32 集 16.8MB 常驻 L2 给出假 parity，n=4M 后 HBM 真值显现）——bench 选点本身是 workload 相关的。
+
+**验收**：CTest **38/38 全过**（新增 `activation-bf16`；`dtype-contract` 退役台账 4 op；RMSNorm/FP16 全家无回归）。
+
+**封版声明**：6-B-3 = DELIVERED / FROZEN。下一拍 6-B-4（BF16 matmul：cuBLAS `CUDA_R_16BF` + `CUBLAS_COMPUTE_32F`，镜像 6-A-5）解锁。
+
+#### 6-B-4 native BF16 matmul（2026-09-07，本轮交付 ✅）
+
+> 镜像 6-A-5 的 4.1→4.4 四段结构。核心差别仅一行：`CUDA_R_16F → CUDA_R_16BF`，
+> `CUBLAS_COMPUTE_32F` 不动。边界：BF16 storage ✅ / FP32 accumulation ✅ /
+> BF16 output ✅ / No FP32 tensor materialization ✅；non-transB 保持 reject（本轮无
+> row-major-B 需求）；Phase 3/5 量化路径（`launch_cublas_gemm_quant_fp16` 只收 FP32
+> A/C）零交叉。退役 `MUL_MAT_TRANSB`（台账 4→5；dual 路径无 BF16 kernel，继续 loud）。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_quant.cu` | 新增 `launch_cublas_gemm_bf16`（逐行镜像 `launch_cublas_gemm_fp16`，仅 `CUDA_R_16F→CUDA_R_16BF` + `__half→__nv_bfloat16`；`get_cublas_handle(stream)` 复用） |
+| `include/forge/cuda_kernels.h` | 新 launch 声明 |
+| `src/operators/cuda/matmul_cuda.cpp` | `cuda_matmul_transB`：BF16 任一位置出现即要求全 BF16 A/B/out（混合 loud，错误信息指到 dtype 对），全 BF16 走新 launch；`require_no_bf16` 三行退役。`_dual` 保持拒绝 |
+| `src/operators/cpu/matmul.cpp` | eager `matmul_transB` 新增 BF16+BF16→BF16 out 路由（bias 仍显式 reject，与 FP16 同口径；混合 BF16×他 dtype 在 eager 层即 loud） |
+| `tests/test_dtype_contract.cpp` | `bf16_retired_ops` 追加 `MUL_MAT_TRANSB`（size 断言 4→5）；`test_bf16_gate` 本体不动 |
+| `tests/test_matmul_bf16.cpp`（新） | CTest `matmul-bf16`：4.1 direct launch（M=1/8/64）+ 4.2 route（+小尺寸 + 混合 loud）+ 4.4 M sweep |
+| `tests/test_matmul_bf16_chain.cpp`（新） | CTest `matmul-bf16-chain`：4.3 RMSNorm→Matmul→silu_multiply（M=1/8/32，K=4096/N=11008） |
+
+**正确性（BF16 先编码，reference 用同解码输入——绝不拿原始 FP32 作 golden）**
+
+| 配置 | max_abs | max_rel |
+|---|---|---|
+| 4.1 native launch（M=1/8/64, K=N=4096） | ~0.24–0.25 | ~3.8–4.2e-3 |
+| 4.2 route（M=1/8/64 + 1×256×512） | 同上（小尺寸 3.1e-2） | ~3.8–3.9e-3 |
+| 混合 BF16×FP32 | loud reject ✅ | — |
+
+解读：`max_rel` 全档锚定 BF16 epsilon 2⁻⁸（纯输出存储舍入）；`max_abs` 随输出量级（O(10–100)，该量级 1 BF16 ULP=0.5–1.0，属 sub-ULP）。阈值实测定版：`max_abs<1.0 / max_rel<0.02`（~4–5× 实测；结构错误超 10×）。
+
+**4.3 chain**：三档全 BF16（dtype 不变量 ✅）；cosine **0.999996**（M=1/8/32 一致）；max_abs 0.40/0.54/0.76；max_rel(|ref|≥1) 0.098/0.134/0.160。诊断结论：小量级元素的 ~10–16% 是 RMSNorm-store 舍入经 K=4096 累加 random-walk 后的诚实传播（6-A-5.3 "few-%" 的 1/8-scale 同构现象），cosine 为证；判据取 cosine≥0.999 为主 + max_abs<2.0 + max_rel(|ref|≥1)<0.3（~2× 实测；`max_rel_info` 仅记录分母伪影，不设闸）。
+
+**4.4 M sweep（best-of-3 交替，K=N=4096，无预设倍率；M=1 重测不定假设）**
+
+| M | BF16 | FP32 | speedup |
+|---|---|---|---|
+| 1 | 0.183 ms | 0.362 ms | **1.97×** |
+| 8 | 0.198 ms | 0.412 ms | **2.07×** |
+| 32 | 0.198 ms | 0.448 ms | **2.26×** |
+| 128 | 0.318 ms | 1.003 ms | **3.15×** |
+| 512 | 1.101 ms | 3.385 ms | **3.07×** |
+
+结论：BF16 cuBLAS 从 M=1 即成立（用户要求重测的点：无 M=1 异常，TensorCore 路径全档有效）；收益随 M 从 ~2× 升至 ~3.1×（流量减半 + TensorCore），与 6-A-5 的 FP16 形态同构。
+
+**验收**：CTest **40/40 全过**（新增 `matmul-bf16` + `matmul-bf16-chain`；`dtype-contract` 退役台账 5 op；量化/FP16/FP32 全家无回归）。
+
+**封版声明**：6-B-4 = DELIVERED / FROZEN。至此形成 `contract → RMSNorm → Activation → Matmul` 完整路线；下一拍 6-B-5（Graph / Binding Integration，多节点 BF16 propagation 一次性解决）解锁。
+
+#### 6-B-5 Graph / Binding Integration（2026-09-07，本轮交付 ✅）
+
+> 不逐 operator 打 graph patch——6-B-2 的单节点 smoke 已证可达性，本轮一次性验证整个
+> BF16 graph contract，并作为 contract 的最终证明面：eager native 的算子在 graph 中同样
+> native，不存在 eager/graph 分叉。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_elementwise.cu` | 新增 `add/multiply_kernel_bf16` + `launch_add_bf16` / `launch_multiply_bf16`（BF16 存储 + FP32 逐元素计算 + BF16 输出，镜像 6-A-8.0） |
+| `include/forge/cuda_kernels.h` | 上两个 launch 声明 |
+| `src/operators/cpu/elementwise.cpp` | eager `ops::add/multiply` 新增 BF16+BF16→BF16 out 路由（CUDA；CPU 显式 loud；混合 loud）。FP16 eager 仍 loud（6-B-1 纪律：FP16 只活在 dst） |
+| `src/core/op_kernels.cpp` | `add/mul_kernel_dst` 在 `require_no_bf16` 之前插 BF16 分流（CUDA 新 launch + stream；CPU 本地 upcast→FP32→BF16；`b` 非 BF16 混合 throw） |
+| `src/core/compute_graph.cpp` | `dst_bf16_capable` 扩为 RMS_NORM\|\|SILU\|\|ADD\|\|MUL；planner 本体零改（勘察确认已 dtype-generic：`dtype_size` 计尺寸，BF16=2B） |
+| `include/forge/compute_dtype_policy.h` | 新增 `bf16_policy()` + `is_bf16_policy()`（weight/activation=BF16，accumulator/norm_compute=FP32，kv=FP32——BF16 KV-cache 是 6-B-6 scope；当前仅具名能力，尚无 selector 消费） |
+| `tests/test_dtype_contract.cpp` | `bf16_retired_ops` 追加 ADD + MUL（size 断言 5→7）；policy 段加 `bf16_policy` 断言；`test_bf16_gate` 本体不动 |
+| `tests/test_graph_bf16.cpp`（新） | CTest `graph-bf16`：5 节点链 RMSNorm→Matmul→SiLU→Add→Mul + trace + capture/replay |
+
+**实测（RTX 4050，M∈{1,8,32}，K=4096/N=11008；capture M=8/K=1024/N=2048）**
+
+```text
+Node      Input  Output  dst_injected
+-------------------------------------
+rms_norm  bf16   bf16    1
+matmul    bf16   bf16    0   (legacy by design, 与 6-A-6 同构)
+silu      bf16   bf16    1
+add       bf16   bf16    1
+mul       bf16   bf16    1
+```
+
+- 全链 `bf16 → bf16`，无 `BF16 → FP32 → BF16`（trace 5/5）。
+- graph vs eager standalone：`max_abs = 0.0` **逐位一致**（三档）——graph 层零数值差异。
+- planner：输出 `nbytes == M*N*2`（BF16 宽度，非 FP32 两倍）。
+- CUDA Graph：ordinary == capture == replay（逐位）；buffer 地址/尺寸稳定（32768 B = 8·2048·2）；capture 窗口零 `cudaMalloc`（allocs 40→41 全命中池）。
+- binding：Python `Tensor(BF16)` / `from_buffer(BF16)` 构造验证通过（nbytes=elements×2）；graph 本体无 Python 绑定（现状如此，scope 外，已记录）。
+
+**验收对照**：9 项用户标准 ①–⑨ 全部 ✅（见上表与数据）；CTest **41/41 全过**（新增 `graph-bf16`；FP16/FP32/量化全家无回归）。
+
+**封版声明**：6-B-5 = DELIVERED / FROZEN。下一拍 6-B-6（BF16 attention，镜像 6-A-7，decode 先行）解锁；`bf16_policy.kv=FP32` 在该拍被真正消费前保持具名状态。
+
+#### 6-B-6 native BF16-Q attention, decode-first（2026-09-07，本轮交付 ✅）
+
+> 镜像 6-A-7 的 decode 切片，但 storage contract 与 6-A-7 不同——**不是"把 `__half`
+> 换成 `__nv_bfloat16`"**：Q 到达时已是 BF16（query 投影输出），K/V 到达时仍是 FP32
+>（authoritative KV store；`bf16_policy.kv` 保持 FP32），全数学 FP32，仅终写转 BF16。
+> 这样"attention compute dtype"与"KV storage dtype"两个变量没有混在一起；BF16 KV
+> 是否入 6-B-6 后半段，待本轮数据决定。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_attn_common.cuh` | `cross_warp_merge_and_write` 新增 `__nv_bfloat16*` 重载（merge 全 FP32，仅终写 `__float2bfloat16`） |
+| `src/operators/cuda/cuda_flash_attn.cu` | 新增 `flash_attn_gqa_decode_kernel_bf16q` + `launch_flash_attention_gqa_decode_bf16q`：Q `__nv_bfloat16`→smem float，K/V float 直读（16B=4 floats，`VEC_COUNT=HD/4`），FP32 scale/online-softmax/PV，HD 16/32/64/96/128，honor stream |
+| `src/operators/cuda/cuda_flash_attn.h` + `include/forge/cuda_kernels.h` | 新 launch 声明 |
+| `include/forge/attention_selector.h` + `attention_selector.cpp` | 新增 `CUDA_BF16_DECODE`（+ name）；`q==BF16 && seq==1` 路由至此；BF16 prefill 故意落回 FP32 case（其 `require_no_bf16` loud）。非 GQA BF16 照旧走 `CUDA_GENERIC_MHA`（loud） |
+| `src/inference/layers/attention_executor.cpp` | 新增 `case CUDA_BF16_DECODE`：q 必 BF16、K/V 必 FP32、mask FP32-or-none、HD 检查、BF16 out、`launch_..._bf16q(..., stream)` |
+| `src/core/op_kernels.cpp` | `flash_attn_gqa_kernel` 新增 BF16-Q 分支（K/V 必 FP32、GQA、HD、seq==1；prefill/MHA/BF16-KV 各自 loud）；FP32/MHA/CPU 分支的 `require_no_bf16` 原样保留 |
+| `tests/test_dtype_contract.cpp` | `bf16_retired_ops` 追加 `FLASH_ATTN_GQA`（size 8；decode-scope，與 `MUL_MAT_TRANSB`/dual 同先例：prefill/BF16-KV/MHA 仍拒）；`test_bf16_gate` 本体不动 |
+| `tests/test_attention_bf16.cpp`（新） | CTest `attn-bf16`：decode 正确性（4 hd）+ FP32 自洽 + stream A/B + selector + loud 四面 + graph node + kv-sweep bench |
+
+**正确性（reference 用同解码 BF16 Q + 同 FP32 K/V；K/V 永不量化）**
+
+| 配置 | max_abs |
+|---|---|
+| decode vs CPU FP32 ref（hd 16/32/64/128, kv=512） | 1.2–2.3e-4 |
+| vs FP32 kernel 自洽（同解码值） | 1.2–2.3e-4 |
+
+输出是 V∈[-1,1] 的 softmax 平均（|out|≤1），误差即 BF16 Q 输入舍入 + 输出舍入；阈值实测定版 `max_abs<1e-3`（~4× 实测；错 scale/轴/顺序给 O(0.1)）。stream A/B 逐位一致 4/4；graph node eager/capture/replay 逐位一致，`O==BF16`，`nbytes==nh*hd*2`。
+
+**6-B-6.6 decode bench（best-of-3 交替，nh=8/nkv=2/hd=64）**
+
+| kv_len | BF16-Q | FP32 | speedup |
+|---|---|---|---|
+| 128（launch-bound） | 0.01709 | 0.01716 | **1.00×** |
+| 512 | 0.02138 | 0.02158 | **1.01×** |
+| 2048（bandwidth-bound） | 0.04385 | 0.04405 | **1.00×** |
+
+结论（诚实的中性结果）：decode 主导成本是 KV-cache streaming——K/V 两侧仍是 FP32 等字节，Q 仅 1KB，BF16-Q 理论上就不该赢。**这正是 `kv=FP32` 现状的直接度量**：decode 的 BF16 收益必须等 BF16 KV（KV 字节减半）才兑现，本轮不硬凑收益。该数据即"BF16 KV 是否入 6-B-6 后半段"的决策依据。
+
+**验收**：CTest **42/42 全过**（新增 `attn-bf16`；`dtype-contract` 退役台账 8 op；FP16/FP32/量化全家无回归）。
+
+**封版声明**：6-B-6 decode 切片 = DELIVERED / FROZEN。未做：BF16 prefill、BF16 KV-cache、paged BF16、MMA/half2、selector 重构——是否开 BF16 KV 后半段，待用户按上表拍板。
+
+#### 6-B-6.7 native BF16 KV decode（2026-09-07，本轮交付 ✅）
+
+> 用户拍板：先做 BF16 KV 后半段，再进 6-B-7。动机不是性能数字，而是 6-B-6 已证明
+> decode 带宽的绑定变量是 KV storage——`BF16-Q + FP32-KV ≈ 1.00×` 之后，唯一有价值的
+> 问题就是"BF16 KV 是否兑现 memory-traffic gain"。只扩 decode，不碰 prefill/paged。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_flash_attn.cu` | 新增 `flash_attn_gqa_decode_kernel_bf16` + `launch_flash_attention_gqa_decode_bf16`：Q/K/V 全 BF16，FP32 数学，BF16 输出；K/V/mask 16B=8×bf16 转换读（`VEC_COUNT=HD/4`→`HD/8`）；HD 集与 stream 语义同 6-B-6 |
+| `src/operators/cuda/cuda_flash_attn.h` + `include/forge/cuda_kernels.h` | 新 launch 声明 |
+| `src/core/op_kernels.cpp` | BF16 分支内按 K/V dtype 分派：全 FP32→bf16q launch，全 BF16→bf16 launch，混合/其他 loud（错误信息指到 K/V 对） |
+| `src/inference/layers/attention_executor.cpp` | `case CUDA_BF16_DECODE` 内同口径分派（mask 跟随 K/V 侧 dtype：BF16-KV 配 BF16 mask，FP32-KV 配 FP32 mask）；selector **不动**（同一 path cover 两种 KV，path 名即"BF16 decode"语义） |
+| `include/forge/compute_dtype_policy.h` | `bf16_policy().kv`: FP32→**BF16**（等待项正式消费）；`is_bf16_policy` 同步 |
+| `tests/test_dtype_contract.cpp` | policy 断言 `kv==BF16`（6-B-6.7 消费记录） |
+| `tests/test_attention_bf16.cpp` | 扩展：all-BF16 正确性（4 hd）+ stream A/B + dispatch 原生性（BF16-QKV 不抛且出 BF16）+ 混合 K/V loud + graph node bf16kv + bench 第三臂 |
+
+**正确性（reference 用同解码 BF16 QKV；K/V 永不跨 dtype 混用）**
+
+| 配置 | max_abs |
+|---|---|
+| all-BF16 vs CPU FP32 ref（hd 16/32/64/128, kv=512） | 1.1–2.2e-4（与 BF16-Q 切片同带，阈值同口径 `1e-3`） |
+| stream A/B | 逐位一致 4/4 |
+| graph node（eager/capture/replay） | 逐位一致，`O==BF16` |
+
+**6-B-6.7 bench（三臂同值不同存储 + best-of-3 交替，nh=8/nkv=2/hd=64）**
+
+| kv_len | BF16-KV | BF16-Q（6-B-6 基线） | FP32 | kv-gain |
+|---|---|---|---|---|
+| 128（launch-bound） | 0.00911 | 0.00853 | 0.00877 | **0.94×** |
+| 512 | 0.01169 | 0.01542 | 0.01568 | **1.32×** |
+| 2048（bandwidth-bound） | 0.02527 | 0.04379 | 0.04397 | **1.73×** |
+
+结论（只记录实测，不预设）：① kv=128 的 0.94× 是 launch-bound 噪声（±7%，6-B-3 同类伪影量级），非回归；② kv=2048 的 **1.73×** 即 KV 字节减半兑现的部分收益——不到 2×，因为 Q/O/softmax 固定成本与转换指令不随 KV 减半；③ BF16-Q 基线与 FP32 全程一致（0.04379 vs 0.04397），6-B-6 的 1.00× 结论复现，A/B 方法可信。
+
+**验收对照（用户 9 项）**：①全 BF16 Q/K/V→BF16 O ✅ ②FP32 accumulation ✅（kernel diff + parity）③vs FP32 ref ✅ ④stream A/B ✅ ⑤capture/replay ✅ ⑥selector/executor ✅（同 path 内 K/V 分派）⑦混合 loud ✅ ⑧kv sweep ✅ ⑨A/B 交替 best-of-N ✅（三臂同值）。
+
+**验收**：CTest **42/42 全过**（`attn-bf16` 内扩展，无新增 CTest 名；其余全家无回归）。
+
+**封版声明**：6-B-6.7 = DELIVERED / FROZEN。BF16 attention decode 至此两种 KV 形态俱全；未做：BF16 prefill、paged BF16、MMA/half2。下一拍 6-B-7（全链路 BF16 E2E：activation / RMSNorm / activation family / matmul / residual / attention / KV 全 native）解锁——E2E 不再引入新 storage 变量。
+
+#### 6-B-7 End-to-end BF16 validation（2026-09-07，本轮交付 ✅ COMPLETE / FROZEN）
+
+> 目标：证明完整 inference 闭链（RMSNorm → QKV 投影 → BF16 Attention + BF16 KV →
+> residual → gated FFN → next layer → logits）在真实 ComputeGraph 执行下不发生
+> `BF16→FP32→BF16` 隐式回退或 dtype contract 断裂。最小闭环 = 2 层 llama 式图
+>（D=256, nh=8, nkv=2, hd=64, FF=512, V=128），prefill（q_len=16）与 decode（q_len=1）
+> 两种 dispatch 模式，BF16 与 FP32 跑**同一拓扑**（同一组 float 模型值驱动两种 dtype
+> 物化，差异只来自 BF16 存储/计算）。
+
+**7.0 前置解锁（同轮交付）**：E2E 勘察发现 prefill 半环没有 kernel 可走（6-B-6 只放行
+decode），因此本轮先补 **native BF16 vectorized prefill**
+（`flash_attn_gqa_kernel_vectorized_bf16` + `launch_..._prefill_bf16`，镜像 6-A-7.2 的
+"只换 dtype boundary"纪律：Q tile smem float、16B=8×bf16 载入、FP32 数学、BF16 输出、
+无 wmma）+ `CUDA_BF16_PREFILL` path（selector 两分支化：q-BF16 seq1→DECODE、
+seq>1→PREFILL）+ executor case + op_kernels 分派（prefill 强制 all-BF16 QKV，
+FP32-KV-prefill 保持 loud）。prefill 正确性（causal FP32 ref，q=4/kv=16，hd 16/64/128）：
+9.7e-4 / 9.7e-4 / 1.9e-3（= 0.5 BF16 ULP，纯输出舍入），阈值定 4e-3（~1 ULP）；
+stream A/B 逐位；dispatch 原生性 + FP32-KV-prefill loud 全过。
+
+**KV 写入/读取链路（与 6-A-8 的关键差异）**：decode 的 K/V cache **不是合成随机张量**
+——由真实 prefill 写入路径产出（与 prefill 图 wk/wv 节点完全相同的 native 算子链
+`rms_norm → matmul_transB`，逐 dtype 分别执行），再作为 decode 图输入消费。
+`produce_decode_kv` 把 KV write path 与 read path 锁进同一个测试。
+
+**新增 / 修改**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_flash_attn.cu/.h` + `cuda_kernels.h` | 7.0 prefill kernel + launch |
+| `attention_selector.{h,cpp}` + `attention_executor.cpp` + `op_kernels.cpp` | 7.0 路由三层 |
+| `tests/test_attention_bf16.cpp` | prefill correctness/stream/dispatch 断言；selector 更新为 decode+prefill 双路由 |
+| `tests/test_e2e_bf16.cpp`（新） | CTest `e2e-bf16`：8.1 = 2 层闭环三项验收；KV 写读链路 |
+| `tests/CMakeLists.txt` | 注册 `e2e-bf16` |
+
+**三项验收（实测，阈值首跑标定后写死）**
+
+1. **dtype trace（`FORGE_TRACE_DTYPE=1`）**：主链全部节点（每层 rms/wq/wk/wv/attn/wo/
+   residual/silu/gate_up × 2 层 + out.rms/logits）in/out 全 BF16，无隐式回退；dst 注入
+   严格等于 dstable 集合（rms/residual/silu/gate_up 走 planner buffer，matmul/attention
+   legacy 系 by design）。
+2. **BF16 vs FP32 parity（同一拓扑、同一模型值）**，阈值固定
+   `max_abs<0.01 / max_rel<0.03(guard |ref|>=0.15) / cosine>=0.999 / top8 mismatch<=1`：
+
+   | 模式 | max_abs | max_rel | cosine | top8 |
+   |---|---|---|---|---|
+   | prefill | 1.321e-03 | 4.768e-03 | 0.9999902 | 8/8 |
+   | decode  | 8.727e-04 | 1.989e-03 | 0.9999886 | 8/8 |
+
+   实测较阈值有 ~1 个数量级余量；guard 非空转（max|ref| 0.282/0.159 ≥ 0.15）。
+3. **CUDA Graph 真链路**：ordinary → capture → replay×3，两模式输出逐位一致，
+   logits buffer 地址/尺寸稳定（prefill 4096 B / decode 256 B，均为 BF16 宽度）。
+
+**验收（回归）**：CTest **43/43 全过**（新增 `e2e-bf16`；`attn-bf16` 扩展 7.0 断言；
+FP16 全家/量化/selector 无回归）。
+
+非目标（明确未做）：真实模型加载（GGUF/sampler/argmax）、paged BF16、BF16 wmma、
+性能测量（BF16 decode/prefill 性能属后续按 6-A Phase 2 铁律另立轮次）。
+
+**封版记录（2026-09-07）：6-B-7 = COMPLETE / FROZEN —— Phase 6-B correctness baseline
+冻结。** 全链形态：
+
+```text
+Phase 6-B — Native BF16 Execution          Status: COMPLETE / FROZEN (2026-09-07)
+
+├── 6-B-0   audit (只读)                        ✅
+├── 6-B-1   contract hardening                  ✅ FROZEN
+├── 6-B-2   RMSNorm                             ✅ FROZEN
+├── 6-B-3   activation family                   ✅ FROZEN
+├── 6-B-4   matmul (CUDA_R_16BF)                ✅ FROZEN
+├── 6-B-5   graph/binding (bf16_policy)         ✅ FROZEN
+├── 6-B-6   attention decode (BF16-Q)           ✅ FROZEN
+├── 6-B-6.7 attention decode (BF16 KV)          ✅ FROZEN
+└── 6-B-7   E2E (+7.0 prefill unlock)           ✅ FROZEN
+
+BF16 weights + BF16 activation + BF16 KV → BF16 compute → FP32 accumulation
+退役台账: RMS_NORM/SILU/GELU/GELU_TANH/MUL_MAT_TRANSB/ADD/MUL/FLASH_ATTN_GQA (8 op)
+CTest 43/43
+```
+
+遗留（不阻塞封版，已记录）：BF16 prefill 性能调优（vectorized 基线已可用）、paged BF16、
+BF16 KV-cache 运行时集成（`KVCacheDType` 无 BF16 成员，E2E 用图输入承载）、
+`bf16_policy` 接入 selector 的消费面、GGUF BF16 native load。
+
+#### 6-B 实施序列（审计后修正）
+
+```text
+6-B-0  audit（本节，✅ 2026-09-07）
+6-B-1  contract 收紧：P0/P1 loud reject + 端到端 BF16 reject 测试（先封漏，不加能力，✅ 2026-09-07 DELIVERED/FROZEN）
+6-B-2  native BF16 RMSNorm（bf16 kernel 第一块试金石，镜像 6-A-2，✅ 2026-09-07 DELIVERED/FROZEN）
+6-B-3  BF16 activation（SILU/GELU/GELU_TANH + gated 变体，镜像 6-A-3/4，✅ 2026-09-07 DELIVERED/FROZEN）
+6-B-4  BF16 matmul（cuBLAS CUDA_R_16BF + CUBLAS_COMPUTE_32F，镜像 6-A-5，✅ 2026-09-07 DELIVERED/FROZEN）
+6-B-5  graph/binding（policy 工厂 bf16_policy、dst-injection BF16 分支、dtype trace BF16 覆盖，✅ 2026-09-07 DELIVERED/FROZEN）
+6-B-6  BF16 attention（decode-first：BF16-Q + FP32-KV，镜像 6-A-7，✅ 2026-09-07 DELIVERED/FROZEN；prefill/paged/MMA 未排期）
+6-B-6.7 BF16 KV decode（BF16-QKV 全形态，kv-gain 0.94/1.32/1.73×，bf16_policy.kv→BF16，✅ 2026-09-07 DELIVERED/FROZEN）
+6-B-7  E2E validation（2层闭环 + prefill产出KV→decode消费 + dtype trace/parity/CUDA Graph，✅ 2026-09-07 COMPLETE/FROZEN —— Phase 6-B 封版）
+6-B-2  native BF16 RMSNorm（bf16 kernel 第一块试金石，镜像 6-A-2）
+6-B-3  BF16 activation（SILU/GELU/GELU_TANH + gated 变体，镜像 6-A-3/4）
+6-B-4  BF16 matmul（cuBLAS CUDA_R_16BF + CUBLAS_COMPUTE_32F，镜像 6-A-5）
+6-B-5  graph/binding（policy 工厂 bf16_policy、dst-injection BF16 分支、dtype trace BF16 覆盖）
+6-B-6  BF16 attention（镜像 6-A-7，decode 先行）
+6-B-7  E2E validation（镜像 6-A-8：dtype trace + parity + CUDA Graph 逐位）
+```
 
 ```text
 BF16 weights + BF16 activation → BF16 Tensor Core → FP32 accumulation
@@ -1772,6 +2631,1075 @@ FP8 weight + FP8 activation → Tensor Core → FP16/FP32 accumulation
 ```
 
 与已完成的 **FP8 KV（KV8）是两回事**：KV8 只压 cache 路径；W8A8 才进入计算路径。
+
+#### 6-C-0 FP8 W8A8 execution audit（2026-09-07，本轮交付 ✅ 只审计不改码）
+
+目标不是"支持 FP8"，而是确定 Forge 中真正的
+`FP8 weight + FP8 activation → Tensor Core → FP16/FP32 accumulation` 执行模型。
+审计完全复制 6-B-0 纪律：先 audit → contract → native kernel → E2E，不先假设
+编码/scale 方案/accumulation dtype。
+
+**Audit-1：FP8 representation 现状 —— 三层全缺，FP8 只活在 KV 里**
+
+| 层 | 现状 | 位置 | 6-C 缺口 |
+|---|---|---|---|
+| `DataType` | **无 FP8 成员** | `include/forge/types.h:6-28` | 需新增 `FP8_E4M3`（E5M2 视 6-C-1 拍板） |
+| Tensor / Python binding | 与 DataType 一致，无 FP8 | `src/bindings/core_types.cpp:6-27` | binding 随枚举扩展 |
+| GGUF（`GgmlDType`） | **无 FP8 映射**；GGUF 标准本身无 FP8 类型 | `include/forge/gguf_model.h:9-39` | **不存在"GGUF FP8 native load"工作项**——FP8 weight 只能来自运行时量化（calibration/quantize tool），这是 6-C-1 contract 设计的前提事实 |
+| FP8 唯一存在形态 | `KVCacheDType::FP8_E4M3/E5M2` | `include/forge/kv_cache.h:17-18` | 与 `DataType` 是两套体系，W8A8 不会自动复用 |
+
+**Audit-2：FP8 KV 基建盘点 —— 编解码可复用，scale 语义不可直接搬**
+
+| 基建 | 位置 | 语义 | W8A8 复用判定 |
+|---|---|---|---|
+| E4M3/E5M2 ⇄ FP32 编解码 | `include/forge/fp8_utils.h:30-128`（host+device，无 scale） | 纯逐元素；E4M3 inf→clamp 240、NaN→240；E5M2 NaN→0 | ✅ 边界/测试/CPU 复用；**❌ 不可进 GEMM 热路径**（每元素 `floorf/log2f/exp2f` 软件转换，吞吐致命） |
+| per-(row, kv_head) amax scale | quantize: `src/operators/cuda/cuda_quant.cu:1432-1466`（`scale = amax/FP8_MAX`）；scale buffer: `src/inference/kv_cache.cpp:862-883`（`fp8_scale_k_/v_` per-layer 独立 float buffer）+ `:1709-1718`（`d_q_key_scale`） | **后验** amax（写入时对整行统计），scale 存带外 buffer | ⚠️ 机制可参考，**粒度/时机均不匹配 GEMM**（见下） |
+| fused FP8 decode 消费面 | `src/operators/cuda/cuda_fused_attn.cu:947,961` | 在线 dequant × scale，FP32 点积/softmax | ✅ "FP8 存储 + FP32 计算"纪律与 6-A/6-B 同构，作为模板 |
+| quantize/dequant matrix kernels | `cuda_quant.cu:1355-1428`（unscaled） | 逐元素 | ✅ 工具性复用 |
+| CPU quantize_row/dequant_row | `src/inference/kv_cache.cpp:561-601` | 逐元素 unscaled | ✅ |
+
+W8A8 与 KV scale 的三个语义差距（6-C-1 必须拍板）：
+
+```text
+1. 粒度：KV = per-row(≈per-token) 后验 amax；W8A8 GEMM 在 sm_89 + cuBLASLt 只支持
+   per-tensor scale（block-scale 需 sm_90+ 或手写 kernel）。per-tensor 后验需全量
+   amax pass（两遍）→ 实用候选：delayed scaling（沿用上一 step amax）/ static calibration。
+2. 传播：KV scale 是带外 buffer；activation scale 必须随 graph 边流动（fp8_policy 的
+   新职责），否则会出现"scale 谁持有"的隐式全局态。
+3. 饱和语义：E4M3 无 NaN clamp 是按 KV 小幅度定的；GEMM 输入是 RMSNorm 后的
+   activation，幅度可控，但 6-C-1 需复核 clamp→240 的决策。
+```
+
+既有债（本轮发现，登记不修）：**paged FP8 decode kernel 签名无 scale 参数**
+（`src/operators/cuda/cuda_paged_kv.cu:752-790`）→ paged FP8 = unscaled 路径，
+与 contiguous scaled 路径语义不一致。处理归 6-C-6。
+
+**Audit-3：静默升级风险 —— gate 是黑名单形状，FP8 会全线穿透**
+
+核心缺口：`is_native_execution_dtype()`（`include/forge/dtype_contract.h:31-33`）
+= 黑名单（`!FP16 && !BF16`）→ 一旦加入 `DataType::FP8`，会被判为 "native dtype"
+**绕过全部 gate**。这正是 6-B-0 四处 P0 在 FP8 上的重演路径。落点（FP8 加入后
+全部 P0：静默当 float 读）：
+
+| 站点 | 位置 | 现行挡板 | FP8 后果 |
+|---|---|---|---|
+| add_kernel_dst FP32 fallback | `src/core/op_kernels.cpp:81-94` | `require_no_bf16` :61-62 | 穿透 → float 误读 |
+| mul_kernel_dst FP32 fallback | `src/core/op_kernels.cpp:154-167` | :134-135 同 | 同 |
+| silu/rms_norm dst FP32 fallback | `src/core/op_kernels.cpp:170-209` | 同型 | 同 |
+| MUL_MAT_TRANSB FP32 cuBLAS 路径 | `src/operators/cuda/matmul_cuda.cpp:329-356` | `require_dtype_supported` + BF16/FP16 分支 | FP8 落 FP32 cublas 静默 |
+| attention selector | `src/inference/layers/attention_selector.cpp:27-38` | 只认 `q_dtype==FP16/BF16` | FP8 落下方 FP32/量化分支，无检查 |
+| graph dtype policy | `include/forge/compute_dtype_policy.h` | 无 fp8_policy | FP8 按 FP32 policy 静默传播 |
+
+6-C-1 gate 设计拍板（本拍输出）：**把 `is_native_execution_dtype` 从黑名单改为
+白名单**（显式列出 FP32 + 量化格式集合），FP8 天生被拒；之后每个 native FP8
+kernel 落地时逐 op 退役（沿用 6-B 退役协议）。理由：per-dtype 黑名单
+（`require_no_fp8` 形式）已被 FP16→BF16 迭代证明每加一个 dtype 都要重扫全库；
+白名单一次收紧，扩展点归一为 `op_supports_lowp()` 单点。
+
+**Audit-4：W8A8 执行路径能力 —— 硬件成立，软件 100% 绿地**
+
+| 项 | 结论 | 证据 |
+|---|---|---|
+| GPU | RTX 4050 Laptop / **sm_89 (Ada)** → FP8 Tensor Core 硬件存在 | nvidia-smi compute_cap 8.9 |
+| CUDA | 12.8 → cuBLASLt FP8（`CUDA_R_8F_E4M3` + `CUBLAS_COMPUTE_32F`）可用 | nvcc V12.8.93 |
+| **编译约束** | `FORGE_CUDA_ARCH="86;89"` 双架构（`CMakeLists.txt:140`）→ **sm_86 无 FP8 TC**，FP8 kernel 必须 `__CUDA_ARCH__>=890` guard，否则 86 目标静默出错 | CMakeLists |
+| cuBLAS 现状 | 只有 `cublasGemmEx`（FP32/16F/16BF，`cuda_quant.cu:1136-1241` + `cuda_common.h:51` handle）；**GemmEx 不接受 FP8 输入**；全库零 cublasLt | rg 核验 |
+| 硬件指令现状 | 全库零 `__nv_fp8` / `cvt.rn.satfinite.e4m3x2` / `mma e4m3` → FP8 TC 执行路径 100% 绿地 | rg 核验 |
+| 可借鉴经验 | Phase 2 wmma（`cuda_flash_attn.cu`）= 手写 TC 路径的组织经验 | — |
+
+6-C-4 技术路线（届时拍板，本拍不定）：
+`a) cuBLASLt`：成熟快，代价 = 新 API 面（descriptor/scale pointer/col-major 布局 trick）+ sm_89 限 per-tensor scale + 对齐约束；
+`b) 手写 mma.sync.m16n8k32`：与 Phase 2 同构，可做 per-block scale（为 6-D NVFP4 铺路），工程量大。
+
+**Capability matrix（6-C-0 快照）**
+
+| Operator | FP8 input | FP8 output | Acc | Native kernel | 当前状态 |
+|---------|---------:| ---------: | ---: | ------------- | ------- |
+| RMSNorm | ✗ | ✗ | FP32 | ✗ | audit → 6-C-2 |
+| SiLU/GELU family | ✗ | ✗ | FP32 | ✗ | audit → 6-C-3 |
+| Matmul (transB) | ✗ | ✗ | FP32 | ✗（GemmEx 不支持 FP8，cublasLt/mma 二选一） | 核心 → 6-C-4 |
+| Attention | KV-only：FP8 K/V + FP32 Q | ✗ | FP32 | ✓（fused scaled / paged unscaled，软件转换） | 策略 → 6-C-6 |
+| Add/Mul | ✗ | ✗ | FP32 | ✗ | 后置 |
+| KV write | FP32→FP8 per-row amax | FP8 | — | ✓ | 可复用 |
+
+**6-C-0 结论与拍板**
+
+1. **scale semantics 是 6-C 的核心设计问题，不是 kernel**：KV 的 per-row 后验 amax
+   不能直接搬进 GEMM；6-C-1 必须先把 activation scale contract（粒度/传播/饱和语义）
+   定死，再写任何 kernel——否则会得到 benchmark 漂亮但全链 FP16/FP32 来回转换的假 W8A8。
+2. FP8 weight 无文件格式来源（GGUF 无 FP8），运行时量化工具是 6-C 的一等工作项。
+3. 6-C 实施序列（镜像 6-B 模板 + activation 先行规则）：
+
+```text
+6-C-0  audit（本节 ✅ 2026-09-07）
+6-C-1  contract：DataType::FP8_E4M3 + is_native_execution_dtype 白名单化 +
+       全链 FP8 loud-reject 测试 + activation scale contract 定稿（✅ 2026-09-07
+       DELIVERED/FROZEN，见上节——先封漏不加能力）
+6-C-2  FP8 RMSNorm（native lowp 试金石，镜像 6-B-2，activation 路径第一块）
+6-C-3  FP8 activation family（SILU/GELU + gated，镜像 6-B-3）
+6-C-4  FP8 matmul（Tensor Core：cuBLASLt vs mma.m16n8k32 拍板，W8A8 首次合体）
+6-C-5  graph/binding/selector（fp8_policy + FP8 dispatch 槽位）
+6-C-6  FP8 attention / KV policy（含 paged FP8 unscaled 债处理）
+6-C-7  E2E FP8 W8A8 validation（镜像 6-B-7）
+6-D    NVFP4（Blackwell 压轴，不动）
+```
+
+4. 遗留登记（不阻塞）：paged FP8 unscaled 不一致（→6-C-6）、fp16_policy 缺失
+   （FP16 目前不经 policy 工厂，记录）、E4M3 clamp 语义复核（→6-C-1）。
+
+**非目标**：不写 FP8 kernel、不做 FP8 benchmark、不动 NVFP4、不补 6-B 遗留项
+（paged BF16 / KVCacheDType BF16 槽位 / GGUF native load 等）。
+
+**验收**：本轮只审计不改码，CTest 43/43 全绿（0 改动基线确认）。
+
+#### 6-C-1 contract 收紧 + activation scale contract 定稿（2026-09-07，本轮交付 ✅ DELIVERED / FROZEN）
+
+先封漏，不加能力：FP8 成为有 representation 的 dtype，但对每个 operator 都 loud reject。
+
+**改动表**
+
+| 文件 | 改动 |
+|---|---|
+| `include/forge/types.h:29-31` | `DataType::FP8_E4M3 = 21`（1 byte/element；与 `KVCacheDType::FP8_E4M3` 两套体系明确分离） |
+| `src/operators/cpu/quant_traits.cpp:58` | traits 表登记 `fp8_e4m3`（type_size 1，非量化） |
+| `include/forge/dtype_contract.h:36-64` | **`is_native_execution_dtype` 黑名单 → 白名单**（显式列出 FP32/INT8/INT32/全量化格式；FP16/BF16/FP8 → lowp；未知未来 dtype 默认拒绝） |
+| `include/forge/dtype_contract.h:124-126` | **`op_supports_fp8(op)` FP8 退役台账**（初始为空 = 对所有 op 拒绝）；`op_supports_dtype` 将 FP8 路由至此台账 |
+| `include/forge/dtype_contract.h:187-201` | `throw_fp8_unsupported` + `require_no_fp8` 路由 gate（镜像 `require_no_bf16`） |
+| `src/bindings/core_types.cpp:28` | Python `DataType.FP8_E4M3` 暴露 |
+| `src/core/op_kernels.cpp` | ADD/MUL/SILU/RMS_NORM 四个 dst kernel：FP32 fallback 的 CPU 分支前补 `require_no_fp8`（CUDA 分支由台账经 `require_dtype_supported` 覆盖） |
+| `src/operators/cpu/attention.cpp` | 3 个 CPU attention 函数 ×Q/K/V(/mask) 补 `require_no_fp8` |
+| `src/inference/layers/attention_executor.cpp` | `CUDA_FP32_PREFILL/DECODE` 两路径 ×Q/K/V 补 `require_no_fp8`（FP8 Q 与 BF16 同样穿透 selector 落默认路径） |
+| `tests/test_dtype_contract.cpp` | `test_fp8_contract`：白名单不变量、台账为空、12 op × FP8 全拒绝（消息含 `fp8_e4m3`/op 名）、`require_no_fp8` 对非 FP8 零影响 |
+| `tests/test_api_contract.py` | 枚举存在性测试加 `FP8_E4M3` |
+
+**Gate 架构（与 6-B 的差异及理由）**：BF16 = "gate 放行 + 路由层逐点拒绝"（两层）；
+FP8 = "**contract 层直接拒绝**（台账）+ 裸站点 `require_no_fp8` 兜底"。因为 6-C-0 审计
+证明 FP8 没有任何 native kernel，contract 层一次收紧最稳；6-C-2..6-C-6 每个 native
+kernel 落地时按 6-B 退役协议逐 op 改台账（kernel + 路由 + 台账三件套同拍落地）。
+`is_native_execution_dtype` 白名单化的收益是**结构性的**：以后每加一个新 dtype，
+默认是拒绝而不是放行——6-B-0 的静默误读模式被从语言层面关死。
+
+**FP8 activation scale contract（定稿，6-C-2+ 按此实现，不得中途改）**
+
+```text
+S1 编码     W 与 A 均 E4M3（Forge codec：bias-7、max finite 240、无 NaN、
+            0x7F/0xFF→240）。E5M2 仅限 KV，不进 W8A8（2-bit mantissa 对
+            weight/activation 过粗）。
+S2 粒度     per-tensor（sm_89 cuBLASLt 硬约束；block-scale 需 sm_90+ 或手写
+            kernel，留给 6-D 评估）。weight：量化时一次性 amax/240 定标；
+            activation：delayed scaling（per-tensor rolling amax，前一 forward
+            的 amax 服务当前 step）。E2E correctness 轮（6-C-7）允许降级为
+            static calibration（固定 scale 不滚动），性能轮再启用 rolling。
+S3 传播     scale 是数据层：activation scale 以 tensor sidecar（device float
+            scalar）随 graph 边透传；不进 ComputeDTypePolicy（policy 是类型
+            层，只声明 dtype 五元组）。禁止"scale 谁持有"的隐式全局态。
+S4 累加     FP32（CUBLAS_COMPUTE_32F / mma f32 accumulate）；attention softmax
+            FP32（沿用 6-A 纪律）。accumulation 不随 activation dtype 变。
+S5 反量化   GEMM 输出一次合并 ×(s_a·s_w)（数学等价，省一次全量往返）。
+S6 位一致性 scale 约定 amax/240 → 量化值域 ⊆ [−240,240] ⊆ E4M3FN 硬件值域，
+            Forge 软件编解码与硬件 cvt/mma 解码在所用值域内位一致（Forge 从
+            不发射 exp=1111 模式；硬件 satfinite 上限 448 ≥ 240）。KV 的既有
+            amax/240 约定不变，两套 FP8 共享同一 scale 惯例。
+```
+
+**验收**：CTest 43/43 全绿（`dtype-contract` 输出 `PASS ... + 6-C-1`）。全库
+`switch(dtype)` 站点均带 default 兜底（kernel_selector/quant_policy 核验），
+FP8 注入场景落 UNSUPPORTED 安全分支。
+
+**非目标**：不写任何 FP8 kernel（含 RMSNorm）、不做 scale sidecar/rolling amax
+实现（S2/S3 是 6-C-2+ 的实现契约）、不接 selector/policy 消费面（6-C-5）、
+不处理 paged FP8 unscaled 债（6-C-6）、不评估 cuBLASLt vs mma（6-C-4）。
+
+#### 6-C-2 Native FP8 RMSNorm（2026-09-07，本轮交付 ✅ DELIVERED / FROZEN）
+
+第一个 native FP8 kernel，严格镜像 6-A-2/6-B-2 模板；本轮不同时引入 scale
+machinery。只退役 `RMS_NORM` 一个台账点（SILU/GELU/ADD/MUL 保持拒绝）。
+
+**执行模型**
+
+```text
+FP8 x / FP8 w --fp8 load(cvt)--> FP32 square/reduction --rsqrt(FP32)--> FP32 scale --fp8 store(cvt)--> FP8 out
+```
+
+storage ≠ compute 纪律延续：FP8 存储 + FP32 reduction/math + FP8 输出。
+
+**改动表**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_rms_norm.cu:15-32,361-471` | `rms_norm_kernel_fp8` / `rms_norm_unweighted_kernel_fp8` + launchers；**硬件 codec** `fp8_hw_load/store_byte`（`cuda_fp8.h`：`__nv_cvt_fp8_to_halfraw` / `__nv_cvt_float_to_fp8(SATFINITE)`；sm_89 编译为 FP8 cvt 指令，sm_86 自动软件 fallback——6-C-0 双架构约束由 cuda_fp8.h 自带 arch 分支解决） |
+| `include/forge/cuda_kernels.h:48-55`、`src/operators/cuda/cuda_rms_norm.h:31-37` | launcher 声明（双头登记） |
+| `src/operators/cpu/norm.cpp:50-68` | eager 路由 `fp8_path`（**仅 FP8×FP8**，混合落 else loud-throw） |
+| `src/core/op_kernels.cpp:310-349` | `rms_norm_kernel_dst` FP8 native 分支（CUDA launcher + CPU decode→FP32 row→encode）；混合 FP8/FP32 落 `require_no_fp8` throw |
+| `src/core/compute_graph.cpp:297-311` | use_dst 判定加 `inputs_fp8 / dst_fp8_capable`（**仅 RMS_NORM**） |
+| `include/forge/dtype_contract.h:128-135` | **`op_supports_fp8` 退役 RMS_NORM**（kernel+路由+台账三件套同拍，6-B 退役协议） |
+| `tests/test_rms_norm_fp8.cpp`（新） | correctness（decoded-input reference）+ 2-hop 链式 + stream A/B + graph smoke + bench |
+| `tests/test_dtype_contract.cpp:322-338` | `fp8_retired_ops = {RMS_NORM}` 显式列表；其余 11 op 保持全拒绝断言 |
+| `tests/CMakeLists.txt:201-207` | 注册 `rms-norm-fp8` |
+
+**Codec 位一致性（S6 落地证据）**：kernel 内用硬件 cvt（快路径），host/边界/测试用
+forge 软件 codec——值域 ⊆ [-240,240]（amax/240 约定）内两者位一致；唯一分歧
+= (240,448] 值域与 0x7F NaN（约定下不可达）+ RNE vs round-half-away tie-break
+（都取最近桶，半步界内）。**forge 软件 codec 禁止进 kernel 热路径**（6-C-0 预言被
+实测证实：见下）。
+
+**正确性数据**（decoded-input reference；cosine 主指标；kernel=硬件 codec）
+
+| Case | max_abs | max_rel | cosine |
+|---|---:|---:|---:|
+| weighted 4096×1 | 5.56e-2 | 4.66e-2 | 0.999687 |
+| weighted 4096×512 | 6.25e-2 | 5.86e-2 | 0.999684 |
+| weighted 8192×1 | 5.46e-2 | 4.53e-2 | 0.999687 |
+| weighted 8192×512 | 6.25e-2 | 5.84e-2 | 0.999684 |
+| unweighted 4096×64 | 6.24e-2 | — | 0.999640 |
+| **chain 2-hop** 4096×8 | 6.25e-2 | 6.67e-2 | **0.999866** |
+
+max_abs=6.25e-2 恰为 E4M3 在 [2,4] binade 的半步（理论值）；max_rel 界
+= 1/16=6.25%（3-bit mantissa binade 低端最坏值），实测 5.9% 贴合。链式两跳
+cosine 0.99987：FP8 store/decode 复合误差有界，无放大（阈值锁 0.998）。混合
+FP8×FP32 loud reject ✓、stream A/B bitwise ✓、graph dst smoke bitwise ✓。
+
+**Bench 数据与两个关键结论**（RTX 4050 Laptop / sm_89；kernel-only 计时）
+
+| Regime | FP8 | BF16 | FP32 |
+|---|---:|---:|---:|
+| 1×4096（launch-bound） | 0.0166 ms | 0.0141 ms | 0.0129 ms |
+| 512×8192（bandwidth-bound） | **96.0 GB/s** | 195.9 GB/s | 147.3 GB/s |
+
+1. **软件 codec 不可进热路径（实测证实 6-C-0 预言）**：首版用 forge 逐元素软件
+   编解码（每元素 5-7 条 SFU+分支），bandwidth 段仅 **36.6 GB/s（BF16 的 1/5.3）**。
+   换硬件 cvt 后 36.6 → 96.0 GB/s（2.6x）。
+2. **逐元素硬件 cvt 仍未达存储带宽收益**：96.0 GB/s = BF16 的 49%。根因：cvt
+   指令按 x2 打包（`e4m3x2`），逐元素调用浪费一半吞吐 + 1B 逐元素 load/store。
+   **下一步（已识别，6-C-2-perf）**：`__nv_fp8x2/x4_e4m3` 向量化 cvt + uint4
+   128-bit load/store——FP8 数据量是 BF16 的一半，向量化后理论 GB/s 计数可超 BF16。
+   本轮不阻塞封版：correctness/kernel/路由/台账为本轮交付物，向量化是独立的
+   performance 轮（correctness 与 performance 分离纪律）。
+
+**验收清单（用户口径 10 项）**：✅ FP8×FP8 native kernel（weighted+unweighted）/
+✅ mixed-weight loud reject / ✅ FP8→FP32 reduction→FP8 out / ✅ decoded-input
+reference / ✅ hidden 4096/8192 × rows 1/512 / ✅ chain correctness / ✅ bandwidth
+benchmark / ✅ stream A/B 一致 / ✅ CTest **44/44** 全绿（+rms-norm-fp8）/
+✅ RMS_NORM 台账退役（唯一退役点）。
+
+**非目标**：不做 FP8 向量化 perf（→6-C-2-perf）、不动 SILU/GELU/ADD/MUL 台账、
+不做 scale sidecar / delayed scaling runtime（→6-C-3+ 契约）、不做 FP8 GEMM/KV/
+graph policy/selector。
+
+#### 6-C-2-perf FP8 RMSNorm 向量化（2026-09-07，本轮交付 ✅ COMPLETE / FROZEN）
+
+6-C-2 封版时识别的独立 performance 轮。目标：把逐元素硬件 cvt（每元素 3-4 条
+cvt 指令 + 1B 访存）换成 sm_89 配对 cvt + 128-bit 访存，回答「FP8 storage 的带宽
+收益是否成立」。correctness 零改动（逐元素位一致）。
+
+**改动表**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_rms_norm.cu:35-56` | 配对 codec helper：`fp8x4_to_float4`（`__nv_cvt_fp8x2_to_halfraw2` = `cvt.rn.f16x2.e4m3x2`，fp8→f16 精确 → 与标量逐元素位一致）、`float4_to_fp8x4`（`__nv_cvt_float2_to_fp8x2` = `cvt.rn.satfinite.e4m3x2.f32`，与标量同一条 per-element RN） |
+| `src/operators/cuda/cuda_rms_norm.cu:437-531` | `rms_norm_kernel_fp8_vec16`（每线程步进 16 fp8 = 1×LDG.128 + 8×配对解码 + FP32 方差和/数学 + 4×配对编码 + 1×STG.128）；launcher 加对齐分发（`cols%16==0` 且 x/out/weight 均 16B 对齐 → vec16，否则标量兜底） |
+| `src/operators/cuda/cuda_rms_norm.cu:581-657` | `rms_norm_unweighted_kernel_fp8_vec16` + launcher 分发（同型） |
+| `tests/test_rms_norm_fp8.cpp` | bench 增加第三 regime：4096×8192（FP8 工作集 ~67MB > L2，DRAM 段诚实可比） |
+
+**双架构约束（6-C-0）**：FORGE_CUDA_ARCH="86;89" 下，配对 intrinsics 在 sm_89 编译为
+硬件 cvt 指令、sm_86 由 cuda_fp8.h 自动软件 fallback（正确性不变，仅慢）——与标量
+codec 的 arch 策略一致。
+
+**Bench 数据（三 regime；RTX 4050 Laptop / sm_89；kernel-only 计时）**
+
+| Regime | FP8 | BF16 | FP32 | FP8 vs BF16 |
+|---|---:|---:|---:|---:|
+| 1×4096（launch-bound） | 0.0180 ms | 0.0177 ms | 0.0236 ms | ≈持平（launch 主导） |
+| 512×8192（L2-resident，FP8 WS ~8.4MB） | 0.0215 ms / 390.1 GB/s | 0.0859 ms / 195.6 GB/s | 0.2300 ms / 146.0 GB/s | **4.0x** |
+| 4096×8192（DRAM-bound，FP8 WS ~67MB） | **0.3920 ms / 171.2 GB/s** | 1.0401 ms / 129.1 GB/s | 1.5724 ms / 170.7 GB/s | **2.65x** |
+
+1. **带宽收益成立（本轮核心结论）**：DRAM 段 FP8 有效带宽 171.2 GB/s（贴 4050
+   Laptop ~192 GB/s 峰值），wall time 0.392ms vs BF16 1.040ms = **2.65x**；L2-resident
+   段 4.0x。对比 6-C-2 封版时的 96.0 GB/s（BF16 的 49%），向量化后反超 BF16 有效带宽。
+2. **测点纪律**：512×8192 的 FP8 工作集（8.4MB）落在 L2 内，390 GB/s > DRAM 峰值
+   即是证据——该点测的是 L2 不是显存，故补 4096×8192（67MB）作为 DRAM 段决策
+   依据。launch-bound 段运行间时钟波动大（0.0063→0.0180ms），仅作参考。
+3. **正确性零扰动**：vec16 与标量逐元素位一致（同一硬件 RN 编解码，仅 FP32 归约
+   顺序不同），全部 correctness/chain/A/B/graph 指标与 6-C-2 封版值完全相同；
+   CTest **44/44** 全绿。
+
+**验收（追加）**：✅ vec16 kernel + 对齐分发 / ✅ 标量兜底保留 / ✅ 三 regime 实测 /
+✅ DRAM 段 FP8 > BF16（2.65x）/ ✅ CTest 44/44。
+
+**非目标**：不做 attention/RMSNorm 之外的 FP8 向量化推广（6-C-3 各 kernel 自带）、
+不动台账与路由、不引入 scale machinery。
+
+#### 6-C-3 Native FP8 activation family（2026-09-07，本轮交付 ✅ COMPLETE / FROZEN）
+
+镜像 6-B-3（activation family）的 FP8 版本，并直接复用 6-C-2 / 6-C-2-perf 已验证的
+硬件 FP8 编解码与 vec16 向量化思路（逐元素位一致，correctness 零扰动）。覆盖 5 个算子：
+
+- 单目：`silu` / `gelu` / `gelu_tanh`（FP8 storage + FP32 超越函数 + FP8 output）
+- gated：`silu_multiply`（SiLU-gated，LLaMA/Qwen/DeepSeek FFN）/ `gelu_multiply`
+  （GeGLU，Gemma4 FFN）——gated 复用 `SILU` / `GELU` 的 `op_supports_fp8` 门，无新 enum
+
+**改动表**
+
+| 文件 | 改动 |
+|---|---|
+| `src/operators/cuda/cuda_activation.cu` | 新增 FP8 编解码 helper（`fp8_hw_load_byte_act` / `fp8_hw_store_byte_act` / `fp8x4_to_float4_act` / `float4_to_fp8x4_act`，与 6-C-2-perf 同型，命名加 `_act` 后缀避免与 `rms_norm.cu` 同名 inline 符号 ODR 冲突）+ `silu/gelu/gelu_tanh` 标量 + vec16 kernel + `launch_silu_fp8` / `launch_gelu_fp8` / `launch_gelu_tanh_fp8`（ngroups=n/16 + 标量尾，128-bit load/store） |
+| `src/operators/cuda/cuda_elementwise.cu` | 新增 gated FP8 kernel（`silu_multiply` / `gelu_multiply` 标量 + vec16）+ `launch_silu_multiply_fp8` / `launch_gelu_multiply_fp8` |
+| `include/forge/cuda_kernels.h` | 声明 5 个 FP8 launcher |
+| `src/operators/cpu/activation.cpp` | `ops::silu/gelu/gelu_tanh` CUDA 分支加 FP8（`launch_*_fp8`）；CPU 保持 FP32-only（与 6-B-3 activation 家族 CPU 行为一致，FP8 落 else loud throw） |
+| `src/operators/cpu/elementwise.cpp` | `ops::silu_multiply/gelu_multiply` CUDA 分支加 FP8（附 up dtype 检查，混合 loud throw） |
+| `src/core/op_kernels.cpp` | `silu_kernel_dst` 在 `require_no_fp8` 前插入 FP8 dst 分支（CUDA: `launch_silu_fp8` + stream；CPU: decode→FP32→encode） |
+| `src/core/compute_graph.cpp` | `dst_fp8_capable` 扩展为 `(RMS_NORM \|\| SILU)`（GELU/GELU_TANH/gated 无 dst kernel，走 legacy W2 eager） |
+| `include/forge/dtype_contract.h` | `op_supports_fp8` 退役台账新增 `SILU / GELU / GELU_TANH`（gated 复用各自 gate） |
+| `tests/test_dtype_contract.cpp` | `fp8_retired_ops` 新增 SILU/GELU/GELU_TANH；`all_ops` 移除三者 |
+| `tests/test_activation_fp8.cpp` | 新增：5 算子 correctness（FP32 reference + cosine 主门）+ micro-bench（FP8 vs FP32 + FP16 字节对齐 sanity，两 regime）+ 单节点 FP8 SILU graph smoke + 混合 dtype loud reject |
+| `tests/CMakeLists.txt` | 注册 `activation-fp8` |
+
+> **实现备注（实测发现并修正）**：
+> 1. vec16 编码 `float4_to_fp8x4_act` 最初复用 6-C-2-perf 的「配对 cvt」`__nv_cvt_float2_to_fp8x2`
+>    把 4 个 FP8 打包进 uint32，但在 `-O2 -flto` 下 **HI 半字（第 3/4 字节）打包不可靠**
+>    （实测低 2 字节正确、高 2 字节为垃圾），导致 gated 输出高位损坏。改为 **4 次独立标量
+>    硬件 cvt 存储**（`fp8_hw_store_byte_act` ×4 再拼成 uint32）——逐元素与标量参考路径
+>    位一致，且规避了配对 intrinsic 的打包 UB。decode 路径（`fp8x4_to_float4_act`）配对
+>    cvt 在 4 个元素上均正确，未改动。
+> 2. 测试 `check_binary` 的参考输入向量 `gf`/`uf` 初版误声明为 `vector<uint8_t>`（应存解码后的
+>    FP32 参考值），float 被截断 → 参考值全乱。改为 `vector<float>` 后参考正确，5 算子全部
+>    通过。该 bug 与 kernel 无关（kernel 输出经原始字节核对始终正确）。
+>
+**正确性模型（与 6-C-2-perf 同）**：逐元素 FP8 编解码与 vec16 同一条硬件 RN
+（`SATFINITE`），标量/vec16 逐元素位一致；唯一残差 = E4M3 输出 store rounding
+（3-bit 尾数）。
+
+| 算子 | max_abs 门（按 E4M3 半步定标） | 实测 max_abs | cosine 主门 | 实测 cosine |
+|---|---:|---:|---:|---:|
+| silu / gelu / gelu_tanh（输出 \|·\|≤~4，binade[2,4] 半步 0.125） | ≤ 0.15 | 0.121 / 0.057 / 0.057 | ≥ 0.998 | 0.9996 / 0.99995 / 0.99995 |
+| silu_multiply / gelu_multiply（输出 \|·\|≤~16，binade[8,16] 半步 0.5） | ≤ 0.60 | 0.494 / 0.498 | ≥ 0.998 | 0.99973 / 0.99969 |
+
+> 门限按 E4M3 store rounding 定标，留足余量；O(1) 结构错误远高于门限 → 必_FAIL。
+> 实测（RTX 4050，n=8192 与 n=2097152 两档一致，max_abs 无档位漂移）。
+
+**双架构约束（6-C-0）**：配对 intrinsics 在 sm_89 编译为硬件 cvt、sm_86 由 `cuda_fp8.h`
+软件 fallback（正确性不变，仅慢）——与 6-C-2 / 6-C-2-perf 一致。
+
+**Micro-bench（regime 同 6-C-2-perf；RTX 4050 sm_89；kernel-only 计时；FP8 数值为
+1B store、FP16/FP32 为对照，GB/s = (元素数 × 读写字节) / 耗时）**
+
+| Regime | FP8 | FP16 | FP32 |
+|---|---:|---:|---:|
+| 1×4096（launch-bound） | silu 0.0067 ms / 1.2 GB/s · mul 0.0065 ms / 1.9 GB/s | 2.6 / 3.8 | 5.5 / 7.6 |
+| 512×8192（L2-resident，n=4194304） | silu 0.0335 ms / **250.2 GB/s** · mul 0.0356 ms / **353.6 GB/s** | 260.6 / 272.2 | 158.6 / 155.5 |
+| 4096×8192（DRAM-bound，~67MB） | 同 L2-resident 量级（512×8192 已出 L2） | — | — |
+
+> 实测结论与 6-C-2-perf 一致：**launch-bound 段 FP8 不更快（≈持平），bandwidth-bound 段
+> FP8 有效带宽反超 FP32 ~2.2x（250 vs 158、354 vs 155），并 ≈追平 FP16（因 FP8 仅 1B
+> store，FP16 为 2B）**。这正是 6-C-3 的设计目标：保持数值/正确性的同时，在受带宽限制
+> 的激活路径上获得 FP8 存储效率。
+
+**验收**：✅ 5 算子 native FP8 kernel（标量 + vec16）/ ✅ 复用 6-C-2-perf 硬件 codec
+逐元素位一致 / ✅ 路由（eager + SILU dst-injection + 混合 loud reject）/ ✅ 退役台账
+SILU/GELU/GELU_TANH（gated 复用 gate）/ ✅ `activation-fp8` CTest 新增 /
+✅ CTest **45/45**（44 + activation-fp8，RTX 4050 实测确认，0 回归）。
+
+**非目标**：不做 FP8 attention / matmul / graph policy（→6-C-4 / 6-C-5 / 6-C-6）、
+不动 RMS_NORM 的 6-C-2 冻结代码、不引入 scale machinery。
+
+**封版声明**：6-C-3 = DELIVERED / FROZEN。下一拍 6-C-4（FP8 matmul：Tensor Core
+cuBLASLt vs `mma.m16n8k32` 拍板，W8A8 首次合体）解锁。
+
+#### 6-C-4.0 FP8 W8A8 Matmul Backend Audit（2026-09-07，Measured）
+
+按工单"第一轮不写 production kernel，先把三条路线的真实可行性摸清"执行。审计脚手架
+`benchmarks/fp8_matmul_audit.cu`（**独立 nvcc 构建，不进 CTest**）：
+
+```bash
+nvcc -O3 -arch=sm_89 -I<forge>/include \
+     -o fp8_matmul_audit fp8_matmul_audit.cu -lcublasLt -lcublas
+```
+
+方法沿用 Forge 既有范式：`auto vs forced path` + `rows/reference parity` +
+`workload-aware benchmark`。M 扫描 `{1,32,64,128,256,512,1024}` ×
+`N,K ∈ {4096², 8192²}`，per-tensor `s_a=0.02 / s_w=0.03`，FP32 累加，
+参考值由 CPU FP32 采样算出（`O(S·K)` 采样，2048 点/组）。
+
+**环境**：RTX 4050 Laptop / sm_89(Ada)，CUDA 12.8 (V12.8.93)，Driver 581.57 / CUDA 13.0。
+
+##### Route A：cuBLASLt FP8 —— ❌ BLOCKED（库层面无 kernel）
+
+`cublasLtMatmulAlgoGetHeuristic` 在**所有**配置下都返回 `returned=0`（枚举不出算法）：
+
+| 配置 | A/B 布局 | transa | scale 指针 | 结果 |
+|---|---|---|---|---|
+| 1 | ROW / ROW（A=M×K）| N | 无 | `15` NOT_SUPPORTED |
+| 2 | ROW / ROW（A=K×M）| **T** | 无 | `15` NOT_SUPPORTED |
+| 3 | **COL32** / COL，D=COL | N | A/B/D（device）| `15` NOT_SUPPORTED |
+| 4 | **COL32** / COL，C,D=**COL32** | N | A/B/C/**D**（device，四路齐）| M=1 `15`；M≥32 `7` INVALID_VALUE |
+
+四个配置都不是"我少设了一个属性"的问题——`AlgoGetHeuristic` 直接交白卷。
+配置 4 已是 NVIDIA 文档描述的完整形态（A/C/D=COL32、B=COL、device per-tensor
+scale、`CUBLAS_COMPUTE_32F`、K 为 32 倍数、ld 为 32 倍数、M/N 为 16 倍数），
+仍无算法。
+
+**定位**：不是架构不支持。公开资料中同一份 cuBLASLt FP8 sample 在 **L40S（同为 Ada /
+sm_89，数据中心卡）** 上以 `transa=CUBLAS_OP_T` 可正常运行并出数；本卡（RTX 4050，
+消费级 Ada）在完全相同的配置下返回 NOT_SUPPORTED。因此结论是
+**cuBLASLt 12.8 不对该消费级 Ada SKU 提供 FP8 GEMM kernel**，而不是 sm_89 不支持 FP8。
+
+> 附带确认：FP8 **Tensor Core 硬件是好的**（见 Route B），被挡住的是 cuBLASLt 的库路径。
+
+##### Route C：cuBLASLt FP16（baseline）—— ✅ 可用
+
+| N=K=4096 | M=1 | 32 | 64 | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|---|---|---|
+| TFLOPs | 0.16 | 5.6 | 11.2 | 18.8 | 22.5 | 23.6 | **24.0** |
+| GB/s | 159 | 181 | 183 | 161 | 105 | 63 | 41 |
+
+parity ≈ `4e-2 ~ 6e-2`（FP16 vs FP32 参考，符合预期）。
+注：`NK=8192²` 时 FP16 掉到 `3~7 TFLOPs`，疑为 cuBLASLt 启发式/4MB workspace 选路不佳，
+属 Route C 自身的调优问题，与本拍 FP8 拍板无关，记入 follow-up。
+
+##### Route B：手写 `mma.sync.m16n8k32` FP8 —— ✅ 可行（硬件路径打通）
+
+| N=K=4096 | M=32 | 64 | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|---|---|
+| TFLOPs | 0.86 | 1.25 | 1.31 | 1.33 | 1.34 | **1.35** |
+| GB/s | 14.0 | 10.5 | 5.9 | 3.4 | 2.1 | 1.5 |
+
+parity ≈ `6e-2 ~ 1e-1`（有界、无 NaN/Inf）。相对 FP16 baseline 的 `4e-2~6e-2` 略大，
+符合 **FP8 < FP16 < FP32** 的精度序——说明 FP8 TC 执行路径**数值正确**，不是"跑出垃圾数"。
+
+M=1 时 Route B 不适用（`m16n8k32` 要求 M≥16），**decode 路径需要单独的 FP8 GEMV**。
+
+##### 拍板
+
+1. **Route A 出局（对本卡）**：6-C-4 的 production backend **不能**建在 cuBLASLt FP8 上。
+   可保留为"运行时能力探测"的可选快路径：用 `AlgoGetHeuristic` 探测，若返回 >0 个算法
+   （数据中心 Ada / Hopper 上会命中）则走 cuBLASLt，否则回落。
+2. **Route B 是唯一可行的 FP8 TC 路径**，且已证明硬件 + 数值都成立。但朴素实现
+   `~1.35 TFLOPs` vs FP16 `~24 TFLOPs`，**prefill 场景落后约 18×**，当前形态不是
+   production 候选——必须工程化（SMEM 分块 + async copy + warp 流水）或直接引入
+   **CUTLASS FP8 GEMM**（它内部处理 COL32/HMMA swizzle 与 epilogue scale）。
+3. **FP8 W8A8 的商业价值不在 prefill 算力，而在 decode 带宽**：M=1 时 FP16 只有
+   `~160 GB/s`，而 FP8 权重字节数减半，理论上可到 `~2×`（6-C-3 已实测 FP8 带宽段
+   `353.6 GB/s`）。所以 6-C-4 的主战场是 **M 小的 decode / GEMV**，不是 M 大的 prefill。
+
+**follow-up（→ 6-C-4.1）**：
+- 引入 CUTLASS FP8 GEMM，或自研分块 mma kernel（SMEM + async copy）。
+- M=1 专用 FP8 GEMV（不依赖 Tensor Core），与 mma 路径分开。
+- 运行时能力探测：`AlgoGetHeuristic` >0 → cuBLASLt FP8，否则回落 FP16 / 自研。
+- Route C 在 `NK=8192²` 的掉速单独排查（workspace / heuristic 选路）。
+
+#### 6-C-4.1 CUTLASS Ada FP8 GEMM（2026-09-07，Measured）
+
+拍板：**CUTLASS 为主候选，Route-B 手写 MMA 保留为 reference/fallback，M=1 拆到 6-C-4.2。**
+CUTLASS **4.8.0** 已 vendor 到 `third_party/cutlass`（**仅源码，未接 CMake**，主工程构建不受影响）。
+第一版按约定**不做 scale fusion**：`alpha=1`、`beta=0`、所有 scale 置 1.0、bias=0、
+epilogue = `Identity` → `D(fp32) == FP32 累加器`，把"MMA 是否工作"与"scale/epilogue 是否正确"
+严格拆开。
+
+**脚手架**：`benchmarks/fp8_cutlass_gemm.cu`（独立 nvcc，不进 CTest）
+
+```bash
+nvcc -O3 -arch=sm_89 --std=c++17 \
+     -I<forge>/include -I<forge>/third_party/cutlass/include \
+     -o fp8_cutlass_gemm fp8_cutlass_gemm.cu -lcublasLt -lcublas
+```
+
+配置（NVIDIA Ada FP8 示例的基本结构）：
+Threadblock `128×64×128` / Warp `64×32×128` / MMA `16×8×32` / Stages `3` / Alignment `16`，
+`Sm89` + `OpMultiplyAdd`，A=E4M3 row-major、B=E4M3 **column-major**、D=FP32 row-major。
+
+**golden 定义**（关键纪律）：`C_golden = Σ_k decode(A_fp8)·decode(B_fp8)`，**基于实际编码后的
+lowp 输入再 decode**，而不是原始随机浮点——避免把量化误差误判成 kernel error。
+
+##### 决定性结果 —— N=K=4096（TFLOPs）
+
+| M | FP32 | FP16 TC | ROUTE_B | **CUTLASS FP8** |
+|---:|---:|---:|---:|---:|
+| 32 | 2.81 | 5.64 | 0.95 ✗ | **6.44** |
+| 64 | 5.29 | 11.13 | 1.41 ✗ | **13.09** |
+| 128 | 7.10 | 20.62 | 1.93 ✗ | **34.81** |
+| 256 | 7.54 | 22.48 | 1.98 ✗ | **39.71** |
+| 512 | 5.94 | 23.42 | 1.98 ✗ | **42.82** |
+| 1024 | 4.68 | 23.94 | 1.97 ✗ | **40.03** |
+
+N=K=8192：CUTLASS 最高 **43.11 TFLOPs**（M=512），对 FP16 `19.20` 为 **2.25×**。
+
+**CUTLASS FP8 相对 cuBLASLt FP16 在 large-M 稳定快 1.8×~2.2×**，相对 FP32 快 ~9×。
+prefill 场景（M≥128）FP8 W8A8 的算力收益**成立且显著**。
+
+##### correctness（max abs err vs FP32 golden）
+
+| Path | N=K=4096 | N=K=8192 | 判定 |
+|---|---|---|---|
+| FP32 | `3.8e-06` | `7.6e-06` | ✅ |
+| FP16 TC | `7.6e-06` | `1.5e-05` | ✅ |
+| **CUTLASS FP8** | `8.9e-03 ~ 1.1e-02` | `1.3e-02 ~ 1.5e-02` | ✅ |
+| ROUTE_B | `9.7e+01 ~ 1.1e+02` | `1.5e+02` | ❌ 数值错误 |
+
+C 的量级约 `~20`，故 CUTLASS 的相对误差约 `5e-4`，符合 E4M3×E4M3→FP32 的累加顺序差异；
+精度序 **FP32 < FP16 < FP8 误差** 成立，说明 CUTLASS 执行的确实是与 golden 同一套数学。
+
+##### 资源（-Xptxas -v）
+
+| Kernel | registers | spill stores / loads | workspace |
+|---|---:|---|---:|
+| CUTLASS `GemmWithAbsMax` | **255** | 48 B / 56 B | **0** |
+| ROUTE_B `fp8_gemm_kernel` | 42 | 0 / 0 | — |
+
+CUTLASS 已顶到 255 寄存器并有少量 spill；换 tile shape 降寄存器压力是后续可选项。
+（selector 排序仍只按实测 latency/throughput，不用寄存器数/occupancy 决定——沿用 Phase 2 纪律。）
+
+##### 两个重要修正（本轮实测发现，影响 6-C-4.0 结论）
+
+1. **主机端 `__float2half` 在本环境返回 0** —— FP16 baseline 曾**静默输出全零**（有耗时、无结果）。
+   改为 **device 端转换**后 FP16 误差 `7.6e-06`。
+   ⚠️ **6-C-4.0 审计里 Route C(FP16) 的 parity 数值因此无效**（当时量的是零输出，不是 FP16 误差），
+   其 ~24 TFLOPs 的耗时同样不可信，需以本轮 device 转换后的数字为准。
+2. **Route-B 手写 MMA 片段布局错误**。已试两种布局（每 lane 连续 16 个 k；套用 fp16
+   `m16n8k16` 的 `row=lane/4` 模式），**两种都只是维度自洽而非 fp8 `m16n8k32` 的真实布局**。
+   ⚠️ **6-C-4.0 审计里 Route B 的 parity 同样无效**（当时 ~6e-2 被误读为"FP8 精度误差"，
+   实际是操作数错位）。
+
+##### 结论与下一步
+
+- **CUTLASS = 6-C-4 production backend（prefill）**：已验证 correctness ✅ / performance ✅ /
+  workspace ✅（0）。下一步才做 scale/epilogue 融合与 graph compatibility。
+- **Route-B 暂不能当 reference/fallback**：数值不正确。修法应当**不再手猜布局**，而是直接复用
+  CUTLASS 的 `arch::Mma<GemmShape<16,8,32>, 32, float_e4m3_t, ...>` SM89 atom（打包由库保证正确），
+  或照 PTX ISA 对 8-bit MMA 的片段定义重写。
+- **M=1 必须独立**：CUTLASS 在 M=32 只有 `6.4 TFLOPs`、M=64 `13 TFLOPs`，说明小 M 不是
+  Tensor-Core 吞吐受限区；M=1 走 6-C-4.2 FP8 GEMV，不塞进 `16×8×32` MMA。
+- **6-C-4.0 的 FP16/Route-B 数字需以本轮为准**（见上两个修正）。
+
+#### 6-C-4.1b scale / epilogue 融合（2026-09-07，Measured）
+
+把 CUTLASS FP8 GEMM 从"纯数学最小版"推进到 Forge 的 **W8A8 实际语义**。
+严格使用已冻结的 6-C-1 contract（`fp8_utils.h` + S6）：
+
+```text
+scale = amax / 240
+q     = fp8_encode(x / scale)          =>  x ≈ decode(q) * scale
+D_fp32 = GEMM(decode(A_fp8), decode(W_fp8)) × s_A·s_W
+```
+
+`scale_a / scale_w` 以 **device 端 tensor sidecar** 形式被 GEMM epilogue 消费；
+**未**接入 `ComputeDTypePolicy`（policy 只管 dtype），本轮只验证 epilogue 对 tensor scale 的消费。
+epilogue 其余部分仍中性化：`alpha=1 / beta=0 / bias=0 / Identity`。
+
+##### 四种尺度（M=256, N=K=4096）
+
+| case | s_a | s_w | s_d(out) | vs_scaled_golden(rel) | vs_real(rel) | fused vs raw·s_A·s_W(rel) | fp8out 位差 | maxULP | far |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| scale==1 | 1.0 | 1.0 | 3.98e-05 | **1.66e-04** | 3.62e-02 | **0.00e+00** | 41/1024 | **1.00** | 0 |
+| normal | 3.33e-02 | 6.67e-02 | 1.79e-02 | **1.66e-04** | 3.62e-02 | 4.41e-08 | 41/1024 | **1.00** | 0 |
+| tiny | 4.17e-07 | 4.17e-07 | 2.29e+08 | **1.66e-04** | 3.62e-02 | 4.97e-08 | 41/1024 | **1.00** | 0 |
+| huge | 4.17e+01 | 4.17e+01 | 2.29e-08 | **1.66e-04** | 3.62e-02 | 4.05e-08 | 41/1024 | **1.00** | 0 |
+
+**判定**
+
+1. **epilogue 正确消费 tensor scale**：`D` 对 golden 的相对误差在四种尺度下**恒为 1.66e-04**
+   （尺度无关），说明 scale 是作为乘性因子正确进入 epilogue 的。
+2. **融合前后一致（无精度损失）**：`CUTLASS(acc) × (s_a·s_w)` 与"融合版"相差
+   **≤5e-08**，scale==1 时为 **0**。→ scale 融合可安全替代"算完再乘"。
+3. **vs_real = 3.62e-02 且四尺度一致**：这是**纯 E4M3 量化误差**（3 位尾数），
+   与尺度无关的"相对"特性符合预期，**不是 kernel error**。
+4. **FP8 输出没有重演 packing bug**：41/1024 位差**全部恰好 1 ULP**
+   （`maxULP=1.00`、`far=0`），即 CUTLASS 转换器与 Forge `fp32_to_fp8_e4m3` 的
+   tie-breaking 差异，**不是 layout/字节序错误**。
+   ⚠️ 前提：必须先施加输出 scale `s_d = 240/amax(D)` 把值压进 ±240，
+   否则 FP8 输出直接饱和到 240，测试将失去意义（首版就踩了这个坑）。
+5. **吞吐零开销**（同一次运行内对照，N=K=4096）：
+
+   | M | 无融合 (1,1) | 有融合 (0.02,0.03) |
+   |---:|---:|---:|
+   | 128 | 34.66 | 34.65 |
+   | 256 | 39.32 | 39.47 |
+   | 512 | 42.60 | 42.72 |
+   | 1024 | 43.30 | 43.23 |
+
+   寄存器/spill **不变**（融合只是运行时指针取值变化，同一 kernel 实例化，仍 255 寄存器）。
+   N=K=8192 的组内对照同样无差异。
+   ⚠️ 合并运行（scale 套件 + 双次 sweep）下 8192 绝对数字被持续负载压低（~8 vs 独立 43），
+   属 laptop GPU 降频，**8192 绝对值需单独复测**；融合对比结论不受影响。
+
+##### 结论
+
+- **6-C-4.1 scale/epilogue backend = CUTLASS** ✅
+  已证明完整路径 `FP8 A × FP8 W → FP32 acc → ×(s_A·s_W)` 与 `amax/240` 语义严格一致，
+  且 FP8 输出 epilogue 无 packing 回归。
+- **Route-B 降级为实验性代码，不进 production selector**（数值不正确，见 6-C-4.1）。
+- 下一步：graph capture 兼容性 + 与 `KernelSelector` 的接入（此前约定：全部确认后才搬进
+  `src/operators/cuda/` 与 `include/forge/`）。
+
+#### 6-C-4.1c CUDA Graph capture / replay 兼容性（2026-09-08，Measured）
+
+**验收标准**（Forge 既有 graph 范式 + 用户 6-C-4.1c 门槛）：
+
+```text
+capture           ✅
+replay × 3        ✅
+eager == replay   bitwise（memcmp）
+scale mutation    ✅
+FP8 output        ≤ 1 ULP / far == 0
+workspace         0
+```
+
+##### 结果：8/8 全部通过（M=256, N=K=4096；4 尺度 × {FP32 输出, FP8 输出}）
+
+| case | out | ws | capture | replay==eager | stable | scale_mut(match | changed) |
+|---|---|---:|---|---|---|---|
+| scale==1 | fp32 | 0 | OK | YES | YES | YES \| YES |
+| scale==1 | fp8 | 0 | OK | YES | YES | YES \| YES |
+| normal | fp32/fp8 | 0 | OK | YES | YES | YES \| YES |
+| tiny | fp32/fp8 | 0 | OK | YES | YES | YES \| YES |
+| huge | fp32/fp8 | 0 | OK | YES | YES | YES \| YES |
+
+- `s_a/s_w` ∈ {(1,1), (0.0333,0.0667), (4.17e-7,4.17e-7), (41.7,41.7)}；FP8 输出用
+  `s_d = 240/amax(D)` 压回 E4M3 合法值域。
+- `replay==eager` 与 `stable` 均为 **memcmp 逐位**；`scale mutation` 按用户指定流程：
+  `capture(s_a) → replay → 修改 device scale → replay 同一 graphExec → 与新 eager 逐位比对`。
+- **关键证明**：`changed=YES` + `match=YES` ⇒ scale 是 **graph-visible device state**
+  （kernel 执行期从 `scale_a_ptr/scale_b_ptr/...` 解引用，见
+  `LinearCombinationGenericWithScalingAndAbsMax::Params`，它在 device 端 epilogue
+  构造时把 `alpha ← alpha·s_a·s_b` 折叠），**不是 capture 时固化的 host 参数**。
+  ⇒ W8A8 runtime 不需要为不同 tensor scale 重建 graph，只需 `cudaMemcpyAsync` 改写
+  device scale 后重放。
+- FP8 输出在 graph 场景是 bitwise 一致（强于 ULP 门槛）；eager 端 ≤1 ULP 已在
+  6-C-4.1b 验证（`maxULP=1.00`、`far=0`）。
+- workspace = 0（无动态 workspace 依赖，天然 graph-stable）。
+
+##### ⚠️ 过程中的关键坑（对 production graph integration 有直接价值）
+
+第一版 `scale_mut` 恒 `changed=NO`。排查后根因**不在 CUTLASS**，而在调用方式：
+`GemmUniversalBase::initialize(args, ws)` 与 `op()` 若不显式传 stream，CUTLASS 把
+kernel 发到 **legacy 默认流**，而 capture 发生在 non-blocking stream 上 ⇒ **捕获到空
+graph**，`replay==eager`/`stable` 都是空 graph 的"平凡真"，`scale_mut` 恒 NO。
+
+修法（两条纪律，写进 production 约束）：
+1. **`op.initialize(args, ws, stream)` + `op(stream)` 必须显式传 capture stream**。
+2. **capture 后校验 `cudaGraphGetNodes(graph, nullptr, &n)`，n==0 判 FAIL** ——
+   空 graph 会让所有 bitwise 检查"平凡通过"，是 graph 测试里最隐蔽的假阳性。
+
+另：capture 必须用 **`cudaStreamNonBlocking`** 流（默认 flag 的流与 legacy 流隐式
+join，capture 会 unjoinable）。
+
+##### 判定
+
+6-C-4.1c = **DELIVERED**。CUTLASS FP8 GEMM 的 graph capture/replay/scale-mutation
+全部满足通过门槛，且没有引入任何 host 临时状态或动态 workspace 依赖。
+
+#### 6-C-4.1d Forge KernelSelector 接入 + production backend 化（2026-09-08，Delivered）
+
+把 6-C-4.1b/6-C-4.1c 验证过的 CUTLASS FP8 GEMM 从 `benchmarks/fp8_cutlass_gemm.cu`
+实验文件搬进生产：`src/operators/cuda/` backend + `include/forge/` 公共 API +
+`KernelSelector` 接入。Route-B 保持实验性，不进入 selector。
+
+**新增 / 修改文件**
+- `include/forge/fp8_gemm.h`（新）：`Fp8W8A8Scales`（device 端 scale sidecar）、
+  `forge::cuda::launch_fp8_gemm_e4m3_fp32` / `launch_fp8_gemm_e4m3_fp8out` 启动器声明，
+  及 `forge::ops::set/get/has_fp8_tensor_scale` 暂存 scale 注册表（6-C-5 前的过渡）。
+- `src/operators/cuda/cuda_fp8_gemm.cu`（新）：CUTLASS `GemmUniversalWithAbsMax`
+  （Sm89）生产实现，FP32 输出与 FP8(E4M3) 输出两条变体。Sm89 设备代码用
+  `#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890` 保护，**只在 sm_89+ 实例化**，
+  因此可在 `86;89` 构建里干净编译；启动器内置 runtime 算力检查，pre-Ada 返回 false。
+- `src/operators/cuda/cuda_fp8_gemm_stub.cu`（新）：CUTLASS 缺失 / 无 Ada arch 时
+  提供同名空实现，保证 `forge_ops` 始终可链接。
+- `src/operators/cpu/fp8_scale_registry.cpp`（新）：暂存 scale 注册表（host-only）。
+- `include/forge/kernel_selector.h` + `kernel_selector.cpp`：新增
+  `KernelVariant::MATMUL_FP8_E4M3`；`select_matmul` 对 `FP8_E4M3` 且 M>1 且 `sm_89+`
+  返回该变体，否则 `UNSUPPORTED`；`select_gemv` 对 `FP8_E4M3` 直接 `UNSUPPORTED`
+  （M==1 FP8 GEMV 留给 6-C-4.2）；新增 `fp8_gemm_supported()`。
+- `src/operators/cuda/matmul_cuda.cpp`：`matmul_multi_row` 的 switch 新增
+  `MATMUL_FP8_E4M3` 分支，路由到 `fp8_w8a8_matmul`（读取暂存 scale → 上传 device
+  scalar → 调生产启动器）。当前仅支持 FP32 out；FP8 out 链路是 6-C-5。
+- `include/forge/dtype_contract.h`：`op_supports_fp8` 台账退役 `MUL_MAT_TRANSB`
+  （kernel + routing + ledger 原子退役）。
+- `src/operators/CMakeLists.txt`：CPU 源列表加入 `fp8_scale_registry.cpp`；CUDA TU
+  按 arch/CUTLASS 存在性条件加入 `cuda_fp8_gemm.cu`，并把 **CUTLASS include 仅挂到该
+  TU**（`set_source_files_properties ... INCLUDE_DIRECTORIES`），主构建保持 CUTLASS-free。
+- `tests/CMakeLists.txt` + `tests/test_fp8_gemm_cuda.cu`（新）：6-C-4.1d 回归门。
+
+**B 布局复用**：Forge 的 transB 权重 `W[N,K]` 行主序，正对应 CUTLASS 的
+`B` 列主序 `[K,N]`（`ldb=K`），故权重指针**原样传入**无转置拷贝。
+
+**验收（复用 6-C-4.1c 门槛）**：测试用生产启动器跑 `M=256, N=K=4096` × 4 尺度，
+对 FP32 参考（用与 kernel 相同的 E4M3 decode 构造）验证 `max_abs_err`、`cosine`、
+FP8 输出 ULP，并断言 `select_kernel(FP8_E4M3, M>1) == MATMUL_FP8_E4M3`；无 Ada GPU
+时优雅 SKIP。graph capture/replay/scale-mutation/workspace==0 这些属性由底层同一
+CUTLASS op 继承（6-C-4.1c 已证明）；matmul op 的 graph 捕获归到 6-C-5。
+
+**实机回归结果（2026-09-08，RTX 4050 / sm_89 / CUDA 12.8）**：
+`ctest -R fp8-gemm --output-on-failure` → `fp8-gemm ... Passed (23.86s)`。逐条满足：
+- FP32 GEMM parity：`max_err=1.42e-2, cosine=0.999997`（达 benchmark 水平）。
+- FP8 output：`fp8_maxULP=1.00, far=0`（≤1 ULP，满足既有结果）。
+- Selector：`M>1, FP8_E4M3, sm89+` 返回 `MATMUL_FP8_E4M3`；`M==1` 明确 `UNSUPPORTED`。
+- 非 FP8 路径：CUTLASS include 仅挂单 TU，forge_ops/infer/model/core/tokenizer 全量编译通过，无回归。
+- 注：`amax_out` 报的是全矩阵融合输出 `golden` 的真实 amax（实测 ~103，非 `s_d` 缩放后的 240），
+  对 6-C-5 链式 `s_d=240/amax` 计算正确；graph capture/replay/scale-mutation 由底层同一 CUTLASS
+  op 继承（6-C-4.1c 已证明），本测试未单独重测（见下「下一步」）。
+
+**已知过渡项**
+- FP8 activation/weight scale 目前靠 `ops::set_fp8_tensor_scale` 暂存注册表
+  （按 tensor data 指针 keyed），**6-C-5 会改为 graph-edge sidecar**，届时该注册表删除。
+- `fp8_w8a8_matmul` 每次调用在 host 侧上传 scale 到 device；graph 捕获该 op 归 6-C-5。
+- 仅 FP32 out；FP8 out 链路（多卡/层叠 W8A8）留 6-C-5。
+
+**下一步（6-C-4.2）**：FP8 GEMV（M==1 decode），独立 kernel，不塞进 `16×8×32` MMA。
+
+#### 6-C-4.2 M==1 FP8 E4M3 GEMV（2026-09-08，Measured）
+
+独立 standalone benchmark + 正确性审计（`tests/test_fp8_gemv_cuda.cu` → `forge-fp8-gemv-bench`，
+未接 Selector）。**不借用 6-C-4.1 的 CUTLASS GEMM 路径**，手写 GEMV kernel。
+
+**Kernel 设计（正确性实验决定布局，非预设线程映射）**：
+- 1D grid 按 `N` 展开；每线程负责 `VELEM` 个连续输出列 `j`，`k` 循环内对每列做点积。
+- `A`（长度 K）载入 shared memory 复用；`W` 按 `k-major`（`W[k*N + j]`，即 Forge transB
+  `[N,K]` 行主序 reinterpret）存储 → 同一 warp 内跨 `j` 天然合并。
+- FP32 累加，`scale_a*scale_w` 在累加后乘（另跑"内联融合"变体做等价校验）。
+- FP8 decode 用 **shared-memory 256 项 LUT**（值 = `fp8_e4m3_to_fp32(byte)`，与 golden 位级一致，
+  单次 shared 读、无分支）——分支式 bit-math decode 实测会把路径拖成 compute-bound，掩盖 fp8
+  的带宽优势（初版 fp8 仅 13 GB/s、向量化反而更慢，修复后 100–163 GB/s）。
+
+**验收（全过，RTX 4050 / sm_89 / CUDA 12.8）**：
+- correctness：golden = decode(A_fp8)×decode(W_fp8)；`cos=1.000000`、`max_abs_err=0`（三档形状）。
+- scale 等价：`s·Σ(aw)`（mode0）vs `Σ(s·a·w)`（mode1）相对差 ~1e-4~7e-4，< 1e-2 门限（仅 FP32 求和重排）。
+- no OOB：本机为 WSL/Windows，compute-sanitizer memcheck 因 WDDM debugger 不可用无法跑；
+  索引经静态分析保证在界内（`base+j<N` 显式 guard、`k<K` 上界、`W` stride 恒 < N），且完整
+  正确性跑（恰好写出 N 个输出并全量比对）通过无异常。
+- M=1 latency / FP8 vs FP16 实测（`µs/token`、有效带宽）：
+
+| K | N | fp8(VEC=1) µs | fp8(VEC=4) µs | fp8(VEC=16) µs | fp16 µs | fp32 µs | fp8 最佳 BW |
+|---|---|---|---|---|---|---|---|
+| 4096 | 4096 | 128 | 253 | 759 | 363 | 390 | 131 GB/s |
+| 4096 | 11008 | 405 | 315 | 918 | 524 | 971 | 143 GB/s |
+| 4096 | 14336 | 584 | 360 | 934 | 671 | 1392 | 163 GB/s |
+
+（fp8 最佳 ≈ min(VEC=1, VEC=4)；VEC=16 因占用率过低恒最慢。N 较小时 VEC=1 最佳，N 较大时
+VEC=4 最佳——ILP 与占用率的权衡，投产选 VEC=4 更稳。）
+
+**结论 / 决策依据（自研 vs CUTLASS/CuTe GEMV）**：
+- 手写的 **LUT-decode + 向量化 W 加载** GEMV 已逼近显存带宽墙：fp8 有效带宽 100–163 GB/s，
+  达 fp16 同构实现的 **1.7×–2.9×**（fp8 半字节宽度的预期收益），FP32 基线 168–186 GB/s。
+- 这是 decode 典型的 **memory-bandwidth-bound** 算子，**不应**按 prefill TFLOPs 评估；
+  decode GEMV 看 `µs/token`、有效带宽、端到端 latency 才有意义（本表已给）。
+- 自研 kernel 已满足正确性 + 带宽目标，且 **sm_89 无 fp8 Tensor-Core GEMV 原生指令**（fp8 MMA
+  走 `16×8×32`、M≥32 才划算，正是 6-C-4.1 已排除的路径）；SM89 GEMV 本质是 fp8-decode + fp32-accum
+  的带宽受限 kernel，**CUTLASS/CuTe 在此形状无额外魔法**。
+- **拍板：自研 M==1 FP8 E4M3 GEMV**（不引入 CUTLASS 依赖，避免重蹈 6-C-4.1 的 CUTLASS 编译面），
+  投产用 VEC=4 向量化 + shared-LUT decode 作为 `MATMUL_FP8_E4M3_GEMV`。
+
+**通过后才接 Selector**：`KernelSelector` 对 `FP8_E4M3 + M==1 → MATMUL_FP8_E4M3_GEMV`
+（本步审计通过后再加，见 6-C-4.3 / 6-C-5 链路整合）。
+
+#### 6-C-4.3 FP8 GEMV production routing（2026-09-08，Measured / Wired）
+
+把 6-C-4.2 审计通过的 GEMV 接入生产路径，**不引入 CUTLASS**（与 6-C-4.1d 的 CUTLASS GEMM
+严格分离）。
+
+**新增文件**：
+- `include/forge/fp8_gemv.h`：声明 `launch_fp8_gemv_e4m3_fp32(A, B, D, K, N, Fp8W8A8Scales&, stream)`；
+  复用 6-C-4.1d 的 `Fp8W8A8Scales`（device 端 scale sidecar）。
+- `src/operators/cuda/cuda_fp8_gemv.cu`：**纯 CUDA，无 CUTLASS 依赖**。直接移植 6-C-4.2
+  审计 kernel（shared-LUT decode + fp32-accum），`VEC=4` 默认 specialization、`VEC=1` scalar
+  fallback（N 非 4 倍数时）、`VEC=16` 不暴露（实测持续更慢）；运行时 `sm_89+` 能力检查。
+- `src/operators/cuda/cuda_fp8_gemv_stub.cu`：结构对称占位（返回 false）；因 GEMV 是纯 CUDA、
+  始终可编译，故**不进构建**（避免与真实 TU 符号冲突）。
+
+**改动文件**：
+- `include/forge/kernel_selector.h`：枚举新增 `MATMUL_FP8_E4M3_GEMV`（归入 `M==1` GEMV 组），
+  `kernel_variant_name` 同步。
+- `src/operators/cuda/kernel_selector.cpp`：`select_gemv` 对 `FP8_E4M3` 返回
+  `fp8_gemm_supported() ? MATMUL_FP8_E4M3_GEMV : UNSUPPORTED`；`select_matmul` 维持
+  `M<=1 → select_gemv`（故 FP8 M==1 **绝不进入** CUTLASS GEMM），`M>1 + sm89+ → MATMUL_FP8_E4M3`。
+- `src/operators/cuda/matmul_cuda.cpp`：`gemv_dispatch_row` 新增 `MATMUL_FP8_E4M3_GEMV` 分支，
+  调用 `fp8_w8a8_gemv`（与 `fp8_w8a8_matmul` 同构，从临时 registry 取 scale 上传 device scalar）。
+- `src/operators/CMakeLists.txt`：无条件编译 `cuda_fp8_gemv.cu`（纯 CUDA，无 CUTLASS include）。
+- `tests/test_fp8_gemv_cuda.cu`：benchmark 新增 **production 回归**——直接驱动真实
+  `launch_fp8_gemv_e4m3_fp32`（即 selector 为 FP8 M==1 选中的 launcher），比对同一 golden；
+  并断言 `select_kernel(FP8_E4M3, M==1) == MATMUL_FP8_E4M3_GEMV`。
+
+**路由规则（已落地）**：
+```text
+FP8_E4M3 + M == 1 + sm89+  → MATMUL_FP8_E4M3_GEMV   // 手写 GEMV
+FP8_E4M3 + M  > 1 + sm89+  → MATMUL_FP8_E4M3         // CUTLASS GEMM (6-C-4.1d)
+FP8_E4M3 + unsupported arch → UNSUPPORTED
+FP8_E4M3 + M == 1          不得进入 CUTLASS GEMM
+```
+
+**实机回归（2026-09-08，RTX 4050 / sm_89 / CUDA 12.8）**：
+- `ctest -R fp8-gemv --output-on-failure` → `fp8-gemv-bench ... Passed (12.43s)`。
+- 同一 benchmark 内：审计 kernel（VEC=1/4/16）cosine=1.0、maxerr=0；**production backend**
+  `fp8 PROD` cosine=1.0、maxerr=0（与 golden 位级一致）；`selector(M==1,FP8) → MATMUL_FP8_E4M3_GEMV`
+  全部命中。
+- 延迟/带宽沿用 6-C-4.2：`MATMUL_FP8_E4M3_GEMV` 实际走 VEC=4/1 的 100–165 GB/s 路径，相对
+  fp16 GEMV 同构 **1.7×–2.9×**。
+
+**与 dtype contract 的关系**：`op_supports_fp8(MUL_MAT_TRANSB)` 在 6-C-4.1d 已为 true，故
+`cuda_matmul_transB` 入口的 `require_dtype_supported` 对 FP8 直接放行——**无需改 contract**，
+GEMV 与 GEMM 共享同一 op 级白名单。
+
+**下一步（6-C-5）**：scale sidecar 不应停留在 `fp8_scale_registry`（pointer→scale 查表）。6-C-5 应让
+`Tensor` 直接携带 FP8 scale sidecar，并沿 `ComputeGraph` edge 传播（GEMV/GEMM → activation 链），
+capture/replay 时 scale 作为 graph-visible state 被 mutation，最终**删除** `fp8_scale_registry`。
+本步骤暂用 registry 过渡（与 6-C-4.1d 同口径）。
+
+#### 6-C-5 FP8 scale sidecar（2026-09-08，Partially Landed — seed）
+
+目标：把 scale 从 **host-side pointer→scale 查表**（`fp8_scale_registry`）搬到 **Tensor 自身的
+sidecar**，让它随 `TensorPtr` 沿 `ComputeGraph` edge 流动。
+
+```text
+现在（已完成的数据模型）：
+Tensor
+ ├── data
+ ├── dtype
+ └── fp8_scale_ / has_fp8_scale_   ← sidecar（6-C-5 seed）
+```
+
+**关键洞察**：`GraphNode` 直接持有 `resolved_inputs`（`TensorPtr`）与 `output`（`TensorPtr`），
+即"edge 就是 Tensor 本身"。因此只要 scale 挂在 Tensor 上，它就天然沿 edge 传播——不需要给
+`ComputeGraph` 额外加 edge-scale 字段。
+
+**已落地（seed，向后兼容）**：
+- `include/forge/tensor.h`：`Tensor` 新增 `fp8_scale_` / `has_fp8_scale_` 字段与
+  `has_fp8_scale()` / `fp8_scale()` / `set_fp8_scale(float)`。默认未设置，legacy 行为不变。
+- `src/core/tensor.cpp`：sidecar 在 `copy_from`（含跨设备 copy node，即 graph edge）、`view`、
+  `slice`、`to_device` 中随数据传播——这是"沿 edge 传播"的实现点。
+- `src/operators/cuda/matmul_cuda.cpp`：新增 `fp8_scale_of(TensorPtr)`，**优先读 Tensor sidecar**，
+  未设置时回退 `fp8_scale_registry`；`fp8_w8a8_matmul` / `fp8_w8a8_gemv` 改为接收
+  `const TensorPtr& a`（非裸指针），`matmul_multi_row` / `gemv_dispatch_row` 及
+  `cuda_matmul_transB` / `cuda_matmul_transB_dual` 调用点同步。
+- 回归：全量 `ctest` **40/40 通过**。
+
+**尚未完成（下一步）**：
+1. FP8 生产者（quantize / FP8 RMSNorm / activation）改为 `set_fp8_scale()` 写在输出 Tensor 上，
+   不再 `set_fp8_tensor_scale(ptr, s)`。
+2. 让 scale 成为 **device 端 scalar** 并作为 graph-visible state：capture 一次、replay 前可 mutation
+   （当前 GEMV launcher 每次调用 host 侧算 `s_a*s_w` 再上传 4B，尚非 graph-visible）。
+3. 打通 GEMV → GEMM → activation 全链（FP8 out + output scale sidecar）。
+4. **删除** `fp8_scale_registry` 与 `ops::set/get/has_fp8_tensor_scale`，迁移全部调用点。
+
+**调用点清点（6-C-5.1 要求的全库 grep，已执行）**：
+
+```text
+src/operators/cpu/fp8_scale_registry.cpp   定义（set/get/has 三个函数）
+src/operators/cuda/matmul_cuda.cpp         consumer（唯一生产 consumer，回退分支）
+src/operators/CMakeLists.txt               构建入口
+include/forge/fp8_gemm.h                   声明
+include/forge/tensor.h                     仅注释
+tests/                                     0 处
+```
+
+结论：`set_fp8_tensor_scale` 在 `src/` 与 `tests/` **均无调用者** —— registry 实际上是
+**死代码**：没有任何 producer 写它，因此回退分支永不触发。**这同时意味着：目前代码库里
+不存在任何 per-tensor FP8 scale producer**（`cuda_quant.cu` 的 `launch_quantize_fp8_e4m3_matrix`
+是**无 scale** 的裸转换 `fp32_to_fp8_e4m3(x)`；另一条 scaled 路径是 KV cache 的 per-(row,head)
+scale，写在 device `scales` 缓冲区，不是 per-tensor）。所以 6-C-5.1 不是"改写 producer"，
+而是**新建** producer；且 6-C-5.7 近乎等价于删死代码。
+
+#### 6-C-5.0 / 5.2 / 5.4 已落地（2026-09-08，Measured）
+
+**6-C-5.0 debug/trace 基础设施**
+- `include/forge/fp8_scale_debug.h` + `src/core/fp8_scale_debug.cpp`（注册进 `forge_core`）。
+- `Fp8ScaleDebugInfo{has_sidecar, has_device_scale, used_registry_fallback, tensor_data,
+  device_scale_ptr, host_scale}`；`fp8_scale_trace(where, t, fallback)` 在
+  `FORGE_TRACE_FP8_SCALE=1` 下输出 `Tensor= / dtype= / scale= / device_scale= / source= /
+  registry_fallback=`；`fp8_scale_source_counts()` 统计 sidecar vs registry。
+- 注意：`fp8_scale_debug_info` **不会**调用 `fp8_scale_device()`，避免"调试本身触发分配"。
+
+**6-C-5.2 device-side scale（关键项）**
+- `Tensor` 增加 `fp8_scale_device_` / `fp8_scale_dirty_`；`fp8_scale_device(stream)` 首次
+  allocate+upload、后续**复用同一地址**（不再每次 GEMM/GEMV `cudaMalloc`）；地址稳定 ⇒
+  graph-visible，改 scale 只回传到同一地址，replay 无需重建 graphExec。
+- 所有权：析构 `free_fp8_scale_device()`；move 构造/赋值转移；`copy_from/view/slice/to_device`
+  传播 host 值并置 dirty。
+
+**6-C-5.4 consumer 统一化**
+- `fp8_scale_device_of(TensorPtr)` 返回 `Fp8ScaleRef{ptr, owned}`：sidecar 路径是
+  **Tensor 自有、稳定地址（owned=false，不 free）**；registry 回退是 per-call 分配
+  （owned=true，调用者 free），并 warn once + 计数。
+- `cuda_fp8_gemv.cu`：kernel 改为接收 `scale_a/scale_w` **device 指针**，在 device 上算
+  `s = (*scale_a) * (*scale_w)`；launcher **删除**每次调用的 `cudaMalloc` + 2 次 D2H + H2D。
+- 全量 `ctest` **40/40 通过**。
+
+#### 6-C-5.1a / 5.1b / 5.2b 已落地（2026-09-08，Measured）
+
+**6-C-5.1a W8A8 quantize producer（方案 A：全 device 端，无 D2H）**
+- `include/forge/fp8_quant.h` + `src/operators/cuda/cuda_fp8_quant.cu`（注册进 `forge_ops`）。
+- 与 KV FP8 quantize **完全分离、不共用数据结构**：KV 继续用 per-(row,head) 的 device
+  `scales`；W8A8 用 per-tensor 的 Tensor sidecar。
+- `TensorPtr quantize_fp8_e4m3_w8a8(src, stream)`：建 FP8 Tensor → 取
+  `fp8_scale_device_slot()` 稳定地址 → device amax reduction → `scale = amax/240` 由 kernel
+  **直接写进该 Tensor 的 device scalar** → `q = encode(x / scale)` 从 device 内存读 scale。
+- `Tensor::fp8_scale_device_slot(stream)`（新增）：只分配、**不上传 host 值**，并置
+  `fp8_scale_device_authoritative_ = true` 且清 dirty，避免后续 `fp8_scale_device()` 覆盖
+  kernel 刚写的值。这是"producer 在 device 上产出 scale"的关键接口。
+- amax scratch 用 static grow-only buffer：capture 期间不 malloc/free。
+
+**6-C-5.1b amax contract（独立任务，已单测）**
+```
+amax > 0 && finite → scale = amax / 240
+amax == 0          → scale = 1，FP8 输出全 0
+amax = NaN/Inf     → reject（scale = NaN）
+```
+- **重要修正**：朴素 `fmaxf` 归约会**吞掉 NaN**（`fmaxf(NaN, x) == x`），导致 NaN 永远不会被
+  reject。因此 amax reduction 同时归约两个量：`[有限 abs-max, non-finite flag]`，finalize 时
+  flag>0 则 `amax = NaN`。已用 device 端 NaN 输入专门验证。
+
+**6-C-5.2b device scalar 生命周期强化（已验证）**
+- host sidecar 改变 **不**导致 device pointer 改变；move 转移所有权后地址不变。
+- `copy_from` / `view` / `slice` 传播 sidecar *值*（新 Tensor 有各自地址）。
+
+**实机结果（RTX 4050 / sm_89）**
+```
+[OK] 6-C-5.2  device scale: addr=0x704c01400 stable, value 0.03125 -> 0.125 (in place)
+[OK] 6-C-5.2b lifetime: addr stable across mutation+move, sidecar 传播 copy_from/view/slice
+[OK] 6-C-5.1a producer: dtype=FP8_E4M3 scale=0.00802083 (amax/240=0.00802083) maxerr=0.0634667
+[OK] 6-C-5.1b edge cases: amax=0 -> scale 1 + zeros; NaN/Inf -> rejected
+```
+全量 `ctest` **40/40 通过**。
+
+**顺带修掉的过期断言**（两处 encode 了 6-C-4.3 之前的路由）：
+- `tests/test_fp8_gemm_cuda.cu`：M==1 selector 期望 `UNSUPPORTED` → 改为 `MATMUL_FP8_E4M3_GEMV`
+  （sm_89+；非 Ada 仍为 `UNSUPPORTED`）。
+- `tests/test_dtype_contract.cpp`：`MUL_MAT_TRANSB` 已在 6-C-4.1d 进入 FP8 白名单，故从
+  `all_ops`（仍拒绝）移入 `fp8_retired_ops`（已退休）——该断言自 6-C-4.1d 起即已过期。
+
+#### 6-C-5.3 Graph-visible scale mutation（2026-09-08，Measured —— 决定性实验通过）
+
+整个 "device-authoritative FP8 scale + CUDA Graph" 设计是否成立的判据。四个子项一次通过。
+
+**5.3a capture 基线**
+构造 `A_FP8(scale=0.02) × W_FP8(scale=0.03) → FP32`，capture 只捕获 GEMV launch；
+capture 前先 warm-up（decoder LUT 在 capture **之外**分配），因此 capture 期间无任何 malloc。
+scale 全部走 Tensor-owned device slot，无 host scalar、无 D2H/H2D。
+
+**5.3b scale mutation（决定性）**
+只改同一个 device slot（`0.02→0.04`、`0.03→0.05`），**不重新 capture、不重新
+instantiate**，直接 replay 同一个 `graphExec`：
+
+```text
+graphExec    0x588efd8a8190        （never re-instantiated）
+scale_a_ptr  0x704c01e00  stable
+scale_w_ptr  0x704c06800  stable
+replay(0.04,0.05) == eager(0.04,0.05)   bitwise 全等（4096/4096）
+```
+
+**5.3c 反向检查**（证明 kernel 真的读了 device scalar，而非"碰巧正确"）
+```text
+scale 不变 → replay 逐位稳定（0 处差异）
+scale 改变 → 输出改变（4096/4096 全部改变，0 处不变）
+```
+
+**5.3d 生命周期回归**
+capture 之后做 host 侧 Tensor move（`shared_ptr` 所有权转移）+ mutation，图中保存的
+device pointer **不失效**，replay 仍观察到新 scale。刻意用所有权转移而非销毁最后一个
+owner：验证所有权模型，不制造 use-after-free。
+
+> 过程中修掉一个**测试自身**的断言方向错误：`diff34 == N`（全部元素都变）被误判为失败，
+> 实际应为 `diff34 == 0`（完全没变）才是失败。修正后 5.3d 通过。
+
+**结论**：scale 在 graph 中保持可见，replay 不需要经过 host 更新，`graphExec` 可长期复用。
+这同时反向验证了 6-C-5.2 的必要性 —— 原先"每次 GEMV `cudaMalloc` + D2H + H2D"的写法会让
+capture 直接不成立（旧 launcher 会在 capture 内分配内存）。
+
+全量 `ctest` **40/40 通过**。
+
+#### 6-C-5.5 FP8 output scale producer（2026-09-08，Measured —— 决定性实验通过）
+
+把 5.3 的 contract 从 **FP8 输入 scale** 扩展到 **FP8 输出 scale**。
+
+**5.5a output producer（复用 5.1a/5.1b，不重写 reduction）**
+- `quantize_fp8_e4m3_output(src, stream)`：便捷形式，分配输出 Tensor。
+- `quantize_fp8_e4m3_output_into(src, dst, stream)`：**dst-injection 形式**，写入预分配
+  的 FP8 Tensor 并复用其稳定 scale slot —— 这是 capture-safe 形式（capture 内不分配）。
+- 抽出共享 `quantize_fp8_e4m3_impl()`，让 5.1a（输入 producer）与 5.5a（输出 producer）
+  **共用同一份已验证的 reduction**，避免第二份实现出现语义漂移。
+- 全程 device：amax → `scale = amax/240` 由 finalize kernel 直写 `*scale_slot` → encode。
+
+**5.5b output scale contract**
+与 5.1b 完全一致，且**明确不重写** `amax = fmaxf(amax, fabsf(x))`（会吞掉 NaN），
+直接复用 5.1b 修好的 finite-amax + non-finite flag reduction。
+
+**5.5c 数值正确性**（覆盖 normal± / all-zero / saturation / NaN / +Inf）
+- 新增 `Tensor::sync_fp8_scale_from_device(stream)`：device-computed scale 的 host mirror
+  是空的，需要显式 D2H 才能让 `has_fp8_scale() / fp8_scale() / fp8_scale_device()` 三者
+  语义一致。刻意做成 opt-in —— D2H 在 graph capture 内非法，绝不能进热路径。
+- 实测：`[OK] +/-, zero(->scale 1 + zeros), saturation, NaN/Inf rejected; host/device agree`
+
+**5.5d 决定性实验：producer 在 graph 内更新 scale slot**
+```text
+graphExec=0x5c4df2b97450 (never re-instantiated)
+scale_ptr=0x704c06800 (stable)
+scale updated BY THE GRAPH: 0.000404167 -> 0.0202083
+replay == eager bitwise
+```
+改变 FP32 输入 D 使 amax 必然变化，**不重新 capture / instantiate**，replay 后 scale slot
+被 **graph 内部的 producer** 更新。这比 5.3（host 写 scale 后 replay）更强，证明：
+
+> scale slot 是 **graph-visible 的 device-side output**，而不是 host bookkeeping。
+
+> 过程中修掉一个**测试自身**的 NaN 比较 bug：`out->fp8_scale() != dev_scale` 在两者都是
+> NaN 时恒为真（`NaN != NaN`），导致误报。改为 NaN 感知比较后通过。
+
+全量 `ctest` **40/40 通过**。
+
+#### 6-C-5.6 W8A8 最小确定性 E2E chain（2026-09-08，Measured —— 决定性实验通过）
+
+新增独立测试目标 `forge-fp8-w8a8-e2e-test`（`tests/test_fp8_w8a8_e2e.cu`），从 **真实 producer
+到真实 consumer、经由 ops 边界（`ops::cuda_matmul_transB`，即 ComputeGraph 层使用的入口）**
+驱动一条最小确定性 W8A8 链，而不是单独调 launcher：
+
+```text
+X_f32 --quantize_fp8_e4m3_w8a8--> A(fp8, device-authoritative scale sidecar)
+        （5.6a：ReLU fused producer -> FP8 activation，device 上不物化 FP32 中间量）
+W_f32 --quantize_fp8_e4m3_w8a8--> B(fp8, device-authoritative scale sidecar)
+Y = cuda_matmul_transB(A, B)          # M>1: CUTLASS GEMM；M==1: FP8 GEMV
+Y.dtype == FP32                       # chain 终止于 FP32，无 FP8->FP32->FP8 往返
+```
+
+实测（RTX 4050, sm_89, fp8-gemv bench + 全量 ctest **41/41**）：
+
+```text
+[OK] decode-chain      (1x4096x1024)      cos=1.000000 maxerr=7.6e-06  deterministic(bitwise) registry=0 sidecar=4
+[OK] decode-act-chain  (1x4096x1024 relu)  cos=1.000000 maxerr=3.8e-06  deterministic(bitwise) registry=0 sidecar=4
+[OK] prefill-chain     (32x512x256)        cos=1.000000 maxerr=3.5e-03  deterministic(bitwise) registry=0 sidecar=4
+[OK] prefill-act-chain (32x512x256 relu)   cos=1.000000 maxerr=1.8e-03  deterministic(bitwise) registry=0 sidecar=4
+[OK] 5.6a activation producer: fused ReLU == relu-then-quantize (bytewise + scale);
+     all-negative -> scale 1 + zeros
+```
+
+门控语义：
+- **FP32-out parity** vs decode 型 CPU golden（复用 producer 产出的同一批字节，避免隐式 FP8->FP32->FP8）；
+- **bitwise determinism**（同一 producer tensor 连续两次 matmul，逐字节相同，路径无原子操作）；
+- **scale 只走 sidecar**：`fp8_scale_source_counts() registry==0 && sidecar>=4`；
+- **dtype 链**：producer 输出 FP8 + `fp8_scale_device_authoritative()`，consumer 输出 FP32；
+- 5.6a 同时验证 ReLU-fused activation producer 与 relu-then-quantize 参考**逐字节 + scale 全等**，
+  以及全负输入坍缩到 `scale=1 + 全零`（5.1b amax==0 contract）。
+
+> **过程中发现并修复一个 6-C-4.2/4.3 的潜伏布局 bug（生产正确性）**：E2E 把同一份权重喂给
+> M>1（CUTLASS GEMM）与 M==1（FP8 GEMV）时 M==1 严重失配。根因是生产 FP8 GEMV kernel 的
+> `W[k*N+j]`（k-major）假设与 Forge 真实 transB 权重布局（row-major `[N,K]`，`W[n*K+k]` ——
+> CPU 参考 `matmul.cpp`、FP32 GEMV `gemv_transB_kernel`、CUTLASS FP8 GEMM（col-major `[K,N]`,
+> ldb=K）均一致）冲突：同一 weight Tensor 在两种 M 下不可能同时对。修复：`cuda_fp8_gemv.cu`
+> 生产 kernel 改为 **warp-per-row n-major**（warp 处理一个输出行、lane 扫 k、每步一个 coalesced
+> 32B sector + warp reduce，结构与已验证的 FP32 `gemv_transB_kernel` 相同）。6-C-4.2 的 VEC 宽度
+> 微基准是 k-major 人工布局上的带宽实验，仍保留在 `test_fp8_gemv_cuda.cu` 中作为历史对照；生产
+> PROD 回归改为喂真实 row-major 权重与其独立 golden（maxerr ~1e-10, cos=1.0）。
+
+#### 6-C-5.7 Legacy scale registry 删除 gate（2026-09-08，Measured）
+
+按 Phase-6 纪律，**先证明生产路径零依赖再删代码**（5.6 全绿后执行）：
+- 删除 `src/operators/cpu/fp8_scale_registry.cpp`，CMake 移除该源（`src/operators/CMakeLists.txt`）；
+- `fp8_gemm.h` 删除 `ops::set/get/has_fp8_tensor_scale` 声明；
+- `matmul_cuda.cpp` 的 `fp8_scale_device_of()` 删除 registry fallback（含 warn-once、per-call
+  `cudaMalloc`/`cudaMemcpy` 分支），仅保留 Tensor sidecar 解析；`Fp8ScaleRef{owned}` 生命周期
+  拆分不再需要，改回裸 `const float*`（sidecar 恒 Tensor-owned / stable / graph-visible）；
+- debug 基础设施（`fp8_scale_debug.h/cpp`）保留 `registry` 计数作为 **live canary**（恒 0，
+  再也不会变正），`Fp8ScaleSourceCounts.registry==0` 成为常真门禁；
+- `tensor.h` 注释同步：unset sidecar 是硬错误（无 silent host fallback）。
+
+实测：全量 `ctest` **41/41 通过**（含 `fp8-gemv-bench`、新增 `fp8-w8a8-e2e`）；
+`grep` 确认 `fp8_scale_registry` / `set_fp8_tensor_scale` 不再有任何 src/tests/benchmarks 引用。
 
 ### 6-D. NVFP4（Blackwell，压轴）
 

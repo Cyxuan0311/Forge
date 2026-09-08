@@ -1222,6 +1222,37 @@ void launch_cublas_gemm_fp16(const __half* A, const __half* B, __half* C, int M,
 #endif
 }
 
+// ---- Phase 6-B-4: native BF16 x BF16 -> BF16 GEMM ----
+// A / B / C are all __nv_bfloat16. Storage is BF16; accumulation runs in FP32
+// (CUBLAS_COMPUTE_32F) on Tensor Cores, then the result is rounded back to BF16
+// for storage. Line-by-line mirror of launch_cublas_gemm_fp16 above -- the only
+// difference is CUDA_R_16F -> CUDA_R_16BF. A BF16 weight that already lives as
+// Tensor::BF16 flows straight into cuBLAS with no FP32 detour.
+void launch_cublas_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
+                             int K, int N, bool transB, cudaStream_t stream) {
+#if FORGE_USE_CUBLAS
+    cublasHandle_t handle = get_cublas_handle(stream);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    cublasGemmEx(handle, opB, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16BF, transB ? K : N, A,
+                 CUDA_R_16BF, K, &beta, C, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F,
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#else
+    (void)A;
+    (void)B;
+    (void)C;
+    (void)M;
+    (void)K;
+    (void)N;
+    (void)transB;
+    (void)stream;
+#endif
+}
+
 // ---- Phase 3: quantized B [N,K] → FP16 + cuBLAS TensorCore GEMM ----
 // Dequantizes the whole weight matrix into a private grow-only scratch buffer
 // (the same pattern as the A-side buffer inside launch_cublas_gemm_fp16_fp32

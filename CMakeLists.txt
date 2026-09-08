@@ -180,6 +180,7 @@ endif()
 add_library(
   forge_core STATIC
   src/core/tensor.cpp
+  src/core/fp8_scale_debug.cpp # 6-C-5.0: FP8 scale debug/trace instrumentation
   src/core/host_mem_pool.cpp
   src/core/cuda_mem_pool.cpp
   src/core/backend.cpp

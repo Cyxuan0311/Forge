@@ -600,7 +600,10 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
 
     // Phase 6-A-5: native FP16 matmul. A and B both FP16 -> native cuBLAS
     // FP16 x FP16 -> FP16 GEMM (FP32 accumulate); output dtype follows the inputs
-    // so the chain stays FP16 end-to-end. BF16 still has no kernel (lands in 6-B).
+    // so the chain stays FP16 end-to-end.
+    // Phase 6-B-4: native BF16 matmul. A and B both BF16 -> native cuBLAS
+    // BF16 x BF16 -> BF16 GEMM (FP32 accumulate); MUL_MAT_TRANSB is retired
+    // from require_no_bf16. Mixed BF16 pairings fail loudly below.
     if (a->device() == DeviceType::CUDA && a->dtype() == DataType::FP16 &&
         b->dtype() == DataType::FP16) {
         if (bias) {
@@ -609,6 +612,26 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                                      "activation).");
         }
         auto out = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{M, N},
+                                            DeviceType::CUDA);
+#ifdef USE_CUDA
+        cuda_matmul_transB(a, b, out, M, K, N, stream);
+#endif
+        return out;
+    }
+    if (a->device() == DeviceType::CUDA &&
+        (a->dtype() == DataType::BF16 || b->dtype() == DataType::BF16)) {
+        if (a->dtype() != DataType::BF16 || b->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                std::string("matmul_transB (CUDA BF16): BF16 matmul needs all-BF16 A/B, got '") +
+                dtype_name(a->dtype()) + "' / '" + dtype_name(b->dtype()) +
+                "' (mixed dtypes fail loudly).");
+        }
+        if (bias) {
+            throw std::runtime_error("matmul_transB (CUDA BF16): bias is not supported in the "
+                                     "native BF16 path yet (6-B-4 scope: BF16 weight + BF16 "
+                                     "activation).");
+        }
+        auto out = std::make_shared<Tensor>(DataType::BF16, std::vector<int64_t>{M, N},
                                             DeviceType::CUDA);
 #ifdef USE_CUDA
         cuda_matmul_transB(a, b, out, M, K, N, stream);

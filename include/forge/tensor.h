@@ -6,6 +6,17 @@
 
 #include "types.h"
 
+// 6-C-5.2: Tensor owns a device-side mirror of its FP8 scale, so it needs
+// cudaStream_t in both CUDA and CPU-only builds. Same fallback pattern the rest of
+// the public headers use (op_dispatch.h / backend.h): an opaque forward declaration
+// of the CUDA stream type when we are not compiling against the CUDA runtime.
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#else
+struct CUstream_st;
+typedef CUstream_st* cudaStream_t;
+#endif
+
 namespace forge {
 
 class Backend;
@@ -86,6 +97,44 @@ public:
     // Whether this tensor owns the underlying storage.
     bool owns_storage() const { return owns_storage_; }
 
+    // 6-C-5: FP8 per-tensor scale sidecar. Lives on the Tensor (data layer), NOT in
+    // ComputeDTypePolicy, so it travels with the TensorPtr along ComputeGraph edges
+    // (a node's output Tensor is fed directly as the next node's resolved_input).
+    // 6-C-5.7: this sidecar is the ONLY source of an FP8 scale -- the legacy host
+    // scale registry (fp8_scale_registry.cpp) has been deleted, so an unset sidecar
+    // is a hard error for every FP8 consumer (no silent host fallback).
+    bool has_fp8_scale() const { return has_fp8_scale_; }
+    float fp8_scale() const { return fp8_scale_; }
+    void set_fp8_scale(float s) {
+        fp8_scale_ = s;
+        has_fp8_scale_ = true;
+        fp8_scale_dirty_ = true;  // device mirror must be re-uploaded
+    }
+
+    // 6-C-5.2: device-visible mirror of the scale. The returned pointer is STABLE
+    // for this Tensor's lifetime (allocated once, then reused) -- that is what makes
+    // it graph-visible: a captured graph keeps reading the same address, and calling
+    // set_fp8_scale() + this accessor re-uploads into that SAME address so a replay
+    // sees the new value without rebuilding the graphExec (6-C-4.1c proven pattern).
+    // Returns nullptr when no scale is set (or on CPU-only builds / OOM).
+    const float* fp8_scale_device(cudaStream_t stream = 0);
+    const float* fp8_scale_device_ptr() const { return fp8_scale_device_; }
+
+    // 6-C-5.1a: writable slot for DEVICE-COMPUTED scales (amax -> amax/240). Allocates
+    // the stable scalar once and returns it WITHOUT uploading the host value: a
+    // producer kernel writes the scale on device, so the pipeline needs no D2H/H2D
+    // round trip and stays capturable by CUDA Graphs. After this call the DEVICE value
+    // is authoritative (see fp8_scale_device_authoritative()) and fp8_scale_device()
+    // will not clobber it.
+    float* fp8_scale_device_slot(cudaStream_t stream = 0);
+    bool fp8_scale_device_authoritative() const { return fp8_scale_device_authoritative_; }
+
+    // 6-C-5.5c: explicit refresh of the HOST mirror for a DEVICE-computed scale
+    // (5.1a / 5.5a producers). Until this is called, fp8_scale() is not meaningful for a
+    // device-authoritative tensor. Deliberately opt-in and never used on the hot path:
+    // a D2H sync is illegal inside CUDA Graph capture.
+    bool sync_fp8_scale_from_device(cudaStream_t stream = 0);
+
     // Replace internal data pointer with externally-owned memory.
     // Returns the old data pointer (caller must free it via deallocate if owns_storage_ was true).
     // After this call, owns_storage_ is false (the external owner manages the memory).
@@ -99,6 +148,8 @@ private:
     void compute_strides();
     void allocate();
     void release();
+    // 6-C-5.2: free the lazily-allocated device mirror of the FP8 scale sidecar.
+    void free_fp8_scale_device();
 
     // ---- Old fields (backward compatible, kept for Phase 1 transition) ----
     void* data_ = nullptr;
@@ -118,6 +169,18 @@ private:
     // Keeps the backing tensor alive when this is a view/slice.
     // Without this, view() creates a dangling pointer when the owning tensor is freed.
     std::shared_ptr<Tensor> backing_;
+
+    // 6-C-5: FP8 per-tensor scale sidecar (see public accessors above). Defaults to
+    // unset so legacy behavior (no scale, or registry-lookup) is preserved.
+    float fp8_scale_ = 0.0f;
+    bool has_fp8_scale_ = false;
+    // 6-C-5.2: lazily-allocated device mirror + pending-upload flag. Owned by this
+    // Tensor (freed in the destructor, transferred by the move ops).
+    float* fp8_scale_device_ = nullptr;
+    bool fp8_scale_dirty_ = true;
+    // 6-C-5.1a: true once the device value is produced ON device (fp8_scale_device_slot)
+    // and the host mirror is therefore not authoritative.
+    bool fp8_scale_device_authoritative_ = false;
 };
 
 using TensorPtr = std::shared_ptr<Tensor>;

@@ -55,6 +55,7 @@ const DataTypeTraits data_type_traits[] = {
     /* 18 IQ2_XS   */ { "iq2_xs",   0, 256, 74,  true,  ops::dequantize_iq2_xs_row },
     /* 19 IQ3_S    */ { "iq3_s",    0, 256, 110, true,  ops::dequantize_iq3_s_row },
     /* 20 IQ4_XS   */ { "iq4_xs",   0, 256, 136, true,  ops::dequantize_iq4_xs_row },
+    /* 21 FP8_E4M3 */ { "fp8_e4m3", 1, 1,   0,   false, nullptr },
 };
 
 }  // namespace forge

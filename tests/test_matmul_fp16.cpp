@@ -284,6 +284,7 @@ int main() {
 
     std::printf("  6-A-5.2 ops::matmul_transB route (FP16 in -> FP16 out):\n");
     check_route(1, 4096, 4096, rng);
+    check_route(1, 256, 512, rng);  // 6-A-8 decode-graph dims (M=1, small K/N)
     check_route(8, 4096, 4096, rng);
     check_route(64, 4096, 4096, rng);
 

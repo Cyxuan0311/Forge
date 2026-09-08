@@ -9,6 +9,7 @@
 #ifdef USE_CUDA
 
 #    include <algorithm>
+#    include <atomic>
 #    include <cstdlib>
 #    include <cstring>
 #    include <functional>
@@ -25,6 +26,9 @@
 #    include "forge/operator_matmul.h"
 #    include "forge/quant_traits.h"
 #    include "matmul_dispatch.h"
+#    include "forge/fp8_gemm.h"
+#    include "forge/fp8_gemv.h"
+#    include "forge/fp8_scale_debug.h"
 
 namespace forge {
 namespace ops {
@@ -77,12 +81,83 @@ DeviceScratch dequant_b_on_device(DequantMatrixFn fn, const TensorPtr& b, int N,
     return scr;
 }
 
+// 6-C-4.1d: W8A8 FP8 E4M3 GEMM (CUTLASS, Ada). A is E4M3 row-major (M,K); B is
+// the transB weight [N,K] row-major, which is exactly CUTLASS column-major [K,N]
+// (ldb = K), so its pointer is passed through as-is.
+// 6-C-5.7: an FP8 consumer reads its per-tensor scale exclusively from the Tensor
+// sidecar (Tensor::fp8_scale_device) -- graph-visible, stable, Tensor-owned device
+// state that travels with the TensorPtr along ComputeGraph edges. The legacy host
+// scale registry (set_fp8_tensor_scale / fp8_scale_registry) is deleted; there is
+// no fallback. `ok` is false when the sidecar is unset.
+static const float* fp8_scale_device_of(const TensorPtr& t, bool* ok) {
+    if (t->has_fp8_scale()) {
+        const float* d = t->fp8_scale_device(/*stream=*/0);
+        fp8_scale_trace("fp8_consumer", t, /*used_registry_fallback=*/false);
+        if (d) {
+            *ok = true;
+            return d;  // stable, Tensor-owned, graph-visible device scalar
+        }
+    }
+    *ok = false;
+    return nullptr;
+}
+
+static void fp8_w8a8_matmul(const TensorPtr& a, const TensorPtr& b, float* o_data, int M,
+                            int K, int N) {
+    const uint8_t* a_fp8 = static_cast<const uint8_t*>(a->data());
+    const uint8_t* b_fp8 = static_cast<const uint8_t*>(b->data());
+    bool ok_a = false, ok_b = false;
+    const float* ra = fp8_scale_device_of(a, &ok_a);
+    const float* rb = fp8_scale_device_of(b, &ok_b);
+    if (!ok_a || !ok_b) {
+        throw std::runtime_error(
+            "fp8_w8a8_matmul: FP8 activation/weight scales missing (6-C-5: the scale "
+            "sidecar must be set on the FP8 Tensor, e.g. by the quantize producer).");
+    }
+
+    // 6-C-5.2: no per-call cudaMalloc/cudaMemcpy -- these are the Tensors' own,
+    // stable device scalars (graph-visible state).
+    cuda::Fp8W8A8Scales sc;
+    sc.scale_a = ra;
+    sc.scale_w = rb;
+    const bool ok = cuda::launch_fp8_gemm_e4m3_fp32(a_fp8, b_fp8, o_data, M, K, N, sc, 0);
+    if (!ok)
+        capability_failure("matmul_transB(fp8)", DataType::FP8_E4M3, M, K, N);
+}
+
+// 6-C-4.2/4.3/5.6: W8A8 FP8 E4M3 GEMV (M == 1 decode). A is E4M3 (length K); B is
+// the transB weight in Forge's native row-major [N,K] form (the same buffer the
+// CUTLASS FP8 GEMM reads). Scale plumbing reads the Tensor FP8 scale sidecar
+// (6-C-5); the legacy host registry is deleted (6-C-5.7).
+static void fp8_w8a8_gemv(const TensorPtr& a, const TensorPtr& b, float* o_row, int K, int N) {
+    const uint8_t* a_fp8 = static_cast<const uint8_t*>(a->data());
+    const uint8_t* b_fp8 = static_cast<const uint8_t*>(b->data());
+    bool ok_a = false, ok_b = false;
+    const float* ra = fp8_scale_device_of(a, &ok_a);
+    const float* rb = fp8_scale_device_of(b, &ok_b);
+    if (!ok_a || !ok_b) {
+        throw std::runtime_error(
+            "fp8_w8a8_gemv: FP8 activation/weight scales missing (6-C-5: the scale "
+            "sidecar must be set on the FP8 Tensor, e.g. by the quantize producer).");
+    }
+
+    // 6-C-5.2: no per-call cudaMalloc/cudaMemcpy; the GEMV forms s = s_a * s_w on
+    // device from these stable, Tensor-owned scalars (graph-visible state).
+    cuda::Fp8W8A8Scales sc;
+    sc.scale_a = ra;
+    sc.scale_w = rb;
+    const bool ok = cuda::launch_fp8_gemv_e4m3_fp32(a_fp8, b_fp8, o_row, K, N, sc, 0);
+    if (!ok)
+        capability_failure("matmul_transB(fp8/gemv)", DataType::FP8_E4M3, 1, K, N);
+}
+
 // M == 1 (decode) single-row dispatch. The unified selector picks the variant;
 // each case launches. A null lookup after a non-UNSUPPORTED variant cannot
 // normally happen (the selector checks the same tables) and is treated as a
 // capability failure for defence in depth.
-void gemv_dispatch_row(const float* a_data, const TensorPtr& b, float* o_row, int K, int N_cols,
+void gemv_dispatch_row(const TensorPtr& a, const TensorPtr& b, float* o_row, int K, int N_cols,
                        const char* op_name) {
+    const float* a_data = static_cast<const float*>(a->data());
     const DataType dt = b->dtype();
 
     KernelProblem problem;
@@ -125,6 +200,10 @@ void gemv_dispatch_row(const float* a_data, const TensorPtr& b, float* o_row, in
         // FP32: use cuBLAS for large N (output_proj), custom GEMV for small N.
         cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_row, 1, K,
                                   N_cols, true);
+        return;
+    case KernelVariant::MATMUL_FP8_E4M3_GEMV:
+        // 6-C-4.2/4.3: W8A8 FP8 E4M3 decode GEMV (M == 1). Hand-written, no CUTLASS.
+        fp8_w8a8_gemv(a, b, o_row, K, N_cols);
         return;
     case KernelVariant::UNSUPPORTED:
     default:
@@ -203,7 +282,8 @@ KernelVariant autotune_prefill(const KernelProblem& problem, const float* a_data
 }
 
 // M > 1 (prefill / speculative verification) dispatch.
-void matmul_multi_row(const float* a_data, const TensorPtr& b, float* o_data, int M, int K, int N) {
+void matmul_multi_row(const TensorPtr& a, const TensorPtr& b, float* o_data, int M, int K, int N) {
+    const float* a_data = static_cast<const float*>(a->data());
     const DataType dt = b->dtype();
 
     KernelProblem problem;
@@ -265,6 +345,11 @@ void matmul_multi_row(const float* a_data, const TensorPtr& b, float* o_data, in
         cuda::launch_cublas_sgemm(a_data, b_scratch.as_float(), o_data, M, K, N, true);
         return;
     }
+    case KernelVariant::MATMUL_FP8_E4M3:
+        // 6-C-4.1d: W8A8 FP8 E4M3 GEMM (CUTLASS, Ada). Only selected on sm_89+
+        // (the launcher returns false otherwise -> capability_failure below).
+        fp8_w8a8_matmul(a, b, o_data, M, K, N);
+        return;
     case KernelVariant::MATMUL_CUBLAS:
         cuda::launch_cublas_sgemm(a_data, static_cast<const float*>(b->data()), o_data, M, K, N,
                                   true);
@@ -333,8 +418,26 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
     // Phase 6-A-5: native FP16 storage -> FP16 storage GEMM (FP32 accumulate).
     // Triggered only when A and B are both FP16; the op allocates an FP16 out for
     // this branch. Everything else (FP32 / quantized) keeps the existing path, so
-    // Phase 5 is untouched. BF16 has no kernel yet (lands in 6-B) -- it passes this
-    // gate (op is "lowp-aware") but is rejected here loudly.
+    // Phase 5 is untouched.
+    // Phase 6-B-4: MUL_MAT_TRANSB is retired from require_no_bf16 -- BF16 A/B
+    // take the native BF16 GEMM below (FP32 accumulate, BF16 out). Mixed BF16
+    // pairings fall through to the float* path and are rejected loudly there
+    // (BF16 bytes must never reach a float reinterpret).
+    if (a->dtype() == DataType::BF16 || b->dtype() == DataType::BF16 ||
+        out->dtype() == DataType::BF16) {
+        if (a->dtype() != DataType::BF16 || b->dtype() != DataType::BF16 ||
+            out->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                std::string("cuda_matmul_transB: BF16 matmul needs all-BF16 A/B/out, got '") +
+                dtype_name(a->dtype()) + "' / '" + dtype_name(b->dtype()) + "' / '" +
+                dtype_name(out->dtype()) + "' (mixed dtypes fail loudly).");
+        }
+        cuda::launch_cublas_gemm_bf16(static_cast<const __nv_bfloat16*>(a->data()),
+                                      static_cast<const __nv_bfloat16*>(b->data()),
+                                      static_cast<__nv_bfloat16*>(out->data()), M, K, N,
+                                      /*transB=*/true, stream);
+        return;
+    }
     if (a->dtype() == DataType::FP16 && b->dtype() == DataType::FP16) {
         if (out->dtype() != DataType::FP16) {
             throw std::runtime_error(
@@ -347,13 +450,12 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
         return;
     }
 
-    const float* a_data = static_cast<const float*>(a->data());
     float* o_data = static_cast<float*>(out->data());
 
     if (M > 1)
-        matmul_multi_row(a_data, b, o_data, M, K, N);
+        matmul_multi_row(a, b, o_data, M, K, N);
     else
-        gemv_dispatch_row(a_data, b, o_data, K, N, "matmul_transB");
+        gemv_dispatch_row(a, b, o_data, K, N, "matmul_transB");
 }
 
 void cuda_matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const TensorPtr& b2,
@@ -363,18 +465,23 @@ void cuda_matmul_transB_dual(const TensorPtr& a, const TensorPtr& b1, const Tens
     require_dtype_supported("cuda_matmul_transB_dual/b1", OpType::MUL_MAT_TRANSB, b1->dtype());
     require_dtype_supported("cuda_matmul_transB_dual/b2", OpType::MUL_MAT_TRANSB, b2->dtype());
     require_dtype_supported("cuda_matmul_transB_dual/out", OpType::MUL_MAT_TRANSB, out->dtype());
+    // 6-B-1: BF16 passes the gate (lowp-aware) but has no kernel -- reject loudly
+    // before any float* cast below.
+    require_no_bf16("cuda_matmul_transB_dual/a", OpType::MUL_MAT_TRANSB, a->dtype());
+    require_no_bf16("cuda_matmul_transB_dual/b1", OpType::MUL_MAT_TRANSB, b1->dtype());
+    require_no_bf16("cuda_matmul_transB_dual/b2", OpType::MUL_MAT_TRANSB, b2->dtype());
+    require_no_bf16("cuda_matmul_transB_dual/out", OpType::MUL_MAT_TRANSB, out->dtype());
 
     (void)K;
     const int N = N1 + N2;
     float* o_data = static_cast<float*>(out->data());
-    const float* a_data = static_cast<const float*>(a->data());
 
     if (M == 1) {
         // Decode: write b1 into the first N1 columns and b2 into the last N2
         // columns of `out` directly. No intermediate tensor allocation and no
         // device-to-device interleave copies.
-        gemv_dispatch_row(a_data, b1, o_data, K, N1, "matmul_transB_dual");
-        gemv_dispatch_row(a_data, b2, o_data + N1, K, N2, "matmul_transB_dual");
+        gemv_dispatch_row(a, b1, o_data, K, N1, "matmul_transB_dual");
+        gemv_dispatch_row(a, b2, o_data + N1, K, N2, "matmul_transB_dual");
         return;
     }
 

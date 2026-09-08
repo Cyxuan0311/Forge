@@ -356,6 +356,7 @@ class TestEnumContracts:
             dt.IQ2_XS,
             dt.IQ3_S,
             dt.BF16,
+            dt.FP8_E4M3,
         ):
             assert v is not None
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include "forge/types.h"
@@ -35,6 +36,24 @@ void launch_rms_norm_fp16(const __half* x, const __half* weight, __half* out, in
 void launch_rms_norm_unweighted_fp16(const __half* x, __half* out, int rows, int cols, float eps,
                                      cudaStream_t stream = 0);
 
+// Phase 6-B-2: real native BF16 RMSNorm (weighted + unweighted: BF16
+// storage/arithmetic, FP32 reduction). Gated at the operator boundary by
+// forge/dtype_contract.h (RMS_NORM already whitelisted; require_no_bf16 no
+// longer applies to it -- retired op-by-op as native kernels land).
+void launch_rms_norm_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* out,
+                           int rows, int cols, float eps, cudaStream_t stream = 0);
+void launch_rms_norm_unweighted_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int rows, int cols,
+                                     float eps, cudaStream_t stream = 0);
+
+// Phase 6-C-2: real native FP8 E4M3 RMSNorm (weighted + unweighted: FP8
+// storage, FP32 reduction/math, FP8 output -- forge E4M3 codec via
+// forge/fp8_utils.h). Gated at the operator boundary by forge/dtype_contract.h
+// (RMS_NORM retired from the op_supports_fp8 ledger in 6-C-2).
+void launch_rms_norm_fp8(const uint8_t* x, const uint8_t* weight, uint8_t* out, int rows, int cols,
+                         float eps, cudaStream_t stream = 0);
+void launch_rms_norm_unweighted_fp8(const uint8_t* x, uint8_t* out, int rows, int cols, float eps,
+                                    cudaStream_t stream = 0);
+
 void launch_silu(const float* x, float* out, int n, cudaStream_t stream = 0);
 
 // Phase 6-A-3: real native FP16 SiLU (FP16 storage, FP32 sigmoid/exp compute,
@@ -57,8 +76,50 @@ void launch_silu_multiply_fp16(const __half* gate, const __half* up, __half* out
 void launch_gelu_multiply_fp16(const __half* gate, const __half* up, __half* out, int n,
                                cudaStream_t stream = 0);
 
+// Phase 6-B-3: real native BF16 activation family (BF16 storage, FP32
+// transcendental compute, BF16 output) -- mirrors the 6-A-3/6-A-4 policy.
+// SILU / GELU / GELU_TANH are retired from require_no_bf16; the gated variants
+// reuse the SILU / GELU gate (no new enum).
+void launch_silu_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int n, cudaStream_t stream = 0);
+void launch_gelu_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int n, cudaStream_t stream = 0);
+void launch_gelu_tanh_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int n,
+                           cudaStream_t stream = 0);
+void launch_silu_multiply_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                               __nv_bfloat16* out, int n, cudaStream_t stream = 0);
+void launch_gelu_multiply_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                               __nv_bfloat16* out, int n, cudaStream_t stream = 0);
+
+// Phase 6-C-3: native FP8 E4M3 activation family (FP8 storage, FP32
+// transcendental compute, FP8 output -- mirrors the 6-A-3/6-A-4/6-B-3 policy and
+// reuses the 6-C-2-perf vec16 hardware FP8 codec). SILU / GELU / GELU_TANH are
+// retired from the op_supports_fp8 ledger; the gated variants reuse the SILU /
+// GELU gate (no new enum). E4M3 E4M3FN storage via the hardware cvt codec.
+void launch_silu_fp8(const uint8_t* x, uint8_t* out, int n, cudaStream_t stream = 0);
+void launch_gelu_fp8(const uint8_t* x, uint8_t* out, int n, cudaStream_t stream = 0);
+void launch_gelu_tanh_fp8(const uint8_t* x, uint8_t* out, int n, cudaStream_t stream = 0);
+void launch_silu_multiply_fp8(const uint8_t* gate, const uint8_t* up, uint8_t* out, int n,
+                              cudaStream_t stream = 0);
+void launch_gelu_multiply_fp8(const uint8_t* gate, const uint8_t* up, uint8_t* out, int n,
+                              cudaStream_t stream = 0);
+
 void launch_gelu_multiply(const float* gate, const float* up, float* out, int n,
                           cudaStream_t stream = 0);
+
+// Phase 6-A-8.0: native FP16 elementwise ADD / MUL (FP16 storage, FP32 compute
+// per element, FP16 output) -- the residual-add and gate*up nodes of the 6-A-8
+// end-to-end FP16 loop. Gated by op_supports_lowp (ADD / MUL).
+void launch_add_fp16(const __half* a, const __half* b, __half* out, int n,
+                     cudaStream_t stream = 0);
+void launch_multiply_fp16(const __half* a, const __half* b, __half* out, int n,
+                          cudaStream_t stream = 0);
+
+// Phase 6-B-5: native BF16 elementwise ADD / MUL (BF16 storage, FP32 compute
+// per element, BF16 output). Gated by op_supports_lowp (ADD / MUL retire from
+// require_no_bf16 with this step).
+void launch_add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, int n,
+                     cudaStream_t stream = 0);
+void launch_multiply_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, int n,
+                           cudaStream_t stream = 0);
 
 void launch_embedding_fp32(const float* weight, const int32_t* indices, float* out, int num_indices,
                            int embed_dim, int vocab_size, bool transposed, cudaStream_t stream = 0);
@@ -257,13 +318,87 @@ void launch_flash_attention_gqa_decode_fp16(const __half* Q, const __half* K, co
                                             const __half* mask_row_or_null = nullptr,
                                             cudaStream_t stream = 0);
 
+// 6-B-6: native BF16-Q GQA decode (decode-first). Q is __nv_bfloat16, K/V stay
+// float (authoritative FP32 KV store), FP32 math, __nv_bfloat16 output.
+// HD 16/32/64/96/128; larger dims rejected host-side, never fallback.
+void launch_flash_attention_gqa_decode_bf16q(const __nv_bfloat16* Q, const float* K, const float* V,
+                                             __nv_bfloat16* O, int kv_len, int num_heads,
+                                             int num_kv_heads, int head_dim,
+                                             const float* mask_row_or_null = nullptr,
+                                             cudaStream_t stream = 0);
+
+// 6-B-6.7: all-BF16 GQA decode (BF16 KV extension; decode-only). Q/K/V all
+// __nv_bfloat16, FP32 math, __nv_bfloat16 output. Same scope/HD set.
+void launch_flash_attention_gqa_decode_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
+                                            const __nv_bfloat16* V, __nv_bfloat16* O, int kv_len,
+                                            int num_heads, int num_kv_heads, int head_dim,
+                                            const __nv_bfloat16* mask_row_or_null = nullptr,
+                                            cudaStream_t stream = 0);
+
+// 6-B-7.0: native BF16 vectorized GQA prefill (E2E unlock). All-BF16 QKV,
+// FP32 math, BF16 output. HD 16/32/64/96/128; no wmma.
+void launch_flash_attention_gqa_prefill_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
+                                             const __nv_bfloat16* V, __nv_bfloat16* O, int q_len,
+                                             int kv_len, int num_heads, int num_kv_heads,
+                                             int head_dim, const __nv_bfloat16* mask, bool causal,
+                                             cudaStream_t stream = 0);
+
 // 6-A-7.2: native FP16 vectorized GQA prefill (same dtype contract as decode).
 // HD 16/32/64/96/128; larger dims rejected host-side, never fallback.
+// Phase 2 round 5: this symbol is now the EXPLICIT vectorized baseline entry
+// (bench A/B arm + fallback). The production entry below routes hd=64 causal
+// no-mask prefill through the promoted wmma kernel (Br=64/Bc=16/4 warps).
 void launch_flash_attention_gqa_prefill_fp16(const __half* Q, const __half* K, const __half* V,
                                              __half* O, int q_len, int kv_len, int num_heads,
                                              int num_kv_heads, int head_dim,
                                              const __half* mask_or_null = nullptr,
                                              bool causal = true, cudaStream_t stream = 0);
+
+// Frozen 6-A-7.2 vectorized prefill, reachable explicitly. Test/bench A/B arm
+// vs the promoted wmma path, and the target of the production entry's
+// fallback for every scope outside (hd=64, causal, no mask).
+void launch_flash_attention_gqa_prefill_fp16_vectorized(const __half* Q, const __half* K,
+                                                        const __half* V, __half* O, int q_len,
+                                                        int kv_len, int num_heads,
+                                                        int num_kv_heads, int head_dim,
+                                                        const __half* mask_or_null = nullptr,
+                                                        bool causal = true,
+                                                        cudaStream_t stream = 0);
+
+// Phase 2 round 2: __half2 decode candidate (paired __half22float2 conversions
+// + hoisted V loads; same FP32 math contract and summation order as the 6-A-7
+// baseline; NOT bitwise vs baseline -- FMA contraction differs between the two
+// compilations, measured deviation <= 1 FP16 output ULP). Bench/test-only: NOT
+// wired into selector or dispatch; production stays on
+// launch_flash_attention_gqa_decode_fp16 until the candidate wins a measured A/B.
+void launch_flash_attention_gqa_decode_fp16_h2(const __half* Q, const __half* K, const __half* V,
+                                               __half* O, int kv_len, int num_heads,
+                                               int num_kv_heads, int head_dim,
+                                               const __half* mask_row_or_null = nullptr,
+                                               cudaStream_t stream = 0);
+
+// Phase 2 round 3: TensorCore (wmma) prefill candidate. f16 operands, f32
+// accumulator: QK^T products exact (f16*f16 exact in f32), accumulation f32;
+// PV's P operand stored f16 (documented contract amendment -- the one new
+// rounding vs the 6-A-7 vectorized baseline). HEAD_DIM=64 only, causal/no
+// mask only. Round-3 default shape (Br=32/Bc=32/2 warps); kept for the
+// round-3/4 measurement history.
+void launch_flash_attention_gqa_prefill_mma_fp16(const __half* Q, const __half* K,
+                                                 const __half* V, __half* O, int q_len,
+                                                 int kv_len, int num_heads, int num_kv_heads,
+                                                 int head_dim, bool causal,
+                                                 cudaStream_t stream = 0);
+
+// Phase 2 round 4: explicit-tile-config scan entry for the wmma prefill
+// candidate (same contract amendment as above). Scan set: br in {32,64} x
+// bc in {16,32,64} x warps in {2,4}, minus br=32 & warps=4 (wmma M=16: each
+// warp must own >= 16 query rows). Other combos fail loudly. The round-4
+// winner (64,16,4) is now wired into launch_flash_attention_gqa_prefill_fp16.
+void launch_flash_attention_gqa_prefill_mma_cfg(const __half* Q, const __half* K,
+                                                const __half* V, __half* O, int q_len,
+                                                int kv_len, int num_heads, int num_kv_heads,
+                                                int head_dim, bool causal, int br, int bc,
+                                                int warps, cudaStream_t stream = 0);
 
 void launch_quantize_q4_0(const float* data, void* q_data, int n, cudaStream_t stream = 0);
 
@@ -342,6 +477,14 @@ void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M
 // already lives as Tensor::FP16 flows into cuBLAS without an FP32 detour.
 void launch_cublas_gemm_fp16(const __half* A, const __half* B, __half* C, int M, int K, int N,
                              bool transB, cudaStream_t stream = 0);
+
+// Phase 6-B-4: native BF16 x BF16 -> BF16 GEMM (FP32 accumulate on Tensor
+// Cores). Storage BF16 in/out, FP32 reduction -- matches the 6-B-2..6-B-3
+// activation policy. Used by the native BF16 matmul route (MUL_MAT_TRANSB) so
+// a weight that already lives as Tensor::BF16 flows into cuBLAS without an
+// FP32 detour. MUL_MAT_TRANSB is retired from require_no_bf16.
+void launch_cublas_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
+                             int K, int N, bool transB, cudaStream_t stream = 0);
 
 // Phase 3/5 (Tensor Core): dequantize the whole quantized B [N, K] matrix to
 // FP16 and run the FP16 cuBLAS GEMM (FP32 accumulate) on Tensor Cores.

@@ -35,18 +35,51 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
 
     if (x->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
-        // Phase 6-A-1 contract gate. RMS_NORM is now in op_supports_lowp, so
+        // Phase 6-A-1 contract gate. RMS_NORM is in op_supports_lowp, so
         // FP16/BF16 pass here; the routing below picks a real kernel or fails
-        // loudly (BF16 / mixed dtypes have no kernel yet).
+        // loudly (mixed dtypes have no kernel; BF16 retired from require_no_bf16
+        // in 6-B-2 with a real __nv_bfloat16 kernel).
         require_dtype_supported("ops::rms_norm/x", OpType::RMS_NORM, dt);
         if (weight) {
             require_dtype_supported("ops::rms_norm/weight", OpType::RMS_NORM, wdt);
         }
 
         const bool fp16_path = (dt == DataType::FP16) && (!weight || wdt == DataType::FP16);
+        const bool bf16_path = (dt == DataType::BF16) && (!weight || wdt == DataType::BF16);
         const bool fp32_path = (dt == DataType::FP32) && (!weight || wdt == DataType::FP32);
+        // 6-C-2: native FP8 path requires BOTH x and weight in FP8_E4M3 -- mixed
+        // FP8/FP32 has no kernel and must land in the loud-throw below, never in
+        // a silent re-cast (weight would be read as uint8_t).
+        const bool fp8_path = (dt == DataType::FP8_E4M3) &&
+                              (!weight || wdt == DataType::FP8_E4M3);
 
-        if (fp16_path) {
+        if (fp8_path) {
+            // 6-C-2: native FP8 RMSNorm -- FP8 storage with an FP32 reduction
+            // (forge E4M3 codec; norm_compute stays FP32 while activation is FP8).
+            const uint8_t* xp = static_cast<const uint8_t*>(x->data());
+            uint8_t* op = static_cast<uint8_t*>(out->data());
+            if (weight) {
+                cuda::launch_rms_norm_fp8(
+                    xp, static_cast<const uint8_t*>(weight->data()), op, rows, cols, eps);
+            } else {
+                // Dedicated unweighted kernel (same host-pointer discipline as
+                // the FP16/BF16 paths: no host buffer may reach the device).
+                cuda::launch_rms_norm_unweighted_fp8(xp, op, rows, cols, eps);
+            }
+        } else if (bf16_path) {
+            // 6-B-2: native BF16 RMSNorm -- BF16 storage/arithmetic with an FP32
+            // reduction (norm_compute stays FP32 while activation is BF16).
+            const __nv_bfloat16* xp = static_cast<const __nv_bfloat16*>(x->data());
+            __nv_bfloat16* op = static_cast<__nv_bfloat16*>(out->data());
+            if (weight) {
+                cuda::launch_rms_norm_bf16(
+                    xp, static_cast<const __nv_bfloat16*>(weight->data()), op, rows, cols, eps);
+            } else {
+                // Dedicated unweighted kernel (same host-pointer discipline as
+                // the FP16 path: no host buffer may reach the device).
+                cuda::launch_rms_norm_unweighted_bf16(xp, op, rows, cols, eps);
+            }
+        } else if (fp16_path) {
             const __half* xp = static_cast<const __half*>(x->data());
             __half* op = static_cast<__half*>(out->data());
             if (weight) {
@@ -76,7 +109,8 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
                 std::string("ops::rms_norm: dtype '") + dtype_name(dt) + "' (weight '" +
                 dtype_name(wdt) + "') has no native kernel for op '" +
                 op_type_name(OpType::RMS_NORM) +
-                "'. Phase 6-A-2 implements the FP16 path only; BF16 arrives with 6-B.");
+                "'. Native paths exist for FP16 (6-A-2), BF16 (6-B-2) and FP8 E4M3 "
+                "(6-C-2, both inputs FP8 only); mixed dtypes fail loudly.");
         }
 #endif
     } else {

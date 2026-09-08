@@ -43,14 +43,17 @@ inline CudaScratchPool& scratch_pool() {
 
 #if FORGE_USE_CUBLAS
 // Lazily-initialized cublas handle (one per process).
+// 6-A-8: the handle's stream must be set on EVERY call, including stream==0.
+// The old `if (stream)` guard left the handle bound to the last non-default
+// stream -- after a CUDA Graph capture stream was destroyed, later decode
+// matmuls launched on a dead stream (segfault inside cuLaunchKernel), and any
+// interleaved multi-stream use ordered against the wrong stream.
 inline cublasHandle_t get_cublas_handle(cudaStream_t stream = 0) {
     static cublasHandle_t handle = nullptr;
     if (!handle) {
         cublasCreate(&handle);
     }
-    if (stream) {
-        cublasSetStream(handle, stream);
-    }
+    cublasSetStream(handle, stream);
     return handle;
 }
 #endif

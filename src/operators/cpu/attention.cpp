@@ -2,6 +2,7 @@
 #include <cstring>
 
 #include "forge/cuda_kernels.h"
+#include "forge/dtype_contract.h"
 #include "forge/operator_attention.h"
 #include "forge/perf_profiler.h"
 
@@ -20,6 +21,15 @@ namespace ops {
 
 TensorPtr scaled_dot_product_attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v,
                                        bool causal) {
+    // 6-B-1 (P1): CPU attention reads Q/K/V as float* below -- BF16 has no
+    // kernel, so reject loudly (FP16-on-CPU stays as-is: out of 6-B-1 scope).
+    require_no_bf16("scaled_dot_product_attention/q", OpType::FLASH_ATTN_GQA, q->dtype());
+    require_no_bf16("scaled_dot_product_attention/k", OpType::FLASH_ATTN_GQA, k->dtype());
+    require_no_bf16("scaled_dot_product_attention/v", OpType::FLASH_ATTN_GQA, v->dtype());
+    // 6-C-1: FP8 has no CPU attention kernel -- reject before the float* reads.
+    require_no_fp8("scaled_dot_product_attention/q", OpType::FLASH_ATTN_GQA, q->dtype());
+    require_no_fp8("scaled_dot_product_attention/k", OpType::FLASH_ATTN_GQA, k->dtype());
+    require_no_fp8("scaled_dot_product_attention/v", OpType::FLASH_ATTN_GQA, v->dtype());
     int seq_len = static_cast<int>(q->shape()[0]);
     int num_heads = static_cast<int>(q->shape()[1]);
     int head_dim = static_cast<int>(q->shape()[2]);
@@ -103,6 +113,22 @@ TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k
 TensorPtr scaled_dot_product_attention_2d(const TensorPtr& q, const TensorPtr& k,
                                           const TensorPtr& v, int q_len, int kv_len, int num_heads,
                                           int head_dim, const TensorPtr& mask, bool causal) {
+    // 6-B-1 (P1): reads Q/K/V (/mask) as float* below -- BF16 has no kernel.
+    require_no_bf16("scaled_dot_product_attention_2d/q", OpType::FLASH_ATTN_GQA, q->dtype());
+    require_no_bf16("scaled_dot_product_attention_2d/k", OpType::FLASH_ATTN_GQA, k->dtype());
+    require_no_bf16("scaled_dot_product_attention_2d/v", OpType::FLASH_ATTN_GQA, v->dtype());
+    if (mask) {
+        require_no_bf16("scaled_dot_product_attention_2d/mask", OpType::FLASH_ATTN_GQA,
+                        mask->dtype());
+    }
+    // 6-C-1: FP8 has no CPU attention kernel -- reject before the float* reads.
+    require_no_fp8("scaled_dot_product_attention_2d/q", OpType::FLASH_ATTN_GQA, q->dtype());
+    require_no_fp8("scaled_dot_product_attention_2d/k", OpType::FLASH_ATTN_GQA, k->dtype());
+    require_no_fp8("scaled_dot_product_attention_2d/v", OpType::FLASH_ATTN_GQA, v->dtype());
+    if (mask) {
+        require_no_fp8("scaled_dot_product_attention_2d/mask", OpType::FLASH_ATTN_GQA,
+                       mask->dtype());
+    }
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     auto out = std::make_shared<Tensor>(
@@ -312,6 +338,22 @@ TensorPtr scaled_dot_product_attention_2d_gqa(const TensorPtr& q, const TensorPt
                                               const TensorPtr& v, int q_len, int kv_len,
                                               int num_heads, int num_kv_heads, int head_dim,
                                               const TensorPtr& mask, bool causal) {
+    // 6-B-1 (P1): reads Q/K/V (/mask) as float* below -- BF16 has no kernel.
+    require_no_bf16("scaled_dot_product_attention_2d_gqa/q", OpType::FLASH_ATTN_GQA, q->dtype());
+    require_no_bf16("scaled_dot_product_attention_2d_gqa/k", OpType::FLASH_ATTN_GQA, k->dtype());
+    require_no_bf16("scaled_dot_product_attention_2d_gqa/v", OpType::FLASH_ATTN_GQA, v->dtype());
+    if (mask) {
+        require_no_bf16("scaled_dot_product_attention_2d_gqa/mask", OpType::FLASH_ATTN_GQA,
+                        mask->dtype());
+    }
+    // 6-C-1: FP8 has no CPU attention kernel -- reject before the float* reads.
+    require_no_fp8("scaled_dot_product_attention_2d_gqa/q", OpType::FLASH_ATTN_GQA, q->dtype());
+    require_no_fp8("scaled_dot_product_attention_2d_gqa/k", OpType::FLASH_ATTN_GQA, k->dtype());
+    require_no_fp8("scaled_dot_product_attention_2d_gqa/v", OpType::FLASH_ATTN_GQA, v->dtype());
+    if (mask) {
+        require_no_fp8("scaled_dot_product_attention_2d_gqa/mask", OpType::FLASH_ATTN_GQA,
+                       mask->dtype());
+    }
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     auto out = std::make_shared<Tensor>(

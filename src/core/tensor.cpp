@@ -36,13 +36,21 @@ Tensor::Tensor(Tensor&& other) noexcept
       owns_storage_(other.owns_storage_),
       storage_(other.storage_),
       layout_(other.layout_),
-      backing_(std::move(other.backing_)) {
+      backing_(std::move(other.backing_)),
+      // 6-C-5.2: take ownership of the device scale mirror (stable address).
+      fp8_scale_(other.fp8_scale_),
+      has_fp8_scale_(other.has_fp8_scale_),
+      fp8_scale_device_(other.fp8_scale_device_),
+      fp8_scale_dirty_(other.fp8_scale_dirty_),
+      fp8_scale_device_authoritative_(other.fp8_scale_device_authoritative_) {
     other.data_ = nullptr;
     other.numel_ = 0;
     other.nbytes_ = 0;
     other.owns_storage_ = false;
     other.storage_ = TensorStorage{};
     other.layout_ = TensorLayout{};
+    other.fp8_scale_device_ = nullptr;
+    other.has_fp8_scale_ = false;
 }
 
 Tensor& Tensor::operator=(Tensor&& other) noexcept {
@@ -59,18 +67,112 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
         storage_ = other.storage_;
         layout_ = other.layout_;
         backing_ = std::move(other.backing_);
+        // 6-C-5.2: free our own device mirror, then take over the source's.
+        free_fp8_scale_device();
+        fp8_scale_ = other.fp8_scale_;
+        has_fp8_scale_ = other.has_fp8_scale_;
+        fp8_scale_device_ = other.fp8_scale_device_;
+        fp8_scale_dirty_ = other.fp8_scale_dirty_;
+        fp8_scale_device_authoritative_ = other.fp8_scale_device_authoritative_;
         other.data_ = nullptr;
         other.numel_ = 0;
         other.nbytes_ = 0;
         other.owns_storage_ = false;
         other.storage_ = TensorStorage{};
         other.layout_ = TensorLayout{};
+        other.fp8_scale_device_ = nullptr;
+        other.has_fp8_scale_ = false;
     }
     return *this;
 }
 
 Tensor::~Tensor() {
     release();
+    free_fp8_scale_device();
+}
+
+// 6-C-5.2: release the lazily-allocated device mirror of the FP8 scale.
+void Tensor::free_fp8_scale_device() {
+#ifdef USE_CUDA
+    if (fp8_scale_device_) {
+        cudaFree(fp8_scale_device_);
+        fp8_scale_device_ = nullptr;
+    }
+#endif
+    fp8_scale_dirty_ = true;
+}
+
+// 6-C-5.2: stable device address for the FP8 scale. Allocated once on first use and
+// reused thereafter (NOT re-allocated per GEMM/GEMV call) so a captured CUDA graph
+// keeps reading the same address. Re-upload happens only when the host value changed
+// (set_fp8_scale / sidecar propagation), which is exactly the "graph-visible state"
+// mutation the 6-C-4.1c CUTLASS experiment proved works with a stable device scalar.
+const float* Tensor::fp8_scale_device(cudaStream_t stream) {
+#ifdef USE_CUDA
+    if (!has_fp8_scale_)
+        return nullptr;
+    if (!fp8_scale_device_) {
+        if (cudaMalloc(reinterpret_cast<void**>(&fp8_scale_device_), sizeof(float)) !=
+            cudaSuccess) {
+            fp8_scale_device_ = nullptr;
+            return nullptr;
+        }
+        fp8_scale_dirty_ = true;  // fresh allocation has no valid content
+    }
+    if (fp8_scale_dirty_) {
+        cudaMemcpyAsync(fp8_scale_device_, &fp8_scale_, sizeof(float), cudaMemcpyHostToDevice,
+                        stream);
+        fp8_scale_dirty_ = false;
+    }
+    return fp8_scale_device_;
+#else
+    (void)stream;
+    return nullptr;
+#endif
+}
+
+// 6-C-5.5c: pull the device-computed scale back into the host mirror so that
+// has_fp8_scale() / fp8_scale() / fp8_scale_device() agree. Opt-in: D2H is illegal
+// inside graph capture, so this is for inspection/tests outside a captured region.
+bool Tensor::sync_fp8_scale_from_device(cudaStream_t stream) {
+#ifdef USE_CUDA
+    if (!has_fp8_scale_ || !fp8_scale_device_) return false;
+    cudaStreamSynchronize(stream);
+    float v = 0.f;
+    if (cudaMemcpy(&v, fp8_scale_device_, sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
+    fp8_scale_ = v;
+    fp8_scale_dirty_ = false;  // host == device again
+    return true;
+#else
+    (void)stream;
+    return false;
+#endif
+}
+
+// 6-C-5.1a: writable, stable device slot for a scale computed ON device.
+// Deliberately does NOT upload the host value: the producer kernel owns the write, so
+// there is no D2H/H2D round trip and the whole producer stays capturable. Marks the
+// device value authoritative and clears the dirty flag so a later fp8_scale_device()
+// does not clobber what the kernel just wrote.
+float* Tensor::fp8_scale_device_slot(cudaStream_t stream) {
+#ifdef USE_CUDA
+    if (!fp8_scale_device_) {
+        if (cudaMalloc(reinterpret_cast<void**>(&fp8_scale_device_), sizeof(float)) !=
+            cudaSuccess) {
+            fp8_scale_device_ = nullptr;
+            return nullptr;
+        }
+    }
+    has_fp8_scale_ = true;  // a scale exists; its value lives on device
+    fp8_scale_device_authoritative_ = true;
+    fp8_scale_dirty_ = false;
+    (void)stream;
+    return fp8_scale_device_;
+#else
+    (void)stream;
+    return nullptr;
+#endif
 }
 
 void Tensor::compute_strides() {
@@ -179,6 +281,10 @@ void Tensor::copy_from(const Tensor& src) {
         cudaMemcpyAsync(data_, src.data_, nbytes_, cudaMemcpyDeviceToDevice);
 #endif
     }
+    // 6-C-5: the FP8 scale sidecar is graph-visible state and must travel with the data.
+    fp8_scale_ = src.fp8_scale_;
+    has_fp8_scale_ = src.has_fp8_scale_;
+    fp8_scale_dirty_ = true;  // 6-C-5.2: re-upload into the (stable) device mirror
 }
 
 void Tensor::to_device(DeviceType target) {
@@ -198,6 +304,14 @@ void Tensor::to_device(DeviceType target) {
     storage_ = new_tensor.storage_;
     layout_ = new_tensor.layout_;
     device_ = target;
+    // 6-C-5: the FP8 scale sidecar is graph-visible state and must survive device moves.
+    //
+    // 6-C-5.2: keep our OWN device mirror (release() above did not free it) so the
+    // device address stays stable across a host<->device migration; just mark it
+    // dirty so the next fp8_scale_device() re-uploads the (unchanged) host value.
+    fp8_scale_ = new_tensor.fp8_scale_;
+    has_fp8_scale_ = new_tensor.has_fp8_scale_;
+    fp8_scale_dirty_ = true;
 
     new_tensor.owns_storage_ = false;
     new_tensor.data_ = nullptr;
@@ -256,6 +370,10 @@ Tensor Tensor::view(const std::vector<int64_t>& new_shape) const {
     } catch (const std::bad_weak_ptr&) {
         // This tensor is not managed by a shared_ptr — backing_ stays null.
     }
+    // 6-C-5: a view carries the parent's FP8 scale sidecar (same logical tensor).
+    t.fp8_scale_ = fp8_scale_;
+    t.has_fp8_scale_ = has_fp8_scale_;
+    t.fp8_scale_dirty_ = true;
     return t;
 }
 
@@ -306,6 +424,10 @@ Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end) const {
     } catch (const std::bad_weak_ptr&) {
         // This tensor is not managed by a shared_ptr — backing_ stays null.
     }
+    // 6-C-5: a slice carries the parent's FP8 scale sidecar (same logical tensor).
+    t.fp8_scale_ = fp8_scale_;
+    t.has_fp8_scale_ = has_fp8_scale_;
+    t.fp8_scale_dirty_ = true;
     return t;
 }
 

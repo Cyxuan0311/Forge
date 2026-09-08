@@ -249,6 +249,78 @@ void check_fp32_consistency(int kv_len, int nh, int nkv, int hd, std::mt19937& g
     CHECK(max_abs < 1e-2f);
 }
 
+// Phase 2 round 2: __half2 decode candidate. Gates:
+//   1. stream A/B: candidate on legacy stream == candidate on capture stream,
+//      BITWISE (same binary);
+//   2. vs the 6-A-7 baseline: NOT bitwise. FMA-contraction decisions differ
+//      between the two compilations (baseline reads K/V straight from global;
+//      the candidate reads the hoisted v8[] register array), so products can
+//      be rounded differently (e.g. 2xFMUL+FADD vs FFMA). The honest gate is
+//      FP16-output equivalence: max_abs <= ~1 ULP (< 1e-3 for |out| <= 1);
+//   3. parity vs the CPU FP32 reference (same bound as the baseline decode).
+void check_decode_h2_candidate(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
+    std::vector<uint16_t> qc, kc, vc;
+    rand_fp16((int64_t)nh * hd, -1.0f, 1.0f, g, qc);
+    rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, kc);
+    rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, vc);
+    auto q = make_dev_fp16(qc, 1, nh * hd);
+    auto k = make_dev_fp16(kc, kv_len, nkv * hd);
+    auto v = make_dev_fp16(vc, kv_len, nkv * hd);
+    auto run = [&](TensorPtr& o, cudaStream_t st, bool candidate) {
+        const __half* qh = reinterpret_cast<const __half*>(q->data());
+        const __half* kh = reinterpret_cast<const __half*>(k->data());
+        const __half* vh = reinterpret_cast<const __half*>(v->data());
+        __half* oh = reinterpret_cast<__half*>(o->data());
+        if (candidate)
+            forge::cuda::launch_flash_attention_gqa_decode_fp16_h2(qh, kh, vh, oh, kv_len, nh,
+                                                                   nkv, hd, nullptr, st);
+        else
+            forge::cuda::launch_flash_attention_gqa_decode_fp16(qh, kh, vh, oh, kv_len, nh, nkv,
+                                                                hd, nullptr, st);
+    };
+    auto oA = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{1, nh * hd},
+                                       DeviceType::CUDA);
+    run(oA, 0, false);  // baseline
+    auto oC = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{1, nh * hd},
+                                       DeviceType::CUDA);
+    run(oC, 0, true);  // candidate, legacy stream
+    cudaStream_t cs = nullptr;
+    CHECK(cudaStreamCreate(&cs) == cudaSuccess);
+    auto oC2 = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{1, nh * hd},
+                                        DeviceType::CUDA);
+    run(oC2, cs, true);  // candidate, capture stream
+    cudaStreamSynchronize(cs);
+    cudaStreamDestroy(cs);
+
+    auto codesA = to_host_u16(oA);
+    auto codesC = to_host_u16(oC);
+    auto codesC2 = to_host_u16(oC2);
+    CHECK(codesC2 == codesC);  // candidate stream A/B, bitwise (same binary)
+
+    // Candidate vs baseline: <= ~1 FP16 output ULP (FMA-contraction noise).
+    auto got = to_host_f32(oC);
+    auto gotA = to_host_f32(oA);
+    float max_vs_base = 0.0f;
+    for (size_t i = 0; i < gotA.size(); ++i)
+        max_vs_base = std::max(max_vs_base, std::fabs(got[i] - gotA[i]));
+
+    // Parity vs CPU FP32 reference (same inputs, same bound as baseline).
+    std::vector<float> qf(qc.size()), kf(kc.size()), vf(vc.size());
+    for (size_t i = 0; i < qc.size(); ++i) qf[i] = f16_to_f32(qc[i]);
+    for (size_t i = 0; i < kc.size(); ++i) kf[i] = f16_to_f32(kc[i]);
+    for (size_t i = 0; i < vc.size(); ++i) vf[i] = f16_to_f32(vc[i]);
+    std::vector<float> ref(static_cast<size_t>(nh * hd));
+    ref_gqa_decode_fp32(qf.data(), kf.data(), vf.data(), ref.data(), kv_len, nh, nkv, hd);
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i)
+        max_abs = std::max(max_abs, std::fabs(got[i] - ref[i]));
+    std::printf("  decode-h2 kv=%d nh=%d nkv=%d hd=%d : max_abs=%.3e (vs baseline %.3e, "
+                "streamA==B: %d)\n",
+                kv_len, nh, nkv, hd, max_abs, max_vs_base, codesC2 == codesC ? 1 : 0);
+    CHECK(max_vs_base < 1e-3f);  // <= ~1 FP16 output ULP
+    CHECK(max_abs < 1e-2f);
+}
+
 // Selector unit test: pure function, q_dtype drives the F16 paths.
 void check_selector() {
     using forge::AttentionPath;
@@ -420,6 +492,228 @@ void check_prefill(int q_len, int kv_len, int nh, int nkv, int hd, std::mt19937&
     CHECK(max_abs < 1e-2f);
 }
 
+// Phase 2 round 3: TensorCore (wmma) prefill candidate. Gates:
+//   1. stream A/B: candidate legacy == candidate capture, BITWISE (same binary);
+//   2. vs the 6-A-7 vectorized baseline: NOT bitwise (P operand stored f16 --
+//      the documented contract amendment -- plus a different f32 accumulation
+//      tree); honest gate: max_abs < 5e-3;
+//   3. vs the CPU FP32 reference: same bound as the baseline prefill (1e-2).
+// hd=64 only (candidate scope); covers q/kv tails (non-multiples of 32) and
+// kv > q. Round 4 adds check_prefill_mma_cfg_scan: the same gates for every
+// scanned tile config via the explicit-config entry.
+void check_prefill_mma_candidate(int q_len, int kv_len, int nh, int nkv, std::mt19937& g) {
+    const int hd = 64;
+    std::vector<uint16_t> qc, kc, vc;
+    rand_fp16((int64_t)q_len * nh * hd, -1.0f, 1.0f, g, qc);
+    rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, kc);
+    rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, vc);
+    auto q = make_dev_fp16(qc, q_len, nh * hd);
+    auto k = make_dev_fp16(kc, kv_len, nkv * hd);
+    auto v = make_dev_fp16(vc, kv_len, nkv * hd);
+    auto run = [&](TensorPtr& o, cudaStream_t st, bool candidate) {
+        const __half* qh = reinterpret_cast<const __half*>(q->data());
+        const __half* kh = reinterpret_cast<const __half*>(k->data());
+        const __half* vh = reinterpret_cast<const __half*>(v->data());
+        __half* oh = reinterpret_cast<__half*>(o->data());
+        if (candidate)
+            forge::cuda::launch_flash_attention_gqa_prefill_mma_fp16(qh, kh, vh, oh, q_len, kv_len,
+                                                                     nh, nkv, hd, true, st);
+        else  // frozen 6-A-7.2 baseline arm -- explicit vectorized entry
+            forge::cuda::launch_flash_attention_gqa_prefill_fp16_vectorized(
+                qh, kh, vh, oh, q_len, kv_len, nh, nkv, hd, nullptr, true, st);
+    };
+    auto oA = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{q_len, nh * hd},
+                                       DeviceType::CUDA);
+    run(oA, 0, false);  // baseline
+    auto oC = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{q_len, nh * hd},
+                                       DeviceType::CUDA);
+    run(oC, 0, true);  // candidate, legacy stream
+    cudaStream_t cs = nullptr;
+    CHECK(cudaStreamCreate(&cs) == cudaSuccess);
+    auto oC2 = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{q_len, nh * hd},
+                                        DeviceType::CUDA);
+    run(oC2, cs, true);  // candidate, capture stream
+    cudaStreamSynchronize(cs);
+    cudaStreamDestroy(cs);
+
+    auto codesC = to_host_u16(oC);
+    auto codesC2 = to_host_u16(oC2);
+    CHECK(codesC2 == codesC);  // candidate stream A/B, bitwise
+
+    // vs CPU FP32 reference
+    std::vector<float> qf(qc.size()), kf(kc.size()), vf(vc.size());
+    for (size_t i = 0; i < qc.size(); ++i) qf[i] = f16_to_f32(qc[i]);
+    for (size_t i = 0; i < kc.size(); ++i) kf[i] = f16_to_f32(kc[i]);
+    for (size_t i = 0; i < vc.size(); ++i) vf[i] = f16_to_f32(vc[i]);
+    std::vector<float> ref((size_t)q_len * nh * hd);
+    ref_gqa_prefill_fp32(qf.data(), kf.data(), vf.data(), ref.data(), q_len, kv_len, nh, nkv, hd,
+                         true);
+
+    auto got = to_host_f32(oC);
+    auto gotA = to_host_f32(oA);
+    float max_abs = 0.0f, max_vs_base = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        max_abs = std::max(max_abs, std::fabs(got[i] - ref[i]));
+        max_vs_base = std::max(max_vs_base, std::fabs(got[i] - gotA[i]));
+    }
+    std::printf("  prefill-mma q=%d kv=%d nh=%d nkv=%d hd=%d : max_abs=%.3e (vs baseline %.3e, "
+                "streamA==B: %d)\n",
+                q_len, kv_len, nh, nkv, hd, max_abs, max_vs_base, codesC2 == codesC ? 1 : 0);
+    CHECK(max_vs_base < 5e-3f);
+    CHECK(max_abs < 1e-2f);
+}
+
+// Phase 2 round 4: run the round-3 gates for every scanned tile config and
+// report one aggregated line per config (worst-case errors over the shapes).
+void check_prefill_mma_cfg_scan(std::mt19937& g) {
+    struct Cfg {
+        int br, bc, warps;
+    };
+    const Cfg cfgs[] = {{32, 16, 2}, {32, 32, 2}, {32, 64, 2}, {64, 16, 2}, {64, 32, 2},
+                        {64, 64, 2}, {64, 16, 4}, {64, 32, 4}, {64, 64, 4}};
+    struct Shape {
+        int q, kv;
+    };
+    const Shape shapes[] = {{16, 64}, {64, 64}, {48, 80}, {64, 128}};
+    for (const auto& c : cfgs) {
+        float worst_ref = 0.0f, worst_base = 0.0f;
+        int ab_ok = 1;
+        for (const auto& s : shapes) {
+            const int q_len = s.q, kv_len = s.kv, nh = 8, nkv = 2, hd = 64;
+            std::vector<uint16_t> qc, kc, vc;
+            rand_fp16((int64_t)q_len * nh * hd, -1.0f, 1.0f, g, qc);
+            rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, kc);
+            rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, vc);
+            auto q = make_dev_fp16(qc, q_len, nh * hd);
+            auto k = make_dev_fp16(kc, kv_len, nkv * hd);
+            auto v = make_dev_fp16(vc, kv_len, nkv * hd);
+            auto launch = [&](TensorPtr& o, cudaStream_t st, bool candidate) {
+                const __half* qh = reinterpret_cast<const __half*>(q->data());
+                const __half* kh = reinterpret_cast<const __half*>(k->data());
+                const __half* vh = reinterpret_cast<const __half*>(v->data());
+                __half* oh = reinterpret_cast<__half*>(o->data());
+                if (candidate)
+                    forge::cuda::launch_flash_attention_gqa_prefill_mma_cfg(qh, kh, vh, oh, q_len,
+                                                                            kv_len, nh, nkv, hd,
+                                                                            true, c.br, c.bc,
+                                                                            c.warps, st);
+                else  // frozen 6-A-7.2 baseline arm -- explicit vectorized entry
+                    forge::cuda::launch_flash_attention_gqa_prefill_fp16_vectorized(
+                        qh, kh, vh, oh, q_len, kv_len, nh, nkv, hd, nullptr, true, st);
+            };
+            auto oA = std::make_shared<Tensor>(DataType::FP16,
+                                               std::vector<int64_t>{q_len, nh * hd},
+                                               DeviceType::CUDA);
+            launch(oA, 0, false);
+            auto oC = std::make_shared<Tensor>(DataType::FP16,
+                                               std::vector<int64_t>{q_len, nh * hd},
+                                               DeviceType::CUDA);
+            launch(oC, 0, true);
+            cudaStream_t cs = nullptr;
+            CHECK(cudaStreamCreate(&cs) == cudaSuccess);
+            auto oC2 = std::make_shared<Tensor>(DataType::FP16,
+                                                std::vector<int64_t>{q_len, nh * hd},
+                                                DeviceType::CUDA);
+            launch(oC2, cs, true);
+            cudaStreamSynchronize(cs);
+            cudaStreamDestroy(cs);
+            if (!(to_host_u16(oC2) == to_host_u16(oC))) ab_ok = 0;
+
+            std::vector<float> qf(qc.size()), kf(kc.size()), vf(vc.size());
+            for (size_t i = 0; i < qc.size(); ++i) qf[i] = f16_to_f32(qc[i]);
+            for (size_t i = 0; i < kc.size(); ++i) kf[i] = f16_to_f32(kc[i]);
+            for (size_t i = 0; i < vc.size(); ++i) vf[i] = f16_to_f32(vc[i]);
+            std::vector<float> ref((size_t)q_len * nh * hd);
+            ref_gqa_prefill_fp32(qf.data(), kf.data(), vf.data(), ref.data(), q_len, kv_len, nh,
+                                 nkv, hd, true);
+            auto got = to_host_f32(oC);
+            auto gotA = to_host_f32(oA);
+            for (size_t i = 0; i < ref.size(); ++i) {
+                worst_ref = std::max(worst_ref, std::fabs(got[i] - ref[i]));
+                worst_base = std::max(worst_base, std::fabs(got[i] - gotA[i]));
+            }
+        }
+        std::printf("  mma-cfg Br=%d Bc=%d w=%d : worst vs ref %.3e, worst vs baseline %.3e, "
+                    "streamA==B: %d\n",
+                    c.br, c.bc, c.warps, worst_ref, worst_base, ab_ok);
+        CHECK(ab_ok == 1);
+        CHECK(worst_base < 5e-3f);
+        CHECK(worst_ref < 1e-2f);
+    }
+}
+
+// Phase 2 round 5 (production wiring): the production prefill entry routes
+// hd=64 causal no-mask through the promoted wmma kernel (must be BITWISE
+// identical to the explicit cfg entry with the round-4 winner (64,16,4)),
+// and every other scope (hd=128, non-causal, masked) to the frozen 6-A-7.2
+// vectorized kernel (bitwise identical to the explicit vectorized entry).
+void check_prefill_production_routing(std::mt19937& g) {
+    struct Shape {
+        int q, kv;
+    };
+    const Shape shapes[] = {{16, 64}, {48, 80}, {64, 128}};
+    for (const auto& s : shapes) {
+        const int q_len = s.q, kv_len = s.kv, nh = 8, nkv = 2;
+        std::vector<uint16_t> qc, kc, vc;
+        rand_fp16((int64_t)q_len * nh * 64, -1.0f, 1.0f, g, qc);
+        rand_fp16((int64_t)kv_len * nkv * 64, -1.0f, 1.0f, g, kc);
+        rand_fp16((int64_t)kv_len * nkv * 64, -1.0f, 1.0f, g, vc);
+        auto q = make_dev_fp16(qc, q_len, nh * 64);
+        auto k = make_dev_fp16(kc, kv_len, nkv * 64);
+        auto v = make_dev_fp16(vc, kv_len, nkv * 64);
+        auto o_prod = std::make_shared<Tensor>(DataType::FP16,
+                                               std::vector<int64_t>{q_len, nh * 64},
+                                               DeviceType::CUDA);
+        auto o_ref = std::make_shared<Tensor>(DataType::FP16,
+                                              std::vector<int64_t>{q_len, nh * 64},
+                                              DeviceType::CUDA);
+        const __half* qh = reinterpret_cast<const __half*>(q->data());
+        const __half* kh = reinterpret_cast<const __half*>(k->data());
+        const __half* vh = reinterpret_cast<const __half*>(v->data());
+        // production entry (hd=64, causal, no mask) -> wmma (64,16,4)
+        forge::cuda::launch_flash_attention_gqa_prefill_fp16(
+            qh, kh, vh, reinterpret_cast<__half*>(o_prod->data()), q_len, kv_len, nh, nkv, 64,
+            nullptr, true, 0);
+        // explicit cfg entry, round-4 winner
+        forge::cuda::launch_flash_attention_gqa_prefill_mma_cfg(
+            qh, kh, vh, reinterpret_cast<__half*>(o_ref->data()), q_len, kv_len, nh, nkv, 64, true,
+            64, 16, 4, 0);
+        cudaDeviceSynchronize();
+        CHECK(to_host_u16(o_prod) == to_host_u16(o_ref));
+    }
+    std::printf("  production routing: hd=64 causal no-mask == wmma(64,16,4) bitwise\n");
+
+    // hd=128 must fall back to the vectorized kernel (bitwise).
+    {
+        const int q_len = 16, kv_len = 64, nh = 8, nkv = 2, hd = 128;
+        std::vector<uint16_t> qc, kc, vc;
+        rand_fp16((int64_t)q_len * nh * hd, -1.0f, 1.0f, g, qc);
+        rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, kc);
+        rand_fp16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, vc);
+        auto q = make_dev_fp16(qc, q_len, nh * hd);
+        auto k = make_dev_fp16(kc, kv_len, nkv * hd);
+        auto v = make_dev_fp16(vc, kv_len, nkv * hd);
+        auto o_prod = std::make_shared<Tensor>(DataType::FP16,
+                                               std::vector<int64_t>{q_len, nh * hd},
+                                               DeviceType::CUDA);
+        auto o_ref = std::make_shared<Tensor>(DataType::FP16,
+                                              std::vector<int64_t>{q_len, nh * hd},
+                                              DeviceType::CUDA);
+        const __half* qh = reinterpret_cast<const __half*>(q->data());
+        const __half* kh = reinterpret_cast<const __half*>(k->data());
+        const __half* vh = reinterpret_cast<const __half*>(v->data());
+        forge::cuda::launch_flash_attention_gqa_prefill_fp16(
+            qh, kh, vh, reinterpret_cast<__half*>(o_prod->data()), q_len, kv_len, nh, nkv, hd,
+            nullptr, true, 0);
+        forge::cuda::launch_flash_attention_gqa_prefill_fp16_vectorized(
+            qh, kh, vh, reinterpret_cast<__half*>(o_ref->data()), q_len, kv_len, nh, nkv, hd,
+            nullptr, true, 0);
+        cudaDeviceSynchronize();
+        CHECK(to_host_u16(o_prod) == to_host_u16(o_ref));
+    }
+    std::printf("  production routing: hd=128 falls back to vectorized, bitwise\n");
+}
+
 // Graph integration for prefill (incl. capture/replay, bitwise).
 void check_graph_node_prefill(int q_len, int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
     std::vector<uint16_t> qc, kc, vc;
@@ -513,6 +807,31 @@ int main() {
     check_fp32_consistency(128, 8, 2, 64, rng);
     check_graph_node(128, 8, 2, 64, rng);
     check_unsupported_hd();
+
+    // Phase 2 round 2: __half2 decode candidate gates (bitwise==baseline +
+    // FP32-ref parity) across template coverage and both workload regimes.
+    std::printf("[Phase 2 round 2] __half2 decode candidate vs 6-A-7 baseline\n");
+    for (int hd : {16, 32, 64, 128}) {
+        check_decode_h2_candidate(512, 8, 2, hd, rng);
+    }
+    check_decode_h2_candidate(128, 8, 2, 64, rng);
+    check_decode_h2_candidate(2048, 8, 2, 64, rng);
+
+    // Phase 2 round 3: wmma prefill candidate gates (incl. q/kv tails, kv>q).
+    std::printf("[Phase 2 round 3] TensorCore prefill candidate vs 6-A-7 baseline\n");
+    check_prefill_mma_candidate(16, 64, 8, 2, rng);
+    check_prefill_mma_candidate(64, 64, 8, 2, rng);
+    check_prefill_mma_candidate(48, 80, 8, 2, rng);
+    check_prefill_mma_candidate(64, 128, 8, 2, rng);
+
+    // Phase 2 round 4: tile-config scan -- round-3 gates for every config.
+    std::printf("[Phase 2 round 4] wmma prefill config scan (Br/Bc/warps, same gates)\n");
+    check_prefill_mma_cfg_scan(rng);
+
+    // Phase 2 round 5: production wiring -- routing + graph through the new
+    // production entry.
+    std::printf("[Phase 2 round 5] wmma prefill promoted into production entry\n");
+    check_prefill_production_routing(rng);
 
     check_prefill(16, 64, 8, 2, 64, rng);
     check_prefill(16, 64, 8, 2, 128, rng);

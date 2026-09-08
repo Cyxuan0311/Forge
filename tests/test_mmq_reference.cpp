@@ -328,16 +328,7 @@ bool run_case(const DtypeSpec& spec, int M, int K, int N, std::mt19937& rng,
         char buf[160];
         std::snprintf(buf, sizeof buf, "rel err %.3e > tol %.0e", *worst_rel, kRelTol);
         *err = buf;
-        if (std::getenv("FORGE_MMQ_DEBUG")) {
-            const size_t wm = worst_idx / N, wn = worst_idx % N;
-            std::printf("       dbg M=%d K=%d N=%d: worst (m=%zu n=%zu) gold=%.4f got=%.4f",
-                        M, K, N, wm, wn, gold[worst_idx], out[worst_idx]);
-            for (int probe = 0; probe < 6; ++probe) {
-                const size_t idx = (wm * N + (wn + probe * 7) % N);
-                std::printf(" | [%.3f=%.3f]", gold[idx], out[idx]);
-            }
-            std::printf("\n");
-        }
+
         return false;
     }
     if (!*deterministic) {

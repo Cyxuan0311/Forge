@@ -191,6 +191,30 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-rms-norm-fp16-test)
   add_test(NAME rms-norm-fp16 COMMAND forge-rms-norm-fp16-test)
 
+  # Phase 6-B-2: native BF16 RMSNorm correctness (FP32 reference parity) +
+  # micro-bench (BF16 vs FP32 + FP16 byte-parity sanity, two workload
+  # regimes) + single-node graph smoke. Skips gracefully when no GPU present.
+  add_executable(forge-rms-norm-bf16-test test_rms_norm_bf16.cpp)
+  forge_link_native(forge-rms-norm-bf16-test)
+  add_test(NAME rms-norm-bf16 COMMAND forge-rms-norm-bf16-test)
+
+  # Phase 6-C-2: native FP8 E4M3 RMSNorm correctness (decoded-input FP32
+  # reference, cosine primary gate) + 2-hop chain validation + stream A/B
+  # determinism + graph smoke + micro-bench (FP8 vs BF16 vs FP32). Skips
+  # gracefully when no GPU present.
+  add_executable(forge-rms-norm-fp8-test test_rms_norm_fp8.cpp)
+  forge_link_native(forge-rms-norm-fp8-test)
+  add_test(NAME rms-norm-fp8 COMMAND forge-rms-norm-fp8-test)
+
+  # Phase 6-C-3: native FP8 E4M3 activation family (silu / gelu / gelu_tanh +
+  # gated silu_multiply / gelu_multiply) correctness (FP32 reference parity,
+  # cosine primary gate) + micro-bench (FP8 vs FP32 + FP16 byte-parity sanity,
+  # two workload regimes) + single-node FP8 SILU graph smoke + mixed-dtype loud
+  # reject. Skips gracefully when no GPU present.
+  add_executable(forge-activation-fp8-test test_activation_fp8.cpp)
+  forge_link_native(forge-activation-fp8-test)
+  add_test(NAME activation-fp8 COMMAND forge-activation-fp8-test)
+
   # Phase 6-A-3: native FP16 SiLU correctness (FP32 reference parity) +
   # micro-bench (FP16 vs FP32 kernel, two workload regimes). Skips gracefully
   # when no GPU present.
@@ -205,6 +229,13 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-activation-fp16-test)
   add_test(NAME activation-fp16 COMMAND forge-activation-fp16-test)
 
+  # Phase 6-B-3: native BF16 activation family correctness (FP32 reference
+  # parity) + micro-bench (BF16 vs FP32 + FP16 byte-parity sanity, two workload
+  # regimes) + single-node SILU graph smoke. Skips gracefully w/o GPU.
+  add_executable(forge-activation-bf16-test test_activation_bf16.cpp)
+  forge_link_native(forge-activation-bf16-test)
+  add_test(NAME activation-bf16 COMMAND forge-activation-bf16-test)
+
   # Phase 6-A-5: native FP16 Matmul (6-A-5.1 direct launch + 6-A-5.2 ops route +
   # 6-A-5.3 real FP16 compute chain RMSNorm->Matmul->SiLU). FP16 storage in/out,
   # FP32 accumulate; checks the no-implicit-FP32 dtype invariant end-to-end.
@@ -216,6 +247,19 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-matmul-fp16-chain-test)
   add_test(NAME matmul-fp16-chain COMMAND forge-matmul-fp16-chain-test)
 
+  # Phase 6-B-4.1/4.2/4.4: native BF16 matmul (CUDA_R_16BF, FP32 accumulate).
+  # Direct launch + ops::matmul_transB route (BF16 in -> BF16 out, mixed loud)
+  # + M-sweep bench (best-of-3 alternating arms). Skips gracefully w/o GPU.
+  add_executable(forge-matmul-bf16-test test_matmul_bf16.cpp)
+  forge_link_native(forge-matmul-bf16-test)
+  add_test(NAME matmul-bf16 COMMAND forge-matmul-bf16-test)
+
+  # Phase 6-B-4.3: native BF16 chain (RMSNorm -> Matmul -> silu_multiply).
+  # Dtype invariant (all BF16) + FP32 reference parity. Skips gracefully w/o GPU.
+  add_executable(forge-matmul-bf16-chain-test test_matmul_bf16_chain.cpp)
+  forge_link_native(forge-matmul-bf16-chain-test)
+  add_test(NAME matmul-bf16-chain COMMAND forge-matmul-bf16-chain-test)
+
   # Phase 6-A-6: native FP16 Graph / Binding integration. Runs the SAME operator
   # chain (RMSNorm -> Matmul -> SiLU) through ComputeGraph instead of standalone
   # calls: graph builder / planner / dst injection must not promote FP16 to FP32
@@ -225,6 +269,13 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-graph-fp16-test)
   add_test(NAME graph-fp16 COMMAND forge-graph-fp16-test)
 
+  # Phase 6-B-5: native BF16 graph integration (RMSNorm -> Matmul -> SiLU ->
+  # Add -> Mul). Dtype propagation + planner sizing + dst injection + dtype
+  # trace + CUDA Graph capture/replay, all BF16. Skips gracefully w/o GPU.
+  add_executable(forge-graph-bf16-test test_graph_bf16.cpp)
+  forge_link_native(forge-graph-bf16-test)
+  add_test(NAME graph-bf16 COMMAND forge-graph-bf16-test)
+
   # Phase 6-A-7.1: native FP16 attention decode (FP16 QKV storage, FP32 QK^T /
   # online-softmax / PV, FP16 out). Direct-launch parity vs CPU FP32 ref +
   # FP32-kernel self-consistency, dtype hard asserts, ordinary-vs-capture
@@ -233,6 +284,35 @@ if(CUDAToolkit_FOUND)
   add_executable(forge-attn-fp16-test test_attention_fp16.cpp)
   forge_link_native(forge-attn-fp16-test)
   add_test(NAME attn-fp16 COMMAND forge-attn-fp16-test)
+
+  # Phase 6-B-6: native BF16-Q decode (BF16 Q + FP32 KV, FP32 math, BF16 out).
+  # Correctness + stream A/B + selector/loud surface + graph node + kv-sweep
+  # bench. Skips gracefully w/o GPU.
+  add_executable(forge-attn-bf16-test test_attention_bf16.cpp)
+  forge_link_native(forge-attn-bf16-test)
+  add_test(NAME attn-bf16 COMMAND forge-attn-bf16-test)
+
+  # Phase 6-A-8: end-to-end native FP16 validation. Minimal 2-layer llama-style
+  # closed loop (RMSNorm -> QKV -> FP16 attention -> o_proj -> residual ->
+  # RMSNorm -> gate/up -> SiLU -> gate*up -> residual -> next layer -> final
+  # norm -> logits), all-FP16 storage through the real ComputeGraph machinery.
+  # Gates: (1) dtype trace -- no implicit FP16->FP32->FP16 on the main chain,
+  # (2) FP16 vs FP32 logits parity (max_abs/max_rel/cosine/top-k, fixed
+  # thresholds), (3) CUDA Graph ordinary -> capture -> replay x N bitwise
+  # stable on the whole graph. Prefill and decode dispatch modes both covered.
+  # 8.0 section chain-validates the new native FP16 ADD / MUL kernels.
+  # Skips gracefully when no GPU present.
+  add_executable(forge-e2e-fp16-test test_e2e_fp16.cpp)
+  forge_link_native(forge-e2e-fp16-test)
+  add_test(NAME e2e-fp16 COMMAND forge-e2e-fp16-test)
+
+  # Phase 6-B-7: end-to-end BF16 validation. 2-layer closed loop (RMSNorm ->
+  # QKV proj -> BF16 attention + BF16 KV -> residual -> gated FFN -> logits),
+  # prefill + decode; decode consumes KV produced by the real prefill write
+  # path. Skips gracefully w/o GPU.
+  add_executable(forge-e2e-bf16-test test_e2e_bf16.cpp)
+  forge_link_native(forge-e2e-bf16-test)
+  add_test(NAME e2e-bf16 COMMAND forge-e2e-bf16-test)
 
   # Q8_0 quantize/dequantize round-trip + per-block scale validation.
   add_executable(forge-q8-roundtrip-test test_q8_roundtrip.cu)
@@ -267,6 +347,31 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-attn-fp8-prefill-test)
   add_test(NAME attn-fp8-prefill COMMAND forge-attn-fp8-prefill-test)
 
+  # Phase 6-C-4.1d: W8A8 FP8 E4M3 GEMM production backend (CUTLASS). Parity vs
+  # FP32 reference + FP8-output ULP + KernelSelector wiring. Skips gracefully when
+  # no Ada GPU is present (launchers return false pre-sm_89).
+  add_executable(forge-fp8-gemm-test test_fp8_gemm_cuda.cu)
+  forge_link_native(forge-fp8-gemm-test)
+  add_test(NAME fp8-gemm COMMAND forge-fp8-gemm-test)
+
+  # Phase 6-C-4.2: M==1 FP8 E4M3 GEMV — standalone benchmark + correctness audit.
+  # Hand-written kernel (independent of the 6-C-4.1 CUTLASS GEMM path). Correctness
+  # (golden = decode(A)xdecode(W)), scale fusion equivalence, FP8 vs FP16/FP32
+  # latency/bandwidth at decode model shapes. No KernelSelector wiring yet. Skips
+  # gracefully when no Ada GPU is present.
+  add_executable(forge-fp8-gemv-bench test_fp8_gemv_cuda.cu)
+  forge_link_native(forge-fp8-gemv-bench)
+  add_test(NAME fp8-gemv-bench COMMAND forge-fp8-gemv-bench)
+
+  # Phase 6-C-5.6: minimal deterministic W8A8 FP8 E2E chain (producer -> FP8
+  # GEMM/GEMV -> FP32) driven through the ops boundary. Gates: FP32-out parity vs
+  # decode golden, bitwise determinism, scale source counters (registry == 0,
+  # sidecar > 0), device-authoritative sidecars, fused-ReLU activation producer
+  # (5.6a). Skips gracefully when no Ada GPU is present.
+  add_executable(forge-fp8-w8a8-e2e-test test_fp8_w8a8_e2e.cu)
+  forge_link_native(forge-fp8-w8a8-e2e-test)
+  add_test(NAME fp8-w8a8-e2e COMMAND forge-fp8-w8a8-e2e-test)
+
   # Phase 2-B + 2-C: KV-tiled prefill across every KV format policy
   # (FP32/F16/Q8_0/FP8-E4M3/FP8-E5M2), contiguous and paged.
   # Phase 2-B + 2-C: KV-tiled prefill AND decode across every KV format policy
@@ -287,6 +392,12 @@ if(CUDAToolkit_FOUND)
   #   ./build/tests/forge-bench-tiled-attn
   add_executable(forge-bench-tiled-attn bench_tiled_attn.cpp)
   forge_link_native(forge-bench-tiled-attn)
+
+  # Phase 2 round 1 (6-A-7 Phase 2): FP16 baseline vs FP32 path, real kernel
+  # timing, Decode/Prefill separate. NOT registered with CTest:
+  #   ./build/tests/forge-bench-fp16-baseline
+  add_executable(forge-bench-fp16-baseline bench_fp16_baseline.cpp)
+  forge_link_native(forge-bench-fp16-baseline)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -343,3 +454,4 @@ if(FORGE_BUILD_BENCHMARKS)
     forge_link_native(forge-bench-${bench})
   endforeach()
 endif()
+

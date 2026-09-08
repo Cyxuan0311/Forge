@@ -35,6 +35,16 @@ enum class AttentionPath {
     CUDA_F16_PREFILL,  // CUDA GQA prefill, all-FP16 QKV (q_len > 1)
     CUDA_F16_DECODE,   // CUDA GQA decode, all-FP16 QKV  (q_len == 1)
 
+    // CUDA native-BF16-Q decode (6-B-6, decode-first): Q BF16, K/V FP32
+    // (authoritative KV store), FP32 math, BF16 output. BF16 prefill has no
+    // path yet (falls through to the FP32 cases, which reject BF16 loudly).
+    CUDA_BF16_DECODE,  // CUDA GQA decode, BF16 Q + FP32 KV (q_len == 1)
+
+    // CUDA native-BF16 prefill (6-B-7.0, E2E unlock): all-BF16 QKV, FP32 math,
+    // BF16 output, vectorized kernel (no wmma). 6-B-6.7 extended K/V to BF16
+    // for decode; this extends Q/K/V to BF16 for prefill (q_len > 1).
+    CUDA_BF16_PREFILL,  // CUDA GQA prefill, all-BF16 QKV (q_len > 1)
+
     // CUDA fused paths (K/V in quantized format, dequantized on-the-fly)
     CUDA_FUSED_Q4_0_DECODE,      // CUDA GQA decode with Q4_0 KV
     CUDA_FUSED_F16_DECODE,       // CUDA GQA decode with F16 KV

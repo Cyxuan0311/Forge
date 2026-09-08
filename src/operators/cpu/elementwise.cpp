@@ -22,6 +22,39 @@ namespace forge {
 namespace ops {
 
 TensorPtr add(const TensorPtr& a, const TensorPtr& b) {
+    // 6-B-5: ADD is retired from require_no_bf16 -- BF16 takes the native
+    // kernel below (BF16 storage, FP32 per-element compute, BF16 out).
+    // FP16 eager still fails loudly (native FP16 lives in dst-injection only,
+    // per the 6-B-1 FP32-only eager discipline); anything else is rejected.
+    require_dtype_supported("ops::add/a", OpType::ADD, a->dtype());
+    require_dtype_supported("ops::add/b", OpType::ADD, b->dtype());
+    if (a->dtype() == DataType::BF16 || b->dtype() == DataType::BF16) {
+        if (a->dtype() != DataType::BF16 || b->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                std::string("ops::add: BF16 add needs all-BF16 inputs, got '") +
+                dtype_name(a->dtype()) + "' / '" + dtype_name(b->dtype()) +
+                "' (mixed dtypes fail loudly).");
+        }
+        auto out = std::make_shared<Tensor>(DataType::BF16, a->shape(), a->device());
+        int n = static_cast<int>(a->numel());
+        if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            cuda::launch_add_bf16(static_cast<const __nv_bfloat16*>(a->data()),
+                                  static_cast<const __nv_bfloat16*>(b->data()),
+                                  static_cast<__nv_bfloat16*>(out->data()), n);
+#endif
+        } else {
+            throw std::runtime_error(
+                "ops::add (CPU): BF16 has no CPU kernel; use the CUDA device "
+                "(Phase 6-B-5).");
+        }
+        return out;
+    }
+    if (a->dtype() != DataType::FP32 || b->dtype() != DataType::FP32) {
+        throw std::runtime_error(
+            std::string("ops::add: dtype '") + dtype_name(a->dtype()) +
+            "' has no native kernel. Eager add is FP32-only except BF16 (6-B-5).");
+    }
     auto out = std::make_shared<Tensor>(DataType::FP32, a->shape(), a->device());
     int n = static_cast<int>(a->numel());
 
@@ -42,6 +75,38 @@ TensorPtr add(const TensorPtr& a, const TensorPtr& b) {
 }
 
 TensorPtr multiply(const TensorPtr& a, const TensorPtr& b) {
+    // 6-B-5: MUL is retired from require_no_bf16 -- BF16 takes the native
+    // kernel below (BF16 storage, FP32 per-element compute, BF16 out).
+    // FP16 eager still fails loudly (dst-injection only, 6-B-1 discipline).
+    require_dtype_supported("ops::multiply/a", OpType::MUL, a->dtype());
+    require_dtype_supported("ops::multiply/b", OpType::MUL, b->dtype());
+    if (a->dtype() == DataType::BF16 || b->dtype() == DataType::BF16) {
+        if (a->dtype() != DataType::BF16 || b->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                std::string("ops::multiply: BF16 multiply needs all-BF16 inputs, got '") +
+                dtype_name(a->dtype()) + "' / '" + dtype_name(b->dtype()) +
+                "' (mixed dtypes fail loudly).");
+        }
+        auto out = std::make_shared<Tensor>(DataType::BF16, a->shape(), a->device());
+        int n = static_cast<int>(a->numel());
+        if (a->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            cuda::launch_multiply_bf16(static_cast<const __nv_bfloat16*>(a->data()),
+                                       static_cast<const __nv_bfloat16*>(b->data()),
+                                       static_cast<__nv_bfloat16*>(out->data()), n);
+#endif
+        } else {
+            throw std::runtime_error(
+                "ops::multiply (CPU): BF16 has no CPU kernel; use the CUDA device "
+                "(Phase 6-B-5).");
+        }
+        return out;
+    }
+    if (a->dtype() != DataType::FP32 || b->dtype() != DataType::FP32) {
+        throw std::runtime_error(
+            std::string("ops::multiply: dtype '") + dtype_name(a->dtype()) +
+            "' has no native kernel. Eager multiply is FP32-only except BF16 (6-B-5).");
+    }
     auto out = std::make_shared<Tensor>(DataType::FP32, a->shape(), a->device());
     int n = static_cast<int>(a->numel());
 
@@ -63,7 +128,8 @@ TensorPtr multiply(const TensorPtr& a, const TensorPtr& b) {
 
 TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
     // Gated activation: SiLU(gate) * up. Output dtype follows gate (== up dtype).
-    // SILU is whitelisted in the dtype contract (6-A-3); BF16 still rejected loudly.
+    // SILU is whitelisted in the dtype contract (6-A-3); BF16 retired from
+    // require_no_bf16 in 6-B-3 with a real __nv_bfloat16 kernel.
     DataType dt = gate->dtype();
     auto out = std::make_shared<Tensor>(dt, gate->shape(), gate->device());
     int n = static_cast<int>(gate->numel());
@@ -71,7 +137,16 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
     if (gate->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         require_dtype_supported("ops::silu_multiply/gate", OpType::SILU, dt);
-        if (dt == DataType::FP16) {
+        if (dt == DataType::BF16) {
+            if (up->dtype() != DataType::BF16) {
+                throw std::runtime_error(
+                    std::string("ops::silu_multiply (CUDA): BF16 gate needs a BF16 up, got '") +
+                    dtype_name(up->dtype()) + "' (mixed dtypes fail loudly).");
+            }
+            cuda::launch_silu_multiply_bf16(static_cast<const __nv_bfloat16*>(gate->data()),
+                                            static_cast<const __nv_bfloat16*>(up->data()),
+                                            static_cast<__nv_bfloat16*>(out->data()), n);
+        } else if (dt == DataType::FP16) {
             cuda::launch_silu_multiply_fp16(static_cast<const __half*>(gate->data()),
                                             static_cast<const __half*>(up->data()),
                                             static_cast<__half*>(out->data()), n);
@@ -79,10 +154,21 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
             cuda::launch_silu_multiply(static_cast<const float*>(gate->data()),
                                        static_cast<const float*>(up->data()),
                                        static_cast<float*>(out->data()), n);
+        } else if (dt == DataType::FP8_E4M3) {
+            // 6-C-3: native FP8 SiLU-gate (FP8 storage, FP32 silu, FP8 output).
+            if (up->dtype() != DataType::FP8_E4M3) {
+                throw std::runtime_error(
+                    std::string("ops::silu_multiply (CUDA): FP8 gate needs an FP8 up, got '") +
+                    dtype_name(up->dtype()) + "' (mixed dtypes fail loudly).");
+            }
+            cuda::launch_silu_multiply_fp8(static_cast<const uint8_t*>(gate->data()),
+                                           static_cast<const uint8_t*>(up->data()),
+                                           static_cast<uint8_t*>(out->data()), n);
         } else {
             throw std::runtime_error(
                 std::string("ops::silu_multiply (CUDA): dtype '") + dtype_name(dt) +
-                "' has no native kernel. Phase 6-A-4 adds FP16 only; BF16 arrives with 6-B.");
+                "' has no native kernel. Native paths exist for FP16 (6-A-4), BF16 "
+                "(6-B-3) and FP8_E4M3 (6-C-3) only.");
         }
 #endif
     } else {
@@ -102,7 +188,8 @@ TensorPtr silu_multiply(const TensorPtr& gate, const TensorPtr& up) {
 
 TensorPtr gelu_multiply(const TensorPtr& gate, const TensorPtr& up) {
     // Gated activation: GELU(gate) * up (GeGLU). Output dtype follows gate.
-    // GELU is whitelisted in the dtype contract (6-A-4); BF16 rejected loudly.
+    // GELU is whitelisted in the dtype contract (6-A-4); BF16 retired from
+    // require_no_bf16 in 6-B-3 with a real __nv_bfloat16 kernel.
     DataType dt = gate->dtype();
     auto out = std::make_shared<Tensor>(dt, gate->shape(), gate->device());
     int n = static_cast<int>(gate->numel());
@@ -110,7 +197,16 @@ TensorPtr gelu_multiply(const TensorPtr& gate, const TensorPtr& up) {
     if (gate->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
         require_dtype_supported("ops::gelu_multiply/gate", OpType::GELU, dt);
-        if (dt == DataType::FP16) {
+        if (dt == DataType::BF16) {
+            if (up->dtype() != DataType::BF16) {
+                throw std::runtime_error(
+                    std::string("ops::gelu_multiply (CUDA): BF16 gate needs a BF16 up, got '") +
+                    dtype_name(up->dtype()) + "' (mixed dtypes fail loudly).");
+            }
+            cuda::launch_gelu_multiply_bf16(static_cast<const __nv_bfloat16*>(gate->data()),
+                                            static_cast<const __nv_bfloat16*>(up->data()),
+                                            static_cast<__nv_bfloat16*>(out->data()), n);
+        } else if (dt == DataType::FP16) {
             cuda::launch_gelu_multiply_fp16(static_cast<const __half*>(gate->data()),
                                             static_cast<const __half*>(up->data()),
                                             static_cast<__half*>(out->data()), n);
@@ -120,10 +216,21 @@ TensorPtr gelu_multiply(const TensorPtr& gate, const TensorPtr& up) {
             cuda::launch_multiply(static_cast<const float*>(gelu_gate->data()),
                                   static_cast<const float*>(up->data()),
                                   static_cast<float*>(out->data()), n);
+        } else if (dt == DataType::FP8_E4M3) {
+            // 6-C-3: native FP8 GeGLU-gate (FP8 storage, FP32 gelu, FP8 output).
+            if (up->dtype() != DataType::FP8_E4M3) {
+                throw std::runtime_error(
+                    std::string("ops::gelu_multiply (CUDA): FP8 gate needs an FP8 up, got '") +
+                    dtype_name(up->dtype()) + "' (mixed dtypes fail loudly).");
+            }
+            cuda::launch_gelu_multiply_fp8(static_cast<const uint8_t*>(gate->data()),
+                                           static_cast<const uint8_t*>(up->data()),
+                                           static_cast<uint8_t*>(out->data()), n);
         } else {
             throw std::runtime_error(
                 std::string("ops::gelu_multiply (CUDA): dtype '") + dtype_name(dt) +
-                "' has no native kernel. Phase 6-A-4 adds FP16 only; BF16 arrives with 6-B.");
+                "' has no native kernel. Native paths exist for FP16 (6-A-4), BF16 "
+                "(6-B-3) and FP8_E4M3 (6-C-3) only.");
         }
 #endif
     } else {

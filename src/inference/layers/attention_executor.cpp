@@ -7,6 +7,7 @@
 #include "cpu/simd.h"
 #include "forge/attention_selector.h"
 #include "forge/cuda_kernels.h"
+#include "forge/dtype_contract.h"
 #include "forge/operators.h"
 
 #ifdef _OPENMP
@@ -593,6 +594,22 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     case AttentionPath::CUDA_FP32_PREFILL: {
         TensorPtr k_sliced, v_sliced;
         get_kv_on_device(k_sliced, v_sliced);
+        // 6-B-1: FP32 prefill reads Q/K/V as float* below -- BF16 falls through
+        // to this default path (selector only recognizes FP16), so reject loudly.
+        require_no_bf16("AttentionExecutor::CUDA_FP32_PREFILL/q", OpType::FLASH_ATTN_GQA,
+                        q->dtype());
+        require_no_bf16("AttentionExecutor::CUDA_FP32_PREFILL/k", OpType::FLASH_ATTN_GQA,
+                        k_sliced->dtype());
+        require_no_bf16("AttentionExecutor::CUDA_FP32_PREFILL/v", OpType::FLASH_ATTN_GQA,
+                        v_sliced->dtype());
+        // 6-C-1: FP8 has no attention kernel on this path -- reject before the
+        // float* reads (FP8 Q falls through the selector like BF16 did).
+        require_no_fp8("AttentionExecutor::CUDA_FP32_PREFILL/q", OpType::FLASH_ATTN_GQA,
+                       q->dtype());
+        require_no_fp8("AttentionExecutor::CUDA_FP32_PREFILL/k", OpType::FLASH_ATTN_GQA,
+                       k_sliced->dtype());
+        require_no_fp8("AttentionExecutor::CUDA_FP32_PREFILL/v", OpType::FLASH_ATTN_GQA,
+                       v_sliced->dtype());
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
@@ -636,6 +653,22 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     case AttentionPath::CUDA_FP32_DECODE: {
         TensorPtr k_sliced, v_sliced;
         get_kv_on_device(k_sliced, v_sliced);
+        // 6-B-1: FP32 decode reads Q/K/V as float* below -- BF16 falls through
+        // to this default path (selector only recognizes FP16), so reject loudly.
+        require_no_bf16("AttentionExecutor::CUDA_FP32_DECODE/q", OpType::FLASH_ATTN_GQA,
+                        q->dtype());
+        require_no_bf16("AttentionExecutor::CUDA_FP32_DECODE/k", OpType::FLASH_ATTN_GQA,
+                        k_sliced->dtype());
+        require_no_bf16("AttentionExecutor::CUDA_FP32_DECODE/v", OpType::FLASH_ATTN_GQA,
+                        v_sliced->dtype());
+        // 6-C-1: FP8 has no attention kernel on this path -- reject before the
+        // float* reads (FP8 Q falls through the selector like BF16 did).
+        require_no_fp8("AttentionExecutor::CUDA_FP32_DECODE/q", OpType::FLASH_ATTN_GQA,
+                       q->dtype());
+        require_no_fp8("AttentionExecutor::CUDA_FP32_DECODE/k", OpType::FLASH_ATTN_GQA,
+                       k_sliced->dtype());
+        require_no_fp8("AttentionExecutor::CUDA_FP32_DECODE/v", OpType::FLASH_ATTN_GQA,
+                       v_sliced->dtype());
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
@@ -692,6 +725,73 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
 #endif
         break;
     }
+    // ---- 6-B-6: native BF16-Q decode (decode-first; BF16 Q + FP32 KV) ----
+    // 6-B-6.7 extends K/V to BF16 (authoritative BF16 KV): the K/V dtype
+    // selects the kernel (FP32 -> bf16q launch, BF16 -> bf16 launch); mixed
+    // K/V dtypes keep loud rejection. Locked rule: selected only when q is
+    // BF16 with seq_len == 1 (selector). No silent reinterpret, no implicit
+    // conversion; BF16 prefill still throws loudly until its own 6-B step.
+    case AttentionPath::CUDA_BF16_DECODE: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
+#ifdef USE_CUDA
+        if (q->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                "AttentionExecutor::CUDA_BF16_DECODE requires a BF16 Q (selector "
+                "routes q-BF16 here; anything else is a dispatch bug).");
+        }
+        const bool kv_fp32 = k_sliced && v_sliced && k_sliced->dtype() == DataType::FP32 &&
+                             v_sliced->dtype() == DataType::FP32;
+        const bool kv_bf16 = k_sliced && v_sliced && k_sliced->dtype() == DataType::BF16 &&
+                             v_sliced->dtype() == DataType::BF16;
+        if (!kv_fp32 && !kv_bf16) {
+            throw std::runtime_error(
+                "AttentionExecutor::CUDA_BF16_DECODE requires all-FP32 or all-BF16 K/V "
+                "(mixed K/V fail loudly).");
+        }
+        if (head_dim != 16 && head_dim != 32 && head_dim != 64 && head_dim != 96 &&
+            head_dim != 128) {
+            throw std::runtime_error("AttentionExecutor::CUDA_BF16_DECODE: unsupported head_dim=" +
+                                     std::to_string(head_dim) + " (6-B-6: 16/32/64/96/128 only).");
+        }
+        attn_out = std::make_shared<Tensor>(
+            DataType::BF16, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        if (kv_bf16) {
+            const __nv_bfloat16* mask_row_bf16 = nullptr;
+            if (mask) {
+                if (mask_on_dev->dtype() != DataType::BF16) {
+                    throw std::runtime_error(
+                        "AttentionExecutor::CUDA_BF16_DECODE requires a BF16 mask with BF16 "
+                        "K/V (or none).");
+                }
+                mask_row_bf16 = reinterpret_cast<const __nv_bfloat16*>(mask_on_dev->data());
+            }
+            cuda::launch_flash_attention_gqa_decode_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q->data()),
+                reinterpret_cast<const __nv_bfloat16*>(k_sliced->data()),
+                reinterpret_cast<const __nv_bfloat16*>(v_sliced->data()),
+                reinterpret_cast<__nv_bfloat16*>(attn_out->data()), total_len, num_heads,
+                num_kv_heads, head_dim, mask_row_bf16, stream);
+        } else {
+            if (mask && mask_on_dev->dtype() != DataType::FP32) {
+                throw std::runtime_error(
+                    "AttentionExecutor::CUDA_BF16_DECODE requires an FP32 mask with FP32 "
+                    "K/V (or none).");
+            }
+            cuda::launch_flash_attention_gqa_decode_bf16q(
+                reinterpret_cast<const __nv_bfloat16*>(q->data()),
+                static_cast<const float*>(k_sliced->data()),
+                static_cast<const float*>(v_sliced->data()),
+                reinterpret_cast<__nv_bfloat16*>(attn_out->data()), total_len, num_heads,
+                num_kv_heads, head_dim, mask_row, stream);
+        }
+#else
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
+                                                            total_len, num_heads, num_kv_heads,
+                                                            head_dim, mask, causal);
+#endif
+        break;
+    }
     // ---- 6-A-7.2: native-FP16 prefill (same dtype contract as decode) ----
     // Mirror of the vectorized FP32 prefill: Q tile in smem, strided KV loop,
     // local_acc kept. K/V must be FP16 (loud otherwise); mask FP16 or absent.
@@ -726,6 +826,53 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
             reinterpret_cast<const __half*>(v_sliced->data()),
             reinterpret_cast<__half*>(attn_out->data()), seq_len, total_len, num_heads,
             num_kv_heads, head_dim, mask_fp16, causal, stream);
+#else
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
+                                                            total_len, num_heads, num_kv_heads,
+                                                            head_dim, mask, causal);
+#endif
+        break;
+    }
+    // ---- 6-B-7.0: native-BF16 prefill (E2E unlock; all-BF16 QKV) ----
+    // Mirror of the F16 prefill above: Q tile in smem, strided KV loop,
+    // local_acc kept, FP32 math, BF16 out. K/V must be BF16 (loud otherwise);
+    // mask BF16 or absent. No wmma (decode-track parity).
+    case AttentionPath::CUDA_BF16_PREFILL: {
+        TensorPtr k_sliced, v_sliced;
+        get_kv_on_device(k_sliced, v_sliced);
+#ifdef USE_CUDA
+        if (q->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                "AttentionExecutor::CUDA_BF16_PREFILL requires a BF16 Q (selector "
+                "routes q-BF16 prefill here; anything else is a dispatch bug).");
+        }
+        if (!k_sliced || !v_sliced || k_sliced->dtype() != DataType::BF16 ||
+            v_sliced->dtype() != DataType::BF16) {
+            throw std::runtime_error(
+                "AttentionExecutor::CUDA_BF16_PREFILL requires BF16 K/V (native BF16 "
+                "prefill needs all-BF16 QKV).");
+        }
+        if (head_dim != 16 && head_dim != 32 && head_dim != 64 && head_dim != 96 &&
+            head_dim != 128) {
+            throw std::runtime_error("AttentionExecutor::CUDA_BF16_PREFILL: unsupported head_dim=" +
+                                     std::to_string(head_dim) + " (6-B-7: 16/32/64/96/128 only).");
+        }
+        const __nv_bfloat16* mask_bf16 = nullptr;
+        if (mask) {
+            if (mask_on_dev->dtype() != DataType::BF16) {
+                throw std::runtime_error(
+                    "AttentionExecutor::CUDA_BF16_PREFILL requires a BF16 mask (or none).");
+            }
+            mask_bf16 = reinterpret_cast<const __nv_bfloat16*>(mask_on_dev->data());
+        }
+        attn_out = std::make_shared<Tensor>(
+            DataType::BF16, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        cuda::launch_flash_attention_gqa_prefill_bf16(
+            reinterpret_cast<const __nv_bfloat16*>(q->data()),
+            reinterpret_cast<const __nv_bfloat16*>(k_sliced->data()),
+            reinterpret_cast<const __nv_bfloat16*>(v_sliced->data()),
+            reinterpret_cast<__nv_bfloat16*>(attn_out->data()), seq_len, total_len, num_heads,
+            num_kv_heads, head_dim, mask_bf16, causal, stream);
 #else
         attn_out = ops::scaled_dot_product_attention_2d_gqa(q, k_sliced, v_sliced, seq_len,
                                                             total_len, num_heads, num_kv_heads,

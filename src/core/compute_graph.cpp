@@ -274,15 +274,42 @@ TensorPtr ComputeGraph::execute(cudaStream_t stream) {
             }
 
             // 6-A-6.3: dst injection must NOT silently materialize FP32. A few dst kernels are
-            // FP32-only (ADD/MUL/ROPE); routing an FP16 chain through them would mis-cast the
-            // buffer and run FP32 kernels. We only inject when the dst kernel can emit the right
-            // dtype: either FP32 inputs, or an FP16-capable dst op (RMS_NORM / SILU).
+            // FP32-only (ROPE); routing an FP16 chain through them would mis-cast the
+            // buffer and run FP32 kernels. We only inject when the dst kernel can emit the
+            // right dtype: either FP32 inputs, or an FP16-capable dst op (6-A-2..6-A-8.0:
+            // RMS_NORM / SILU / ADD / MUL).
+            // 6-B-1: same rule extended to BF16 -- a BF16 input must never be
+            // injected into an FP32-only dst kernel (which would read it as
+            // float*); the dst kernel itself throws loudly as the second line
+            // of defense.
+            // 6-B-2: RMS_NORM is retired from require_no_bf16 (real BF16 dst
+            // branch in rms_norm_kernel_dst), so a BF16 input may be injected
+            // for RMS_NORM only. Every other op keeps the 6-B-1 block.
+            // 6-B-3: SILU joins the retired set (real BF16 dst branch in
+            // silu_kernel_dst). GELU / GELU_TANH have no dst kernels (legacy
+            // path via ops::gelu / ops::gelu_tanh), so no gate change for them.
+            // 6-B-5: ADD + MUL join the retired set (real BF16 dst branches
+            // above) -- the residual-add and scale nodes of BF16 graphs.
             bool inputs_fp16 = !node.resolved_inputs.empty() &&
                                node.resolved_inputs[0]->dtype() == DataType::FP16;
+            bool inputs_bf16 = !node.resolved_inputs.empty() &&
+                               node.resolved_inputs[0]->dtype() == DataType::BF16;
+            // 6-C-2: FP8 joins -- RMS_NORM only (real FP8 dst branch in
+            // rms_norm_kernel_dst); every other op keeps FP8 out of dst.
+            bool inputs_fp8 = !node.resolved_inputs.empty() &&
+                              node.resolved_inputs[0]->dtype() == DataType::FP8_E4M3;
             bool dst_fp16_capable =
+                (node.op_type == OpType::RMS_NORM || node.op_type == OpType::SILU ||
+                 node.op_type == OpType::ADD || node.op_type == OpType::MUL);
+            bool dst_bf16_capable = (node.op_type == OpType::RMS_NORM ||
+                                     node.op_type == OpType::SILU || node.op_type == OpType::ADD ||
+                                     node.op_type == OpType::MUL);
+            bool dst_fp8_capable =
                 (node.op_type == OpType::RMS_NORM || node.op_type == OpType::SILU);
             use_dst = has_dst && alloc && alloc->size > 0 && buf_map &&
-                      (!inputs_fp16 || dst_fp16_capable);
+                      (!inputs_fp16 || dst_fp16_capable) &&
+                      (!inputs_bf16 || dst_bf16_capable) &&
+                      (!inputs_fp8 || dst_fp8_capable);
 
             if (use_dst) {
                 // Construct dst view into the pre-allocated per-backend buffer, with the
