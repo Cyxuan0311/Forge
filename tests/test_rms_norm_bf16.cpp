@@ -139,12 +139,16 @@ int run_correctness() {
             for (auto& b : wb)
                 b = f32_to_bf16(urand(rng, 0.9f, 1.1f));
 
-            auto x_host = std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CPU);
-            auto w_host = std::make_shared<Tensor>(DataType::BF16, shape2(1, cols), DeviceType::CPU);
+            auto x_host =
+                std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CPU);
+            auto w_host =
+                std::make_shared<Tensor>(DataType::BF16, shape2(1, cols), DeviceType::CPU);
             std::memcpy(x_host->data(), xb.data(), xb.size() * 2);
             std::memcpy(w_host->data(), wb.data(), wb.size() * 2);
-            auto x_dev = std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CUDA);
-            auto w_dev = std::make_shared<Tensor>(DataType::BF16, shape2(1, cols), DeviceType::CUDA);
+            auto x_dev =
+                std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CUDA);
+            auto w_dev =
+                std::make_shared<Tensor>(DataType::BF16, shape2(1, cols), DeviceType::CUDA);
             x_dev->copy_from(*x_host);
             w_dev->copy_from(*w_host);
 
@@ -154,7 +158,8 @@ int run_correctness() {
                 std::printf("FAIL: BF16 RMSNorm returned wrong dtype\n");
                 return 1;
             }
-            auto out_host = std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CPU);
+            auto out_host =
+                std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CPU);
             out_host->copy_from(*out_dev);
 
             // Reference from the same decoded BF16 inputs.
@@ -209,7 +214,8 @@ int run_correctness() {
             std::printf("FAIL: unweighted BF16 RMSNorm returned wrong dtype\n");
             return 1;
         }
-        auto out_host = std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CPU);
+        auto out_host =
+            std::make_shared<Tensor>(DataType::BF16, shape2(rows, cols), DeviceType::CPU);
         out_host->copy_from(*out_dev);
 
         std::vector<float> xf(xb.size()), ref(xb.size());

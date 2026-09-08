@@ -27,7 +27,8 @@ static int g_failures = 0;
 
 static bool device_is_ada() {
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaGetDevice(&dev) != cudaSuccess)
+        return false;
     int major = 0, minor = 0;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
@@ -45,7 +46,8 @@ static float* upload_scalar(float v) {
 // subnormal quantum 2^-9. Mirrors benchmarks/fp8_cutlass_gemm.cu.
 static float e4m3_ulp(float v) {
     float a = fabsf(v);
-    if (a < exp2f(-6.0f)) return exp2f(-9.0f);
+    if (a < exp2f(-6.0f))
+        return exp2f(-9.0f);
     int e = (int)floorf(log2f(a));
     return exp2f((float)e - 3.0f);
 }
@@ -59,8 +61,10 @@ int main() {
     const int M = 256, N = 4096, K = 4096;
 
     std::vector<float> hA(M * K), hB(N * K);
-    for (float& v : hA) v = (float)rand() / RAND_MAX * 2.f - 1.f;
-    for (float& v : hB) v = (float)rand() / RAND_MAX * 2.f - 1.f;
+    for (float& v : hA)
+        v = (float)rand() / RAND_MAX * 2.f - 1.f;
+    for (float& v : hB)
+        v = (float)rand() / RAND_MAX * 2.f - 1.f;
 
     // Fixed sample of output positions for the CPU golden (deterministic, cheap).
     std::vector<int> si, sj;
@@ -82,8 +86,10 @@ int main() {
     for (float p : {0.90f, 0.98f, 0.50f, 0.12f}) {
         // amax-based scale (6-C-1 contract S6): scale = amax / 240.
         float amaxA = 0.f, amaxB = 0.f;
-        for (float v : hA) amaxA = std::max(amaxA, std::fabs(v));
-        for (float v : hB) amaxB = std::max(amaxB, std::fabs(v));
+        for (float v : hA)
+            amaxA = std::max(amaxA, std::fabs(v));
+        for (float v : hB)
+            amaxB = std::max(amaxB, std::fabs(v));
         const float sa = amaxA / 240.f;
         const float sw = amaxB / 240.f;
 
@@ -115,7 +121,10 @@ int main() {
         if (!ok) {
             printf("[fp8-gemm] FAIL: fp32 launcher returned false\n");
             ++g_failures;
-            cudaFree(d_sa); cudaFree(d_sw); cudaFree(d_one); cudaFree(d_zero);
+            cudaFree(d_sa);
+            cudaFree(d_sw);
+            cudaFree(d_one);
+            cudaFree(d_zero);
             continue;
         }
 
@@ -128,8 +137,10 @@ int main() {
             const int i = si[s], j = sj[s];
             float acc = 0.f;
             for (int k = 0; k < K; ++k) {
-                float a = forge::fp8_e4m3_to_fp32(forge::fp32_to_fp8_e4m3(hA[(size_t)i * K + k] / sa));
-                float b = forge::fp8_e4m3_to_fp32(forge::fp32_to_fp8_e4m3(hB[(size_t)k * N + j] / sw));
+                float a =
+                    forge::fp8_e4m3_to_fp32(forge::fp32_to_fp8_e4m3(hA[(size_t)i * K + k] / sa));
+                float b =
+                    forge::fp8_e4m3_to_fp32(forge::fp32_to_fp8_e4m3(hB[(size_t)k * N + j] / sw));
                 acc += a * b;
             }
             const float golden = acc * sa * sw;
@@ -169,7 +180,8 @@ int main() {
                 const float ulp = e4m3_ulp(ev);
                 const float ratio = (ulp > 0.f) ? std::fabs(dv - ev) / ulp : 0.f;
                 max_ulp = std::max(max_ulp, ratio);
-                if (ratio > 1.5f) ++far;  // beyond ~1 ULP -> far
+                if (ratio > 1.5f)
+                    ++far;  // beyond ~1 ULP -> far
             }
             float amax = 0.f;
             cudaMemcpy(&amax, d_amax, sizeof(float), cudaMemcpyDeviceToHost);
@@ -183,25 +195,46 @@ int main() {
             printf("[fp8-gemm] WARN: fp8out launcher false\n");
         }
 
-        printf("[fp8-gemm] p=%.2f: max_err=%.3e cosine=%.6f fp8_maxULP=%.2f far=%d\n",
-               p, max_err, cosine, max_ulp, far);
+        printf("[fp8-gemm] p=%.2f: max_err=%.3e cosine=%.6f fp8_maxULP=%.2f far=%d\n", p, max_err,
+               cosine, max_ulp, far);
 
-        if (max_err > 0.05f) { printf("[fp8-gemm] FAIL: max_err too large\n"); ++g_failures; }
-        if (cosine < 0.9995f) { printf("[fp8-gemm] FAIL: cosine too low\n"); ++g_failures; }
-        if (far != 0) { printf("[fp8-gemm] FAIL: fp8 output far count %d\n", far); ++g_failures; }
-        if (max_ulp > 1.5f) { printf("[fp8-gemm] FAIL: fp8 maxULP %.2f > 1.5\n", max_ulp); ++g_failures; }
+        if (max_err > 0.05f) {
+            printf("[fp8-gemm] FAIL: max_err too large\n");
+            ++g_failures;
+        }
+        if (cosine < 0.9995f) {
+            printf("[fp8-gemm] FAIL: cosine too low\n");
+            ++g_failures;
+        }
+        if (far != 0) {
+            printf("[fp8-gemm] FAIL: fp8 output far count %d\n", far);
+            ++g_failures;
+        }
+        if (max_ulp > 1.5f) {
+            printf("[fp8-gemm] FAIL: fp8 maxULP %.2f > 1.5\n", max_ulp);
+            ++g_failures;
+        }
 
-        cudaFree(dDf8); cudaFree(d_amax); cudaFree(d_sd);
-        cudaFree(d_sa); cudaFree(d_sw); cudaFree(d_one); cudaFree(d_zero);
+        cudaFree(dDf8);
+        cudaFree(d_amax);
+        cudaFree(d_sd);
+        cudaFree(d_sa);
+        cudaFree(d_sw);
+        cudaFree(d_one);
+        cudaFree(d_zero);
     }
 
-    cudaFree(dA); cudaFree(dBcol); cudaFree(dD);
+    cudaFree(dA);
+    cudaFree(dBcol);
+    cudaFree(dD);
 
     // ---- Selector wiring ----
     forge::KernelProblem prob;
     prob.domain = forge::KernelDomain::MatMul;
     prob.dtype = forge::DataType::FP8_E4M3;
-    prob.M = 256; prob.N = 4096; prob.K = 4096;
+    prob.M = 256;
+    prob.N = 4096;
+    prob.K = 4096;
     forge::KernelVariant v = forge::select_kernel(prob);
     if (v != forge::KernelVariant::MATMUL_FP8_E4M3) {
         printf("[fp8-gemm] FAIL: selector returned %s, expected MATMUL_FP8_E4M3\n",
@@ -216,11 +249,13 @@ int main() {
     forge::KernelProblem probe1;
     probe1.domain = forge::KernelDomain::MatMul;
     probe1.dtype = forge::DataType::FP8_E4M3;
-    probe1.M = 1; probe1.N = 4096; probe1.K = 4096;
+    probe1.M = 1;
+    probe1.N = 4096;
+    probe1.K = 4096;
     forge::KernelVariant v1 = forge::select_kernel(probe1);
     const bool ada = (v != forge::KernelVariant::UNSUPPORTED);  // M>1 FP8 reachable on this GPU
-    const forge::KernelVariant want1 = ada ? forge::KernelVariant::MATMUL_FP8_E4M3_GEMV
-                                           : forge::KernelVariant::UNSUPPORTED;
+    const forge::KernelVariant want1 =
+        ada ? forge::KernelVariant::MATMUL_FP8_E4M3_GEMV : forge::KernelVariant::UNSUPPORTED;
     if (v1 != want1) {
         printf("[fp8-gemm] FAIL: M==1 selector returned %s, expected %s\n",
                forge::kernel_variant_name(v1), forge::kernel_variant_name(want1));

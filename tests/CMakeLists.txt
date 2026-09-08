@@ -173,9 +173,10 @@ target_include_directories(
 # The binary skips gracefully at runtime when no GPU is available.
 # -----------------------------------------------------------------------------
 if(CUDAToolkit_FOUND)
-  add_executable(forge-mmq-ref-test
-                 test_mmq_reference.cpp
-                 ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
+  add_executable(
+    forge-mmq-ref-test
+    test_mmq_reference.cpp
+    ${PROJECT_SOURCE_DIR}/src/operators/cpu/common/dequant.cpp)
   forge_link_native(forge-mmq-ref-test)
   add_test(NAME mmq-ref COMMAND forge-mmq-ref-test)
 
@@ -337,7 +338,8 @@ if(CUDAToolkit_FOUND)
 
   # Phase 2-C: Vectorized FP32 prefill vs Scalar prefill parity (bit-exact
   # reformat) and both vs a CPU naive GQA reference.
-  add_executable(forge-attn-backend-parity-test test_attention_backend_parity.cpp)
+  add_executable(forge-attn-backend-parity-test
+                 test_attention_backend_parity.cpp)
   forge_link_native(forge-attn-backend-parity-test)
   add_test(NAME attn-backend-parity COMMAND forge-attn-backend-parity-test)
 
@@ -454,4 +456,3 @@ if(FORGE_BUILD_BENCHMARKS)
     forge_link_native(forge-bench-${bench})
   endforeach()
 endif()
-

@@ -324,10 +324,11 @@ void bench_unary(const char* name,
     const double b16 = static_cast<double>(n) * 2.0 * 2.0;  // read+write, 2B
     const double b32 = static_cast<double>(n) * 2.0 * 4.0;  // read+write, 4B
     const char* reg = (n <= 8192) ? "launch-bound" : "bandwidth-bound";
-    std::printf("bench %s n=%d iters=%d [%s]: BF16 %.4f ms/iter %.1f GB/s | FP16 %.4f ms/iter %.1f GB/s | FP32 %.4f ms/iter %.1f GB/s\n",
-                name, n, iters, reg, msbf / iters, b16 / (msbf / 1000.0 / iters) / 1e9,
-                ms16 / iters, b16 / (ms16 / 1000.0 / iters) / 1e9, ms32 / iters,
-                b32 / (ms32 / 1000.0 / iters) / 1e9);
+    std::printf(
+        "bench %s n=%d iters=%d [%s]: BF16 %.4f ms/iter %.1f GB/s | FP16 %.4f ms/iter %.1f GB/s | "
+        "FP32 %.4f ms/iter %.1f GB/s\n",
+        name, n, iters, reg, msbf / iters, b16 / (msbf / 1000.0 / iters) / 1e9, ms16 / iters,
+        b16 / (ms16 / 1000.0 / iters) / 1e9, ms32 / iters, b32 / (ms32 / 1000.0 / iters) / 1e9);
 }
 
 // micro-bench: one gated op (reads gate+up, writes 1), three arms, two regimes.
@@ -363,8 +364,8 @@ void bench_gated(const char* name,
     u32->copy_from(*h32);
     for (int i = 0; i < 5; ++i) {
         bf16(static_cast<const __nv_bfloat16*>(gb->data()),
-             static_cast<const __nv_bfloat16*>(ub->data()),
-             static_cast<__nv_bfloat16*>(ob->data()), n);
+             static_cast<const __nv_bfloat16*>(ub->data()), static_cast<__nv_bfloat16*>(ob->data()),
+             n);
         fp16(static_cast<const __half*>(g16->data()), static_cast<const __half*>(u16->data()),
              static_cast<__half*>(o16->data()), n);
         fp32(static_cast<const float*>(g32->data()), static_cast<const float*>(u32->data()),
@@ -379,8 +380,8 @@ void bench_gated(const char* name,
     cudaEventRecord(es);
     for (int i = 0; i < iters; ++i)
         bf16(static_cast<const __nv_bfloat16*>(gb->data()),
-             static_cast<const __nv_bfloat16*>(ub->data()),
-             static_cast<__nv_bfloat16*>(ob->data()), n);
+             static_cast<const __nv_bfloat16*>(ub->data()), static_cast<__nv_bfloat16*>(ob->data()),
+             n);
     cudaEventRecord(ee);
     cudaEventSynchronize(ee);
     cudaEventElapsedTime(&msbf, es, ee);
@@ -404,10 +405,11 @@ void bench_gated(const char* name,
     const double b16 = static_cast<double>(n) * 3.0 * 2.0;  // gate+up+out, 2B
     const double b32 = static_cast<double>(n) * 3.0 * 4.0;  // gate+up+out, 4B
     const char* reg = (n <= 8192) ? "launch-bound" : "bandwidth-bound";
-    std::printf("bench %s n=%d iters=%d [%s]: BF16 %.4f ms/iter %.1f GB/s | FP16 %.4f ms/iter %.1f GB/s | FP32 %.4f ms/iter %.1f GB/s\n",
-                name, n, iters, reg, msbf / iters, b16 / (msbf / 1000.0 / iters) / 1e9,
-                ms16 / iters, b16 / (ms16 / 1000.0 / iters) / 1e9, ms32 / iters,
-                b32 / (ms32 / 1000.0 / iters) / 1e9);
+    std::printf(
+        "bench %s n=%d iters=%d [%s]: BF16 %.4f ms/iter %.1f GB/s | FP16 %.4f ms/iter %.1f GB/s | "
+        "FP32 %.4f ms/iter %.1f GB/s\n",
+        name, n, iters, reg, msbf / iters, b16 / (msbf / 1000.0 / iters) / 1e9, ms16 / iters,
+        b16 / (ms16 / 1000.0 / iters) / 1e9, ms32 / iters, b32 / (ms32 / 1000.0 / iters) / 1e9);
 }
 
 }  // namespace
@@ -429,61 +431,65 @@ int main() {
     std::printf("[6-B-3] BF16 activation family correctness vs FP32 reference\n");
     std::mt19937 rng(0xB16AC7);
 
-    check_unary("silu", [](const TensorPtr& x) { return forge::ops::silu(x); }, silu_ref, rng);
-    check_unary("gelu", [](const TensorPtr& x) { return forge::ops::gelu(x); }, gelu_ref, rng);
-    check_unary("gelu_tanh", [](const TensorPtr& x) { return forge::ops::gelu_tanh(x); },
-                gelu_tanh_ref, rng);
-    check_binary("silu_multiply",
-                 [](const TensorPtr& g, const TensorPtr& u) { return forge::ops::silu_multiply(g, u); },
-                 [](float g, float u) { return silu_ref(g) * u; }, rng);
-    check_binary("gelu_multiply",
-                 [](const TensorPtr& g, const TensorPtr& u) { return forge::ops::gelu_multiply(g, u); },
-                 [](float g, float u) { return gelu_ref(g) * u; }, rng);
+    check_unary(
+        "silu", [](const TensorPtr& x) { return forge::ops::silu(x); }, silu_ref, rng);
+    check_unary(
+        "gelu", [](const TensorPtr& x) { return forge::ops::gelu(x); }, gelu_ref, rng);
+    check_unary(
+        "gelu_tanh", [](const TensorPtr& x) { return forge::ops::gelu_tanh(x); }, gelu_tanh_ref,
+        rng);
+    check_binary(
+        "silu_multiply",
+        [](const TensorPtr& g, const TensorPtr& u) { return forge::ops::silu_multiply(g, u); },
+        [](float g, float u) { return silu_ref(g) * u; }, rng);
+    check_binary(
+        "gelu_multiply",
+        [](const TensorPtr& g, const TensorPtr& u) { return forge::ops::gelu_multiply(g, u); },
+        [](float g, float u) { return gelu_ref(g) * u; }, rng);
     check_mixed_loud();
     run_graph_smoke(rng);
 
     if (failures == 0) {
         std::printf("[6-B-3] micro-bench (BF16 vs FP32 + FP16 sanity, two regimes)\n");
-        bench_unary("silu",
-                    [](const __nv_bfloat16* x, __nv_bfloat16* o, int n) {
-                        forge::cuda::launch_silu_bf16(x, o, n);
-                    },
-                    [](const __half* x, __half* o, int n) {
-                        forge::cuda::launch_silu_fp16(x, o, n);
-                    },
-                    [](const float* x, float* o, int n) { forge::cuda::launch_silu(x, o, n); },
-                    4096, 2000);
-        bench_unary("silu",
-                    [](const __nv_bfloat16* x, __nv_bfloat16* o, int n) {
-                        forge::cuda::launch_silu_bf16(x, o, n);
-                    },
-                    [](const __half* x, __half* o, int n) {
-                        forge::cuda::launch_silu_fp16(x, o, n);
-                    },
-                    [](const float* x, float* o, int n) { forge::cuda::launch_silu(x, o, n); },
-                    512 * 8192, 50);
-        bench_gated("silu_multiply",
-                    [](const __nv_bfloat16* g, const __nv_bfloat16* u, __nv_bfloat16* o, int n) {
-                        forge::cuda::launch_silu_multiply_bf16(g, u, o, n);
-                    },
-                    [](const __half* g, const __half* u, __half* o, int n) {
-                        forge::cuda::launch_silu_multiply_fp16(g, u, o, n);
-                    },
-                    [](const float* g, const float* u, float* o, int n) {
-                        forge::cuda::launch_silu_multiply(g, u, o, n);
-                    },
-                    4096, 2000);
-        bench_gated("silu_multiply",
-                    [](const __nv_bfloat16* g, const __nv_bfloat16* u, __nv_bfloat16* o, int n) {
-                        forge::cuda::launch_silu_multiply_bf16(g, u, o, n);
-                    },
-                    [](const __half* g, const __half* u, __half* o, int n) {
-                        forge::cuda::launch_silu_multiply_fp16(g, u, o, n);
-                    },
-                    [](const float* g, const float* u, float* o, int n) {
-                        forge::cuda::launch_silu_multiply(g, u, o, n);
-                    },
-                    512 * 8192, 50);
+        bench_unary(
+            "silu",
+            [](const __nv_bfloat16* x, __nv_bfloat16* o, int n) {
+                forge::cuda::launch_silu_bf16(x, o, n);
+            },
+            [](const __half* x, __half* o, int n) { forge::cuda::launch_silu_fp16(x, o, n); },
+            [](const float* x, float* o, int n) { forge::cuda::launch_silu(x, o, n); }, 4096, 2000);
+        bench_unary(
+            "silu",
+            [](const __nv_bfloat16* x, __nv_bfloat16* o, int n) {
+                forge::cuda::launch_silu_bf16(x, o, n);
+            },
+            [](const __half* x, __half* o, int n) { forge::cuda::launch_silu_fp16(x, o, n); },
+            [](const float* x, float* o, int n) { forge::cuda::launch_silu(x, o, n); }, 512 * 8192,
+            50);
+        bench_gated(
+            "silu_multiply",
+            [](const __nv_bfloat16* g, const __nv_bfloat16* u, __nv_bfloat16* o, int n) {
+                forge::cuda::launch_silu_multiply_bf16(g, u, o, n);
+            },
+            [](const __half* g, const __half* u, __half* o, int n) {
+                forge::cuda::launch_silu_multiply_fp16(g, u, o, n);
+            },
+            [](const float* g, const float* u, float* o, int n) {
+                forge::cuda::launch_silu_multiply(g, u, o, n);
+            },
+            4096, 2000);
+        bench_gated(
+            "silu_multiply",
+            [](const __nv_bfloat16* g, const __nv_bfloat16* u, __nv_bfloat16* o, int n) {
+                forge::cuda::launch_silu_multiply_bf16(g, u, o, n);
+            },
+            [](const __half* g, const __half* u, __half* o, int n) {
+                forge::cuda::launch_silu_multiply_fp16(g, u, o, n);
+            },
+            [](const float* g, const float* u, float* o, int n) {
+                forge::cuda::launch_silu_multiply(g, u, o, n);
+            },
+            512 * 8192, 50);
         std::printf("PASS activation-bf16 (Phase 6-B-3)\n");
         return 0;
     }

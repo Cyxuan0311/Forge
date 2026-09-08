@@ -30,10 +30,10 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <algorithm>
 #include <random>
 #include <vector>
 
@@ -68,7 +68,8 @@ float time_ms(Fn&& fn, int iters) {
     fn();  // warmup
     cudaDeviceSynchronize();
     cudaEventRecord(s);
-    for (int i = 0; i < iters; ++i) fn();
+    for (int i = 0; i < iters; ++i)
+        fn();
     cudaEventRecord(e);
     cudaDeviceSynchronize();
     float ms = 0;
@@ -97,14 +98,16 @@ struct DevBuf {
     void fill_random(std::mt19937& g, float lo, float hi) {
         std::uniform_real_distribution<float> d(lo, hi);
         std::vector<float> host(bytes / 4);
-        for (auto& v : host) v = d(g);
+        for (auto& v : host)
+            v = d(g);
         check_cuda(cudaMemcpy(p, host.data(), bytes, cudaMemcpyHostToDevice), "fill H2D");
     }
     void fill_fp16(std::mt19937& g, float lo, float hi) {
         std::uniform_real_distribution<float> d(lo, hi);
         size_t n = bytes / 2;
         std::vector<uint16_t> host(n);
-        for (size_t i = 0; i < n; ++i) host[i] = f32_to_f16(d(g));
+        for (size_t i = 0; i < n; ++i)
+            host[i] = f32_to_f16(d(g));
         check_cuda(cudaMemcpy(p, host.data(), bytes, cudaMemcpyHostToDevice), "fill H2D");
     }
 };
@@ -115,8 +118,8 @@ constexpr int kNh = 8, kNkv = 2, kHd = 64;  // the 6-A GQA shape family
 // Decode streams the whole KV cache once per token: bandwidth-bound for large
 // kv, launch-bound for small kv. Report ms/token + implied tokens/s.
 void bench_decode(std::mt19937& g) {
-    std::printf("  [decode] q_len=1 GQA nh=%d nkv=%d hd=%d (FP16 kernel vs FP32 kernel)\n",
-                kNh, kNkv, kHd);
+    std::printf("  [decode] q_len=1 GQA nh=%d nkv=%d hd=%d (FP16 kernel vs FP32 kernel)\n", kNh,
+                kNkv, kHd);
     struct Cfg {
         int kv;
         int iters;
@@ -124,10 +127,10 @@ void bench_decode(std::mt19937& g) {
     const Cfg cfgs[] = {{128, 500}, {512, 300}, {2048, 100}};  // small -> large
     for (const auto& c : cfgs) {
         const int kv_dim = kNkv * kHd, out_dim = kNh * kHd;
-        DevBuf q16(1 * out_dim * 2), k16((size_t)c.kv * kv_dim * 2),
-            v16((size_t)c.kv * kv_dim * 2), o16(1 * out_dim * 2);
-        DevBuf q32(1 * out_dim * 4), k32((size_t)c.kv * kv_dim * 4),
-            v32((size_t)c.kv * kv_dim * 4), o32(1 * out_dim * 4);
+        DevBuf q16(1 * out_dim * 2), k16((size_t)c.kv * kv_dim * 2), v16((size_t)c.kv * kv_dim * 2),
+            o16(1 * out_dim * 2);
+        DevBuf q32(1 * out_dim * 4), k32((size_t)c.kv * kv_dim * 4), v32((size_t)c.kv * kv_dim * 4),
+            o32(1 * out_dim * 4);
         q16.fill_fp16(g, -1, 1);
         k16.fill_fp16(g, -1, 1);
         v16.fill_fp16(g, -1, 1);
@@ -145,7 +148,8 @@ void bench_decode(std::mt19937& g) {
         float ms32 = time_ms(
             [&] {
                 launch_flash_attention_gqa_decode(q32.as<float>(), k32.as<float>(), v32.as<float>(),
-                                                  o32.as<float>(), c.kv, kNh, kNkv, kHd, nullptr, 0);
+                                                  o32.as<float>(), c.kv, kNh, kNkv, kHd, nullptr,
+                                                  0);
             },
             c.iters);
         std::printf(
@@ -175,8 +179,8 @@ void bench_decode_h2(std::mt19937& g) {
     const Cfg cfgs[] = {{128, 500}, {512, 300}, {2048, 100}};  // small -> large
     for (const auto& c : cfgs) {
         const int kv_dim = kNkv * kHd, out_dim = kNh * kHd;
-        DevBuf q16(1 * out_dim * 2), k16((size_t)c.kv * kv_dim * 2),
-            v16((size_t)c.kv * kv_dim * 2), o16(1 * out_dim * 2);
+        DevBuf q16(1 * out_dim * 2), k16((size_t)c.kv * kv_dim * 2), v16((size_t)c.kv * kv_dim * 2),
+            o16(1 * out_dim * 2);
         DevBuf o16b(1 * out_dim * 2);
         q16.fill_fp16(g, -1, 1);
         k16.fill_fp16(g, -1, 1);
@@ -184,8 +188,8 @@ void bench_decode_h2(std::mt19937& g) {
 
         auto base_fn = [&] {
             launch_flash_attention_gqa_decode_fp16(q16.as<__half>(), k16.as<__half>(),
-                                                   v16.as<__half>(), o16.as<__half>(), c.kv,
-                                                   kNh, kNkv, kHd, nullptr, 0);
+                                                   v16.as<__half>(), o16.as<__half>(), c.kv, kNh,
+                                                   kNkv, kHd, nullptr, 0);
         };
         auto h2_fn = [&] {
             launch_flash_attention_gqa_decode_fp16_h2(q16.as<__half>(), k16.as<__half>(),
@@ -197,9 +201,10 @@ void bench_decode_h2(std::mt19937& g) {
             ms_base = std::min(ms_base, time_ms(base_fn, c.iters));
             ms_h2 = std::min(ms_h2, time_ms(h2_fn, c.iters));
         }
-        std::printf("    kv=%4d : baseline %8.4f ms/tok | h2 candidate %8.4f ms/tok | "
-                    "h2 vs baseline %.3fx\n",
-                    c.kv, ms_base, ms_h2, ms_base / ms_h2);
+        std::printf(
+            "    kv=%4d : baseline %8.4f ms/tok | h2 candidate %8.4f ms/tok | "
+            "h2 vs baseline %.3fx\n",
+            c.kv, ms_base, ms_h2, ms_base / ms_h2);
     }
 }
 
@@ -247,10 +252,9 @@ void bench_prefill_mma_scan(std::mt19937& g) {
         for (size_t ci = 0; ci < 9; ++ci) {
             const MmaCfg& m = mcfgs[ci];
             auto mma_fn = [&] {
-                launch_flash_attention_gqa_prefill_mma_cfg(q16.as<__half>(), k16.as<__half>(),
-                                                           v16.as<__half>(), o16b.as<__half>(),
-                                                           c.q, c.q, kNh, kNkv, kHd, true, m.br,
-                                                           m.bc, m.warps, 0);
+                launch_flash_attention_gqa_prefill_mma_cfg(
+                    q16.as<__half>(), k16.as<__half>(), v16.as<__half>(), o16b.as<__half>(), c.q,
+                    c.q, kNh, kNkv, kHd, true, m.br, m.bc, m.warps, 0);
             };
             float ms_base = 1e30f, ms_mma = 1e30f;
             for (int rep = 0; rep < 5; ++rep) {  // interleaved to share clock state
@@ -262,10 +266,11 @@ void bench_prefill_mma_scan(std::mt19937& g) {
                 best_ratio[qi] = ratio;
                 best_cfg[qi] = static_cast<int>(ci);
             }
-            std::printf("    q=%4d Br=%2d Bc=%2d w=%d : baseline %8.4f ms | cfg %8.4f ms | "
-                        "%.3fx%s\n",
-                        c.q, m.br, m.bc, m.warps, ms_base, ms_mma, ratio,
-                        (m.br == 32 && m.bc == 32 && m.warps == 2) ? "  (round-3 shape)" : "");
+            std::printf(
+                "    q=%4d Br=%2d Bc=%2d w=%d : baseline %8.4f ms | cfg %8.4f ms | "
+                "%.3fx%s\n",
+                c.q, m.br, m.bc, m.warps, ms_base, ms_mma, ratio,
+                (m.br == 32 && m.bc == 32 && m.warps == 2) ? "  (round-3 shape)" : "");
         }
     }
     for (size_t qi = 0; qi < 3; ++qi) {
@@ -278,9 +283,10 @@ void bench_prefill_mma_scan(std::mt19937& g) {
 // ---- section 2: attention prefill (q_len == kv_len, causal) ---------------
 // Prefill is the vectorized regime: q_len in a sweep from small to large.
 void bench_prefill(std::mt19937& g) {
-    std::printf("  [prefill] q=kv causal GQA nh=%d nkv=%d hd=%d (FP16 vectorized vs FP32 "
-                "vectorized)\n",
-                kNh, kNkv, kHd);
+    std::printf(
+        "  [prefill] q=kv causal GQA nh=%d nkv=%d hd=%d (FP16 vectorized vs FP32 "
+        "vectorized)\n",
+        kNh, kNkv, kHd);
     struct Cfg {
         int q;
         int iters;
@@ -344,21 +350,29 @@ void bench_elementwise(std::mt19937& g) {
             // traffic: 2 reads + 1 write
             double gbs16 = 3.0 * c.n * 2 / (ms16 / 1000.0) / 1e9;
             double gbs32 = 3.0 * c.n * 4 / (ms32 / 1000.0) / 1e9;
-            std::printf("    %s n=%6zu %-15s : FP16 %8.4f ms (%6.1f GB/s) | FP32 %8.4f ms "
-                        "(%6.1f GB/s) | speedup %.2fx\n",
-                        op, c.n, c.regime, ms16, gbs16, ms32, gbs32, ms32 / ms16);
+            std::printf(
+                "    %s n=%6zu %-15s : FP16 %8.4f ms (%6.1f GB/s) | FP32 %8.4f ms "
+                "(%6.1f GB/s) | speedup %.2fx\n",
+                op, c.n, c.regime, ms16, gbs16, ms32, gbs32, ms32 / ms16);
         };
         bench_one(
-            [&] { launch_add_fp16(a16.as<__half>(), b16.as<__half>(), o16.as<__half>(),
-                                  (int)c.n, 0); },
-            [&] { forge::cuda::launch_add_bias(a32.as<float>(), b32.as<float>(), o32.as<float>(),
-                                               (int)c.n, 0); },
+            [&] {
+                launch_add_fp16(a16.as<__half>(), b16.as<__half>(), o16.as<__half>(), (int)c.n, 0);
+            },
+            [&] {
+                forge::cuda::launch_add_bias(a32.as<float>(), b32.as<float>(), o32.as<float>(),
+                                             (int)c.n, 0);
+            },
             "add");
         bench_one(
-            [&] { launch_multiply_fp16(a16.as<__half>(), b16.as<__half>(), o16.as<__half>(),
-                                       (int)c.n, 0); },
-            [&] { forge::cuda::launch_multiply(a32.as<float>(), b32.as<float>(), o32.as<float>(),
-                                               (int)c.n, 0); },
+            [&] {
+                launch_multiply_fp16(a16.as<__half>(), b16.as<__half>(), o16.as<__half>(), (int)c.n,
+                                     0);
+            },
+            [&] {
+                forge::cuda::launch_multiply(a32.as<float>(), b32.as<float>(), o32.as<float>(),
+                                             (int)c.n, 0);
+            },
             "mul");
     }
 }

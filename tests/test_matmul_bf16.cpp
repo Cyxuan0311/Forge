@@ -100,12 +100,12 @@ void rand_bf16_matrix(int64_t r, int64_t c, std::mt19937& g, std::vector<uint16_
 }
 
 int failures = 0;
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        if (!(cond)) {                                                    \
-            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
-            ++failures;                                                   \
-        }                                                                 \
+#define CHECK(cond)                                                     \
+    do {                                                                \
+        if (!(cond)) {                                                  \
+            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            ++failures;                                                 \
+        }                                                               \
     } while (0)
 
 // Compare a native BF16 result (decoded) to the FP32 reference; the residual
@@ -305,9 +305,11 @@ void bench_matmul(int M, int K, int N, int iters) {
     // Traffic: A,B read + C written. BF16 => 3 * 2B/elt; FP32 => 3 * 4B/elt.
     const double bytes_bf = static_cast<double>(M) * (K + K + N) * 2.0;
     const double bytes32 = static_cast<double>(M) * (K + K + N) * 4.0;
-    std::printf("bench M=%4d K=%d N=%d iters=%d : BF16 %.5f ms/iter %.1f GB/s | FP32 %.5f ms/iter %.1f GB/s | %.2fx\n",
-                M, K, N, iters, best_bf, bytes_bf / (best_bf / 1000.0) / 1e9, best_32,
-                bytes32 / (best_32 / 1000.0) / 1e9, best_32 / best_bf);
+    std::printf(
+        "bench M=%4d K=%d N=%d iters=%d : BF16 %.5f ms/iter %.1f GB/s | FP32 %.5f ms/iter %.1f "
+        "GB/s | %.2fx\n",
+        M, K, N, iters, best_bf, bytes_bf / (best_bf / 1000.0) / 1e9, best_32,
+        bytes32 / (best_32 / 1000.0) / 1e9, best_32 / best_bf);
 }
 
 }  // namespace
@@ -340,7 +342,9 @@ int main() {
     check_mixed_loud(rng);
 
     if (failures == 0) {
-        std::printf("[6-B-4.4] micro-bench (BF16 vs FP32 cuBLAS, M sweep, best-of-3 alternating; K=N=4096)\n");
+        std::printf(
+            "[6-B-4.4] micro-bench (BF16 vs FP32 cuBLAS, M sweep, best-of-3 alternating; "
+            "K=N=4096)\n");
         bench_matmul(1, 4096, 4096, 200);
         bench_matmul(8, 4096, 4096, 100);
         bench_matmul(32, 4096, 4096, 50);

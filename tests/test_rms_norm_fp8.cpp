@@ -301,8 +301,8 @@ int run_chain() {
         ref2[i] = forge::fp8_e4m3_to_fp32(forge::fp32_to_fp8_e4m3(ref2[i]));
 
     Metrics m = compare(got, ref2);
-    std::printf("  chain 2-hop hidden=%5d rows=%4d : max_abs=%.3e max_rel=%.3e cosine=%.6f\n",
-                cols, rows, m.max_abs, m.max_rel, m.cosine);
+    std::printf("  chain 2-hop hidden=%5d rows=%4d : max_abs=%.3e max_rel=%.3e cosine=%.6f\n", cols,
+                rows, m.max_abs, m.max_rel, m.cosine);
     if (m.cosine < 0.998 || m.max_rel > 0.09f) {
         std::printf("    FAIL chain drift beyond fp8 store compounding bound\n");
         return 1;
@@ -339,15 +339,15 @@ int run_stream_ab() {
     cudaDeviceSynchronize();  // copies must land before the side-stream launch
     std::vector<uint8_t> ob_side(static_cast<size_t>(rows) * cols);
     {
-        auto out_side = std::make_shared<Tensor>(DataType::FP8_E4M3, shape2(rows, cols),
-                                                 DeviceType::CUDA);
+        auto out_side =
+            std::make_shared<Tensor>(DataType::FP8_E4M3, shape2(rows, cols), DeviceType::CUDA);
         forge::cuda::launch_rms_norm_fp8(static_cast<const uint8_t*>(x_side->data()),
                                          static_cast<const uint8_t*>(w_side->data()),
-                                         static_cast<uint8_t*>(out_side->data()), rows, cols,
-                                         1e-5f, side);
+                                         static_cast<uint8_t*>(out_side->data()), rows, cols, 1e-5f,
+                                         side);
         cudaStreamSynchronize(side);
-        auto host = std::make_shared<Tensor>(DataType::FP8_E4M3, shape2(rows, cols),
-                                             DeviceType::CPU);
+        auto host =
+            std::make_shared<Tensor>(DataType::FP8_E4M3, shape2(rows, cols), DeviceType::CPU);
         host->copy_from(*out_side);
         const uint8_t* p = static_cast<const uint8_t*>(host->data());
         ob_side.assign(p, p + static_cast<size_t>(rows) * cols);
@@ -466,8 +466,7 @@ void run_bench(int rows, int cols, float eps, int iters) {
     auto launch_bf16 = [&] {
         forge::cuda::launch_rms_norm_bf16(static_cast<const __nv_bfloat16*>(xb->data()),
                                           static_cast<const __nv_bfloat16*>(wb->data()),
-                                          static_cast<__nv_bfloat16*>(ob->data()), rows, cols,
-                                          eps);
+                                          static_cast<__nv_bfloat16*>(ob->data()), rows, cols, eps);
     };
     auto launch_fp32 = [&] {
         forge::cuda::launch_rms_norm(static_cast<const float*>(x32->data()),
@@ -533,9 +532,9 @@ int main() {
     failures += run_graph_smoke();
     if (failures == 0) {
         std::printf("[6-C-2] micro-bench (FP8 vs BF16 vs FP32, three regimes)\n");
-        run_bench(1, 4096, 1e-5f, 50);    // launch-bound
-        run_bench(512, 8192, 1e-5f, 50);  // L2-resident (fp8 working set ~8.4 MB)
-        run_bench(4096, 8192, 1e-5f, 20); // DRAM-bound (fp8 ~67 MB > L2, honest bandwidth)
+        run_bench(1, 4096, 1e-5f, 50);     // launch-bound
+        run_bench(512, 8192, 1e-5f, 50);   // L2-resident (fp8 working set ~8.4 MB)
+        run_bench(4096, 8192, 1e-5f, 20);  // DRAM-bound (fp8 ~67 MB > L2, honest bandwidth)
         std::printf("PASS rms-norm-fp8 (Phase 6-C-2)\n");
         return 0;
     }

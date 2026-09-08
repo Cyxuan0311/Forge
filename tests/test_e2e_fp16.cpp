@@ -98,12 +98,12 @@ int failures = 0;
     } while (0)
 
 // ---- FIXED parity thresholds (6-A-8.1; frozen from the first measured run) ----
-constexpr float kParityMaxAbs = 0.05f;   // logits are O(0.1..1) by construction
-constexpr float kParityMaxRel = 0.05f;   // denominator guard: |ref| >= 0.15
-constexpr float kParityRelGuard = 0.15f; // max|ref| = 0.207 prefill / 0.187 decode: engages
-constexpr float kParityCosine = 0.999f;  // plan.md 2.2 end-to-end bar
+constexpr float kParityMaxAbs = 0.05f;    // logits are O(0.1..1) by construction
+constexpr float kParityMaxRel = 0.05f;    // denominator guard: |ref| >= 0.15
+constexpr float kParityRelGuard = 0.15f;  // max|ref| = 0.207 prefill / 0.187 decode: engages
+constexpr float kParityCosine = 0.999f;   // plan.md 2.2 end-to-end bar
 constexpr int kTopK = 8;
-constexpr int kTopKMinAgree = 7;         // of 8; random ties make 8/8 brittle
+constexpr int kTopKMinAgree = 7;  // of 8; random ties make 8/8 brittle
 
 // Materialize a device tensor from float values. FP16 storage rounds through
 // f32->f16; FP32 stores as-is (the FP32 reference graph sees the exact values
@@ -112,7 +112,8 @@ TensorPtr dev_from_values(const std::vector<float>& vals, int64_t r, int64_t c, 
     auto host = std::make_shared<Tensor>(dt, std::vector<int64_t>{r, c}, DeviceType::CPU);
     if (dt == DataType::FP16) {
         auto* h = static_cast<uint16_t*>(host->data());
-        for (size_t i = 0; i < vals.size(); ++i) h[i] = f32_to_f16(vals[i]);
+        for (size_t i = 0; i < vals.size(); ++i)
+            h[i] = f32_to_f16(vals[i]);
     } else {
         std::memcpy(host->data(), vals.data(), vals.size() * 4);
     }
@@ -136,7 +137,8 @@ std::vector<float> to_host_f32(const TensorPtr& t) {
     std::vector<float> v(n);
     if (t->dtype() == DataType::FP16) {
         auto* h = static_cast<uint16_t*>(host->data());
-        for (size_t i = 0; i < n; ++i) v[i] = f16_to_f32(h[i]);
+        for (size_t i = 0; i < n; ++i)
+            v[i] = f16_to_f32(h[i]);
     } else {
         std::memcpy(v.data(), host->data(), n * 4);
     }
@@ -146,7 +148,8 @@ std::vector<float> to_host_f32(const TensorPtr& t) {
 void rand_vals(int64_t n, float lo, float hi, std::mt19937& g, std::vector<float>& out) {
     std::uniform_real_distribution<float> d(lo, hi);
     out.resize(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) out[i] = d(g);
+    for (int64_t i = 0; i < n; ++i)
+        out[i] = d(g);
 }
 
 // =========================================================================
@@ -163,11 +166,11 @@ void check_elementwise_fp16_kernels(std::mt19937& g) {
         bc[i] = f32_to_f16(bv[i]);
     }
     auto mk16 = [&](const std::vector<uint16_t>& c) {
-        auto host = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{1, n},
-                                             DeviceType::CPU);
+        auto host =
+            std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{1, n}, DeviceType::CPU);
         std::memcpy(host->data(), c.data(), c.size() * 2);
-        auto dev = std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{1, n},
-                                            DeviceType::CUDA);
+        auto dev =
+            std::make_shared<Tensor>(DataType::FP16, std::vector<int64_t>{1, n}, DeviceType::CUDA);
         dev->copy_from(*host);
         return dev;
     };
@@ -221,9 +224,9 @@ struct GraphSpec {
     int D = 256;
     int nh = 8, nkv = 2, hd = 64;
     int FF = 512;
-    int V = 128;      // vocab (logits width)
+    int V = 128;  // vocab (logits width)
     int layers = 2;
-    int q_len = 16;   // == kv_len => prefill; 1 => decode
+    int q_len = 16;  // == kv_len => prefill; 1 => decode
     int kv_len = 16;
 };
 
@@ -237,12 +240,12 @@ struct GraphSpec {
 // inputs -- not recomputed from the single token. Prefill computes K/V from
 // the (multi-token) hidden state like a real prefill does.
 struct ModelValues {
-    std::vector<float> x;                                          // [q_len, D]
-    std::vector<std::vector<float>> w_attn, wq, wk, wv, wo;        // per layer
-    std::vector<std::vector<float>> w_ffn, wg, wu;                 // per layer
-    std::vector<std::vector<float>> k_cache, v_cache;              // per layer, decode only
-    std::vector<float> w_out;                                      // [1, D]
-    std::vector<float> wvoc;                                       // [V, D]
+    std::vector<float> x;                                    // [q_len, D]
+    std::vector<std::vector<float>> w_attn, wq, wk, wv, wo;  // per layer
+    std::vector<std::vector<float>> w_ffn, wg, wu;           // per layer
+    std::vector<std::vector<float>> k_cache, v_cache;        // per layer, decode only
+    std::vector<float> w_out;                                // [1, D]
+    std::vector<float> wvoc;                                 // [V, D]
 };
 
 ModelValues make_model_values(const GraphSpec& s, std::mt19937& g) {
@@ -357,39 +360,41 @@ std::unique_ptr<ComputeGraph> build_model_graph(const GraphSpec& s, const ModelT
 
     for (int l = 0; l < s.layers; ++l) {
         std::string p = "L" + std::to_string(l) + ".";
-        int h = g->add_node(p + "rms_attn", OpType::RMS_NORM, {cur, w_attn_i[l]},
-                            rms_params, DeviceType::CUDA);
+        int h = g->add_node(p + "rms_attn", OpType::RMS_NORM, {cur, w_attn_i[l]}, rms_params,
+                            DeviceType::CUDA);
         int q = g->add_node(p + "wq", OpType::MUL_MAT_TRANSB, {-h - 1, wq_i[l]}, nullptr,
                             DeviceType::CUDA);
         // Attention K/V: prefill projects the hidden state; decode reads the
         // cache inputs directly (q_len=1, causal covers the whole cache since
         // both FP32 and FP16 decode kernels attend all total_len positions).
-        int k_i = (s.q_len != 1) ? -g->add_node(p + "wk", OpType::MUL_MAT_TRANSB,
-                                                {-h - 1, wk_i[l]}, nullptr, DeviceType::CUDA) - 1
+        int k_i = (s.q_len != 1) ? -g->add_node(p + "wk", OpType::MUL_MAT_TRANSB, {-h - 1, wk_i[l]},
+                                                nullptr, DeviceType::CUDA) -
+                                       1
                                  : k_cache_i[l];
-        int v_i = (s.q_len != 1) ? -g->add_node(p + "wv", OpType::MUL_MAT_TRANSB,
-                                                {-h - 1, wv_i[l]}, nullptr, DeviceType::CUDA) - 1
+        int v_i = (s.q_len != 1) ? -g->add_node(p + "wv", OpType::MUL_MAT_TRANSB, {-h - 1, wv_i[l]},
+                                                nullptr, DeviceType::CUDA) -
+                                       1
                                  : v_cache_i[l];
-        int attn = g->add_node(p + "attn", OpType::FLASH_ATTN_GQA, {-q - 1, k_i, v_i},
-                               attn_params, DeviceType::CUDA);
+        int attn = g->add_node(p + "attn", OpType::FLASH_ATTN_GQA, {-q - 1, k_i, v_i}, attn_params,
+                               DeviceType::CUDA);
         int o = g->add_node(p + "wo", OpType::MUL_MAT_TRANSB, {-attn - 1, wo_i[l]}, nullptr,
                             DeviceType::CUDA);
-        int x2 = g->add_node(p + "residual1", OpType::ADD, {cur, -o - 1}, nullptr,
+        int x2 =
+            g->add_node(p + "residual1", OpType::ADD, {cur, -o - 1}, nullptr, DeviceType::CUDA);
+        int h2 = g->add_node(p + "rms_ffn", OpType::RMS_NORM, {-x2 - 1, w_ffn_i[l]}, rms_params,
                              DeviceType::CUDA);
-        int h2 = g->add_node(p + "rms_ffn", OpType::RMS_NORM, {-x2 - 1, w_ffn_i[l]},
-                             rms_params, DeviceType::CUDA);
         int gt = g->add_node(p + "wg", OpType::MUL_MAT_TRANSB, {-h2 - 1, wg_i[l]}, nullptr,
                              DeviceType::CUDA);
         int ut = g->add_node(p + "wu", OpType::MUL_MAT_TRANSB, {-h2 - 1, wu_i[l]}, nullptr,
                              DeviceType::CUDA);
         int act = g->add_node(p + "silu", OpType::SILU, {-gt - 1}, nullptr, DeviceType::CUDA);
-        int gated = g->add_node(p + "gate_up", OpType::MUL, {-act - 1, -ut - 1}, nullptr,
-                                DeviceType::CUDA);
+        int gated =
+            g->add_node(p + "gate_up", OpType::MUL, {-act - 1, -ut - 1}, nullptr, DeviceType::CUDA);
         cur = -g->add_node(p + "residual2", OpType::ADD, {-x2 - 1, -gated - 1}, nullptr,
-                           DeviceType::CUDA) - 1;
+                           DeviceType::CUDA) -
+              1;
     }
-    int hf = g->add_node("out.rms", OpType::RMS_NORM, {cur, w_out_i}, rms_params,
-                         DeviceType::CUDA);
+    int hf = g->add_node("out.rms", OpType::RMS_NORM, {cur, w_out_i}, rms_params, DeviceType::CUDA);
     g->add_node("logits", OpType::MUL_MAT_TRANSB, {-hf - 1, wvoc_i}, nullptr, DeviceType::CUDA);
     return g;
 }
@@ -427,7 +432,8 @@ Parity compare_logits(const std::vector<float>& got16, const std::vector<float>&
     };
     auto ta = topk(got16), tb = topk(ref32);
     for (int i = 0; i < kTopK; ++i)
-        if (ta[i] != tb[i]) p.topk_agree++;
+        if (ta[i] != tb[i])
+            p.topk_agree++;
     return p;
 }
 
@@ -470,10 +476,12 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, std::mt19937& g) {
     for (const auto& r : trace) {
         bool all_in_fp16 = true;
         for (auto d : r.input_dtypes)
-            if (d != DataType::FP16) all_in_fp16 = false;
+            if (d != DataType::FP16)
+                all_in_fp16 = false;
         CHECK(all_in_fp16);
         CHECK(r.output_dtype == DataType::FP16);
-        if (r.dst_injected) dst_injected++;
+        if (r.dst_injected)
+            dst_injected++;
     }
 
     // The dst-injectable FP16 ops must actually go through the planner buffer
@@ -518,7 +526,8 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, std::mt19937& g) {
     runner.set_enabled(true);
 
     // C: capture the whole graph on the capture stream.
-    bool captured = runner.try_replay_or_capture(*g16, [&]() { g16->execute(cs); }, cs);
+    bool captured = runner.try_replay_or_capture(
+        *g16, [&]() { g16->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     CHECK(captured);
     CHECK(to_host_u16(g16->last_output()) == codesA);
@@ -526,7 +535,8 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, std::mt19937& g) {
     // D: replay x N -- bitwise stable every time, buffer address/size stable.
     constexpr int kReplays = 3;
     for (int i = 0; i < kReplays; ++i) {
-        bool replayed = runner.try_replay_or_capture(*g16, [&]() { g16->execute(cs); }, cs);
+        bool replayed = runner.try_replay_or_capture(
+            *g16, [&]() { g16->execute(cs); }, cs);
         cudaStreamSynchronize(cs);
         CHECK(replayed);
         CHECK(to_host_u16(g16->last_output()) == codesA);
@@ -534,7 +544,6 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, std::mt19937& g) {
         CHECK(g16->last_output()->nbytes() == nbytesA);
     }
     cudaStreamDestroy(cs);
-
 
     g16->release_graph();
     g32->release_graph();
@@ -550,7 +559,6 @@ int main() {
     }
     setenv("FORGE_TRACE_DTYPE", "1", 1);
     forge::register_builtin_op_kernels();
-
 
     std::mt19937 rng(0x6A08);
 

@@ -62,20 +62,20 @@ float bf16_to_f32(uint16_t h) {
 }
 
 TensorPtr make_dev_bf16(const std::vector<uint16_t>& h, int64_t r, int64_t c) {
-    auto host = std::make_shared<Tensor>(DataType::BF16, std::vector<int64_t>{r, c},
-                                         DeviceType::CPU);
+    auto host =
+        std::make_shared<Tensor>(DataType::BF16, std::vector<int64_t>{r, c}, DeviceType::CPU);
     std::memcpy(host->data(), h.data(), h.size() * 2);
-    auto dev = std::make_shared<Tensor>(DataType::BF16, std::vector<int64_t>{r, c},
-                                        DeviceType::CUDA);
+    auto dev =
+        std::make_shared<Tensor>(DataType::BF16, std::vector<int64_t>{r, c}, DeviceType::CUDA);
     dev->copy_from(*host);
     return dev;
 }
 TensorPtr make_dev_fp32(const std::vector<float>& h, int64_t r, int64_t c) {
-    auto host = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{r, c},
-                                         DeviceType::CPU);
+    auto host =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{r, c}, DeviceType::CPU);
     std::memcpy(host->data(), h.data(), h.size() * 4);
-    auto dev = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{r, c},
-                                        DeviceType::CUDA);
+    auto dev =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{r, c}, DeviceType::CUDA);
     dev->copy_from(*host);
     return dev;
 }
@@ -93,7 +93,8 @@ std::vector<float> to_host_f32(const TensorPtr& t) {
     if (t->dtype() == DataType::BF16) {
         std::vector<uint16_t> c(v.size());
         std::memcpy(c.data(), host->data(), c.size() * 2);
-        for (size_t i = 0; i < v.size(); ++i) v[i] = bf16_to_f32(c[i]);
+        for (size_t i = 0; i < v.size(); ++i)
+            v[i] = bf16_to_f32(c[i]);
     } else {
         std::memcpy(v.data(), host->data(), v.size() * 4);
     }
@@ -112,12 +113,14 @@ int failures = 0;
 void rand_bf16(int64_t n, float lo, float hi, std::mt19937& g, std::vector<uint16_t>& codes) {
     std::uniform_real_distribution<float> d(lo, hi);
     codes.resize(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) codes[i] = f32_to_bf16(d(g));
+    for (int64_t i = 0; i < n; ++i)
+        codes[i] = f32_to_bf16(d(g));
 }
 void rand_f32(int64_t n, float lo, float hi, std::mt19937& g, std::vector<float>& vals) {
     std::uniform_real_distribution<float> d(lo, hi);
     vals.resize(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) vals[i] = d(g);
+    for (int64_t i = 0; i < n; ++i)
+        vals[i] = d(g);
 }
 
 // CPU FP32 GQA reference (2-pass softmax). score = dot(q,k) * rsqrt(head_dim)
@@ -135,7 +138,8 @@ void ref_gqa_decode_fp32(const float* Q, const float* K, const float* V, float* 
             for (int d = 0; d < hd; ++d)
                 dot += Q[h * hd + d] * K[(size_t)j * nkv * hd + kvh * hd + d];
             scores[j] = dot * scale;
-            if (scores[j] > mx) mx = scores[j];
+            if (scores[j] > mx)
+                mx = scores[j];
         }
         float sum = 0.0f;
         for (int j = 0; j < kv_len; ++j) {
@@ -191,7 +195,8 @@ void check_decode(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
     // K/V are never quantized here (authoritative store); the only rounding
     // under test is the BF16 Q input store + the BF16 output store.
     std::vector<float> qf(qc.size());
-    for (size_t i = 0; i < qc.size(); ++i) qf[i] = bf16_to_f32(qc[i]);
+    for (size_t i = 0; i < qc.size(); ++i)
+        qf[i] = bf16_to_f32(qc[i]);
     std::vector<float> ref(static_cast<size_t>(nh * hd));
     ref_gqa_decode_fp32(qf.data(), kf.data(), vf.data(), ref.data(), kv_len, nh, nkv, hd);
 
@@ -218,7 +223,8 @@ void check_fp32_consistency(int kv_len, int nh, int nkv, int hd, std::mt19937& g
     rand_f32((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, kf);
     rand_f32((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, vf);
     std::vector<float> qf(qc.size());
-    for (size_t i = 0; i < qc.size(); ++i) qf[i] = bf16_to_f32(qc[i]);
+    for (size_t i = 0; i < qc.size(); ++i)
+        qf[i] = bf16_to_f32(qc[i]);
     auto q32 = make_dev_fp32(qf, 1, nh * hd);
     auto k32 = make_dev_fp32(kf, kv_len, nkv * hd);
     auto v32 = make_dev_fp32(vf, kv_len, nkv * hd);
@@ -234,9 +240,9 @@ void check_fp32_consistency(int kv_len, int nh, int nkv, int hd, std::mt19937& g
     auto ob = std::make_shared<Tensor>(DataType::BF16, std::vector<int64_t>{1, nh * hd},
                                        DeviceType::CUDA);
     forge::cuda::launch_flash_attention_gqa_decode_bf16q(
-        reinterpret_cast<const __nv_bfloat16*>(qb->data()),
-        static_cast<const float*>(k32->data()), static_cast<const float*>(v32->data()),
-        reinterpret_cast<__nv_bfloat16*>(ob->data()), kv_len, nh, nkv, hd, nullptr, 0);
+        reinterpret_cast<const __nv_bfloat16*>(qb->data()), static_cast<const float*>(k32->data()),
+        static_cast<const float*>(v32->data()), reinterpret_cast<__nv_bfloat16*>(ob->data()),
+        kv_len, nh, nkv, hd, nullptr, 0);
     cudaDeviceSynchronize();
 
     auto got32 = to_host_f32(o32);
@@ -244,8 +250,8 @@ void check_fp32_consistency(int kv_len, int nh, int nkv, int hd, std::mt19937& g
     float max_abs = 0.0f;
     for (size_t i = 0; i < got32.size(); ++i)
         max_abs = std::max(max_abs, std::fabs(gotbf[i] - got32[i]));
-    std::printf("  fp32-consistency kv=%d nh=%d nkv=%d hd=%d : max_abs=%.3e\n", kv_len, nh, nkv,
-                hd, max_abs);
+    std::printf("  fp32-consistency kv=%d nh=%d nkv=%d hd=%d : max_abs=%.3e\n", kv_len, nh, nkv, hd,
+                max_abs);
     // Same decoded values through both kernels: only the BF16 output store
     // differs. Observed 1.2-2.4e-4; same ~4x bound as above.
     CHECK(max_abs < 1e-3f);
@@ -292,9 +298,12 @@ void check_decode_bf16(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
 
     // Reference: all inputs decoded from the same BF16 codes.
     std::vector<float> qf(qc.size()), kf(kc.size()), vf(vc.size());
-    for (size_t i = 0; i < qc.size(); ++i) qf[i] = bf16_to_f32(qc[i]);
-    for (size_t i = 0; i < kc.size(); ++i) kf[i] = bf16_to_f32(kc[i]);
-    for (size_t i = 0; i < vc.size(); ++i) vf[i] = bf16_to_f32(vc[i]);
+    for (size_t i = 0; i < qc.size(); ++i)
+        qf[i] = bf16_to_f32(qc[i]);
+    for (size_t i = 0; i < kc.size(); ++i)
+        kf[i] = bf16_to_f32(kc[i]);
+    for (size_t i = 0; i < vc.size(); ++i)
+        vf[i] = bf16_to_f32(vc[i]);
     std::vector<float> ref(static_cast<size_t>(nh * hd));
     ref_gqa_decode_fp32(qf.data(), kf.data(), vf.data(), ref.data(), kv_len, nh, nkv, hd);
 
@@ -302,8 +311,8 @@ void check_decode_bf16(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
     float max_abs = 0.0f;
     for (size_t i = 0; i < ref.size(); ++i)
         max_abs = std::max(max_abs, std::fabs(got[i] - ref[i]));
-    std::printf("  decode-bf16kv kv=%d nh=%d nkv=%d hd=%d : max_abs=%.3e (A==B: %d)\n", kv_len,
-                nh, nkv, hd, max_abs, codesA == codesB ? 1 : 0);
+    std::printf("  decode-bf16kv kv=%d nh=%d nkv=%d hd=%d : max_abs=%.3e (A==B: %d)\n", kv_len, nh,
+                nkv, hd, max_abs, codesA == codesB ? 1 : 0);
     // Calibration (RTX 4050, 2026-09-07): |out| <= 1; observed 1.1-2.2e-4 --
     // the same band as the BF16-Q slice (K/V rounding adds no measurable
     // bias at kv=512; softmax averaging absorbs it). Same ~4x bound.
@@ -332,7 +341,8 @@ void ref_gqa_prefill_fp32(const float* Q, const float* K, const float* V, float*
                 for (int d = 0; d < hd; ++d)
                     dot += qr[d] * K[(size_t)j * nkv * hd + kvh * hd + d];
                 scores[j] = dot * scale;
-                if (scores[j] > mx) mx = scores[j];
+                if (scores[j] > mx)
+                    mx = scores[j];
             }
             float sum = 0.0f;
             for (int j = 0; j < kv_len; ++j) {
@@ -366,8 +376,7 @@ void check_prefill_bf16(int q_len, int kv_len, int nh, int nkv, int hd, std::mt1
         reinterpret_cast<const __nv_bfloat16*>(q->data()),
         reinterpret_cast<const __nv_bfloat16*>(k->data()),
         reinterpret_cast<const __nv_bfloat16*>(v->data()),
-        reinterpret_cast<__nv_bfloat16*>(o->data()), q_len, kv_len, nh, nkv, hd, nullptr, true,
-        0);
+        reinterpret_cast<__nv_bfloat16*>(o->data()), q_len, kv_len, nh, nkv, hd, nullptr, true, 0);
     cudaDeviceSynchronize();
     auto codesA = to_host_u16(o);
 
@@ -386,9 +395,12 @@ void check_prefill_bf16(int q_len, int kv_len, int nh, int nkv, int hd, std::mt1
     cudaStreamDestroy(cs);
 
     std::vector<float> qf(qc.size()), kf(kc.size()), vf(vc.size());
-    for (size_t i = 0; i < qc.size(); ++i) qf[i] = bf16_to_f32(qc[i]);
-    for (size_t i = 0; i < kc.size(); ++i) kf[i] = bf16_to_f32(kc[i]);
-    for (size_t i = 0; i < vc.size(); ++i) vf[i] = bf16_to_f32(vc[i]);
+    for (size_t i = 0; i < qc.size(); ++i)
+        qf[i] = bf16_to_f32(qc[i]);
+    for (size_t i = 0; i < kc.size(); ++i)
+        kf[i] = bf16_to_f32(kc[i]);
+    for (size_t i = 0; i < vc.size(); ++i)
+        vf[i] = bf16_to_f32(vc[i]);
     std::vector<float> ref(static_cast<size_t>(q_len * nh * hd));
     ref_gqa_prefill_fp32(qf.data(), kf.data(), vf.data(), ref.data(), q_len, kv_len, nh, nkv, hd);
 
@@ -436,8 +448,8 @@ void check_selector() {
 // BF16 K/V with BF16 Q, BF16-Q prefill (seq>1), non-GQA BF16, hd256 -- all via
 // the dispatch layer, all must throw with a BF16 marker.
 void check_loud(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
-    auto run_dispatch = [&](const TensorPtr& q, const TensorPtr& k, const TensorPtr& v,
-                            int qlen, int hdm, const char* label) {
+    auto run_dispatch = [&](const TensorPtr& q, const TensorPtr& k, const TensorPtr& v, int qlen,
+                            int hdm, const char* label) {
         int32_t params[forge::OP_PARAMS_MAX_SIZE / sizeof(int32_t)] = {0};
         params[0] = nh;
         params[1] = nkv;
@@ -521,9 +533,8 @@ void check_loud(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
         params[4] = 1;
         TensorPtr out;
         try {
-            out = forge::OpDispatch::instance().execute(forge::OpType::FLASH_ATTN_GQA,
-                                                        DeviceType::CUDA, {qpre, kpre, vpre},
-                                                        params, 0);
+            out = forge::OpDispatch::instance().execute(
+                forge::OpType::FLASH_ATTN_GQA, DeviceType::CUDA, {qpre, kpre, vpre}, params, 0);
         } catch (const std::exception& e) {
             std::printf("FAIL all-BF16 prefill dispatch threw: %s\n", e.what());
             ++failures;
@@ -592,8 +603,7 @@ void check_graph_node(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
     params[2] = hd;
     params[3] = 1;  // causal
     params[4] = 1;  // CUDA
-    graph->add_node("attn", forge::OpType::FLASH_ATTN_GQA, {qi, ki, vi}, params,
-                    DeviceType::CUDA);
+    graph->add_node("attn", forge::OpType::FLASH_ATTN_GQA, {qi, ki, vi}, params, DeviceType::CUDA);
 
     CHECK(forge::CudaGraphRunner::is_compatible(*graph));
 
@@ -615,17 +625,20 @@ void check_graph_node(int kv_len, int nh, int nkv, int hd, std::mt19937& g) {
     CHECK(cudaStreamCreate(&cs) == cudaSuccess);
     forge::CudaGraphRunner runner;
     runner.set_enabled(true);
-    bool captured = runner.try_replay_or_capture(*graph, [&]() { graph->execute(cs); }, cs);
+    bool captured = runner.try_replay_or_capture(
+        *graph, [&]() { graph->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     CHECK(captured);
     CHECK(to_host_u16(graph->last_output()) == codesA);
-    bool replayed = runner.try_replay_or_capture(*graph, [&]() { graph->execute(cs); }, cs);
+    bool replayed = runner.try_replay_or_capture(
+        *graph, [&]() { graph->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     CHECK(replayed);
     CHECK(to_host_u16(graph->last_output()) == codesA);
     cudaStreamDestroy(cs);
-    std::printf("  graph node kv=%d nh=%d nkv=%d hd=%d : eager/capture/replay bitwise OK (BF16-Q)\n",
-                kv_len, nh, nkv, hd);
+    std::printf(
+        "  graph node kv=%d nh=%d nkv=%d hd=%d : eager/capture/replay bitwise OK (BF16-Q)\n",
+        kv_len, nh, nkv, hd);
 }
 
 // 6-B-6.7 graph node variant: all-BF16 QKV -- eager vs capture vs replay,
@@ -649,8 +662,7 @@ void check_graph_node_bf16kv(int kv_len, int nh, int nkv, int hd, std::mt19937& 
     params[2] = hd;
     params[3] = 1;  // causal
     params[4] = 1;  // CUDA
-    graph->add_node("attn", forge::OpType::FLASH_ATTN_GQA, {qi, ki, vi}, params,
-                    DeviceType::CUDA);
+    graph->add_node("attn", forge::OpType::FLASH_ATTN_GQA, {qi, ki, vi}, params, DeviceType::CUDA);
 
     CHECK(forge::CudaGraphRunner::is_compatible(*graph));
 
@@ -669,11 +681,13 @@ void check_graph_node_bf16kv(int kv_len, int nh, int nkv, int hd, std::mt19937& 
     CHECK(cudaStreamCreate(&cs) == cudaSuccess);
     forge::CudaGraphRunner runner;
     runner.set_enabled(true);
-    bool captured = runner.try_replay_or_capture(*graph, [&]() { graph->execute(cs); }, cs);
+    bool captured = runner.try_replay_or_capture(
+        *graph, [&]() { graph->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     CHECK(captured);
     CHECK(to_host_u16(graph->last_output()) == codesA);
-    bool replayed = runner.try_replay_or_capture(*graph, [&]() { graph->execute(cs); }, cs);
+    bool replayed = runner.try_replay_or_capture(
+        *graph, [&]() { graph->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     CHECK(replayed);
     CHECK(to_host_u16(graph->last_output()) == codesA);
@@ -693,14 +707,17 @@ void bench_decode(int kv_len, int nh, int nkv, int hd) {
     std::vector<float> qf, kf, vf;
     rand_bf16((int64_t)nh * hd, -1.0f, 1.0f, g, qc);
     qf.resize(qc.size());
-    for (size_t i = 0; i < qc.size(); ++i) qf[i] = bf16_to_f32(qc[i]);
+    for (size_t i = 0; i < qc.size(); ++i)
+        qf[i] = bf16_to_f32(qc[i]);
     rand_bf16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, kc);
     rand_bf16((int64_t)kv_len * nkv * hd, -1.0f, 1.0f, g, vc);
     kf.resize(kc.size());
     vf.resize(vc.size());
     // Same decoded values in the FP32 buffers: arms differ ONLY in storage.
-    for (size_t i = 0; i < kc.size(); ++i) kf[i] = bf16_to_f32(kc[i]);
-    for (size_t i = 0; i < vc.size(); ++i) vf[i] = bf16_to_f32(vc[i]);
+    for (size_t i = 0; i < kc.size(); ++i)
+        kf[i] = bf16_to_f32(kc[i]);
+    for (size_t i = 0; i < vc.size(); ++i)
+        vf[i] = bf16_to_f32(vc[i]);
     auto qb = make_dev_bf16(qc, 1, nh * hd);
     auto q32 = make_dev_fp32(qf, 1, nh * hd);
     auto kb = make_dev_bf16(kc, kv_len, nkv * hd);
@@ -783,8 +800,10 @@ void bench_decode(int kv_len, int nh, int nkv, int hd) {
         best_bfq = std::min(best_bfq, time_bfq(iters));
         best_32 = std::min(best_32, time_f32(iters));
     }
-    std::printf("bench decode kv=%5d nh=%d nkv=%d hd=%d : BF16-KV %.5f ms/tok | BF16-Q %.5f ms/tok | FP32 %.5f ms/tok | kv-gain %.2fx\n",
-                kv_len, nh, nkv, hd, best_bfkv, best_bfq, best_32, best_bfq / best_bfkv);
+    std::printf(
+        "bench decode kv=%5d nh=%d nkv=%d hd=%d : BF16-KV %.5f ms/tok | BF16-Q %.5f ms/tok | FP32 "
+        "%.5f ms/tok | kv-gain %.2fx\n",
+        kv_len, nh, nkv, hd, best_bfkv, best_bfq, best_32, best_bfq / best_bfkv);
 }
 
 }  // namespace
@@ -829,7 +848,8 @@ int main() {
     check_graph_node_bf16kv(128, 8, 2, 64, rng);
 
     if (failures == 0) {
-        std::printf("[6-B-6.6/6.7] decode benchmark (BF16-KV vs BF16-Q vs FP32, best-of-3 alternating)\n");
+        std::printf(
+            "[6-B-6.6/6.7] decode benchmark (BF16-KV vs BF16-Q vs FP32, best-of-3 alternating)\n");
         bench_decode(128, 8, 2, 64);
         bench_decode(512, 8, 2, 64);
         bench_decode(2048, 8, 2, 64);

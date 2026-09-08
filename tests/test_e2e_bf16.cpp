@@ -91,12 +91,12 @@ int failures = 0;
 // max_rel=2.0e-3 / cosine=0.9999886 / topk 8/8. Bounds below sit ~6-10x above
 // observed -- the same margin discipline as 6-A-8's 0.05 vs 2e-4, rescaled
 // for BF16 storage. A real regression (fallback/garbage) misses by 10x+.
-constexpr float kParityMaxAbs = 0.01f;    // logits are O(0.1..1) by construction
-constexpr float kParityMaxRel = 0.03f;    // denominator guard: |ref| >= 0.15
+constexpr float kParityMaxAbs = 0.01f;  // logits are O(0.1..1) by construction
+constexpr float kParityMaxRel = 0.03f;  // denominator guard: |ref| >= 0.15
 constexpr float kParityRelGuard = 0.15f;
-constexpr float kParityCosine = 0.999f;   // plan.md 2.2 end-to-end bar
+constexpr float kParityCosine = 0.999f;  // plan.md 2.2 end-to-end bar
 constexpr int kTopK = 8;
-constexpr int kTopKMinAgree = 7;          // same bar as 6-A-8 (observed 8/8)
+constexpr int kTopKMinAgree = 7;  // same bar as 6-A-8 (observed 8/8)
 
 // Materialize a device tensor from float values. BF16 storage rounds through
 // f32->bf16; FP32 stores as-is (the FP32 reference graph sees the exact values
@@ -105,7 +105,8 @@ TensorPtr dev_from_values(const std::vector<float>& vals, int64_t r, int64_t c, 
     auto host = std::make_shared<Tensor>(dt, std::vector<int64_t>{r, c}, DeviceType::CPU);
     if (dt == DataType::BF16) {
         auto* h = static_cast<uint16_t*>(host->data());
-        for (size_t i = 0; i < vals.size(); ++i) h[i] = f32_to_bf16(vals[i]);
+        for (size_t i = 0; i < vals.size(); ++i)
+            h[i] = f32_to_bf16(vals[i]);
     } else {
         std::memcpy(host->data(), vals.data(), vals.size() * 4);
     }
@@ -129,7 +130,8 @@ std::vector<float> to_host_f32(const TensorPtr& t) {
     std::vector<float> v(n);
     if (t->dtype() == DataType::BF16) {
         auto* h = static_cast<uint16_t*>(host->data());
-        for (size_t i = 0; i < n; ++i) v[i] = bf16_to_f32(h[i]);
+        for (size_t i = 0; i < n; ++i)
+            v[i] = bf16_to_f32(h[i]);
     } else {
         std::memcpy(v.data(), host->data(), n * 4);
     }
@@ -139,16 +141,17 @@ std::vector<float> to_host_f32(const TensorPtr& t) {
 void rand_vals(int64_t n, float lo, float hi, std::mt19937& g, std::vector<float>& out) {
     std::uniform_real_distribution<float> d(lo, hi);
     out.resize(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) out[i] = d(g);
+    for (int64_t i = 0; i < n; ++i)
+        out[i] = d(g);
 }
 
 struct GraphSpec {
     int D = 256;
     int nh = 8, nkv = 2, hd = 64;
     int FF = 512;
-    int V = 128;      // vocab (logits width)
+    int V = 128;  // vocab (logits width)
     int layers = 2;
-    int q_len = 16;   // == kv_len => prefill; 1 => decode
+    int q_len = 16;  // == kv_len => prefill; 1 => decode
     int kv_len = 16;
 };
 
@@ -157,11 +160,11 @@ struct GraphSpec {
 // consumes the exact values. Any logits difference is therefore attributable
 // to BF16 storage/compute inside the chain, not to input drift.
 struct ModelValues {
-    std::vector<float> x;                                     // [q_len, D]
-    std::vector<std::vector<float>> w_attn, wq, wk, wv, wo;   // per layer
-    std::vector<std::vector<float>> w_ffn, wg, wu;            // per layer
-    std::vector<float> w_out_v;                               // [1, D]
-    std::vector<float> wvoc;                                  // [V, D]
+    std::vector<float> x;                                    // [q_len, D]
+    std::vector<std::vector<float>> w_attn, wq, wk, wv, wo;  // per layer
+    std::vector<std::vector<float>> w_ffn, wg, wu;           // per layer
+    std::vector<float> w_out_v;                              // [1, D]
+    std::vector<float> wvoc;                                 // [V, D]
 };
 
 ModelValues make_model_values(const GraphSpec& s, std::mt19937& g) {
@@ -282,38 +285,40 @@ std::unique_ptr<ComputeGraph> build_model_graph(const GraphSpec& s, const ModelT
 
     for (int l = 0; l < s.layers; ++l) {
         std::string p = "L" + std::to_string(l) + ".";
-        int h = g->add_node(p + "rms_attn", OpType::RMS_NORM, {cur, w_attn_i[l]},
-                            rms_params, DeviceType::CUDA);
+        int h = g->add_node(p + "rms_attn", OpType::RMS_NORM, {cur, w_attn_i[l]}, rms_params,
+                            DeviceType::CUDA);
         int q = g->add_node(p + "wq", OpType::MUL_MAT_TRANSB, {-h - 1, wq_i[l]}, nullptr,
                             DeviceType::CUDA);
         // Attention K/V: prefill projects the hidden state; decode reads the
         // cache inputs directly (q_len=1, causal covers the whole cache).
-        int k_i = (s.q_len != 1) ? -g->add_node(p + "wk", OpType::MUL_MAT_TRANSB,
-                                                {-h - 1, wk_i[l]}, nullptr, DeviceType::CUDA) - 1
+        int k_i = (s.q_len != 1) ? -g->add_node(p + "wk", OpType::MUL_MAT_TRANSB, {-h - 1, wk_i[l]},
+                                                nullptr, DeviceType::CUDA) -
+                                       1
                                  : k_cache_i[l];
-        int v_i = (s.q_len != 1) ? -g->add_node(p + "wv", OpType::MUL_MAT_TRANSB,
-                                                {-h - 1, wv_i[l]}, nullptr, DeviceType::CUDA) - 1
+        int v_i = (s.q_len != 1) ? -g->add_node(p + "wv", OpType::MUL_MAT_TRANSB, {-h - 1, wv_i[l]},
+                                                nullptr, DeviceType::CUDA) -
+                                       1
                                  : v_cache_i[l];
-        int attn = g->add_node(p + "attn", OpType::FLASH_ATTN_GQA, {-q - 1, k_i, v_i},
-                               attn_params, DeviceType::CUDA);
+        int attn = g->add_node(p + "attn", OpType::FLASH_ATTN_GQA, {-q - 1, k_i, v_i}, attn_params,
+                               DeviceType::CUDA);
         int o = g->add_node(p + "wo", OpType::MUL_MAT_TRANSB, {-attn - 1, wo_i[l]}, nullptr,
                             DeviceType::CUDA);
-        int x2 = g->add_node(p + "residual1", OpType::ADD, {cur, -o - 1}, nullptr,
+        int x2 =
+            g->add_node(p + "residual1", OpType::ADD, {cur, -o - 1}, nullptr, DeviceType::CUDA);
+        int h2 = g->add_node(p + "rms_ffn", OpType::RMS_NORM, {-x2 - 1, w_ffn_i[l]}, rms_params,
                              DeviceType::CUDA);
-        int h2 = g->add_node(p + "rms_ffn", OpType::RMS_NORM, {-x2 - 1, w_ffn_i[l]},
-                             rms_params, DeviceType::CUDA);
         int gt = g->add_node(p + "wg", OpType::MUL_MAT_TRANSB, {-h2 - 1, wg_i[l]}, nullptr,
                              DeviceType::CUDA);
         int ut = g->add_node(p + "wu", OpType::MUL_MAT_TRANSB, {-h2 - 1, wu_i[l]}, nullptr,
                              DeviceType::CUDA);
         int act = g->add_node(p + "silu", OpType::SILU, {-gt - 1}, nullptr, DeviceType::CUDA);
-        int gated = g->add_node(p + "gate_up", OpType::MUL, {-act - 1, -ut - 1}, nullptr,
-                                DeviceType::CUDA);
+        int gated =
+            g->add_node(p + "gate_up", OpType::MUL, {-act - 1, -ut - 1}, nullptr, DeviceType::CUDA);
         cur = -g->add_node(p + "residual2", OpType::ADD, {-x2 - 1, -gated - 1}, nullptr,
-                           DeviceType::CUDA) - 1;
+                           DeviceType::CUDA) -
+              1;
     }
-    int hf = g->add_node("out.rms", OpType::RMS_NORM, {cur, w_out_i}, rms_params,
-                         DeviceType::CUDA);
+    int hf = g->add_node("out.rms", OpType::RMS_NORM, {cur, w_out_i}, rms_params, DeviceType::CUDA);
     g->add_node("logits", OpType::MUL_MAT_TRANSB, {-hf - 1, wvoc_i}, nullptr, DeviceType::CUDA);
     return g;
 }
@@ -351,14 +356,14 @@ Parity compare_logits(const std::vector<float>& gotbf, const std::vector<float>&
     };
     auto ta = topk(gotbf), tb = topk(ref32);
     for (int i = 0; i < kTopK; ++i)
-        if (ta[i] != tb[i]) p.topk_agree++;
+        if (ta[i] != tb[i])
+            p.topk_agree++;
     return p;
 }
 
 // ---- the full 6-B-7 gate set for one mode (prefill / decode) ----
 void check_e2e(const GraphSpec& s, const ModelValues& mv, const GraphSpec& pre,
-               const ModelTensors& tp_bf, const ModelTensors& tp_fp,
-               std::mt19937& g) {
+               const ModelTensors& tp_bf, const ModelTensors& tp_fp, std::mt19937& g) {
     (void)g;
     const char* mode = (s.q_len == 1) ? "decode" : "prefill";
 
@@ -412,10 +417,12 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, const GraphSpec& pre,
     for (const auto& r : trace) {
         bool all_in_bf16 = true;
         for (auto d : r.input_dtypes)
-            if (d != DataType::BF16) all_in_bf16 = false;
+            if (d != DataType::BF16)
+                all_in_bf16 = false;
         CHECK(all_in_bf16);
         CHECK(r.output_dtype == DataType::BF16);
-        if (r.dst_injected) dst_injected++;
+        if (r.dst_injected)
+            dst_injected++;
     }
 
     // The dst-injectable BF16 ops must actually go through the planner buffer
@@ -439,9 +446,9 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, const GraphSpec& pre,
 
     // ---- acceptance 2: BF16 vs FP32 parity (FIXED thresholds) ----
     Parity par = compare_logits(got, ref);
-    std::printf("  e2e-%s parity: max_abs=%.3e max_rel=%.3e cosine=%.7f max_ref=%.3e topk_mismatch=%d/%d\n",
-                mode, par.max_abs, par.max_rel, par.cosine, par.max_ref, par.topk_agree,
-                par.agree_k);
+    std::printf(
+        "  e2e-%s parity: max_abs=%.3e max_rel=%.3e cosine=%.7f max_ref=%.3e topk_mismatch=%d/%d\n",
+        mode, par.max_abs, par.max_rel, par.cosine, par.max_ref, par.topk_agree, par.agree_k);
 
     CHECK(par.max_ref >= kParityRelGuard);  // the rel metric must be non-vacuous
     CHECK(par.max_abs < kParityMaxAbs);
@@ -463,7 +470,8 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, const GraphSpec& pre,
     runner.set_enabled(true);
 
     // C: capture the whole graph on the capture stream.
-    bool captured = runner.try_replay_or_capture(*gbf, [&]() { gbf->execute(cs); }, cs);
+    bool captured = runner.try_replay_or_capture(
+        *gbf, [&]() { gbf->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     CHECK(captured);
     CHECK(to_host_u16(gbf->last_output()) == codesA);
@@ -471,7 +479,8 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, const GraphSpec& pre,
     // D: replay x N -- bitwise stable every time, buffer address/size stable.
     constexpr int kReplays = 3;
     for (int i = 0; i < kReplays; ++i) {
-        bool replayed = runner.try_replay_or_capture(*gbf, [&]() { gbf->execute(cs); }, cs);
+        bool replayed = runner.try_replay_or_capture(
+            *gbf, [&]() { gbf->execute(cs); }, cs);
         cudaStreamSynchronize(cs);
         CHECK(replayed);
         CHECK(to_host_u16(gbf->last_output()) == codesA);
@@ -479,7 +488,6 @@ void check_e2e(const GraphSpec& s, const ModelValues& mv, const GraphSpec& pre,
         CHECK(gbf->last_output()->nbytes() == nbytesA);
     }
     cudaStreamDestroy(cs);
-
 
     gbf->release_graph();
     g32->release_graph();
@@ -495,7 +503,6 @@ int main() {
     }
     setenv("FORGE_TRACE_DTYPE", "1", 1);
     forge::register_builtin_op_kernels();
-
 
     std::mt19937 rng(0x6B07);
 

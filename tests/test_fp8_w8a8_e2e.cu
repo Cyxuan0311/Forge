@@ -50,7 +50,8 @@ static int g_failures = 0;
 
 static bool device_is_ada() {
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaGetDevice(&dev) != cudaSuccess)
+        return false;
     int major = 0, minor = 0;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
@@ -60,7 +61,8 @@ static bool device_is_ada() {
 static TensorPtr make_cuda_fp32(const std::vector<float>& h, int64_t rows, int64_t cols) {
     auto t = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{rows, cols},
                                       DeviceType::CUDA);
-    if (!t->data()) throw std::runtime_error("make_cuda_fp32: CUDA alloc failed");
+    if (!t->data())
+        throw std::runtime_error("make_cuda_fp32: CUDA alloc failed");
     cudaMemcpy(t->data(), h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
     return t;
 }
@@ -93,7 +95,8 @@ static void fetch_floats(const TensorPtr& t, std::vector<float>& h) {
 // is a device-authoritative FP8 tensor (producer owns the scale write).
 static TensorPtr quantize_and_check(const TensorPtr& x, const char* what) {
     auto q = quantize_fp8_e4m3_w8a8(x, 0);
-    if (!q) throw std::runtime_error(std::string(what) + ": producer returned null");
+    if (!q)
+        throw std::runtime_error(std::string(what) + ": producer returned null");
     if (q->dtype() != DataType::FP8_E4M3)
         throw std::runtime_error(std::string(what) + ": producer output not FP8_E4M3");
     if (!q->has_fp8_scale() || !q->fp8_scale_device_ptr())
@@ -110,8 +113,7 @@ static TensorPtr quantize_and_check(const TensorPtr& x, const char* what) {
 // A and B arrive pre-quantized (bytes fetched from the device producer), so the
 // golden re-uses exactly the encoded payload the device path consumes.
 static std::vector<float> ref_chain(const std::vector<uint8_t>& qA, float sa,
-                                    const std::vector<uint8_t>& qB, float sb, int M, int K,
-                                    int N) {
+                                    const std::vector<uint8_t>& qB, float sb, int M, int K, int N) {
     std::vector<float> y((size_t)M * N, 0.f);
     for (int m = 0; m < M; ++m)
         for (int n = 0; n < N; ++n) {
@@ -132,11 +134,13 @@ static bool run_chain_case(const char* name, int M, int K, int N, bool apply_rel
     std::uniform_real_distribution<float> u(-0.8f, 0.8f);
 
     std::vector<float> hx((size_t)M * K), hw((size_t)N * K);
-    for (float& v : hx) v = u(rng);
+    for (float& v : hx)
+        v = u(rng);
     // Row-major [N,K] Forge transB weight: output row n holds its K input weights
     // contiguously (W[n*K + k]) -- the production layout for FP8 GEMM and GEMV.
     for (int n = 0; n < N; ++n)
-        for (int k = 0; k < K; ++k) hw[(size_t)n * K + k] = u(rng);
+        for (int k = 0; k < K; ++k)
+            hw[(size_t)n * K + k] = u(rng);
     auto x_dev = make_cuda_fp32(hx, M, K);
     auto w_dev = make_cuda_fp32(hw, N, K);
 
@@ -176,8 +180,8 @@ static bool run_chain_case(const char* name, int M, int K, int N, bool apply_rel
         return false;
     }
     if (out1->dtype() != DataType::FP32) {
-        printf("  [FAIL] %s: chain output dtype is %s, expected FP32 (no FP8 re-quantize)\n",
-               name, dtype_name(out1->dtype()).c_str());
+        printf("  [FAIL] %s: chain output dtype is %s, expected FP32 (no FP8 re-quantize)\n", name,
+               dtype_name(out1->dtype()).c_str());
         ok = false;
     }
 
@@ -188,7 +192,8 @@ static bool run_chain_case(const char* name, int M, int K, int N, bool apply_rel
     // Gate 2: determinism -- the two identical runs must be bitwise equal.
     int bdiff = 0;
     for (size_t i = 0; i < y1.size(); ++i)
-        if (std::memcmp(&y1[i], &y2[i], sizeof(float)) != 0) ++bdiff;
+        if (std::memcmp(&y1[i], &y2[i], sizeof(float)) != 0)
+            ++bdiff;
     if (bdiff != 0) {
         printf("  [FAIL] %s: two identical runs differ on %d/%zu elements (not deterministic)\n",
                name, bdiff, y1.size());
@@ -223,9 +228,10 @@ static bool run_chain_case(const char* name, int M, int K, int N, bool apply_rel
     }
 
     if (ok)
-        printf("  [OK] 6-C-5.6 %s (%dx%dx%d relu=%d): FP32 out, cosine=%.6f maxerr=%.3e "
-               "deterministic(bitwise) registry=%llu sidecar=%llu\n",
-               name, M, K, N, (int)apply_relu, cosine, maxerr, c.registry, c.sidecar);
+        printf(
+            "  [OK] 6-C-5.6 %s (%dx%dx%d relu=%d): FP32 out, cosine=%.6f maxerr=%.3e "
+            "deterministic(bitwise) registry=%llu sidecar=%llu\n",
+            name, M, K, N, (int)apply_relu, cosine, maxerr, c.registry, c.sidecar);
     return ok;
 }
 
@@ -238,21 +244,23 @@ static bool test_activation_producer() {
     std::mt19937 rng(777u);
     std::uniform_real_distribution<float> u(-1.f, 1.f);
     std::vector<float> hx(n);
-    for (float& v : hx) v = u(rng);
+    for (float& v : hx)
+        v = u(rng);
 
     auto x_dev = make_cuda_fp32(hx, n, 1);
 
     // Reference: relu on host, then the plain (unfused) output producer.
     std::vector<float> hrelu(n);
-    for (int i = 0; i < n; ++i) hrelu[i] = std::max(hx[i], 0.f);
+    for (int i = 0; i < n; ++i)
+        hrelu[i] = std::max(hx[i], 0.f);
     auto xr_dev = make_cuda_fp32(hrelu, n, 1);
     auto ref = quantize_fp8_e4m3_output(xr_dev, 0);
     const float ref_scale = read_device_scale(ref);
     const std::vector<uint8_t> ref_bytes = fetch_bytes(ref);
 
     // Fused: quantize(relu(x)) in one producer -- no FP32 relu tensor on device.
-    auto act = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n, 1},
-                                        DeviceType::CUDA);
+    auto act =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n, 1}, DeviceType::CUDA);
     if (!act->fp8_scale_device_slot(0)) {
         printf("  [FAIL] 6-C-5.6a: activation slot alloc failed\n");
         return false;
@@ -263,36 +271,40 @@ static bool test_activation_producer() {
 
     int bdiff = 0;
     for (int i = 0; i < n; ++i)
-        if (act_bytes[i] != ref_bytes[i]) ++bdiff;
+        if (act_bytes[i] != ref_bytes[i])
+            ++bdiff;
     const bool scale_eq = (std::memcmp(&act_scale, &ref_scale, sizeof(float)) == 0);
     if (bdiff != 0 || !scale_eq) {
-        printf("  [FAIL] 6-C-5.6a: fused relu producer != relu-then-quantize (bytes differ "
-               "%d/%d, scale %g vs %g)\n",
-               bdiff, n, act_scale, ref_scale);
+        printf(
+            "  [FAIL] 6-C-5.6a: fused relu producer != relu-then-quantize (bytes differ "
+            "%d/%d, scale %g vs %g)\n",
+            bdiff, n, act_scale, ref_scale);
         ok = false;
     }
     // Negative-heavy input must collapse to scale 1 / all-zero bytes (relu kills
     // every negative; amax == 0 contract from 5.1b).
     std::vector<float> hneg(n, -1.5f);
     auto xn_dev = make_cuda_fp32(hneg, n, 1);
-    auto act_neg = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n, 1},
-                                            DeviceType::CUDA);
+    auto act_neg =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n, 1}, DeviceType::CUDA);
     act_neg->fp8_scale_device_slot(0);
     quantize_fp8_e4m3_output_into(xn_dev, act_neg, 0, true);
     const float neg_scale = read_device_scale(act_neg);
     const std::vector<uint8_t> neg_bytes = fetch_bytes(act_neg);
     int nz = 0;
     for (uint8_t b : neg_bytes)
-        if (b != 0) ++nz;
+        if (b != 0)
+            ++nz;
     if (neg_scale != 1.f || nz != 0) {
-        printf("  [FAIL] 6-C-5.6a: all-negative input -> scale %g, %d non-zero bytes\n",
-               neg_scale, nz);
+        printf("  [FAIL] 6-C-5.6a: all-negative input -> scale %g, %d non-zero bytes\n", neg_scale,
+               nz);
         ok = false;
     }
 
     if (ok)
-        printf("  [OK] 6-C-5.6a activation producer: fused ReLU == relu-then-quantize "
-               "(bytewise + scale); all-negative -> scale 1 + zeros\n");
+        printf(
+            "  [OK] 6-C-5.6a activation producer: fused ReLU == relu-then-quantize "
+            "(bytewise + scale); all-negative -> scale 1 + zeros\n");
     return ok;
 }
 
@@ -307,14 +319,19 @@ int main() {
     }
 
     // 5.6: M == 1 decode chain routes through the FP8 GEMV consumer.
-    if (!run_chain_case("decode-chain", 1, 4096, 1024, /*apply_relu=*/false)) ++g_failures;
-    if (!run_chain_case("decode-act-chain", 1, 4096, 1024, /*apply_relu=*/true)) ++g_failures;
+    if (!run_chain_case("decode-chain", 1, 4096, 1024, /*apply_relu=*/false))
+        ++g_failures;
+    if (!run_chain_case("decode-act-chain", 1, 4096, 1024, /*apply_relu=*/true))
+        ++g_failures;
     // 5.6: M > 1 prefill chain routes through the CUTLASS FP8 GEMM consumer.
-    if (!run_chain_case("prefill-chain", 32, 512, 256, /*apply_relu=*/false)) ++g_failures;
-    if (!run_chain_case("prefill-act-chain", 32, 512, 256, /*apply_relu=*/true)) ++g_failures;
+    if (!run_chain_case("prefill-chain", 32, 512, 256, /*apply_relu=*/false))
+        ++g_failures;
+    if (!run_chain_case("prefill-act-chain", 32, 512, 256, /*apply_relu=*/true))
+        ++g_failures;
 
     // 5.6a: fused ReLU activation producer correctness (single scale contract).
-    if (!test_activation_producer()) ++g_failures;
+    if (!test_activation_producer())
+        ++g_failures;
 
     if (g_failures == 0) {
         printf("\n[fp8-w8a8-e2e] PASS\n");

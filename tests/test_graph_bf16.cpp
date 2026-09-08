@@ -114,8 +114,8 @@ std::unique_ptr<forge::ComputeGraph> build_chain_graph(const TensorPtr& x, const
     float eps = 1e-5f;
     std::memcpy(rms_params, &eps, sizeof(float));
 
-    int n0 = g->add_node("rms_norm", forge::OpType::RMS_NORM, {x_i, w_i}, rms_params,
-                         DeviceType::CUDA);
+    int n0 =
+        g->add_node("rms_norm", forge::OpType::RMS_NORM, {x_i, w_i}, rms_params, DeviceType::CUDA);
     int n1 = g->add_node("matmul", forge::OpType::MUL_MAT_TRANSB, {-n0 - 1, b_i}, nullptr,
                          DeviceType::CUDA);
     int n2 = g->add_node("silu", forge::OpType::SILU, {-n1 - 1}, nullptr, DeviceType::CUDA);
@@ -170,8 +170,8 @@ void check_graph_chain(int M, int K, int N, std::mt19937& g) {
                 max_rel = re;
         }
     }
-    std::printf("  graph chain M=%d K=%d N=%d : max_abs=%.3e max_rel(|ref|>=1)=%.3e (out=%s)\n",
-                M, K, N, max_abs, max_rel, forge::dtype_name(out->dtype()).c_str());
+    std::printf("  graph chain M=%d K=%d N=%d : max_abs=%.3e max_rel(|ref|>=1)=%.3e (out=%s)\n", M,
+                K, N, max_abs, max_rel, forge::dtype_name(out->dtype()).c_str());
     // Same operators, same tensors, plus graph plumbing (planning / dst
     // injection / dispatch). Thresholds mirror the 6-B-4.3 chain family
     // (cosine-grade agreement); a regression (FP32 fallback, mis-cast dst
@@ -189,10 +189,10 @@ void check_graph_chain(int M, int K, int N, std::mt19937& g) {
                 all_in_bf16 = false;
         CHECK(all_in_bf16);
         CHECK(r.output_dtype == DataType::BF16);  // no BF16 -> FP32 materialization
-        std::printf("    trace %-9s in=%s out=%s dst_injected=%d\n", r.name.c_str(),
-                    forge::dtype_name(r.input_dtypes.empty() ? DataType::BF16 : r.input_dtypes[0])
-                        .c_str(),
-                    forge::dtype_name(r.output_dtype).c_str(), r.dst_injected ? 1 : 0);
+        std::printf(
+            "    trace %-9s in=%s out=%s dst_injected=%d\n", r.name.c_str(),
+            forge::dtype_name(r.input_dtypes.empty() ? DataType::BF16 : r.input_dtypes[0]).c_str(),
+            forge::dtype_name(r.output_dtype).c_str(), r.dst_injected ? 1 : 0);
     }
     if (trace.size() == 5) {
         // dst-injected nodes wrote BF16 into the pre-allocated graph buffer.
@@ -259,7 +259,8 @@ void check_cuda_graph_bf16_capture(int M, int K, int N, std::mt19937& g) {
     forge::CudaGraphRunner runner;
     runner.set_enabled(true);
     // C: capture the full chain on the capture stream.
-    bool captured = runner.try_replay_or_capture(*graph, [&]() { graph->execute(cs); }, cs);
+    bool captured = runner.try_replay_or_capture(
+        *graph, [&]() { graph->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     size_t allocs_after = forge::cuda_mem::alloc_count();
     size_t hits_after = forge::cuda_mem::hit_count();
@@ -271,7 +272,8 @@ void check_cuda_graph_bf16_capture(int M, int K, int N, std::mt19937& g) {
     CHECK(codesC == codesA);
 
     // D: replay on the same stream — must match capture bitwise.
-    bool replayed = runner.try_replay_or_capture(*graph, [&]() { graph->execute(cs); }, cs);
+    bool replayed = runner.try_replay_or_capture(
+        *graph, [&]() { graph->execute(cs); }, cs);
     cudaStreamSynchronize(cs);
     CHECK(replayed);
     auto codesD = to_host_u16(graph->last_output());
@@ -282,8 +284,8 @@ void check_cuda_graph_bf16_capture(int M, int K, int N, std::mt19937& g) {
     CHECK(graph->last_output()->nbytes() == nbytesA);
 
     cudaStreamDestroy(cs);
-    std::printf("  cuda graph M=%d K=%d N=%d : capture+replay OK, buffer=%p size=%zu (BF16)\n",
-                M, K, N, bufA, nbytesA);
+    std::printf("  cuda graph M=%d K=%d N=%d : capture+replay OK, buffer=%p size=%zu (BF16)\n", M,
+                K, N, bufA, nbytesA);
 }
 
 }  // namespace
@@ -299,7 +301,9 @@ int main() {
     setenv("FORGE_TRACE_DTYPE", "1", 1);
     forge::register_builtin_op_kernels();
 
-    std::printf("[6-B-5] Native BF16 Graph / Binding integration (RMSNorm -> Matmul -> SiLU -> Add -> Mul)\n");
+    std::printf(
+        "[6-B-5] Native BF16 Graph / Binding integration (RMSNorm -> Matmul -> SiLU -> Add -> "
+        "Mul)\n");
     std::mt19937 rng(0x6B05);
 
     check_graph_chain(1, 4096, 11008, rng);

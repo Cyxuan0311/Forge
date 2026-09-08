@@ -75,12 +75,12 @@ TensorPtr make_host_fp32(const std::vector<float>& h, int64_t r, int64_t c) {
 }
 
 int failures = 0;
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        if (!(cond)) {                                                    \
-            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
-            ++failures;                                                   \
-        }                                                                 \
+#define CHECK(cond)                                                     \
+    do {                                                                \
+        if (!(cond)) {                                                  \
+            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            ++failures;                                                 \
+        }                                                               \
     } while (0)
 
 void rand_bf16(int64_t n, float lo, float hi, std::mt19937& g, std::vector<uint16_t>& codes,
@@ -174,8 +174,10 @@ void check_chain(int M, int K, int N, std::mt19937& g) {
         n2 += (double)ref_vec[i] * ref_vec[i];
     }
     float cosine = (n1 > 0 && n2 > 0) ? (float)(dot / std::sqrt(n1 * n2)) : 0.0f;
-    std::printf("  chain M=%d K=%d N=%d : max_abs=%.3e max_rel(|ref|>=1)=%.3e max_rel_info=%.3e cosine=%.7f (all stages BF16)\n",
-                M, K, N, max_abs, max_rel, max_rel_info, cosine);
+    std::printf(
+        "  chain M=%d K=%d N=%d : max_abs=%.3e max_rel(|ref|>=1)=%.3e max_rel_info=%.3e "
+        "cosine=%.7f (all stages BF16)\n",
+        M, K, N, max_abs, max_rel, max_rel_info, cosine);
     CHECK(cosine >= 0.999f);
     // Calibration (RTX 4050, 2026-09-07): cosine 0.999996 all M; max_abs
     // 0.40/0.54/0.76 (propagated RMSNorm-store rounding through K=4096, ~2-3x
@@ -199,7 +201,9 @@ int main() {
         return 0;
     }
 
-    std::printf("[6-B-4.3] Real native BF16 chain: RMSNorm -> Matmul -> SiLU (dtype invariant + correctness)\n");
+    std::printf(
+        "[6-B-4.3] Real native BF16 chain: RMSNorm -> Matmul -> SiLU (dtype invariant + "
+        "correctness)\n");
     std::mt19937 rng(0x6B44);
 
     // M=1 (decode GEMV), M=8 and M=32 (prefill rows) exercise both branches.

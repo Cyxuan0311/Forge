@@ -24,21 +24,21 @@
 // stay correct for both M == 1 (GEMV) and M > 1 (GEMM), which only holds in the
 // row-major form.
 
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cmath>
-#include <vector>
 #include <random>
 #include <string>
+#include <vector>
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-
-#include "forge/fp8_utils.h"
 #include "forge/fp8_gemv.h"
+#include "forge/fp8_quant.h"
+#include "forge/fp8_utils.h"
 #include "forge/kernel_selector.h"
 #include "forge/tensor.h"
-#include "forge/fp8_quant.h"
 
 using namespace forge;
 
@@ -101,16 +101,20 @@ __global__ void gemv_fp8(float* __restrict__ D, const uint8_t* __restrict__ A,
     uint8_t* Ash = reinterpret_cast<uint8_t*>(smem + 256 * sizeof(float));
     const int tid = threadIdx.x;
 
-    for (int i = tid; i < 256; i += blockDim.x) LUT[i] = lut[i];
-    for (int k = tid; k < K; k += blockDim.x) Ash[k] = A[k];
+    for (int i = tid; i < 256; i += blockDim.x)
+        LUT[i] = lut[i];
+    for (int k = tid; k < K; k += blockDim.x)
+        Ash[k] = A[k];
     __syncthreads();
 
     const int base = blockIdx.x * blockDim.x * VELEM + tid * VELEM;
-    if (base >= N) return;
+    if (base >= N)
+        return;
 
     float acc[VELEM];
 #pragma unroll
-    for (int v = 0; v < VELEM; ++v) acc[v] = 0.f;
+    for (int v = 0; v < VELEM; ++v)
+        acc[v] = 0.f;
 
     for (int k = 0; k < K; ++k) {
         const float af = LUT[Ash[k]];
@@ -132,12 +136,14 @@ __global__ void gemv_fp8(float* __restrict__ D, const uint8_t* __restrict__ A,
     }
     if (mode == 0) {
 #pragma unroll
-        for (int v = 0; v < VELEM; ++v) acc[v] *= s;
+        for (int v = 0; v < VELEM; ++v)
+            acc[v] *= s;
     }
 #pragma unroll
     for (int v = 0; v < VELEM; ++v) {
         const int j = base + v;
-        if (j < N) D[j] = acc[v];
+        if (j < N)
+            D[j] = acc[v];
     }
 }
 
@@ -149,15 +155,18 @@ __global__ void gemv_tmpl(float* __restrict__ D, const InT* __restrict__ A,
     const int tid = threadIdx.x;
 
     // Cooperative load of A (length K) into shared memory (reused over K steps).
-    for (int k = tid; k < K; k += blockDim.x) Ash[k] = A[k];
+    for (int k = tid; k < K; k += blockDim.x)
+        Ash[k] = A[k];
     __syncthreads();
 
     const int base = blockIdx.x * blockDim.x * VEC + tid * VEC;
-    if (base >= N) return;
+    if (base >= N)
+        return;
 
     float acc[VEC];
 #pragma unroll
-    for (int v = 0; v < VEC; ++v) acc[v] = 0.f;
+    for (int v = 0; v < VEC; ++v)
+        acc[v] = 0.f;
 
     for (int k = 0; k < K; ++k) {
         const float af = Decode<InT>::f(Ash[k]);
@@ -174,12 +183,14 @@ __global__ void gemv_tmpl(float* __restrict__ D, const InT* __restrict__ A,
     }
     if (mode == 0) {
 #pragma unroll
-        for (int v = 0; v < VEC; ++v) acc[v] *= s;
+        for (int v = 0; v < VEC; ++v)
+            acc[v] *= s;
     }
 #pragma unroll
     for (int v = 0; v < VEC; ++v) {
         const int j = base + v;
-        if (j < N) D[j] = acc[v];
+        if (j < N)
+            D[j] = acc[v];
     }
 }
 
@@ -188,7 +199,8 @@ __global__ void gemv_tmpl(float* __restrict__ D, const InT* __restrict__ A,
 // ---------------------------------------------------------------------------
 static bool device_ok() {
     int n = 0;
-    if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return false;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0)
+        return false;
     int major = 0, minor = 0;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
@@ -286,8 +298,9 @@ static RunResult run_one(int K, int N, const std::vector<InT>& hA, const std::ve
 // FP8 E4M3 runner with the shared-LUT kernel. `dLUT` is the device 256-entry
 // decode table (value = fp8_e4m3_to_fp32(byte)). VELEM sweeps the vector width.
 template <int VELEM>
-static RunResult run_fp8(int K, int N, const std::vector<uint8_t>& hA, const std::vector<uint8_t>& hW,
-                        const std::vector<float>& golden, float s, bool check, const float* dLUT) {
+static RunResult run_fp8(int K, int N, const std::vector<uint8_t>& hA,
+                         const std::vector<uint8_t>& hW, const std::vector<float>& golden, float s,
+                         bool check, const float* dLUT) {
     RunResult r{0, 0, 0, 0, 0};
     const size_t Wbytes = (size_t)K * N;
     const size_t Abytes = (size_t)K;
@@ -372,8 +385,8 @@ static bool test_device_scale_lifetime() {
     bool ok = true;
 
     // (1) host value change keeps the same device address
-    auto a = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024},
-                                      DeviceType::CUDA);
+    auto a =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024}, DeviceType::CUDA);
     a->set_fp8_scale(0.02f);
     const float* p0 = a->fp8_scale_device();
     a->set_fp8_scale(0.04f);
@@ -385,8 +398,8 @@ static bool test_device_scale_lifetime() {
     }
 
     // (2) move transfers ownership: the SAME address is served by the moved-to tensor
-    auto b = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024},
-                                      DeviceType::CUDA);
+    auto b =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024}, DeviceType::CUDA);
     b->set_fp8_scale(0.03f);
     const float* pb = b->fp8_scale_device();
     Tensor moved(std::move(*b));
@@ -398,11 +411,11 @@ static bool test_device_scale_lifetime() {
     }
 
     // (3) copy_from / view / slice propagate the sidecar VALUE (new tensor, own address)
-    auto src = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024},
-                                        DeviceType::CUDA);
+    auto src =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024}, DeviceType::CUDA);
     src->set_fp8_scale(0.05f);
-    auto dst = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024},
-                                        DeviceType::CUDA);
+    auto dst =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{1024}, DeviceType::CUDA);
     dst->copy_from(*src);
     auto v = src->view(std::vector<int64_t>{32, 32});
     auto sl = src->slice(0, 0, 16);
@@ -421,8 +434,9 @@ static bool test_device_scale_lifetime() {
     }
 
     if (ok)
-        printf("  [OK] 6-C-5.2b lifetime: addr stable across mutation+move, sidecar propagates "
-               "via copy_from/view/slice\n");
+        printf(
+            "  [OK] 6-C-5.2b lifetime: addr stable across mutation+move, sidecar propagates "
+            "via copy_from/view/slice\n");
     return ok;
 }
 
@@ -459,8 +473,9 @@ static bool test_quant_producer() {
         return false;
     }
     if (!q->fp8_scale_device_authoritative()) {
-        printf("  [FAIL] device scale is not marked authoritative (scale not computed on "
-               "device)\n");
+        printf(
+            "  [FAIL] device scale is not marked authoritative (scale not computed on "
+            "device)\n");
         return false;
     }
 
@@ -543,7 +558,8 @@ static bool test_quant_edge_cases() {
         cudaMemcpy(hq.data(), q->data(), n, cudaMemcpyDeviceToHost);
         bool all_zero = true;
         for (int i = 0; i < n; ++i)
-            if (hq[i] != 0) all_zero = false;
+            if (hq[i] != 0)
+                all_zero = false;
         if (s != 1.f || !all_zero) {
             printf("  [FAIL] amax==0: scale=%g all_zero=%d\n", s, (int)all_zero);
             ok = false;
@@ -568,7 +584,8 @@ static bool test_quant_edge_cases() {
         }
     }
 
-    if (ok) printf("  [OK] 6-C-5.1b edge cases: amax=0 -> scale 1 + zeros; NaN/Inf -> rejected\n");
+    if (ok)
+        printf("  [OK] 6-C-5.1b edge cases: amax=0 -> scale 1 + zeros; NaN/Inf -> rejected\n");
     return ok;
 }
 
@@ -593,13 +610,15 @@ static bool test_graph_scale_mutation() {
         seed = seed * 6364136223846793005ull + 1442695040888963407ull;
         return static_cast<uint8_t>((seed >> 33) & 0xFF);
     };
-    for (int i = 0; i < K; ++i) hA[i] = rnd();
-    for (size_t i = 0; i < hW.size(); ++i) hW[i] = rnd();
+    for (int i = 0; i < K; ++i)
+        hA[i] = rnd();
+    for (size_t i = 0; i < hW.size(); ++i)
+        hW[i] = rnd();
 
-    auto A = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{K},
-                                      DeviceType::CUDA);
-    auto W = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{N, K},
-                                      DeviceType::CUDA);
+    auto A =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{K}, DeviceType::CUDA);
+    auto W =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{N, K}, DeviceType::CUDA);
     auto D = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{N}, DeviceType::CUDA);
     cudaMemcpy(A->data(), hA.data(), K, cudaMemcpyHostToDevice);
     cudaMemcpy(W->data(), hW.data(), hW.size(), cudaMemcpyHostToDevice);
@@ -669,7 +688,7 @@ static bool test_graph_scale_mutation() {
     W->set_fp8_scale(0.05f);
     const float* pa1 = A->fp8_scale_device(s);  // H2D into the SAME address
     const float* pw1 = W->fp8_scale_device(s);
-    cudaStreamSynchronize(s);                   // ensure the upload precedes the replay
+    cudaStreamSynchronize(s);  // ensure the upload precedes the replay
 
     std::vector<float> out2;
     replay(out2);  // SAME gexec
@@ -691,7 +710,8 @@ static bool test_graph_scale_mutation() {
     int diff2 = 0;
     float maxd2 = 0.f;
     for (int i = 0; i < N; ++i) {
-        if (out2[i] != eager2[i]) ++diff2;
+        if (out2[i] != eager2[i])
+            ++diff2;
         maxd2 = std::max(maxd2, std::fabs(out2[i] - eager2[i]));
     }
     if (diff2 != 0) {
@@ -703,17 +723,20 @@ static bool test_graph_scale_mutation() {
     // ---- 5.3c: reverse check -- the kernel must really read the device scale ----
     int same12 = 0;
     for (int i = 0; i < N; ++i)
-        if (out1[i] == out2[i]) ++same12;
+        if (out1[i] == out2[i])
+            ++same12;
     if (same12 == N) {
-        printf("  [FAIL] output identical after mutation: the replay is NOT reading the "
-               "device scalar\n");
+        printf(
+            "  [FAIL] output identical after mutation: the replay is NOT reading the "
+            "device scalar\n");
         ok = false;
     }
     std::vector<float> out3;
     replay(out3);  // no mutation in between -> must be bit-stable
     int diff23 = 0;
     for (int i = 0; i < N; ++i)
-        if (out2[i] != out3[i]) ++diff23;
+        if (out2[i] != out3[i])
+            ++diff23;
     if (diff23 != 0) {
         printf("  [FAIL] replay not deterministic without mutation (%d differ)\n", diff23);
         ok = false;
@@ -739,7 +762,8 @@ static bool test_graph_scale_mutation() {
     // full match (diff34 == 0) is the failure, not the success.
     int diff34 = 0;
     for (int i = 0; i < N; ++i)
-        if (out3[i] != out4[i]) ++diff34;
+        if (out3[i] != out4[i])
+            ++diff34;
     if (diff34 == 0) {
         printf("  [FAIL] replay after move+mutation did not observe the new scale\n");
         ok = false;
@@ -783,14 +807,13 @@ static bool test_fp8_output_correctness() {
     nans[n / 2] = std::numeric_limits<float>::quiet_NaN();
     pinf[n / 2] = std::numeric_limits<float>::infinity();
 
-    const Case cases[] = {{"normal+", pos},      {"normal-", neg}, {"all-zero", zeros},
-                          {"saturation", sat},   {"NaN", nans},    {"+Inf", pinf}};
+    const Case cases[] = {{"normal+", pos},    {"normal-", neg}, {"all-zero", zeros},
+                          {"saturation", sat}, {"NaN", nans},    {"+Inf", pinf}};
 
     for (const auto& c : cases) {
-        auto src = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{n},
-                                            DeviceType::CUDA);
-        cudaMemcpy(src->data(), c.data.data(), (size_t)n * sizeof(float),
-                   cudaMemcpyHostToDevice);
+        auto src =
+            std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{n}, DeviceType::CUDA);
+        cudaMemcpy(src->data(), c.data.data(), (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
 
         auto out = quantize_fp8_e4m3_output(src, 0);
         if (out->dtype() != DataType::FP8_E4M3 || !out->has_fp8_scale() ||
@@ -807,8 +830,7 @@ static bool test_fp8_output_correctness() {
             continue;
         }
         float dev_scale = 0.f;
-        cudaMemcpy(&dev_scale, out->fp8_scale_device_ptr(), sizeof(float),
-                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(&dev_scale, out->fp8_scale_device_ptr(), sizeof(float), cudaMemcpyDeviceToHost);
         // NaN-aware: `NaN != NaN` is true, so two NaNs must be treated as agreeing.
         const bool both_nan = std::isnan(out->fp8_scale()) && std::isnan(dev_scale);
         if (!both_nan && out->fp8_scale() != dev_scale) {
@@ -817,8 +839,7 @@ static bool test_fp8_output_correctness() {
             ok = false;
         }
 
-        const bool expect_reject = (std::string(c.name) == "NaN" ||
-                                    std::string(c.name) == "+Inf");
+        const bool expect_reject = (std::string(c.name) == "NaN" || std::string(c.name) == "+Inf");
         if (expect_reject) {
             if (!std::isnan(dev_scale)) {
                 printf("  [FAIL] %s: not rejected (scale=%g, expected NaN)\n", c.name, dev_scale);
@@ -833,7 +854,8 @@ static bool test_fp8_output_correctness() {
 
         // finite amax of the source (NaN/Inf already handled above)
         float amax = 0.f;
-        for (float v : c.data) amax = std::max(amax, std::fabs(v));
+        for (float v : c.data)
+            amax = std::max(amax, std::fabs(v));
         const float want_scale = (amax > 0.f) ? amax / 240.0f : 1.f;
         if (std::fabs(dev_scale - want_scale) > 1e-6f * std::max(1.f, want_scale)) {
             printf("  [FAIL] %s: scale %g != amax/240 %g\n", c.name, dev_scale, want_scale);
@@ -854,7 +876,8 @@ static bool test_fp8_output_correctness() {
         if (std::string(c.name) == "all-zero") {
             bool all_zero = true;
             for (int i = 0; i < n; ++i)
-                if (hq[i] != 0) all_zero = false;
+                if (hq[i] != 0)
+                    all_zero = false;
             if (dev_scale != 1.f || !all_zero) {
                 printf("  [FAIL] all-zero: scale=%g all_zero=%d\n", dev_scale, (int)all_zero);
                 ok = false;
@@ -863,8 +886,9 @@ static bool test_fp8_output_correctness() {
     }
 
     if (ok)
-        printf("  [OK] 6-C-5.5c output correctness: +/-, zero(->scale 1 + zeros), "
-               "saturation, NaN/Inf rejected; host/device scale agree\n");
+        printf(
+            "  [OK] 6-C-5.5c output correctness: +/-, zero(->scale 1 + zeros), "
+            "saturation, NaN/Inf rejected; host/device scale agree\n");
     return ok;
 }
 
@@ -876,15 +900,14 @@ static bool test_fp8_output_correctness() {
 static bool test_fp8_output_graph_mutation() {
     const int n = 8192;
 
-    auto src = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{n},
-                                        DeviceType::CUDA);
-    auto dst = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n},
-                                        DeviceType::CUDA);
+    auto src = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{n}, DeviceType::CUDA);
+    auto dst =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n}, DeviceType::CUDA);
 
     std::vector<float> d1(n), d2(n);
     for (int i = 0; i < n; ++i) {
-        d1[i] = 0.001f * ((i % 97) + 1);        // amax ~ 0.097
-        d2[i] = 0.050f * ((i % 97) + 1);        // amax ~ 4.85  -> very different scale
+        d1[i] = 0.001f * ((i % 97) + 1);  // amax ~ 0.097
+        d2[i] = 0.050f * ((i % 97) + 1);  // amax ~ 4.85  -> very different scale
     }
     cudaMemcpy(src->data(), d1.data(), (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
 
@@ -948,14 +971,13 @@ static bool test_fp8_output_graph_mutation() {
         ok = false;
     }
     if (!(sc2 > sc1 * 2.0f)) {
-        printf("  [FAIL] producer did not update the scale on replay (sc1=%g sc2=%g)\n", sc1,
-               sc2);
+        printf("  [FAIL] producer did not update the scale on replay (sc1=%g sc2=%g)\n", sc1, sc2);
         ok = false;
     }
 
     // eager reference at D2 must match the replay bitwise (bytes AND scale).
-    auto dst_e = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n},
-                                          DeviceType::CUDA);
+    auto dst_e =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{n}, DeviceType::CUDA);
     dst_e->fp8_scale_device_slot(s);
     quantize_fp8_e4m3_output_into(src, dst_e, s);
     cudaStreamSynchronize(s);
@@ -966,7 +988,8 @@ static bool test_fp8_output_graph_mutation() {
 
     int bdiff = 0;
     for (int i = 0; i < n; ++i)
-        if (q2[i] != qe[i]) ++bdiff;
+        if (q2[i] != qe[i])
+            ++bdiff;
     if (bdiff != 0 || sc2 != sce) {
         printf("  [FAIL] replay != eager (bytes differ %d/%d, scale %g vs %g)\n", bdiff, n, sc2,
                sce);
@@ -975,10 +998,9 @@ static bool test_fp8_output_graph_mutation() {
 
     if (ok) {
         printf("  [OK] 6-C-5.5d output graph mutation:\n");
-        printf("       graphExec=%p (never re-instantiated), scale_ptr=%p (stable)\n",
-               (void*)gexec, (void*)slot0);
-        printf("       scale updated BY THE GRAPH: %g -> %g; replay == eager bitwise\n", sc1,
-               sc2);
+        printf("       graphExec=%p (never re-instantiated), scale_ptr=%p (stable)\n", (void*)gexec,
+               (void*)slot0);
+        printf("       scale updated BY THE GRAPH: %g -> %g; replay == eager bitwise\n", sc1, sc2);
     }
 
     cudaGraphExecDestroy(gexec);
@@ -992,8 +1014,8 @@ static bool test_fp8_output_graph_mutation() {
 // (d) updated in place at the SAME address after a mutation. (d) is the exact primitive
 // 6-C-5.3 relies on: replay sees the new scale without rebuilding the graphExec.
 static bool test_tensor_device_scale() {
-    auto t = std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{4096},
-                                      DeviceType::CUDA);
+    auto t =
+        std::make_shared<Tensor>(DataType::FP8_E4M3, std::vector<int64_t>{4096}, DeviceType::CUDA);
     t->set_fp8_scale(0.03125f);
 
     const float* p1 = t->fp8_scale_device();
@@ -1111,7 +1133,8 @@ int main(int argc, char** argv) {
 
     // Device decode LUT (value = fp8_e4m3_to_fp32(byte)) — shared with the golden.
     float hLUT[256];
-    for (int i = 0; i < 256; ++i) hLUT[i] = fp8_e4m3_to_fp32((uint8_t)i);
+    for (int i = 0; i < 256; ++i)
+        hLUT[i] = fp8_e4m3_to_fp32((uint8_t)i);
     float* dLUT = nullptr;
     cudaMalloc(&dLUT, sizeof(hLUT));
     cudaMemcpy(dLUT, hLUT, sizeof(hLUT), cudaMemcpyHostToDevice);
@@ -1163,16 +1186,22 @@ int main(int argc, char** argv) {
         std::uniform_real_distribution<float> u(-1.f, 1.f);
 
         std::vector<float> hAr(K), hWr((size_t)K * N);
-        for (int i = 0; i < K; ++i) hAr[i] = u(rng);
-        for (size_t i = 0; i < (size_t)K * N; ++i) hWr[i] = u(rng);
+        for (int i = 0; i < K; ++i)
+            hAr[i] = u(rng);
+        for (size_t i = 0; i < (size_t)K * N; ++i)
+            hWr[i] = u(rng);
 
         // ---- FP8 E4M3 (with real scale s = sa*sw != 1) ----
         std::vector<uint8_t> hAf(K), hWf((size_t)K * N);
-        for (int i = 0; i < K; ++i) hAf[i] = fp32_to_fp8_e4m3(hAr[i]);
-        for (size_t i = 0; i < (size_t)K * N; ++i) hWf[i] = fp32_to_fp8_e4m3(hWr[i]);
+        for (int i = 0; i < K; ++i)
+            hAf[i] = fp32_to_fp8_e4m3(hAr[i]);
+        for (size_t i = 0; i < (size_t)K * N; ++i)
+            hWf[i] = fp32_to_fp8_e4m3(hWr[i]);
         float amaxA = 0, amaxW = 0;
-        for (int i = 0; i < K; ++i) amaxA = std::max(amaxA, std::fabs(hAr[i]));
-        for (size_t i = 0; i < (size_t)K * N; ++i) amaxW = std::max(amaxW, std::fabs(hWr[i]));
+        for (int i = 0; i < K; ++i)
+            amaxA = std::max(amaxA, std::fabs(hAr[i]));
+        for (size_t i = 0; i < (size_t)K * N; ++i)
+            amaxW = std::max(amaxW, std::fabs(hWr[i]));
         const float sa = amaxA / 240.f, sw = amaxW / 240.f, s = sa * sw;
 
         std::vector<float> gFp8(N, 0.f);
@@ -1186,10 +1215,11 @@ int main(int argc, char** argv) {
         auto r1 = run_fp8<1>(K, N, hAf, hWf, gFp8, s, !sanitize, dLUT);
         auto r4 = run_fp8<4>(K, N, hAf, hWf, gFp8, s, !sanitize, dLUT);
         auto r16 = run_fp8<16>(K, N, hAf, hWf, gFp8, s, !sanitize, dLUT);
-        printf("  fp8 VEC=1 : us/tok=%8.3f  BW=%6.1f GB/s  maxerr=%9.3e  cos=%f  scaleMaxRel=%9.3e\n",
-               r1.us_per_token, r1.bandwidth_gbs, r1.max_abs_err, r1.cosine, r1.scale_max_rel);
-        printf("  fp8 VEC=4 : us/tok=%8.3f  BW=%6.1f GB/s  maxerr=%9.3e  cos=%f\n",
-               r4.us_per_token, r4.bandwidth_gbs, r4.max_abs_err, r4.cosine);
+        printf(
+            "  fp8 VEC=1 : us/tok=%8.3f  BW=%6.1f GB/s  maxerr=%9.3e  cos=%f  scaleMaxRel=%9.3e\n",
+            r1.us_per_token, r1.bandwidth_gbs, r1.max_abs_err, r1.cosine, r1.scale_max_rel);
+        printf("  fp8 VEC=4 : us/tok=%8.3f  BW=%6.1f GB/s  maxerr=%9.3e  cos=%f\n", r4.us_per_token,
+               r4.bandwidth_gbs, r4.max_abs_err, r4.cosine);
         printf("  fp8 VEC=16: us/tok=%8.3f  BW=%6.1f GB/s  maxerr=%9.3e  cos=%f\n",
                r16.us_per_token, r16.bandwidth_gbs, r16.max_abs_err, r16.cosine);
 
@@ -1203,7 +1233,8 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> hWf_prod((size_t)K * N);
         std::vector<float> gFp8_prod(N, 0.f);
         for (int n = 0; n < N; ++n)
-            for (int k = 0; k < K; ++k) hWf_prod[(size_t)n * K + k] = hWf[(size_t)k * N + n];
+            for (int k = 0; k < K; ++k)
+                hWf_prod[(size_t)n * K + k] = hWf[(size_t)k * N + n];
         for (int n = 0; n < N; ++n) {
             float acc = 0.f;
             for (int k = 0; k < K; ++k)
@@ -1211,8 +1242,7 @@ int main(int argc, char** argv) {
             gFp8_prod[n] = acc * s;
         }
         auto rp = run_prod_gemv(K, N, hAf, hWf_prod, gFp8_prod, sa, sw, !sanitize);
-        printf("  fp8 PROD(row-major W):    maxerr=%9.3e  cos=%f\n", rp.max_abs_err,
-               rp.cosine);
+        printf("  fp8 PROD(row-major W):    maxerr=%9.3e  cos=%f\n", rp.max_abs_err, rp.cosine);
 
         // selector routing check: FP8 + M==1 + sm89+ -> MATMUL_FP8_E4M3_GEMV
         KernelProblem kp;
@@ -1227,8 +1257,10 @@ int main(int argc, char** argv) {
         // ---- FP16 baseline ----
         std::vector<__half> hAh(K), hWh((size_t)K * N);
         std::vector<float> gFp16(N, 0.f);
-        for (int i = 0; i < K; ++i) hAh[i] = __float2half(hAr[i]);
-        for (size_t i = 0; i < (size_t)K * N; ++i) hWh[i] = __float2half(hWr[i]);
+        for (int i = 0; i < K; ++i)
+            hAh[i] = __float2half(hAr[i]);
+        for (size_t i = 0; i < (size_t)K * N; ++i)
+            hWh[i] = __float2half(hWr[i]);
         for (int j = 0; j < N; ++j) {
             float acc = 0.f;
             for (int k = 0; k < K; ++k)
@@ -1242,11 +1274,14 @@ int main(int argc, char** argv) {
         // ---- FP32 baseline ----
         std::vector<float> hAf32(K), hWf32((size_t)K * N);
         std::vector<float> gFp32(N, 0.f);
-        for (int i = 0; i < K; ++i) hAf32[i] = hAr[i];
-        for (size_t i = 0; i < (size_t)K * N; ++i) hWf32[i] = hWr[i];
+        for (int i = 0; i < K; ++i)
+            hAf32[i] = hAr[i];
+        for (size_t i = 0; i < (size_t)K * N; ++i)
+            hWf32[i] = hWr[i];
         for (int j = 0; j < N; ++j) {
             float acc = 0.f;
-            for (int k = 0; k < K; ++k) acc += hAf32[k] * hWf32[(size_t)k * N + j];
+            for (int k = 0; k < K; ++k)
+                acc += hAf32[k] * hWf32[(size_t)k * N + j];
             gFp32[j] = acc;
         }
         auto rf32 = run_one<float, 4>(K, N, hAf32, hWf32, gFp32, 1.f, !sanitize);
@@ -1256,26 +1291,50 @@ int main(int argc, char** argv) {
         // ---- gates ----
         if (!sanitize) {
             bool ok = true;
-            if (r16.cosine < 0.9995f) { printf("  [FAIL] fp8 cosine too low\n"); ok = false; }
-            if (r16.max_abs_err > 0.05f) { printf("  [FAIL] fp8 max_abs_err too high\n"); ok = false; }
+            if (r16.cosine < 0.9995f) {
+                printf("  [FAIL] fp8 cosine too low\n");
+                ok = false;
+            }
+            if (r16.max_abs_err > 0.05f) {
+                printf("  [FAIL] fp8 max_abs_err too high\n");
+                ok = false;
+            }
             // scale fusion equivalence: s*sum(a*w) (mode 0) vs sum(s*a*w) (mode 1) differ
-            // only by FP32 summation reordering (~K*eps relative); a real divergence would be >> 1%.
-            if (r16.scale_max_rel > 1e-2f) { printf("  [FAIL] scale fusion not equivalent\n"); ok = false; }
-            if (rp.cosine < 0.9995f) { printf("  [FAIL] fp8 PROD backend cosine too low\n"); ok = false; }
+            // only by FP32 summation reordering (~K*eps relative); a real divergence would be >>
+            // 1%.
+            if (r16.scale_max_rel > 1e-2f) {
+                printf("  [FAIL] scale fusion not equivalent\n");
+                ok = false;
+            }
+            if (rp.cosine < 0.9995f) {
+                printf("  [FAIL] fp8 PROD backend cosine too low\n");
+                ok = false;
+            }
             if (vr != KernelVariant::MATMUL_FP8_E4M3_GEMV) {
                 printf("  [FAIL] selector picked %s (expected MATMUL_FP8_E4M3_GEMV)\n",
                        kernel_variant_name(vr));
                 ok = false;
             }
-            if (rf16.cosine < 0.9995f) { printf("  [FAIL] fp16 cosine too low\n"); ok = false; }
-            if (rf32.cosine < 0.9995f) { printf("  [FAIL] fp32 cosine too low\n"); ok = false; }
-            if (!ok) ++failures;
+            if (rf16.cosine < 0.9995f) {
+                printf("  [FAIL] fp16 cosine too low\n");
+                ok = false;
+            }
+            if (rf32.cosine < 0.9995f) {
+                printf("  [FAIL] fp32 cosine too low\n");
+                ok = false;
+            }
+            if (!ok)
+                ++failures;
             double fp8best = r1.us_per_token;
-            if (r4.us_per_token < fp8best) fp8best = r4.us_per_token;
-            if (r16.us_per_token < fp8best) fp8best = r16.us_per_token;
+            if (r4.us_per_token < fp8best)
+                fp8best = r4.us_per_token;
+            if (r16.us_per_token < fp8best)
+                fp8best = r16.us_per_token;
             double fp8best_bw = r1.bandwidth_gbs;
-            if (r4.bandwidth_gbs > fp8best_bw) fp8best_bw = r4.bandwidth_gbs;
-            if (r16.bandwidth_gbs > fp8best_bw) fp8best_bw = r16.bandwidth_gbs;
+            if (r4.bandwidth_gbs > fp8best_bw)
+                fp8best_bw = r4.bandwidth_gbs;
+            if (r16.bandwidth_gbs > fp8best_bw)
+                fp8best_bw = r16.bandwidth_gbs;
             printf("  -> FP8 best vs FP16: speedup=%.2fx ; FP8 best BW=%.1f GB/s\n",
                    rf16.us_per_token / fp8best, fp8best_bw);
         }
