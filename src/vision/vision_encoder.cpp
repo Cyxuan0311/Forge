@@ -13,10 +13,7 @@
 #include "forge/perf_profiler.h"
 #include "forge/vit_shared.h"
 #include "forge/vision_registry.h"
-
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 namespace forge {
 
@@ -322,16 +319,17 @@ TensorPtr SiglipViTEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev
         float* kr_data = static_cast<float*>(k_reordered->data());
         float* vr_data = static_cast<float*>(v_reordered->data());
 
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < num_patches; ++i) {
-            int src = window_idx[i];
-            std::memcpy(qr_data + i * num_heads * head_dim, q_data + src * num_heads * head_dim,
-                        num_heads * head_dim * sizeof(float));
-            std::memcpy(kr_data + i * num_heads * head_dim, k_data + src * num_heads * head_dim,
-                        num_heads * head_dim * sizeof(float));
-            std::memcpy(vr_data + i * num_heads * head_dim, v_data + src * num_heads * head_dim,
-                        num_heads * head_dim * sizeof(float));
-        }
+        forge::cpu::parallel_for_chunks(num_patches, 1, [&](int i0, int i1) {
+            for (int i = i0; i < i1; ++i) {
+                int src = window_idx[i];
+                std::memcpy(qr_data + i * num_heads * head_dim, q_data + src * num_heads * head_dim,
+                            num_heads * head_dim * sizeof(float));
+                std::memcpy(kr_data + i * num_heads * head_dim, k_data + src * num_heads * head_dim,
+                            num_heads * head_dim * sizeof(float));
+                std::memcpy(vr_data + i * num_heads * head_dim, v_data + src * num_heads * head_dim,
+                            num_heads * head_dim * sizeof(float));
+            }
+        });
 
         // Build block-diagonal mask
         auto mask = std::make_shared<Tensor>(
@@ -355,12 +353,13 @@ TensorPtr SiglipViTEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev
             std::make_shared<Tensor>(DataType::FP32, attn_out->shape(), DeviceType::CPU);
         const float* ao_data = static_cast<const float*>(attn_out->data());
         float* ar_data = static_cast<float*>(attn_restored->data());
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < num_patches; ++i) {
-            int dst = window_idx[i];
-            std::memcpy(ar_data + dst * num_heads * head_dim, ao_data + i * num_heads * head_dim,
-                        num_heads * head_dim * sizeof(float));
-        }
+        forge::cpu::parallel_for_chunks(num_patches, 1, [&](int i0, int i1) {
+            for (int i = i0; i < i1; ++i) {
+                int dst = window_idx[i];
+                std::memcpy(ar_data + dst * num_heads * head_dim, ao_data + i * num_heads * head_dim,
+                            num_heads * head_dim * sizeof(float));
+            }
+        });
 
         // Output projection (using cached weight m_o_w_)
         if (dev == DeviceType::CUDA) {
@@ -395,28 +394,29 @@ TensorPtr SiglipViTEncoder::merge_tokens(const TensorPtr& hidden, DeviceType dev
     float* mean_data = static_cast<float*>(mean_res->data());
     const float* norm_data = static_cast<const float*>(normed_cpu->data());
 
-#pragma omp parallel for schedule(dynamic) if (new_num_patches > 4)
-    for (int new_idx = 0; new_idx < new_num_patches; ++new_idx) {
-        int gh = new_idx / new_grid;
-        int gw = new_idx % new_grid;
-        float* concat_ptr = concat_data + new_idx * concat_dim;
-        float* mean_ptr = mean_data + new_idx * dim;
-        std::fill(mean_ptr, mean_ptr + dim, 0.0f);
-        for (int dh = 0; dh < 2; ++dh) {
-            for (int dw = 0; dw < 2; ++dw) {
-                int orig_idx = (gh * 2 + dh) * grid_size + (gw * 2 + dw);
-                const float* src = norm_data + orig_idx * dim;
-                int offset = (dh * 2 + dw) * dim;
-                std::memcpy(concat_ptr + offset, src, dim * sizeof(float));
-                for (int d = 0; d < dim; ++d) {
-                    mean_ptr[d] += src[d];
+    forge::cpu::parallel_for_chunks_dynamic(new_num_patches, 1, [&](int n0, int n1) {
+        for (int new_idx = n0; new_idx < n1; ++new_idx) {
+            int gh = new_idx / new_grid;
+            int gw = new_idx % new_grid;
+            float* concat_ptr = concat_data + new_idx * concat_dim;
+            float* mean_ptr = mean_data + new_idx * dim;
+            std::fill(mean_ptr, mean_ptr + dim, 0.0f);
+            for (int dh = 0; dh < 2; ++dh) {
+                for (int dw = 0; dw < 2; ++dw) {
+                    int orig_idx = (gh * 2 + dh) * grid_size + (gw * 2 + dw);
+                    const float* src = norm_data + orig_idx * dim;
+                    int offset = (dh * 2 + dw) * dim;
+                    std::memcpy(concat_ptr + offset, src, dim * sizeof(float));
+                    for (int d = 0; d < dim; ++d) {
+                        mean_ptr[d] += src[d];
+                    }
                 }
             }
+            for (int d = 0; d < dim; ++d) {
+                mean_ptr[d] *= 0.25f;
+            }
         }
-        for (int d = 0; d < dim; ++d) {
-            mean_ptr[d] *= 0.25f;
-        }
-    }
+    });
 
     // DS FFN: concat(4*dim) -> LayerNorm -> FFN -> dim, then add mean_res
     if (m_ds_ln_w_) {
@@ -458,20 +458,21 @@ TensorPtr SiglipViTEncoder::project(const TensorPtr& hidden, DeviceType dev) {
     float* concat_data = static_cast<float*>(concat_tokens->data());
     const float* h_data = static_cast<const float*>(hidden_cpu->data());
 
-#pragma omp parallel for schedule(dynamic) if (new_num > 4)
-    for (int idx = 0; idx < new_num; ++idx) {
-        int gh = idx / new_grid;
-        int gw = idx % new_grid;
-        float* out_ptr = concat_data + idx * concat_dim;
-        for (int dh = 0; dh < 2; ++dh) {
-            for (int dw = 0; dw < 2; ++dw) {
-                int orig_idx = (gh * 2 + dh) * grid_size + (gw * 2 + dw);
-                const float* src = h_data + orig_idx * dim;
-                int offset = (dh * 2 + dw) * dim;
-                std::memcpy(out_ptr + offset, src, dim * sizeof(float));
+    forge::cpu::parallel_for_chunks_dynamic(new_num, 1, [&](int n0, int n1) {
+        for (int idx = n0; idx < n1; ++idx) {
+            int gh = idx / new_grid;
+            int gw = idx % new_grid;
+            float* out_ptr = concat_data + idx * concat_dim;
+            for (int dh = 0; dh < 2; ++dh) {
+                for (int dw = 0; dw < 2; ++dw) {
+                    int orig_idx = (gh * 2 + dh) * grid_size + (gw * 2 + dw);
+                    const float* src = h_data + orig_idx * dim;
+                    int offset = (dh * 2 + dw) * dim;
+                    std::memcpy(out_ptr + offset, src, dim * sizeof(float));
+                }
             }
         }
-    }
+    });
 
     // LayerNorm (using cached weights)
     auto h = to_device(concat_tokens, dev);

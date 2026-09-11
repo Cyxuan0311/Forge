@@ -13,10 +13,7 @@
 
 #include "forge/logger.h"
 #include "forge/operators.h"
-
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 namespace forge {
 
@@ -130,28 +127,27 @@ TensorPtr vit_patch_embed(const TensorPtr& pixel_values, const VisionConfig& cfg
         std::memcpy(bias.data(), b->data(), embed_dim * sizeof(float));
     }
 
-#pragma omp parallel for schedule(dynamic) if (num_patches > 4)
-    for (int patch_idx = 0; patch_idx < num_patches; ++patch_idx) {
-        int ph = patch_idx / num_patches_w;
-        int pw = patch_idx % num_patches_w;
-        float* patch_out = out + patch_idx * embed_dim;
-        std::memcpy(patch_out, bias.data(), embed_dim * sizeof(float));
-        for (int dy = 0; dy < ps; ++dy) {
-            for (int dx = 0; dx < ps; ++dx) {
-                int img_y = ph * ps + dy;
-                int img_x = pw * ps + dx;
-                for (int c = 0; c < 3; ++c) {
-                    float pixel_val = px[c * img_size * img_size + img_y * img_size + img_x];
-                    // GGUF stores conv weight as [KW, KH, IC, OC] in column-major.
-                    // After shape reversal, logical shape is [OC, IC, KH, KW].
-                    for (int d = 0; d < embed_dim; ++d) {
-                        patch_out[d] +=
-                            pixel_val * w_data[d * 3 * ps * ps + c * ps * ps + dy * ps + dx];
+    forge::cpu::parallel_for_chunks_dynamic(num_patches, 1, [&](int p0, int p1) {
+        for (int patch_idx = p0; patch_idx < p1; ++patch_idx) {
+            int ph = patch_idx / num_patches_w;
+            int pw = patch_idx % num_patches_w;
+            float* patch_out = out + patch_idx * embed_dim;
+            std::memcpy(patch_out, bias.data(), embed_dim * sizeof(float));
+            for (int dy = 0; dy < ps; ++dy) {
+                for (int dx = 0; dx < ps; ++dx) {
+                    int img_y = ph * ps + dy;
+                    int img_x = pw * ps + dx;
+                    for (int c = 0; c < 3; ++c) {
+                        float pixel_val = px[c * img_size * img_size + img_y * img_size + img_x];
+                        for (int d = 0; d < embed_dim; ++d) {
+                            patch_out[d] +=
+                                pixel_val * w_data[d * 3 * ps * ps + c * ps * ps + dy * ps + dx];
+                        }
                     }
                 }
             }
         }
-    }
+    });
     return output;
 }
 
@@ -171,19 +167,20 @@ TensorPtr vit_add_pos_embed_2d(const TensorPtr& patches, const VisionConfig& cfg
     int grid_size = cfg.image_size / cfg.patch_size;
     int n_embd_buckets = cfg.n_embd_buckets;
 
-#pragma omp parallel for schedule(static) if (num_patches > 4)
-    for (int i = 0; i < num_patches; ++i) {
-        int patch_h = i / grid_size;
-        int patch_w = i % grid_size;
-        int bucket_h = static_cast<int>(
-            std::floor(static_cast<double>(n_embd_buckets) * patch_h / grid_size));
-        int bucket_w = static_cast<int>(
-            std::floor(static_cast<double>(n_embd_buckets) * patch_w / grid_size));
-        int bucket_idx = bucket_h * n_embd_buckets + bucket_w;
-        for (int d = 0; d < dim; ++d) {
-            h_data[i * dim + d] += pd[bucket_idx * dim + d];
+    forge::cpu::parallel_for_chunks(num_patches, 1, [&](int i0, int i1) {
+        for (int i = i0; i < i1; ++i) {
+            int patch_h = i / grid_size;
+            int patch_w = i % grid_size;
+            int bucket_h = static_cast<int>(
+                std::floor(static_cast<double>(n_embd_buckets) * patch_h / grid_size));
+            int bucket_w = static_cast<int>(
+                std::floor(static_cast<double>(n_embd_buckets) * patch_w / grid_size));
+            int bucket_idx = bucket_h * n_embd_buckets + bucket_w;
+            for (int d = 0; d < dim; ++d) {
+                h_data[i * dim + d] += pd[bucket_idx * dim + d];
+            }
         }
-    }
+    });
     return patches;
 }
 

@@ -20,13 +20,10 @@
 #include "forge/logger.h"
 #include "forge/model.h"
 #include "forge/operators.h"
+#include "cpu/common/thread_pool.h"
 #include "forge/perf_profiler.h"
 #include "forge/vit_shared.h"
 #include "forge/vision_registry.h"
-
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 
 namespace forge {
 
@@ -275,35 +272,35 @@ TensorPtr Qwen3VLViTEncoder::patch_embedding(const TensorPtr& pixel_values) {
     // Conv2d with stride=ps: each patch at grid (ph, pw) covers pixels
     //   [ph*ps..ph*ps+ps-1, pw*ps..pw*ps+ps-1]
 
-#pragma omp parallel for schedule(dynamic) if (num_patches > 4)
-    for (int patch_idx = 0; patch_idx < num_patches; ++patch_idx) {
-        int ph = patch_idx / num_patches_w;
-        int pw = patch_idx % num_patches_w;
-        float* patch_out = out + patch_idx * embed_dim;
-        std::memcpy(patch_out, bias.data(), embed_dim * sizeof(float));
+    forge::cpu::parallel_for_chunks_dynamic(num_patches, 1, [&](int p0, int p1) {
+        for (int patch_idx = p0; patch_idx < p1; ++patch_idx) {
+            int ph = patch_idx / num_patches_w;
+            int pw = patch_idx % num_patches_w;
+            float* patch_out = out + patch_idx * embed_dim;
+            std::memcpy(patch_out, bias.data(), embed_dim * sizeof(float));
 
-        for (int dy = 0; dy < ps; ++dy) {
-            for (int dx = 0; dx < ps; ++dx) {
-                int img_y = ph * ps + dy;
-                int img_x = pw * ps + dx;
-                for (int c = 0; c < 3; ++c) {
-                    float pixel_val = px[c * img_size * img_size + img_y * img_size + img_x];
-                    int kv_idx = c * ps * ps + dy * ps + dx;
-                    // Both convs produce all embed_dim channels; add their contributions
-                    if (w0_data) {
-                        for (int d = 0; d < embed_dim; ++d) {
-                            patch_out[d] += pixel_val * w0_data[d * 3 * ps * ps + kv_idx];
+            for (int dy = 0; dy < ps; ++dy) {
+                for (int dx = 0; dx < ps; ++dx) {
+                    int img_y = ph * ps + dy;
+                    int img_x = pw * ps + dx;
+                    for (int c = 0; c < 3; ++c) {
+                        float pixel_val = px[c * img_size * img_size + img_y * img_size + img_x];
+                        int kv_idx = c * ps * ps + dy * ps + dx;
+                        if (w0_data) {
+                            for (int d = 0; d < embed_dim; ++d) {
+                                patch_out[d] += pixel_val * w0_data[d * 3 * ps * ps + kv_idx];
+                            }
                         }
-                    }
-                    if (w1_data) {
-                        for (int d = 0; d < embed_dim; ++d) {
-                            patch_out[d] += pixel_val * w1_data[d * 3 * ps * ps + kv_idx];
+                        if (w1_data) {
+                            for (int d = 0; d < embed_dim; ++d) {
+                                patch_out[d] += pixel_val * w1_data[d * 3 * ps * ps + kv_idx];
+                            }
                         }
                     }
                 }
             }
         }
-    }
+    });
     return output;
 }
 
@@ -335,17 +332,18 @@ TensorPtr Qwen3VLViTEncoder::spatial_merge(const TensorPtr& patches, int nx, int
     // Build the permutation: for each new token index, which original index?
     // new_idx = block_y * half_nx * 4 + block_x * 4 + (x%2)*2 + (y%2)
     // orig_idx = x * ny + y  (row-major with x as column, y as row)
-#pragma omp parallel for schedule(static) if (num_patches > 64)
-    for (int new_idx = 0; new_idx < num_patches; ++new_idx) {
-        int block_y = new_idx / (half_nx * 4);
-        int rem = new_idx % (half_nx * 4);
-        int block_x = rem / 4;
-        int within = rem % 4;
-        int x = block_x * 2 + (within / 2);  // within: 0→(0,0), 1→(0,1), 2→(1,0), 3→(1,1)
-        int y = block_y * 2 + (within % 2);
-        int orig_idx = x * ny + y;
-        std::memcpy(dst + new_idx * dim, src + orig_idx * dim, dim * sizeof(float));
-    }
+    forge::cpu::parallel_for_chunks(num_patches, 1, [&](int n0, int n1) {
+        for (int new_idx = n0; new_idx < n1; ++new_idx) {
+            int block_y = new_idx / (half_nx * 4);
+            int rem = new_idx % (half_nx * 4);
+            int block_x = rem / 4;
+            int within = rem % 4;
+            int x = block_x * 2 + (within / 2);
+            int y = block_y * 2 + (within % 2);
+            int orig_idx = x * ny + y;
+            std::memcpy(dst + new_idx * dim, src + orig_idx * dim, dim * sizeof(float));
+        }
+    });
     return output;
 }
 
@@ -376,23 +374,25 @@ TensorPtr Qwen3VLViTEncoder::add_position_embedding(const TensorPtr& patches, in
     if (transposed) {
         // [dim, max_patches] — each column is a position's embedding
         int max_patches = static_cast<int>(pos_shape[1]);
-#pragma omp parallel for schedule(static) if (num_patches > 4)
-        for (int i = 0; i < num_patches; ++i) {
-            int pos_idx = std::min(i, max_patches - 1);
-            for (int d = 0; d < dim; ++d) {
-                h_data[i * dim + d] += pd[d * max_patches + pos_idx];
+        forge::cpu::parallel_for_chunks(num_patches, 1, [&](int i0, int i1) {
+            for (int i = i0; i < i1; ++i) {
+                int pos_idx = std::min(i, max_patches - 1);
+                for (int d = 0; d < dim; ++d) {
+                    h_data[i * dim + d] += pd[d * max_patches + pos_idx];
+                }
             }
-        }
+        });
     } else {
         // [max_patches, dim] — standard row-major
         int max_patches = static_cast<int>(pos_total / dim);
-#pragma omp parallel for schedule(static) if (num_patches > 4)
-        for (int i = 0; i < num_patches; ++i) {
-            int pos_idx = std::min(i, max_patches - 1);
-            for (int d = 0; d < dim; ++d) {
-                h_data[i * dim + d] += pd[pos_idx * dim + d];
+        forge::cpu::parallel_for_chunks(num_patches, 1, [&](int i0, int i1) {
+            for (int i = i0; i < i1; ++i) {
+                int pos_idx = std::min(i, max_patches - 1);
+                for (int d = 0; d < dim; ++d) {
+                    h_data[i * dim + d] += pd[pos_idx * dim + d];
+                }
             }
-        }
+        });
     }
     return patches;
 }
@@ -423,64 +423,60 @@ void Qwen3VLViTEncoder::apply_mrope(float* data, int num_patches, int num_heads,
     float base = 10000.0f;
     float theta_scale = std::pow(base, -2.0f / n_dims);  // freq_base^(-2/n_dims)
 
-#pragma omp parallel for schedule(static) if (num_patches > 4)
-    for (int i = 0; i < num_patches; ++i) {
-        float pos_base[4] = {
-            static_cast<float>(positions[i * 4 + 0]),  // section 0: row/height
-            static_cast<float>(positions[i * 4 + 1]),  // section 1: column/width
-            static_cast<float>(positions[i * 4 + 2]),  // section 2: unused
-            static_cast<float>(positions[i * 4 + 3]),  // section 3: unused
-        };
+    forge::cpu::parallel_for_chunks(num_patches, 1, [&](int i0, int i1) {
+        for (int i = i0; i < i1; ++i) {
+            float pos_base[4] = {
+                static_cast<float>(positions[i * 4 + 0]),
+                static_cast<float>(positions[i * 4 + 1]),
+                static_cast<float>(positions[i * 4 + 2]),
+                static_cast<float>(positions[i * 4 + 3]),
+            };
 
-        for (int h = 0; h < num_heads; ++h) {
-            float* head_ptr = data + (i * num_heads + h) * head_dim;
+            for (int h = 0; h < num_heads; ++h) {
+                float* head_ptr = data + (i * num_heads + h) * head_dim;
 
-            // Accumulate thetas per section (matching ggml_mrope_cache_init with indep_sects=true)
-            float theta[4] = {pos_base[0], pos_base[1], pos_base[2], pos_base[3]};
+                float theta[4] = {pos_base[0], pos_base[1], pos_base[2], pos_base[3]};
 
-            for (int d = 0; d < n_dims; ++d) {
-                int sector = d % head_dim;  // sect_dims = head_dim for {16,16,16,16}
+                for (int d = 0; d < n_dims; ++d) {
+                    int sector = d % head_dim;
 
-                // Reset theta at section boundaries (independent sections)
-                if (sector == 0) {
-                    theta[0] = pos_base[0];
-                } else if (sector == section_dim) {
-                    theta[1] = pos_base[1];
-                } else if (sector == 2 * section_dim) {
-                    theta[2] = pos_base[2];
-                } else if (sector == 3 * section_dim) {
-                    theta[3] = pos_base[3];
+                    if (sector == 0) {
+                        theta[0] = pos_base[0];
+                    } else if (sector == section_dim) {
+                        theta[1] = pos_base[1];
+                    } else if (sector == 2 * section_dim) {
+                        theta[2] = pos_base[2];
+                    } else if (sector == 3 * section_dim) {
+                        theta[3] = pos_base[3];
+                    }
+
+                    float pos_theta;
+                    if (sector >= 3 * section_dim) {
+                        pos_theta = theta[3];
+                    } else if (sector >= 2 * section_dim) {
+                        pos_theta = theta[2];
+                    } else if (sector >= section_dim) {
+                        pos_theta = theta[1];
+                    } else {
+                        pos_theta = theta[0];
+                    }
+
+                    float cos_val = std::cos(pos_theta);
+                    float sin_val = std::sin(pos_theta);
+
+                    float x0 = head_ptr[d];
+                    float x1 = head_ptr[d + n_dims];
+                    head_ptr[d] = x0 * cos_val - x1 * sin_val;
+                    head_ptr[d + n_dims] = x0 * sin_val + x1 * cos_val;
+
+                    theta[0] *= theta_scale;
+                    theta[1] *= theta_scale;
+                    theta[2] *= theta_scale;
+                    theta[3] *= theta_scale;
                 }
-
-                // Select which section's theta to use
-                float pos_theta;
-                if (sector >= 3 * section_dim) {
-                    pos_theta = theta[3];
-                } else if (sector >= 2 * section_dim) {
-                    pos_theta = theta[2];
-                } else if (sector >= section_dim) {
-                    pos_theta = theta[1];
-                } else {
-                    pos_theta = theta[0];
-                }
-
-                float cos_val = std::cos(pos_theta);
-                float sin_val = std::sin(pos_theta);
-
-                // Half-rotation pair: (d, d + n_dims)
-                float x0 = head_ptr[d];
-                float x1 = head_ptr[d + n_dims];
-                head_ptr[d] = x0 * cos_val - x1 * sin_val;
-                head_ptr[d + n_dims] = x0 * sin_val + x1 * cos_val;
-
-                // Advance all thetas (matching ggml's behavior)
-                theta[0] *= theta_scale;
-                theta[1] *= theta_scale;
-                theta[2] *= theta_scale;
-                theta[3] *= theta_scale;
             }
         }
-    }
+    });
 }
 
 // ---- forward_vit_block ----
@@ -522,13 +518,14 @@ TensorPtr Qwen3VLViTEncoder::forward_vit_block(const TensorPtr& hidden, const Vi
 
         // Fused QKV layout: [num_patches, 3*dim]
         // Q: [0, dim), K: [dim, 2*dim), V: [2*dim, 3*dim)
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < num_patches; ++i) {
-            const float* row = qkv_data + i * 3 * dim;
-            std::memcpy(q_data + i * dim, row, dim * sizeof(float));
-            std::memcpy(k_data + i * dim, row + dim, dim * sizeof(float));
-            std::memcpy(v_data + i * dim, row + 2 * dim, dim * sizeof(float));
-        }
+        forge::cpu::parallel_for_chunks(num_patches, 1, [&](int i0, int i1) {
+            for (int i = i0; i < i1; ++i) {
+                const float* row = qkv_data + i * 3 * dim;
+                std::memcpy(q_data + i * dim, row, dim * sizeof(float));
+                std::memcpy(k_data + i * dim, row + dim, dim * sizeof(float));
+                std::memcpy(v_data + i * dim, row + 2 * dim, dim * sizeof(float));
+            }
+        });
 
         if (was_cuda) {
             q = to_device(q, DeviceType::CUDA);
@@ -625,8 +622,7 @@ TensorPtr Qwen3VLViTEncoder::forward_deepstack(const TensorPtr& hidden, int laye
         DataType::FP32, std::vector<int64_t>{new_num, concat_dim}, DeviceType::CPU);
     float* concat_data = static_cast<float*>(concat_tokens->data());
 
-#pragma omp parallel for schedule(dynamic) if (new_num > 4)
-    for (int idx = 0; idx < new_num; ++idx) {
+    cpu::parallel_for_dynamic(new_num, 1, [&](int idx) {
         int gh = idx / new_grid;
         int gw = idx % new_grid;
         float* out_ptr = concat_data + idx * concat_dim;
@@ -640,7 +636,7 @@ TensorPtr Qwen3VLViTEncoder::forward_deepstack(const TensorPtr& hidden, int laye
                 std::memcpy(out_ptr + offset, src, dim * sizeof(float));
             }
         }
-    }
+        });
 
     // LayerNorm + FC1 + GELU + FC2
     auto h = to_device(concat_tokens, dev);
@@ -678,14 +674,15 @@ TensorPtr Qwen3VLViTEncoder::project(const TensorPtr& hidden, int num_patches, i
         DataType::FP32, std::vector<int64_t>{new_num, concat_dim}, DeviceType::CPU);
     float* concat_data = static_cast<float*>(concat_tokens->data());
 
-#pragma omp parallel for schedule(static) if (new_num > 4)
-    for (int idx = 0; idx < new_num; ++idx) {
-        float* out_ptr = concat_data + idx * concat_dim;
-        for (int k = 0; k < merge_factor; ++k) {
-            const float* src = h_data + (idx * merge_factor + k) * dim;
-            std::memcpy(out_ptr + k * dim, src, dim * sizeof(float));
+    forge::cpu::parallel_for_chunks(new_num, 1, [&](int n0, int n1) {
+        for (int idx = n0; idx < n1; ++idx) {
+            float* out_ptr = concat_data + idx * concat_dim;
+            for (int k = 0; k < merge_factor; ++k) {
+                const float* src = h_data + (idx * merge_factor + k) * dim;
+                std::memcpy(out_ptr + k * dim, src, dim * sizeof(float));
+            }
         }
-    }
+    });
 
     // mm projector: mm.0 (GELU) + mm.2
     auto h = to_device(concat_tokens, dev);
