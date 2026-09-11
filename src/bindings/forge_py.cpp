@@ -15,12 +15,10 @@
 
 #include "common.h"
 #include "forge/threads.h"
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 // Thread count requested via forge.set_num_threads(). create_context() applies
-// it to the engine ContextParams so the engine's omp_set_num_threads() (which
+// it to the engine ContextParams so the engine's set_num_threads() (which
 // overrides the global) uses the requested value instead of the default of 4.
 int forge_global_cpu_threads = 4;
 
@@ -41,14 +39,12 @@ PYBIND11_MODULE(forge, m) {
     m.def(
         "set_num_threads",
         [](int n) {
-#ifdef _OPENMP
             if (n < 1)
                 n = 1;
-            omp_set_num_threads(n);
-#endif
+            forge::cpu::set_num_threads(n);
             forge_global_cpu_threads = n;
         },
-        py::arg("n"), "Set number of CPU threads for inference (OpenMP)");
+        py::arg("n"), "Set number of CPU threads for inference (thread pool)");
 
     m.def(
         "auto_detect_threads",
@@ -56,9 +52,7 @@ PYBIND11_MODULE(forge, m) {
             int n = (hidden > 0 && intermediate > 0)
                         ? forge::detect_best_cpu_threads(hidden, intermediate)
                         : forge::detect_best_cpu_threads();
-#ifdef _OPENMP
-            omp_set_num_threads(n);
-#endif
+            forge::cpu::set_num_threads(n);
             forge_global_cpu_threads = n;
             return n;
         },
