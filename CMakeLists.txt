@@ -144,8 +144,6 @@ if(CUDAToolkit_FOUND)
   detect_cuda_architecture(FORGE_CUDA_ARCH)
 endif()
 
-find_package(OpenMP)
-
 option(FORGE_BUILD_PYTHON
        "Build Python bindings (requires Python3 development)" ON)
 if(FORGE_BUILD_PYTHON)
@@ -204,8 +202,6 @@ if(CUDAToolkit_FOUND)
   target_compile_definitions(forge_core PUBLIC USE_CUDA)
   target_link_libraries(forge_core PUBLIC CUDA::cudart)
 endif()
-target_link_libraries(forge_core
-                      PUBLIC $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
 target_link_libraries(forge_core PUBLIC forge_cpu_features)
 
 # ---- Operators library (static) ----
@@ -319,9 +315,7 @@ target_include_directories(
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge_infer PUBLIC USE_CUDA)
 endif()
-target_link_libraries(
-  forge_infer PUBLIC forge_core forge_ops forge_model
-                     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+target_link_libraries(forge_infer PUBLIC forge_core forge_ops forge_model)
 target_link_libraries(forge_infer PUBLIC forge_cpu_features)
 
 # ---- CLI executable ----
@@ -342,13 +336,53 @@ target_link_libraries(
           forge_core
           forge_tokenizer
           forge_vision
-          $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
-          $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+          $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
 if(CUDAToolkit_FOUND)
   target_link_libraries(forge-cli PRIVATE CUDA::cudart
                                           $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
   set_target_properties(
     forge-cli
+    PROPERTIES CUDA_SEPARABLE_COMPILATION ON
+               CUDA_RESOLVE_DEVICE_SYMBOLS ON
+               CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}")
+endif()
+
+# ---- forge-server (OpenAI-compatible HTTP API server) ----
+add_library(
+  forge_httplib STATIC
+  third_party/cpp-httplib/httplib.cpp third_party/cpp-httplib/httplib.h)
+target_include_directories(
+  forge_httplib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib)
+find_package(Threads REQUIRED)
+target_link_libraries(forge_httplib PUBLIC Threads::Threads)
+
+add_executable(
+  forge-server
+  src/server/server_main.cpp src/server/server_state.cpp
+  src/server/server_routes.cpp)
+target_include_directories(
+  forge-server
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+          ${CMAKE_CURRENT_SOURCE_DIR}/src/server
+          ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+if(CUDAToolkit_FOUND)
+  target_compile_definitions(forge-server PRIVATE USE_CUDA)
+endif()
+target_link_libraries(
+  forge-server
+  PRIVATE forge_infer
+          forge_model
+          forge_ops
+          forge_core
+          forge_tokenizer
+          forge_vision
+          forge_httplib
+          $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
+if(CUDAToolkit_FOUND)
+  target_link_libraries(forge-server PRIVATE CUDA::cudart
+                                             $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
+  set_target_properties(
+    forge-server
     PROPERTIES CUDA_SEPARABLE_COMPILATION ON
                CUDA_RESOLVE_DEVICE_SYMBOLS ON
                CUDA_ARCHITECTURES "${FORGE_CUDA_ARCH}")
