@@ -371,8 +371,56 @@ ChatCompletionResult ServerState::chat_completion(
         pending.erase(0, emit);
     };
 
-    Generator gen(*ctx_, sampler_cfg);
-    GenerationResult result = gen.generate(prompt_ids, gen_cfg, cb);
+    // ---- Session prefix reuse ----
+    // Chat front-ends resend the whole conversation on every turn. When the KV
+    // cache still holds a prefix of this prompt, forward only the tail: the
+    // cached positions hold exactly these token ids, so reusing them is exact,
+    // not an approximation. A mismatch (compaction, edited history, a different
+    // conversation) just yields a short prefix and falls back to a full
+    // prefill once the reuse is not worth it.
+    int prefix_len = 0;
+    if (ctx_->params().kv_storage_mode == KVStorageMode::Contiguous &&
+        !cached_kv_tokens_.empty()) {
+        const size_t lim = std::min(cached_kv_tokens_.size(), prompt_ids.size());
+        size_t m = 0;
+        while (m < lim && cached_kv_tokens_[m] == prompt_ids[m]) {
+            ++m;
+        }
+        prefix_len = static_cast<int>(m);
+    }
+    gen_cfg.prefix_len = prefix_len;
+    gen_cfg.reset_kv_cache = (prefix_len == 0);
+    if (prefix_len == 0) {
+        // generate() resets the KV cache on this path; keep the mirror honest
+        // so a later request cannot reuse rows that no longer exist.
+        cached_kv_tokens_.clear();
+    }
+    if (opt_.perf && prefix_len > 0) {
+        std::cout << "[server] prefix reuse: " << prefix_len << "/" << prompt_ids.size()
+                  << " tokens from cache (" << (prompt_ids.size() - prefix_len) << " to prefill)\n";
+    }
+
+    GenerationResult result;
+    try {
+        Generator gen(*ctx_, sampler_cfg);
+        result = gen.generate(prompt_ids, gen_cfg, cb);
+    } catch (...) {
+        // A failed request can leave the KV cache partially overwritten, so the
+        // recorded prefix no longer describes what is resident. Drop the mirror
+        // and let the next request start from a clean cache.
+        cached_kv_tokens_.clear();
+        throw;
+    }
+
+    // Mirror what the KV cache now holds: this prompt plus whatever was
+    // generated. Drop it when it can no longer fit beside a generation budget,
+    // otherwise the next request would overflow the cache.
+    cached_kv_tokens_ = prompt_ids;
+    cached_kv_tokens_.insert(cached_kv_tokens_.end(), result.token_ids.begin(),
+                             result.token_ids.end());
+    if (static_cast<int>(cached_kv_tokens_.size()) + gen_budget > kv_capacity) {
+        cached_kv_tokens_.clear();
+    }
 
     if (on_token && !stop_hit && !pending.empty()) {
         on_token(pending);  // flush any trailing partial sequence

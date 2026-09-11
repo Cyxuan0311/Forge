@@ -27,6 +27,12 @@ struct GenerationConfig {
     int eos_token_id = -1;
     std::vector<int32_t> stop_token_ids;  // Additional stop tokens beyond eos
     bool reset_kv_cache = true;           // If false, append to existing KV (multi-turn)
+    // Number of leading prompt tokens whose KV rows are already resident from a
+    // previous request (session prefix reuse). Only prompt_tokens[prefix_len:]
+    // is forwarded, starting at KV position prefix_len; the caller must
+    // guarantee the cached positions really hold those token ids. Ignored when
+    // 0. Implies reset_kv_cache == false.
+    int prefix_len = 0;
     // When non-null and the pointee becomes true, generate() stops at the next
     // decode boundary and reports finish_reason "aborted". Owned by the caller
     // and must outlive the generate() call.

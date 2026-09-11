@@ -1,5 +1,6 @@
 #include "forge/generator.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -88,29 +89,47 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     sampler_.set_config(sampler_cfg);
     sampler_.clear_history();
 
-    if (config.reset_kv_cache) {
+    int prompt_len = static_cast<int>(prompt_tokens.size());
+
+    // ---- Session prefix reuse ----
+    // The caller guarantees that KV positions [0, prefix_len) already hold
+    // prompt_tokens[0, prefix_len), so only the tail needs a forward. Clamped
+    // to leave at least one token: we need a logits row to sample from.
+    int prefix_len = 0;
+    if (config.prefix_len > 0 && prompt_len > 1) {
+        prefix_len = std::min(config.prefix_len, prompt_len - 1);
+    }
+    const int fwd_len = prompt_len - prefix_len;
+
+    // The KV write cursor is monotonic, so a previous request can leave rows
+    // beyond prefix_len. Prefill masks them out (causal: j > q_pos), but decode
+    // attends to everything below total_len, so rewind to the reuse point.
+    if (prefix_len > 0) {
+        if (auto* kv = engine->kv_cache()) {
+            kv->rollback(prefix_len);
+        }
+    } else if (config.reset_kv_cache) {
         ctx_.reset_kv_cache();
     }
-
-    int prompt_len = static_cast<int>(prompt_tokens.size());
 
     // ---- Prefill phase ----
     int token_id;
     {
         const auto prefill_start = std::chrono::steady_clock::now();
         PERF_SCOPE("generator/prefill");
-        SET_PERF_CONTEXT(0, "prefill", -1, dev == DeviceType::CUDA ? "cuda" : "cpu", prompt_len);
-        auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{prompt_len},
+        SET_PERF_CONTEXT(0, "prefill", -1, dev == DeviceType::CUDA ? "cuda" : "cpu", fwd_len);
+        auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{fwd_len},
                                                   DeviceType::CPU);
-        std::memcpy(input_ids->data(), prompt_tokens.data(), prompt_len * sizeof(int32_t));
+        std::memcpy(input_ids->data(), prompt_tokens.data() + prefix_len,
+                    fwd_len * sizeof(int32_t));
 
         if (dev == DeviceType::CUDA) {
             input_ids->to_device(DeviceType::CUDA);
         }
 
-        auto logits = engine->forward_request(ForwardRequest::from_ids(input_ids, 0));
+        auto logits = engine->forward_request(ForwardRequest::from_ids(input_ids, prefix_len));
 
-        auto last_logits = std::make_shared<Tensor>(logits->slice(0, prompt_len - 1, prompt_len));
+        auto last_logits = std::make_shared<Tensor>(logits->slice(0, fwd_len - 1, fwd_len));
 
         {
             PERF_SCOPE("generator/prefill_sampler");

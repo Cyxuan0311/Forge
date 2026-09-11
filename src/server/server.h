@@ -111,6 +111,14 @@ private:
     std::mutex inference_mutex_;  // serializes all inference (single KV cache)
     std::string model_id_;
     std::atomic<int> active_requests_{0};
+
+    // ---- Session prefix reuse ----
+    // Token ids currently resident in the KV cache: the previous request's
+    // prompt plus the tokens it generated. Chat front-ends (opencode, ...)
+    // resend the whole conversation every turn, so the next prompt usually
+    // starts with exactly these ids and only the tail has to be prefilled.
+    // Guarded by inference_mutex_.
+    std::vector<int32_t> cached_kv_tokens_;
 };
 
 // CORS + OPTIONS preflight + optional Bearer api-key auth (server_routes.cpp).
