@@ -16,10 +16,6 @@
 #    include "../cuda/matmul_cuda.h"
 #endif
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
-
 #if FORGE_USE_OPENBLAS
 #    include <cblas.h>
 #endif
@@ -52,15 +48,13 @@ TensorPtr dequantize_weight(const TensorPtr& weight) {
     const uint8_t* q_data = static_cast<const uint8_t*>(weight->data());
     float* out = static_cast<float*>(fp32_weight->data());
 
-#pragma omp parallel
-    {
+    cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
         std::vector<float> row_buf(K);
-#pragma omp for schedule(dynamic, 64)
-        for (int n = 0; n < N; ++n) {
+        for (int n = n0; n < n1; ++n) {
             dequant_fn(q_data, row_buf.data(), K, n);
             std::memcpy(out + n * K, row_buf.data(), K * sizeof(float));
         }
-    }
+    });
     return fp32_weight;
 }
 
@@ -90,15 +84,13 @@ TensorPtr dequantize_q4_0_weight(const TensorPtr& q_weight) {
     auto fp32 = std::make_shared<Tensor>(DataType::FP32, q_weight->shape(), q_weight->device());
     const uint8_t* q_data = static_cast<const uint8_t*>(q_weight->data());
     float* out = static_cast<float*>(fp32->data());
-#pragma omp parallel
-    {
+    cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
         std::vector<float> row_buf(K);
-#pragma omp for schedule(dynamic, 64)
-        for (int n = 0; n < N; ++n) {
+        for (int n = n0; n < n1; ++n) {
             dequantize_q4_0_row(q_data, row_buf.data(), K, n);
             std::memcpy(out + n * K, row_buf.data(), K * sizeof(float));
         }
-    }
+    });
     return fp32;
 }
 
@@ -110,15 +102,13 @@ TensorPtr dequantize_q4_1_weight(const TensorPtr& q_weight) {
     auto fp32 = std::make_shared<Tensor>(DataType::FP32, q_weight->shape(), q_weight->device());
     const uint8_t* q_data = static_cast<const uint8_t*>(q_weight->data());
     float* out = static_cast<float*>(fp32->data());
-#pragma omp parallel
-    {
+    cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
         std::vector<float> row_buf(K);
-#pragma omp for schedule(dynamic, 64)
-        for (int n = 0; n < N; ++n) {
+        for (int n = n0; n < n1; ++n) {
             dequantize_q4_1_row(q_data, row_buf.data(), K, n);
             std::memcpy(out + n * K, row_buf.data(), K * sizeof(float));
         }
-    }
+    });
     return fp32;
 }
 
@@ -140,45 +130,46 @@ TensorPtr quantize_q8_0_weight(const TensorPtr& fp32_weight) {
     const float* src = static_cast<const float*>(fp32_weight->data());
     uint8_t* dst = static_cast<uint8_t*>(q_weight->data());
 
-#pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const float* row = src + n * K;
-        uint8_t* q_row = dst + static_cast<size_t>(n) * row_bytes;
+    cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const float* row = src + n * K;
+            uint8_t* q_row = dst + static_cast<size_t>(n) * row_bytes;
 
-        for (int bi = 0; bi < blocks_per_row; ++bi) {
-            int base = bi * BLOCK_EL;
-            int remaining = K - base;
-            int nel = remaining < BLOCK_EL ? remaining : BLOCK_EL;
+            for (int bi = 0; bi < blocks_per_row; ++bi) {
+                int base = bi * BLOCK_EL;
+                int remaining = K - base;
+                int nel = remaining < BLOCK_EL ? remaining : BLOCK_EL;
 
-            // Find max absolute value in this block
-            float amax = 0.0f;
-            for (int j = 0; j < nel; ++j) {
-                float av = std::fabs(row[base + j]);
-                if (av > amax)
-                    amax = av;
-            }
+                // Find max absolute value in this block
+                float amax = 0.0f;
+                for (int j = 0; j < nel; ++j) {
+                    float av = std::fabs(row[base + j]);
+                    if (av > amax)
+                        amax = av;
+                }
 
-            // Compute scale: amax / 127
-            float scale = amax / 127.0f;
-            float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+                // Compute scale: amax / 127
+                float scale = amax / 127.0f;
+                float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
 
-            // Encode scale as fp16
-            uint16_t scale_fp16 = fp32_to_fp16_bits(scale);
-            memcpy(q_row + bi * BLOCK_BYTES, &scale_fp16, 2);
+                // Encode scale as fp16
+                uint16_t scale_fp16 = fp32_to_fp16_bits(scale);
+                memcpy(q_row + bi * BLOCK_BYTES, &scale_fp16, 2);
 
-            // Quantize values to int8
-            int8_t* qs = reinterpret_cast<int8_t*>(q_row + bi * BLOCK_BYTES + 2);
-            for (int j = 0; j < nel; ++j) {
-                float v = row[base + j] * inv_scale;
-                int qv = static_cast<int>(std::roundf(v));
-                qs[j] = static_cast<int8_t>(std::max(-128, std::min(127, qv)));
-            }
-            // Zero-fill remaining bytes in partial block
-            for (int j = nel; j < BLOCK_EL; ++j) {
-                qs[j] = 0;
+                // Quantize values to int8
+                int8_t* qs = reinterpret_cast<int8_t*>(q_row + bi * BLOCK_BYTES + 2);
+                for (int j = 0; j < nel; ++j) {
+                    float v = row[base + j] * inv_scale;
+                    int qv = static_cast<int>(std::roundf(v));
+                    qs[j] = static_cast<int8_t>(std::max(-128, std::min(127, qv)));
+                }
+                // Zero-fill remaining bytes in partial block
+                for (int j = nel; j < BLOCK_EL; ++j) {
+                    qs[j] = 0;
+                }
             }
         }
-    }
+    });
     return q_weight;
 }
 
@@ -194,41 +185,42 @@ TensorPtr quantize_q4_0_weight(const TensorPtr& fp32_weight) {
     auto q4 = std::make_shared<Tensor>(DataType::Q4_0, fp32_weight->shape(), fp32_weight->device());
     const float* src = static_cast<const float*>(fp32_weight->data());
     uint8_t* dst = static_cast<uint8_t*>(q4->data());
-#pragma omp parallel for schedule(dynamic, 64)
-    for (int n = 0; n < N; ++n) {
-        const float* row = src + n * K;
-        uint8_t* row_dst = dst + n * row_bytes;
-        for (int bi = 0; bi < blocks_per_row; ++bi) {
-            int base = bi * QK;
-            int n_el = (base + QK <= K) ? QK : (K - base);
-            float amax = 0.0f;
-            for (int j = 0; j < n_el; ++j) {
-                float v = std::abs(row[base + j]);
-                if (v > amax) amax = v;
-            }
-            float d = amax / 7.0f;  // Q4_0 range is [-8, 7]: max representable = 7*d
-            float id = d > 0.0f ? 1.0f / d : 0.0f;
-            uint16_t d_bits = fp32_to_fp16_bits(d);
-            std::memcpy(row_dst + bi * BLOCK_BYTES, &d_bits, 2);
-            uint8_t* qs = row_dst + bi * BLOCK_BYTES + 2;
-            for (int j = 0; j < 16; ++j) {
-                uint8_t lo = 0, hi = 0;
-                if (j < n_el) {
-                    int q = (int)(row[base + j] * id + (row[base + j] >= 0 ? 0.5f : -0.5f)) + 8;
-                    if (q < 0) q = 0;
-                    if (q > 15) q = 15;
-                    lo = (uint8_t)q;
+    cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const float* row = src + n * K;
+            uint8_t* row_dst = dst + n * row_bytes;
+            for (int bi = 0; bi < blocks_per_row; ++bi) {
+                int base = bi * QK;
+                int n_el = (base + QK <= K) ? QK : (K - base);
+                float amax = 0.0f;
+                for (int j = 0; j < n_el; ++j) {
+                    float v = std::abs(row[base + j]);
+                    if (v > amax) amax = v;
                 }
-                if (j + 16 < n_el) {
-                    int q = (int)(row[base + 16 + j] * id + (row[base + 16 + j] >= 0 ? 0.5f : -0.5f)) + 8;
-                    if (q < 0) q = 0;
-                    if (q > 15) q = 15;
-                    hi = (uint8_t)q;
+                float d = amax / 7.0f;  // Q4_0 range is [-8, 7]: max representable = 7*d
+                float id = d > 0.0f ? 1.0f / d : 0.0f;
+                uint16_t d_bits = fp32_to_fp16_bits(d);
+                std::memcpy(row_dst + bi * BLOCK_BYTES, &d_bits, 2);
+                uint8_t* qs = row_dst + bi * BLOCK_BYTES + 2;
+                for (int j = 0; j < 16; ++j) {
+                    uint8_t lo = 0, hi = 0;
+                    if (j < n_el) {
+                        int q = (int)(row[base + j] * id + (row[base + j] >= 0 ? 0.5f : -0.5f)) + 8;
+                        if (q < 0) q = 0;
+                        if (q > 15) q = 15;
+                        lo = (uint8_t)q;
+                    }
+                    if (j + 16 < n_el) {
+                        int q = (int)(row[base + 16 + j] * id + (row[base + 16 + j] >= 0 ? 0.5f : -0.5f)) + 8;
+                        if (q < 0) q = 0;
+                        if (q > 15) q = 15;
+                        hi = (uint8_t)q;
+                    }
+                    qs[j] = lo | (hi << 4);
                 }
-                qs[j] = lo | (hi << 4);
             }
         }
-    }
+    });
     return q4;
 }
 
@@ -322,8 +314,7 @@ TensorPtr matmul(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias) 
 #elif defined(USE_NEON)
         PERF_SCOPE("matmul/fp32_gemm_scalar");
         std::memset(o_data, 0, M * N * sizeof(float));
-#    pragma omp parallel for schedule(dynamic) if (M * N > 64)
-        for (int m = 0; m < M; ++m) {
+        auto gemm_row = [&](int m) {
             const float* a_row = a_data + m * K;
             float* o_row = o_data + m * N;
             for (int k = 0; k < K; ++k) {
@@ -333,12 +324,18 @@ TensorPtr matmul(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias) 
                     o_row[n] += a_val * b_row[n];
                 }
             }
+        };
+        if (M * N > 64) {
+            cpu::parallel_for_chunks_dynamic(M, 1, [&](int m0, int m1) {
+                for (int m = m0; m < m1; ++m) gemm_row(m);
+            });
+        } else {
+            for (int m = 0; m < M; ++m) gemm_row(m);
         }
 #else
         PERF_SCOPE("matmul/fp32_gemm_scalar");
         std::memset(o_data, 0, M * N * sizeof(float));
-#    pragma omp parallel for schedule(dynamic) if (M * N > 64)
-        for (int m = 0; m < M; ++m) {
+        auto gemm_row = [&](int m) {
             const float* a_row = a_data + m * K;
             float* o_row = o_data + m * N;
             for (int k = 0; k < K; ++k) {
@@ -348,6 +345,13 @@ TensorPtr matmul(const TensorPtr& a, const TensorPtr& b, const TensorPtr& bias) 
                     o_row[n] += a_val * b_row[n];
                 }
             }
+        };
+        if (M * N > 64) {
+            cpu::parallel_for_chunks_dynamic(M, 1, [&](int m0, int m1) {
+                for (int m = m0; m < m1; ++m) gemm_row(m);
+            });
+        } else {
+            for (int m = 0; m < M; ++m) gemm_row(m);
         }
 #endif
     }
@@ -407,15 +411,16 @@ TensorPtr matmul_transB_shared_input(const TensorPtr& input,
         int block_bytes = dtype_block_size(dt);
         size_t row_stride = (size_t)((K + block_el - 1) / block_el) * block_bytes;
 
-        // Single OpenMP region: all weight matrices' rows
+        // Single thread-pool region: all weight matrices' rows
         int total_N = n_w * N;
-        #pragma omp parallel for schedule(static)
-        for (int idx = 0; idx < total_N; ++idx) {
-            int w = idx / N;
-            int n = idx % N;
-            const uint8_t* row = w_ptrs[w] + (size_t)n * row_stride;
-            o_data[w * N + n] = dot_fn(row, q8_buf.data(), nb);
-        }
+        cpu::parallel_for_chunks(total_N, 1, [&](int i0, int i1) {
+            for (int idx = i0; idx < i1; ++idx) {
+                int w = idx / N;
+                int n = idx % N;
+                const uint8_t* row = w_ptrs[w] + (size_t)n * row_stride;
+                o_data[w * N + n] = dot_fn(row, q8_buf.data(), nb);
+            }
+        });
         return out;
     }
 #elif defined(USE_NEON) || defined(USE_VSX)
@@ -447,13 +452,14 @@ TensorPtr matmul_transB_shared_input(const TensorPtr& input,
             size_t row_stride = (size_t)((K + block_el - 1) / block_el) * block_bytes;
 
             int total_N = n_w * N;
-            #pragma omp parallel for schedule(static)
-            for (int idx = 0; idx < total_N; ++idx) {
-                int w = idx / N;
-                int n = idx % N;
-                const uint8_t* row = w_ptrs[w] + (size_t)n * row_stride;
-                o_data[w * N + n] = dot_fn(row, q8_buf.data(), nb);
-            }
+            cpu::parallel_for_chunks(total_N, 1, [&](int i0, int i1) {
+                for (int idx = i0; idx < i1; ++idx) {
+                    int w = idx / N;
+                    int n = idx % N;
+                    const uint8_t* row = w_ptrs[w] + (size_t)n * row_stride;
+                    o_data[w * N + n] = dot_fn(row, q8_buf.data(), nb);
+                }
+            });
             return out;
         }
     }
@@ -502,9 +508,10 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
         std::vector<std::vector<cpu::block_q8_K>> q8_bufs(n_pairs,
             std::vector<cpu::block_q8_K>(nb));
         const float* in_data = static_cast<const float*>(inputs->data());
-        #pragma omp parallel for schedule(static)
-        for (int p = 0; p < n_pairs; ++p)
-            cpu::quantize_row_q8_K(in_data + (size_t)p * K, q8_bufs[p].data(), K);
+        cpu::parallel_for_chunks(n_pairs, 1, [&](int p0, int p1) {
+            for (int p = p0; p < p1; ++p)
+                cpu::quantize_row_q8_K(in_data + (size_t)p * K, q8_bufs[p].data(), K);
+        });
 
         // Collect weight pointers
         std::vector<const uint8_t*> w_ptrs(n_pairs);
@@ -515,15 +522,16 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
         int block_bytes = dtype_block_size(dt);
         size_t row_stride = (size_t)((K + block_el - 1) / block_el) * block_bytes;
 
-        // Single OpenMP region: all pairs' rows
+        // Single thread-pool region: all pairs' rows
         int total_N = n_pairs * N;
-        #pragma omp parallel for schedule(static)
-        for (int idx = 0; idx < total_N; ++idx) {
-            int p = idx / N;
-            int n = idx % N;
-            const uint8_t* row = w_ptrs[p] + (size_t)n * row_stride;
-            o_data[p * N + n] = dot_fn(row, q8_bufs[p].data(), nb);
-        }
+        cpu::parallel_for_chunks(total_N, 1, [&](int i0, int i1) {
+            for (int idx = i0; idx < i1; ++idx) {
+                int p = idx / N;
+                int n = idx % N;
+                const uint8_t* row = w_ptrs[p] + (size_t)n * row_stride;
+                o_data[p * N + n] = dot_fn(row, q8_bufs[p].data(), nb);
+            }
+        });
         return out;
     }
 #elif defined(USE_NEON) || defined(USE_VSX)
@@ -546,9 +554,10 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
             std::vector<std::vector<cpu::block_q8_K>> q8_bufs(n_pairs,
                 std::vector<cpu::block_q8_K>(nb));
             const float* in_data = static_cast<const float*>(inputs->data());
-            #pragma omp parallel for schedule(static)
-            for (int p = 0; p < n_pairs; ++p)
-                cpu::quantize_row_q8_K(in_data + (size_t)p * K, q8_bufs[p].data(), K);
+            cpu::parallel_for_chunks(n_pairs, 1, [&](int p0, int p1) {
+                for (int p = p0; p < p1; ++p)
+                    cpu::quantize_row_q8_K(in_data + (size_t)p * K, q8_bufs[p].data(), K);
+            });
 
             std::vector<const uint8_t*> w_ptrs(n_pairs);
             for (int p = 0; p < n_pairs; ++p)
@@ -559,13 +568,14 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
             size_t row_stride = (size_t)((K + block_el - 1) / block_el) * block_bytes;
 
             int total_N = n_pairs * N;
-            #pragma omp parallel for schedule(static)
-            for (int idx = 0; idx < total_N; ++idx) {
-                int p = idx / N;
-                int n = idx % N;
-                const uint8_t* row = w_ptrs[p] + (size_t)n * row_stride;
-                o_data[p * N + n] = dot_fn(row, q8_bufs[p].data(), nb);
-            }
+            cpu::parallel_for_chunks(total_N, 1, [&](int i0, int i1) {
+                for (int idx = i0; idx < i1; ++idx) {
+                    int p = idx / N;
+                    int n = idx % N;
+                    const uint8_t* row = w_ptrs[p] + (size_t)n * row_stride;
+                    o_data[p * N + n] = dot_fn(row, q8_bufs[p].data(), nb);
+                }
+            });
             return out;
         }
     }
@@ -801,11 +811,9 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                                 expected_total, b->nbytes());
                         fflush(stderr);
                     }
-#pragma omp parallel
-                    {
+                    cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
                         std::vector<float> row_buf(K);
-#pragma omp for schedule(dynamic)
-                        for (int n = 0; n < N; ++n) {
+                        for (int n = n0; n < n1; ++n) {
                             dequant_fn(q_data, row_buf.data(), K, n);
                             for (int m = 0; m < M; ++m) {
                                 const float* a_row = a_data + m * K;
@@ -816,7 +824,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                                 o_data[m * N + n] = sum;
                             }
                         }
-                    }
+                    });
                 }
             } else if (b->dtype() == DataType::Q8_0) {
                 PERF_SCOPE("matmul_transB/q8_0_gemv_neon");
@@ -943,18 +951,16 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 }
 #ifdef USE_AVX2
 // For Q4_K/Q6_K: dequantize scalar + AVX2 dot product
-#    pragma omp parallel
-                {
+                cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
                     std::vector<float> row_buf(K);
-#    pragma omp for schedule(dynamic)
-                    for (int n = 0; n < N; ++n) {
+                    for (int n = n0; n < n1; ++n) {
                         dequant_fn(q_data, row_buf.data(), K, n);
                         for (int m = 0; m < M; ++m) {
                             o_data[m * N + n] =
                                 cpu::dot_product_avx2(a_data + m * K, row_buf.data(), K);
                         }
                     }
-                }
+                });
 #elif defined(USE_NEON)
 #    if FORGE_USE_OPENBLAS
                 PERF_SCOPE("matmul_transB/dequant+gemm_openblas");
@@ -967,11 +973,9 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                                 b_fp32.data(), K, 0.0f, o_data, N);
                 }
 #    else
-#        pragma omp parallel
-                {
+                cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
                     std::vector<float> row_buf(K);
-#        pragma omp for schedule(dynamic)
-                    for (int n = 0; n < N; ++n) {
+                    for (int n = n0; n < n1; ++n) {
                         dequant_fn(q_data, row_buf.data(), K, n);
                         for (int m = 0; m < M; ++m) {
                             const float* a_row = a_data + m * K;
@@ -982,7 +986,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                             o_data[m * N + n] = sum;
                         }
                     }
-                }
+                });
 #    endif
 #else
 #    if FORGE_USE_OPENBLAS
@@ -996,11 +1000,9 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                                 b_fp32.data(), K, 0.0f, o_data, N);
                 }
 #    else
-#        pragma omp parallel
-                {
+                cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
                     std::vector<float> row_buf(K);
-#        pragma omp for schedule(dynamic)
-                    for (int n = 0; n < N; ++n) {
+                    for (int n = n0; n < n1; ++n) {
                         dequant_fn(q_data, row_buf.data(), K, n);
                         for (int m = 0; m < M; ++m) {
                             const float* a_row = a_data + m * K;
@@ -1011,7 +1013,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                             o_data[m * N + n] = sum;
                         }
                     }
-                }
+                });
 #    endif
 #endif
             }
@@ -1033,8 +1035,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
 #else
             PERF_SCOPE("matmul_transB/fp32_gemv_scalar");
             const float* b_data = static_cast<const float*>(b->data());
-#    pragma omp parallel for schedule(dynamic) if (M * N > 64)
-            for (int m = 0; m < M; ++m) {
+            auto gemv_row = [&](int m) {
                 const float* a_row = a_data + m * K;
                 float* o_row = o_data + m * N;
                 for (int n = 0; n < N; ++n) {
@@ -1045,6 +1046,13 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                     }
                     o_row[n] = sum;
                 }
+            };
+            if (M * N > 64) {
+                cpu::parallel_for_chunks_dynamic(M, 1, [&](int m0, int m1) {
+                    for (int m = m0; m < m1; ++m) gemv_row(m);
+                });
+            } else {
+                for (int m = 0; m < M; ++m) gemv_row(m);
             }
 #endif
         }

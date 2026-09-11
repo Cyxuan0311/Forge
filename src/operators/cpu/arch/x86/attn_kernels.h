@@ -72,7 +72,97 @@ static inline void fmadd_f32(float* acc, const float* src, int n, float weight) 
         acc[i] += weight * src[i];
 }
 
+// ---- simd_gemm: C[M x N] += A[M x K] * B[K x N] (row-major, N contiguous) ----
+// Accumulating GEMM used by tiled prefill attention. Adapted from llama.cpp
+// ggml-cpu/simd-gemm.h (AVX2, RM=6 x RN=2 micro-kernel). No internal memset and
+// no internal OpenMP, so it is safe to call from a per-head parallel region.
+static inline void simd_gemm_ukernel(float* C, const float* A, const float* B, int K, int N) {
+    constexpr int KN = 8;
+    __m256 acc[6][2];
+    for (int i = 0; i < 6; ++i)
+        for (int r = 0; r < 2; ++r)
+            acc[i][r] = _mm256_loadu_ps(C + i * N + r * KN);
+    for (int kk = 0; kk < K; ++kk) {
+        __m256 Bv0 = _mm256_loadu_ps(B + kk * N);
+        __m256 Bv1 = _mm256_loadu_ps(B + kk * N + KN);
+        for (int i = 0; i < 6; ++i) {
+            __m256 p = _mm256_set1_ps(A[i * K + kk]);
+            // NOTE: operand order matters -- FMA adds the accumulator as the
+            // 3rd argument (matches llama.cpp GGML_F32x8_FMA(a,b,c)=b*c+a):
+            //   acc += p * Bv  ==  _mm256_fmadd_ps(Bv, p, acc)
+            acc[i][0] = _mm256_fmadd_ps(Bv0, p, acc[i][0]);
+            acc[i][1] = _mm256_fmadd_ps(Bv1, p, acc[i][1]);
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        _mm256_storeu_ps(C + i * N, acc[i][0]);
+        _mm256_storeu_ps(C + i * N + KN, acc[i][1]);
+    }
+}
+
+static inline void simd_gemm_ukernel_1(float* C, const float* A, const float* B, int K, int N) {
+    constexpr int KN = 8;
+    __m256 acc[6];
+    for (int i = 0; i < 6; ++i) acc[i] = _mm256_loadu_ps(C + i * N);
+    for (int kk = 0; kk < K; ++kk) {
+        __m256 Bv = _mm256_loadu_ps(B + kk * N);
+        for (int i = 0; i < 6; ++i) {
+            __m256 p = _mm256_set1_ps(A[i * K + kk]);
+            acc[i] = _mm256_fmadd_ps(Bv, p, acc[i]);
+        }
+    }
+    for (int i = 0; i < 6; ++i) _mm256_storeu_ps(C + i * N, acc[i]);
+}
+
+static inline void simd_gemm(float* C, const float* A, const float* B, int M, int K, int N) {
+    constexpr int KN = 8;
+    int ii = 0;
+    for (; ii + 6 <= M; ii += 6) {
+        int jj = 0;
+        for (; jj + 2 * KN <= N; jj += 2 * KN)
+            simd_gemm_ukernel(C + jj, A, B + jj, K, N);
+        for (; jj + KN <= N; jj += KN)
+            simd_gemm_ukernel_1(C + jj, A, B + jj, K, N);
+        for (; jj < N; ++jj)
+            for (int i = 0; i < 6; ++i) {
+                float* c = C + i * N + jj;
+                const float* a = A + i * K;
+                float v = *c;
+                for (int kk = 0; kk < K; ++kk) v += a[kk] * B[kk * N + jj];
+                *c = v;
+            }
+        A += 6 * K;
+        C += 6 * N;
+    }
+    for (; ii < M; ++ii) {
+        float* c_row = C;
+        const float* a_row = A;
+        for (int kk = 0; kk < K; ++kk) {
+            float av = a_row[kk];
+            const float* b_row = B + kk * N;
+            for (int jj = 0; jj < N; ++jj) c_row[jj] += av * b_row[jj];
+        }
+        A += K;
+        C += N;
+    }
+}
+
 #endif  // USE_AVX2
+
+#ifndef USE_AVX2
+// Scalar fallback (only compiled if this header is ever included without AVX2).
+static inline void simd_gemm(float* C, const float* A, const float* B, int M, int K, int N) {
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = A + (size_t)m * K;
+        float* c_row = C + (size_t)m * N;
+        for (int kk = 0; kk < K; ++kk) {
+            float av = a_row[kk];
+            const float* b_row = B + (size_t)kk * N;
+            for (int n = 0; n < N; ++n) c_row[n] += av * b_row[n];
+        }
+    }
+}
+#endif  // !USE_AVX2
 
 }  // namespace cpu
 }  // namespace forge

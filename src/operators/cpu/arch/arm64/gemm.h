@@ -1,4 +1,5 @@
 #pragma once
+#include "cpu/common/thread_pool.h"
 // ARM64 NEON GEMM micro-kernels for batch decode (M >= 1, both decode & prefill).
 // Provides gemm_q4_K_neon, gemm_q6_K_neon, gemm_q2_K_neon, gemm_q3_K_neon, gemm_q5_K_neon.
 // All functions compute: out = a @ w^T, where a is [M, K] and w is [N, K] in quantized format.
@@ -88,8 +89,8 @@ static void gemm_q4_K_neon(
     if (M == 1) {
         // Decode: RM=4 row grouping, Q8_K shared across 4 weight rows
         const size_t row_bytes = (size_t)nb * Q4_K_BLOCK_BYTES;
-        #pragma omp parallel for schedule(static)
-        for (int n_base = 0; n_base < N; n_base += 4) {
+        cpu::parallel_for_chunks(N, 4, [&](int n_base0, int n_base1) {
+            for (int n_base = n_base0; n_base < n_base1; n_base += 4) {
             int rows = (n_base + 4 <= N) ? 4 : (N - n_base);
             for (int r = 0; r < rows; ++r) {
                 const uint8_t* q4_row = w_data + (size_t)(n_base + r) * row_bytes;
@@ -183,11 +184,11 @@ static void gemm_q4_K_neon(
                 o_data[n_base + r] = sum;
             }
         }
+            });
     } else {
         // Prefill: work-stealing over N, shared Q4_K decoding per N-column
         std::atomic<int> next_n{0};
-        #pragma omp parallel
-        {
+        cpu::parallel_for_chunks(N, 1, [&](int g0, int g1) {
             // Stack accumulators (up to M=64)
             float acc_vec[64];
             while (true) {
@@ -296,7 +297,7 @@ static void gemm_q4_K_neon(
                 for (int m = 0; m < M; ++m)
                     o_data[(size_t)m * N + n] = acc_vec[m];
             }
-        }
+        });
     }
 }
 
@@ -325,8 +326,8 @@ static void gemm_q6_K_neon(
 
     if (M == 1) {
         const size_t row_bytes = (size_t)nb * Q6_K_BLOCK_BYTES;
-        #pragma omp parallel for schedule(static)
-        for (int n_base = 0; n_base < N; n_base += 4) {
+        cpu::parallel_for_chunks(N, 4, [&](int n_base0, int n_base1) {
+            for (int n_base = n_base0; n_base < n_base1; n_base += 4) {
             int rows = (n_base + 4 <= N) ? 4 : (N - n_base);
             for (int r = 0; r < rows; ++r) {
                 const uint8_t* q6_row = w_data + (size_t)(n_base + r) * row_bytes;
@@ -396,11 +397,11 @@ static void gemm_q6_K_neon(
                 o_data[n_base + r] = sum;
             }
         }
+            });
     } else {
         // Prefill: work-stealing over N
         std::atomic<int> next_n{0};
-        #pragma omp parallel
-        {
+        cpu::parallel_for_chunks(N, 1, [&](int g0, int g1) {
             float acc_vec[64];
             while (true) {
                 int n = next_n.fetch_add(1, std::memory_order_relaxed);
@@ -481,7 +482,7 @@ static void gemm_q6_K_neon(
                 for (int m = 0; m < M; ++m)
                     o_data[(size_t)m * N + n] = acc_vec[m];
             }
-        }
+        });
     }
 }
 
@@ -493,12 +494,11 @@ static void gemm_k_row_dot_neon(const float* a_data, const uint8_t* w_data,
     scratch_vec<block_q8_K> q8_all((size_t)M * nb);
     for (int m = 0; m < M; ++m)
         quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
-    #pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
+    cpu::parallel_for(N, [&](int n) {
         const uint8_t* row = w_data + (size_t)n * nb * block_bytes;
         for (int m = 0; m < M; ++m)
             o_data[(size_t)m * N + n] = dot_fn(row, q8_all.data() + (size_t)m * nb, nb);
-    }
+        });
 }
 
 static void gemm_q2_K_neon(const float* a, const uint8_t* w, float* out, int M, int K, int N) {

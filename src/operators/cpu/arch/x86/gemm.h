@@ -1,4 +1,5 @@
 #pragma once
+#include "cpu/common/thread_pool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,9 +7,6 @@
 #include <cstring>
 
 #include "vec.h"
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 #ifdef USE_AVX2
 #    include <immintrin.h>
 #endif
@@ -26,8 +24,7 @@ static void gemm_fp32_avx2(const float* a, const float* b, float* out, int M, in
     constexpr int MR = 6;
     constexpr int NR = 4;
 
-#    pragma omp parallel for schedule(dynamic) if (M * N > 64)
-    for (int m = 0; m < M; ++m) {
+    cpu::parallel_for_dynamic(M, 1, [&](int m) {
         const float* a_row = a + m * K;
         float* o_row = out + m * N;
         for (int k = 0; k < K; ++k) {
@@ -44,7 +41,7 @@ static void gemm_fp32_avx2(const float* a, const float* b, float* out, int M, in
                 o_row[n] += a_val * b[k * N + n];
             }
         }
-    }
+        });
 }
 #endif  // USE_AVX2
 
@@ -59,8 +56,7 @@ static void gemm_q4_0_avx2(const float* a, const uint8_t* w, float* out, int M, 
 
     std::memset(out, 0, (size_t)M * N * sizeof(float));
 
-#    pragma omp parallel for schedule(dynamic) if (M * K > 64)
-    for (int m = 0; m < M; ++m) {
+    cpu::parallel_for_dynamic(M, 1, [&](int m) {
         const float* a_row = a + m * K;
         float* o_row = out + m * N;
         for (int k = 0; k < K; ++k) {
@@ -133,7 +129,7 @@ static void gemm_q4_0_avx2(const float* a, const uint8_t* w, float* out, int M, 
                 }
             }
         }
-    }
+        });
 }
 #endif  // USE_AVX2
 

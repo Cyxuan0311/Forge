@@ -9,10 +9,7 @@
 #include "forge/perf_profiler.h"
 
 #include "cpu/simd.h"
-
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -126,12 +123,13 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
         const float* w_data = weight ? static_cast<const float*>(weight->data()) : nullptr;
         float* o_data = static_cast<float*>(out->data());
 
-#pragma omp parallel for schedule(static) if (rows > 1)
-        for (int r = 0; r < rows; ++r) {
-            const float* x_row = x_data + r * cols;
-            float* o_row = o_data + r * cols;
-            forge::cpu::rms_norm_row_f32(x_row, w_data, o_row, cols, eps);
-        }
+        forge::cpu::parallel_for_chunks(rows, 1, [&](int r0, int r1) {
+            for (int r = r0; r < r1; ++r) {
+                const float* x_row = x_data + r * cols;
+                float* o_row = o_data + r * cols;
+                forge::cpu::rms_norm_row_f32(x_row, w_data, o_row, cols, eps);
+            }
+        });
     }
     return out;
 }
@@ -211,25 +209,26 @@ TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPt
     const float* x_data = static_cast<const float*>(x_cpu->data());
     float* o_data = static_cast<float*>(out->data());
 
-#pragma omp parallel for schedule(static) if (rows > 1)
-    for (int r = 0; r < rows; ++r) {
-        float mean = 0.0f;
-        for (int c = 0; c < cols; ++c)
-            mean += x_data[r * cols + c];
-        mean /= cols;
+    forge::cpu::parallel_for_chunks(rows, 1, [&](int r0, int r1) {
+        for (int r = r0; r < r1; ++r) {
+            float mean = 0.0f;
+            for (int c = 0; c < cols; ++c)
+                mean += x_data[r * cols + c];
+            mean /= cols;
 
-        float var = 0.0f;
-        for (int c = 0; c < cols; ++c) {
-            float d = x_data[r * cols + c] - mean;
-            var += d * d;
-        }
-        var /= cols;
+            float var = 0.0f;
+            for (int c = 0; c < cols; ++c) {
+                float d = x_data[r * cols + c] - mean;
+                var += d * d;
+            }
+            var /= cols;
 
-        float inv_std = 1.0f / std::sqrt(var + eps);
-        for (int c = 0; c < cols; ++c) {
-            o_data[r * cols + c] = (x_data[r * cols + c] - mean) * inv_std * w_fp32[c] + b_fp32[c];
+            float inv_std = 1.0f / std::sqrt(var + eps);
+            for (int c = 0; c < cols; ++c) {
+                o_data[r * cols + c] = (x_data[r * cols + c] - mean) * inv_std * w_fp32[c] + b_fp32[c];
+            }
         }
-    }
+    });
 
     // Move back to original device if needed
     if (x->device() == DeviceType::CUDA) {

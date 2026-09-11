@@ -111,6 +111,21 @@ static inline void fmadd_f32(float* acc, const float* src, int n, float weight) 
     }
 }
 
+// ---- simd_gemm: C[M x N] += A[M x K] * B[K x N] (row-major, N contiguous) ----
+// Scalar fallback for tiled prefill attention (x86 provides an AVX2 version).
+// Accumulating GEMM, no internal memset / no internal OpenMP.
+static inline void simd_gemm(float* C, const float* A, const float* B, int M, int K, int N) {
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = A + (size_t)m * K;
+        float* c_row = C + (size_t)m * N;
+        for (int kk = 0; kk < K; ++kk) {
+            float av = a_row[kk];
+            const float* b_row = B + (size_t)kk * N;
+            for (int n = 0; n < N; ++n) c_row[n] += av * b_row[n];
+        }
+    }
+}
+
 #endif // USE_VSX
 
 }  // namespace cpu

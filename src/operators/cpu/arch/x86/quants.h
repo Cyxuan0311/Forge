@@ -12,7 +12,7 @@
 #include "../../common/quant_helpers.h"
 #include "../../common/quant_tables.h"
 #include "scales.h"
-#include "thread_pool.h"
+#include "cpu/common/thread_pool.h"
 #include "vec.h"
 #include "forge/types.h"
 
@@ -114,22 +114,24 @@ static void gemv_iq2_s_q8k_transB_avx2(const float* a, const uint8_t* w, float* 
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
-            out[n] = dot_iq2_s_q8_K_avx2(row, q8_buf.data(), nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
+                out[n] = dot_iq2_s_q8_K_avx2(row, q8_buf.data(), nb);
+            }
+        });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
-            for (int m = 0; m < M; ++m)
-                out[m * N + n] = dot_iq2_s_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
+                for (int m = 0; m < M; ++m)
+                    out[m * N + n] = dot_iq2_s_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
+            }
+        });
     }
 }
 
@@ -273,22 +275,24 @@ static void gemv_iq2_xs_q8k_transB_avx2(const float* a, const uint8_t* w, float*
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
-            out[n] = dot_iq2_xs_q8_K_avx2(row, q8_buf.data(), nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
+                out[n] = dot_iq2_xs_q8_K_avx2(row, q8_buf.data(), nb);
+            }
+        });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
-            for (int m = 0; m < M; ++m)
-                out[m * N + n] = dot_iq2_xs_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
+                for (int m = 0; m < M; ++m)
+                    out[m * N + n] = dot_iq2_xs_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
+            }
+        });
     }
 }
 
@@ -364,22 +368,24 @@ static void gemv_iq3_s_q8k_transB_avx2(const float* a, const uint8_t* w, float* 
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
-            out[n] = dot_iq3_s_q8_K_avx2(row, q8_buf.data(), nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
+                out[n] = dot_iq3_s_q8_K_avx2(row, q8_buf.data(), nb);
+            }
+        });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
-            for (int m = 0; m < M; ++m)
-                out[m * N + n] = dot_iq3_s_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
+                for (int m = 0; m < M; ++m)
+                    out[m * N + n] = dot_iq3_s_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
+            }
+        });
     }
 }
 
@@ -524,22 +530,24 @@ static void gemv_iq4_xs_q8k_transB_avx2(const float* a, const uint8_t* w, float*
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * row_bytes;
-            out[n] = dot_iq4_xs_q8_K_avx2(row, q8_buf.data(), nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * row_bytes;
+                out[n] = dot_iq4_xs_q8_K_avx2(row, q8_buf.data(), nb);
+            }
+        });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * row_bytes;
-            for (int m = 0; m < M; ++m)
-                out[m * N + n] = dot_iq4_xs_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * row_bytes;
+                for (int m = 0; m < M; ++m)
+                    out[m * N + n] = dot_iq4_xs_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
+            }
+        });
     }
 }
 
@@ -558,11 +566,12 @@ static void gemv_iq4_xs_ffn_down_residual_avx2(const float* a, const uint8_t* w,
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* row = w + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
-        out[n] = ops::dot_iq4_xs_q8_K_avx2(row, q8_buf.data(), nb) + residual[n];
-    }
+    parallel_for_chunks(N, 1, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* row = w + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
+            out[n] = ops::dot_iq4_xs_q8_K_avx2(row, q8_buf.data(), nb) + residual[n];
+        }
+    });
 }
 
 static void gemv_iq4_xs_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
@@ -576,15 +585,16 @@ static void gemv_iq4_xs_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate,
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
 
-#pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
-        const uint8_t* gate_row = w_gate + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
-        const uint8_t* up_row = w_up + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
+    parallel_for_chunks(N, 1, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* gate_row = w_gate + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
+            const uint8_t* up_row = w_up + (size_t)n * nb * IQ4_XS_BLOCK_SIZE;
 
-        float gate_val = silu(ops::dot_iq4_xs_q8_K_avx2(gate_row, q8_buf.data(), nb));
-        float up_val = ops::dot_iq4_xs_q8_K_avx2(up_row, q8_buf.data(), nb);
-        out[n] = gate_val * up_val;
-    }
+            float gate_val = silu(ops::dot_iq4_xs_q8_K_avx2(gate_row, q8_buf.data(), nb));
+            float up_val = ops::dot_iq4_xs_q8_K_avx2(up_row, q8_buf.data(), nb);
+            out[n] = gate_val * up_val;
+        }
+    });
 }
 
 }  // namespace cpu
@@ -605,22 +615,24 @@ static void gemv_iq4_nl_q8k_transB_avx2(const float* a, const uint8_t* w, float*
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * row_bytes;
-            out[n] = dot_iq4_nl_q8_K_avx2(row, q8_buf.data(), nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * row_bytes;
+                out[n] = dot_iq4_nl_q8_K_avx2(row, q8_buf.data(), nb);
+            }
+        });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* row = w + (size_t)n * row_bytes;
-            for (int m = 0; m < M; ++m)
-                out[m * N + n] = dot_iq4_nl_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* row = w + (size_t)n * row_bytes;
+                for (int m = 0; m < M; ++m)
+                    out[m * N + n] = dot_iq4_nl_q8_K_avx2(row, q8_all.data() + (size_t)m * nb, nb);
+            }
+        });
     }
 }
 
@@ -734,29 +746,31 @@ static void gemv_q3_k_q4_k_fused_qkv_avx2(const float* a, const uint8_t* wq, con
 
     // Q and K use Q3_K Q8_K dot product
     auto dot_q3_rows = [&](const uint8_t* w, float* out, int N) {
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            const uint8_t* q3_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
-            __m256 acc = _mm256_setzero_ps();
-            for (int i = 0; i < nb; ++i) {
-                _mm_prefetch((const char*)(q3_row + (i + 1) * Q3_K_BLOCK_BYTES), _MM_HINT_T0);
-                _mm_prefetch((const char*)(q8_buf.data() + i + 1), _MM_HINT_T0);
-                acc = _mm256_add_ps(
-                    acc, cpu::q3_k_sb_dot_avx2(q3_row + (size_t)i * Q3_K_BLOCK_BYTES, &q8_buf[i]));
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                const uint8_t* q3_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
+                __m256 acc = _mm256_setzero_ps();
+                for (int i = 0; i < nb; ++i) {
+                    _mm_prefetch((const char*)(q3_row + (i + 1) * Q3_K_BLOCK_BYTES), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(q8_buf.data() + i + 1), _MM_HINT_T0);
+                    acc = _mm256_add_ps(
+                        acc, cpu::q3_k_sb_dot_avx2(q3_row + (size_t)i * Q3_K_BLOCK_BYTES, &q8_buf[i]));
+                }
+                out[n] = cpu::hsum_avx2(acc);
             }
-            out[n] = cpu::hsum_avx2(acc);
-        }
+        });
     };
 
     dot_q3_rows(wq, out_q, N_q);
     dot_q3_rows(wk, out_k, N_k);
 
     // V uses Q4_K Q8_K dot product (inline, shares same q8_buf)
-#pragma omp parallel for schedule(static)
-    for (int n = 0; n < N_v; ++n) {
-        const uint8_t* q4_row = wv + (size_t)n * nb * Q4_K_BLOCK_BYTES;
-        out_v[n] = dot_q4_K_q8_K_row_avx2(q4_row, q8_buf.data(), nb);
-    }
+    cpu::parallel_for_chunks(N_v, 1, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
+            const uint8_t* q4_row = wv + (size_t)n * nb * Q4_K_BLOCK_BYTES;
+            out_v[n] = dot_q4_K_q8_K_row_avx2(q4_row, q8_buf.data(), nb);
+        }
+    });
 }
 
 // ============================================================================
@@ -863,12 +877,13 @@ static void gemv_q5_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
-            _mm_prefetch((const char*)(w + (size_t)(n + 4) * nb * Q5_K_BLOCK_BYTES), _MM_HINT_T1);
-            const uint8_t* q5_row = w + (size_t)n * nb * Q5_K_BLOCK_BYTES;
-            out[n] = dot_q5_K_q8_K_row_avx2(q5_row, q8_buf.data(), nb);
-        }
+        cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+            for (int n = n0; n < n1; ++n) {
+                _mm_prefetch((const char*)(w + (size_t)(n + 4) * nb * Q5_K_BLOCK_BYTES), _MM_HINT_T1);
+                const uint8_t* q5_row = w + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+                out[n] = dot_q5_K_q8_K_row_avx2(q5_row, q8_buf.data(), nb);
+            }
+        });
     } else {
         for (int m_start = 0; m_start < M; m_start += nrc) {
             int m_cur = (m_start + nrc <= M) ? nrc : (M - m_start);
@@ -876,12 +891,13 @@ static void gemv_q5_k_transB_avx2(const float* a, const uint8_t* w, float* out, 
             for (int m = 0; m < m_cur; ++m)
                 cpu::quantize_row_q8_K(a + (m_start + m) * K, q8_tile.data() + m * nb, K);
 
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n) {
-                const uint8_t* q5_row = w + (size_t)n * nb * Q5_K_BLOCK_BYTES;
-                for (int m = 0; m < m_cur; ++m)
-                    out[(m_start + m) * N + n] = dot_q5_K_q8_K_row_avx2(q5_row, q8_tile.data() + m * nb, nb);
-            }
+            cpu::parallel_for_chunks(N, 1, [&](int n0, int n1) {
+                for (int n = n0; n < n1; ++n) {
+                    const uint8_t* q5_row = w + (size_t)n * nb * Q5_K_BLOCK_BYTES;
+                    for (int m = 0; m < m_cur; ++m)
+                        out[(m_start + m) * N + n] = dot_q5_K_q8_K_row_avx2(q5_row, q8_tile.data() + m * nb, nb);
+                }
+            });
         }
     }
 }

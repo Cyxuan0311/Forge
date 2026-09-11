@@ -1,3 +1,4 @@
+#include "cpu/common/thread_pool.h"
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -11,9 +12,6 @@
 
 #include "cpu/simd.h"
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 
 namespace forge {
 namespace {
@@ -425,14 +423,11 @@ void rms_norm_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst,
         const float* w_data = weight ? static_cast<const float*>(weight->data()) : nullptr;
         float* o_data = static_cast<float*>(dst->data());
 
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (rows > 1)
-#endif
-        for (int r = 0; r < rows; ++r) {
+        cpu::parallel_for(rows, [&](int r) {
             const float* x_row = x_data + r * cols;
             float* o_row = o_data + r * cols;
             forge::cpu::rms_norm_row_f32(x_row, w_data, o_row, cols, eps);
-        }
+            });
     }
 }
 

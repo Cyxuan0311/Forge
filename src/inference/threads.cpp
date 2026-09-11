@@ -19,9 +19,7 @@
 #include <thread>
 #include <vector>
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 #if defined(_WIN32)
 // windows.h defines min/max macros that break std::min/std::max below.
@@ -53,13 +51,9 @@ static constexpr int kProbeRounds = 3;           // rounds per candidate
 static constexpr double kPreferPhysicalMargin = 0.92;
 
 static double now_seconds() {
-#ifdef _OPENMP
-    return omp_get_wtime();
-#else
     return std::chrono::duration<double>(
                std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-#endif
+               .count();
 }
 
 int physical_core_count() {
@@ -147,9 +141,7 @@ static int allowed_cpu_count() {
 
 static double gemv_ms(int threads, TensorPtr& t_in, TensorPtr& t_gate,
                       TensorPtr& t_up) {
-#ifdef _OPENMP
-    omp_set_num_threads(threads);
-#endif
+    forge::cpu::set_num_threads(threads);
     // Each matmul in real decode is a fresh short OpenMP burst with other
     // sequential work (norms, attention, sampling) in between. Sustained
     // best-of-N timing hides the per-burst wake-up / HT-ramp cost and
@@ -258,11 +250,9 @@ int detect_best_cpu_threads(int hidden, int intermediate) {
         }
     }
 
-#ifdef _OPENMP
     // Restore the logical default; engines set the real count per call from
     // ContextParams.
-    omp_set_num_threads(logical);
-#endif
+    forge::cpu::set_num_threads(logical);
 
     return best_threads;
 }

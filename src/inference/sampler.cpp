@@ -1,3 +1,4 @@
+#include "cpu/common/thread_pool.h"
 #include "forge/sampler.h"
 
 #include <algorithm>
@@ -11,9 +12,6 @@
 
 #include "cpu/simd.h"
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -30,101 +28,82 @@ namespace {
 
 constexpr int kSamplerParallelMinN = 16384;
 
-#ifdef _OPENMP
 inline void sampler_chunk(int n, int t, int nt, int& b, int& e) {
     b = static_cast<int>(static_cast<int64_t>(n) * t / nt);
     e = static_cast<int>(static_cast<int64_t>(n) * (t + 1) / nt);
 }
-#endif
 
 float parallel_max_f32(const float* data, int n) {
-#ifdef _OPENMP
-    int nt = omp_get_max_threads();
+    int nt = cpu::get_num_threads();
     if (nt > 1 && n >= kSamplerParallelMinN) {
         std::vector<float> partials(nt, -1e30f);
-#pragma omp parallel
-        {
-            int t = omp_get_thread_num();
-            int b, e;
-            sampler_chunk(n, t, nt, b, e);
+cpu::parallel_for_chunks_ex(n, 1, [&](int t, int nth, int g0, int g1) {
+            int b = g0, e = g1;
             partials[t] = forge::cpu::max_f32(data + b, e - b);
         }
+    );
         float m = partials[0];
         for (int t = 1; t < nt; ++t) m = std::max(m, partials[t]);
         return m;
     }
-#endif
     return forge::cpu::max_f32(data, n);
 }
 
 float parallel_softcap_and_max_f32(float* data, int n, float cap) {
-#ifdef _OPENMP
-    int nt = omp_get_max_threads();
+    int nt = cpu::get_num_threads();
     if (nt > 1 && n >= kSamplerParallelMinN) {
         std::vector<float> partials(nt, -1e30f);
-#pragma omp parallel
-        {
-            int t = omp_get_thread_num();
-            int b, e;
-            sampler_chunk(n, t, nt, b, e);
+cpu::parallel_for_chunks_ex(n, 1, [&](int t, int nth, int g0, int g1) {
+            int b = g0, e = g1;
             partials[t] = forge::cpu::softcap_and_max_f32(data + b, e - b, cap);
         }
+    );
         float m = partials[0];
         for (int t = 1; t < nt; ++t) m = std::max(m, partials[t]);
         return m;
     }
-#endif
     return forge::cpu::softcap_and_max_f32(data, n, cap);
 }
 
 float parallel_exp_and_sum_f32(const float* data, float* out, int n, float max_val,
                                float inv_temp) {
-#ifdef _OPENMP
-    int nt = omp_get_max_threads();
+    int nt = cpu::get_num_threads();
     if (nt > 1 && n >= kSamplerParallelMinN) {
         std::vector<float> partials(nt, 0.0f);
-#pragma omp parallel
-        {
-            int t = omp_get_thread_num();
-            int b, e;
-            sampler_chunk(n, t, nt, b, e);
+cpu::parallel_for_chunks_ex(n, 1, [&](int t, int nth, int g0, int g1) {
+            int b = g0, e = g1;
             partials[t] = forge::cpu::exp_and_sum_f32(data + b, out + b, e - b, max_val, inv_temp);
         }
+    );
         float sum = 0.0f;
         for (int t = 0; t < nt; ++t) sum += partials[t];
         return sum;
     }
-#endif
     return forge::cpu::exp_and_sum_f32(data, out, n, max_val, inv_temp);
 }
 
 void parallel_scale_normalize_f32(float* data, int n, float inv) {
-#ifdef _OPENMP
-    int nt = omp_get_max_threads();
+    int nt = cpu::get_num_threads();
     if (nt > 1 && n >= kSamplerParallelMinN) {
-#pragma omp parallel
-        {
-            int t = omp_get_thread_num();
-            int b, e;
-            sampler_chunk(n, t, nt, b, e);
+cpu::parallel_for_chunks_ex(n, 1, [&](int t, int nth, int g0, int g1) {
+            int b = g0, e = g1;
             forge::cpu::scale_normalize_f32(data + b, e - b, inv);
         }
+    );
         return;
     }
-#endif
     forge::cpu::scale_normalize_f32(data, n, inv);
 }
 
 void parallel_build_pairs(std::vector<std::pair<float, int>>& indexed, const float* probs,
                           int n) {
-#ifdef _OPENMP
-    int nt = omp_get_max_threads();
+    int nt = cpu::get_num_threads();
     if (nt > 1 && n >= kSamplerParallelMinN) {
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < n; ++i) indexed[i] = {probs[i], i};
+cpu::parallel_for(n, [&](int i) {
+            indexed[i] = {probs[i], i};
+        });
         return;
     }
-#endif
     for (int i = 0; i < n; ++i) indexed[i] = {probs[i], i};
 }
 
@@ -134,15 +113,11 @@ void parallel_build_pairs(std::vector<std::pair<float, int>>& indexed, const flo
 void parallel_top_k_pairs(std::vector<std::pair<float, int>>& indexed,
                           std::vector<std::pair<float, int>>& out, int n, int k) {
     auto desc = [](const auto& a, const auto& b) { return a.first > b.first; };
-#ifdef _OPENMP
-    int nt = omp_get_max_threads();
+    int nt = cpu::get_num_threads();
     if (nt > 1 && n >= kSamplerParallelMinN && k < n) {
         out.resize(static_cast<size_t>(nt) * k);
-#pragma omp parallel
-        {
-            int t = omp_get_thread_num();
-            int b, e;
-            sampler_chunk(n, t, nt, b, e);
+cpu::parallel_for_chunks_ex(n, 1, [&](int t, int nth, int g0, int g1) {
+            int b = g0, e = g1;
             int c = std::min(k, e - b);
             std::nth_element(indexed.begin() + b, indexed.begin() + b + c, indexed.begin() + e,
                              desc);
@@ -150,11 +125,11 @@ void parallel_top_k_pairs(std::vector<std::pair<float, int>>& indexed,
             std::copy(indexed.begin() + b, indexed.begin() + b + c,
                       out.begin() + static_cast<size_t>(t) * k);
         }
+    );
         std::partial_sort(out.begin(), out.begin() + k, out.end(), desc);
         out.resize(k);
         return;
     }
-#endif
     std::nth_element(indexed.begin(), indexed.begin() + k, indexed.end(), desc);
     std::sort(indexed.begin(), indexed.begin() + k, desc);
     out.assign(indexed.begin(), indexed.begin() + k);
@@ -164,18 +139,15 @@ void parallel_top_k_pairs(std::vector<std::pair<float, int>>& indexed,
 void parallel_full_sort_pairs(std::vector<std::pair<float, int>>& src,
                               std::vector<std::pair<float, int>>& dst, int n) {
     auto desc = [](const auto& a, const auto& b) { return a.first > b.first; };
-#ifdef _OPENMP
-    int nt = omp_get_max_threads();
+    int nt = cpu::get_num_threads();
     if (nt > 1 && n >= kSamplerParallelMinN) {
         std::vector<std::pair<int, int>> ranges(nt);
-#pragma omp parallel
-        {
-            int t = omp_get_thread_num();
-            int b, e;
-            sampler_chunk(n, t, nt, b, e);
+cpu::parallel_for_chunks_ex(n, 1, [&](int t, int nth, int g0, int g1) {
+            int b = g0, e = g1;
             ranges[t] = {b, e};
             std::sort(src.begin() + b, src.begin() + e, desc);
         }
+    );
         std::vector<int> pos(nt, 0);
         for (int i = 0; i < n; ++i) {
             int best = -1;
@@ -196,7 +168,6 @@ void parallel_full_sort_pairs(std::vector<std::pair<float, int>>& src,
         }
         return;
     }
-#endif
     std::sort(src.begin(), src.end(), desc);
     dst.assign(src.begin(), src.end());
 }

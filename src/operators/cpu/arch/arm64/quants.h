@@ -1,4 +1,5 @@
 #pragma once
+#include "cpu/common/thread_pool.h"
 // ARM64 NEON I-quant kernel implementations (FORGE_ARCH_ARM64 + USE_NEON).
 // NEON (ARMv8-A ASIMD) translations of the x86 IQ quant dot product and GEMV
 // kernels from arch/x86/quants.h.
@@ -178,23 +179,21 @@ static void gemv_iq4_nl_q8k_transB_neon(const float* a, const uint8_t* w, float*
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * row_bytes;
             out[n] = dot_iq4_nl_q8_K_neon(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * row_bytes;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq4_nl_q8_K_neon(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 
@@ -327,23 +326,21 @@ static void gemv_iq2_xs_q8k_transB_neon(const float* a, const uint8_t* w, float*
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
             out[n] = dot_iq2_xs_q8_K_neon(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq2_xs_q8_K_neon(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 
@@ -473,23 +470,21 @@ static void gemv_iq3_s_q8k_transB_neon(const float* a, const uint8_t* w, float* 
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
             out[n] = dot_iq3_s_q8_K_neon(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq3_s_q8_K_neon(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 
@@ -604,23 +599,21 @@ static void gemv_iq2_s_q8k_transB_neon(const float* a, const uint8_t* w, float* 
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
             out[n] = dot_iq2_s_q8_K_neon(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq2_s_q8_K_neon(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 
@@ -896,8 +889,7 @@ static void gemv_q3_k_q4_k_fused_qkv_neon(const float* a, const uint8_t* wq,
 
     // Q and K use Q3_K → q3_k_sb_dot
     auto dot_q3_rows = [&](const uint8_t* w, float* out, int N) {
-        #pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* q3_row = w + (size_t)n * nb * Q3_K_BLOCK_BYTES;
             float32x4_t acc = vdupq_n_f32(0.0f);
             for (int i = 0; i < nb; ++i) {
@@ -905,18 +897,17 @@ static void gemv_q3_k_q4_k_fused_qkv_neon(const float* a, const uint8_t* wq,
                     q3_row + (size_t)i * Q3_K_BLOCK_BYTES, &q8_buf[i]));
             }
             out[n] = vgetq_lane_f32(acc, 0);  // total is broadcast to all lanes
-        }
+            });
     };
 
     dot_q3_rows(wq, out_q, N_q);
     dot_q3_rows(wk, out_k, N_k);
 
     // V uses Q4_K → dot_q4_K_q8_K_row
-    #pragma omp parallel for schedule(static)
-    for (int n = 0; n < N_v; ++n) {
+    cpu::parallel_for(N_v, [&](int n) {
         const uint8_t* q4_row = wv + (size_t)n * nb * Q4_K_BLOCK_BYTES;
         out_v[n] = dot_q4_K_q8_K_row_neon(q4_row, q8_buf.data(), nb);
-    }
+        });
 }
 
 // ============================================================================
@@ -934,8 +925,7 @@ static void gemv_q3_k_fused_ffn_up_neon(const float* a, const uint8_t* w_gate,
     std::vector<cpu::block_q8_K> q8_buf(nb);
     cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-    #pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
+    cpu::parallel_for(N, [&](int n) {
         const uint8_t* gate_row = w_gate + (size_t)n * nb * Q3_K_BLOCK_BYTES;
         const uint8_t* up_row = w_up + (size_t)n * nb * Q3_K_BLOCK_BYTES;
 
@@ -952,7 +942,7 @@ static void gemv_q3_k_fused_ffn_up_neon(const float* a, const uint8_t* w_gate,
         float gate_val = vgetq_lane_f32(gate_acc, 0);  // total is broadcast to all lanes
         float up_val = vgetq_lane_f32(up_acc, 0);
         out[n] = (gate_val / (1.0f + std::exp(-gate_val))) * up_val;
-    }
+        });
 }
 
 // ============================================================================
@@ -971,8 +961,7 @@ static void gemv_q4_0_fused_ffn_up_neon(const float* a, const uint8_t* w_gate,
     std::vector<cpu::block_q8_0_act> q8_buf(nb);
     cpu::quantize_row_q8_0_act(a, q8_buf.data(), K);
 
-    #pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
+    cpu::parallel_for(N, [&](int n) {
         const uint8_t* gate_row = w_gate + (size_t)n * nb * BLOCK_BYTES;
         const uint8_t* up_row = w_up + (size_t)n * nb * BLOCK_BYTES;
 
@@ -982,7 +971,7 @@ static void gemv_q4_0_fused_ffn_up_neon(const float* a, const uint8_t* w_gate,
             up_row, q8_buf.data(), nb);
 
         out[n] = (gate_val / (1.0f + std::exp(-gate_val))) * up_val;
-    }
+        });
 }
 
 // K-quant row dots shared by GEMM and fused projections.
@@ -1091,12 +1080,11 @@ static inline void fused_ffn_up_k_neon(const float* a, const uint8_t* gate, cons
     const int nb = (K + 255) / 256;
     scratch_vec<block_q8_K> q8(nb);
     quantize_row_q8_K(a, q8.data(), K);
-    #pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
+    cpu::parallel_for(N, [&](int n) {
         const float g = dot(gate + (size_t)n * nb * block_bytes, q8.data(), nb);
         const float u = dot(up + (size_t)n * nb * block_bytes, q8.data(), nb);
         out[n] = (g / (1.0f + std::exp(-g))) * u;
-    }
+        });
 }
 
 template <typename DotFn>
@@ -1107,9 +1095,9 @@ static inline void fused_qkv_k_neon(const float* a, const uint8_t* wq, const uin
     scratch_vec<block_q8_K> q8(nb);
     quantize_row_q8_K(a, q8.data(), K);
     auto run = [&](const uint8_t* w, float* o, int N) {
-        #pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n)
+        cpu::parallel_for(N, [&](int n) {
             o[n] = dot(w + (size_t)n * nb * block_bytes, q8.data(), nb);
+            });
     };
     run(wq, oq, Nq); run(wk, ok, Nk); run(wv, ov, Nv);
 }
@@ -1120,9 +1108,9 @@ static inline void fused_residual_k_neon(const float* a, const uint8_t* w, const
     const int nb = (K + 255) / 256;
     scratch_vec<block_q8_K> q8(nb);
     quantize_row_q8_K(a, q8.data(), K);
-    #pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n)
+    cpu::parallel_for(N, [&](int n) {
         out[n] = residual[n] + dot(w + (size_t)n * nb * block_bytes, q8.data(), nb);
+        });
 }
 
 static inline void gemv_q3_K_fused_ffn_up_neon(const float* a, const uint8_t* g, const uint8_t* u, float* o, int K, int N) { fused_ffn_up_k_neon(a,g,u,o,K,N,sizeof(block_q3_K),dot_q3_K_q8_K_row_neon); }

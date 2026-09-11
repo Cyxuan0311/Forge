@@ -1,4 +1,5 @@
 #pragma once
+#include "cpu/common/thread_pool.h"
 // PPC64 VSX I-quant (IQ2_S / IQ2_XS / IQ3_S / IQ4_NL) fused dot-product and
 // GEMV kernels.
 //
@@ -112,23 +113,21 @@ static void gemv_iq4_nl_q8k_transB_vsx(const float* a, const uint8_t* w, float* 
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * row_bytes;
             out[n] = dot_iq4_nl_q8_K_vsx(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * row_bytes;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq4_nl_q8_K_vsx(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 
@@ -216,23 +215,21 @@ static void gemv_iq2_xs_q8k_transB_vsx(const float* a, const uint8_t* w, float* 
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
             out[n] = dot_iq2_xs_q8_K_vsx(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_XS_BLOCK_SIZE;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq2_xs_q8_K_vsx(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 
@@ -333,23 +330,21 @@ static void gemv_iq3_s_q8k_transB_vsx(const float* a, const uint8_t* w, float* o
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
             out[n] = dot_iq3_s_q8_K_vsx(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ3_S_BLOCK_SIZE;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq3_s_q8_K_vsx(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 
@@ -441,23 +436,21 @@ static void gemv_iq2_s_q8k_transB_vsx(const float* a, const uint8_t* w, float* o
         std::vector<cpu::block_q8_K> q8_buf(nb);
         cpu::quantize_row_q8_K(a, q8_buf.data(), K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
             out[n] = dot_iq2_s_q8_K_vsx(row, q8_buf.data(), nb);
-        }
+            });
     } else {
         std::vector<cpu::block_q8_K> q8_all((size_t)M * nb);
         for (int m = 0; m < M; ++m)
             cpu::quantize_row_q8_K(a + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
 
-#pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* row = w + (size_t)n * nb * IQ2_S_BLOCK_SIZE;
             for (int m = 0; m < M; ++m)
                 out[(size_t)m * N + n] = dot_iq2_s_q8_K_vsx(row,
                     q8_all.data() + (size_t)m * nb, nb);
-        }
+            });
     }
 }
 

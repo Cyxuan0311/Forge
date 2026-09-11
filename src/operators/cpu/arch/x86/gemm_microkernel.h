@@ -18,12 +18,8 @@
 #    include <immintrin.h>
 #    include "../../common/quant_helpers.h"  // block_q8_K, block_q6_K, quantize_row_q8_K, get_scale_shuffle
 #    include "scales.h"                       // get_scale_shuffle*, decode_q4_k_scales
-#    include "thread_pool.h"
+#    include "cpu/common/thread_pool.h"
 #    include "vec_dot.h"          // block_q8_0_act, quantize_row_q8_0_act, vdot::fp16_to_fp32
-#endif
-
-#ifdef _OPENMP
-#    include <omp.h>
 #endif
 
 namespace forge {
@@ -134,8 +130,8 @@ static void gemm_q4_0_decode_avx2(const float* a_data,
     quantize_row_q8_0_act(a_data, q8_act.data(), (int)K);
 
     // Process RM=4 weight rows at a time
-    #pragma omp parallel for schedule(static)
-    for (int64_t n = 0; n < N; n += RM) {
+    cpu::parallel_for_chunks((int)(N), RM, [&](int pf_b, int pf_e) {
+    for (int64_t n = pf_b; n < pf_e; n += RM) {
         int64_t rows = (n + RM <= N) ? RM : (N - n);
 
         // Initialize accumulators for up to 4 output rows
@@ -205,6 +201,7 @@ static void gemm_q4_0_decode_avx2(const float* a_data,
         if (rows > 2) o_data[n + 2] = vdot::hsum_ps256(acc2);
         if (rows > 3) o_data[n + 3] = vdot::hsum_ps256(acc3);
     }
+    });
 }
 
 // ============================================================================
@@ -331,8 +328,8 @@ static void gemm_q4_0_decode_f16c_avx2(const float* a_data,
     scratch_vec<block_q8_0_act> q8_act(nb);
     quantize_row_q8_0_act(a_data, q8_act.data(), (int)K);
 
-    #pragma omp parallel for schedule(static)
-    for (int64_t n = 0; n < N; n += RM) {
+    cpu::parallel_for_chunks((int)(N), RM, [&](int pf_b, int pf_e) {
+    for (int64_t n = pf_b; n < pf_e; n += RM) {
         int64_t rows = (n + RM <= N) ? RM : (N - n);
 
         __m256 acc0 = _mm256_setzero_ps();
@@ -414,6 +411,7 @@ static void gemm_q4_0_decode_f16c_avx2(const float* a_data,
         if (rows > 2) o_data[n + 2] = vdot::hsum_ps256(acc2);
         if (rows > 3) o_data[n + 3] = vdot::hsum_ps256(acc3);
     }
+    });
 }
 
 // ============================================================================
@@ -654,12 +652,9 @@ static void gemm_q4_0_8x8_batch_avx2(
     const __m256i m4b = _mm256_set1_epi8(0x0F);
     const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
 
-    #pragma omp parallel
-    {
-        const int64_t ith = omp_get_thread_num();
-        const int64_t nth = omp_get_num_threads();
-        const int64_t g_begin = (num_groups * ith) / nth;
-        const int64_t g_end = (num_groups * (ith + 1)) / nth;
+    cpu::parallel_for_chunks_ex((int)num_groups, 1, [&](int /*ith*/, int /*nth*/, int i0, int i1) {
+        const int64_t g_begin = i0;
+        const int64_t g_end = i1;
         alignas(32) std::vector<float> acc(M * RM);
         for (int64_t g = g_begin; g < g_end; ++g) {
             const block_q4_0x8* gb = reinterpret_cast<const block_q4_0x8*>(
@@ -693,7 +688,7 @@ static void gemm_q4_0_8x8_batch_avx2(
                                  _mm256_permutevar8x32_ps(
                                      _mm256_loadu_ps(acc.data() + m * RM), finalperm));
         }
-    }
+    });
 }
 
 // Q4_0 8x8 decode GEMV (M=1) on the block_q4_0x8 layout, Q8_0 activation.
@@ -714,12 +709,13 @@ static void gemv_q4_0_8x8_q8_0_avx2(const float* a_data, const uint8_t* w_repack
     const __m256i m4b = _mm256_set1_epi8(0x0F);
     const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
 
-    #pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < num_groups; ++g) {
-        __m256 acc_row = gemv_q4_0_8x8_dot_group(
-            w_repacked + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
-        _mm256_storeu_ps(o_data + g * RM, _mm256_permutevar8x32_ps(acc_row, finalperm));
-    }
+    cpu::parallel_for_chunks((int)num_groups, 1, [&](int g0, int g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            __m256 acc_row = gemv_q4_0_8x8_dot_group(
+                w_repacked + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
+            _mm256_storeu_ps(o_data + g * RM, _mm256_permutevar8x32_ps(acc_row, finalperm));
+        }
+    });
 }
 
 // Q4_0 8x8 decode GEMV (M=1) with elementwise residual add (used for both the
@@ -742,14 +738,15 @@ static void gemv_q4_0_8x8_residual_avx2(const float* a_data, const uint8_t* w_re
     const __m256i m4b = _mm256_set1_epi8(0x0F);
     const __m256i finalperm = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
 
-    #pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < num_groups; ++g) {
-        __m256 acc_row = gemv_q4_0_8x8_dot_group(
-            w_repacked + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
-        const __m256 res = _mm256_loadu_ps(r_data + g * RM);
-        _mm256_storeu_ps(o_data + g * RM,
-                         _mm256_add_ps(_mm256_permutevar8x32_ps(acc_row, finalperm), res));
-    }
+    cpu::parallel_for_chunks((int)num_groups, 1, [&](int g0, int g1) {
+        for (int64_t g = g0; g < g1; ++g) {
+            __m256 acc_row = gemv_q4_0_8x8_dot_group(
+                w_repacked + g * nb * sizeof(block_q4_0x8), q8_act.data(), nb, lut, m4b);
+            const __m256 res = _mm256_loadu_ps(r_data + g * RM);
+            _mm256_storeu_ps(o_data + g * RM,
+                             _mm256_add_ps(_mm256_permutevar8x32_ps(acc_row, finalperm), res));
+        }
+    });
 }
 
 // Fused FFN gate+up Q4_0 8x8 decode GEMV (M=1): computes out = silu(gate)*up
@@ -775,8 +772,8 @@ static void gemv_q4_0_fused_ffn_up_8x8_avx2(const float* a_data,
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
 
-    #pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < num_groups; ++g) {
+    cpu::parallel_for_chunks((int)(num_groups), 1, [&](int pf_b, int pf_e) {
+    for (int64_t g = pf_b; g < pf_e; ++g) {
         const block_q4_0x8* gb = reinterpret_cast<const block_q4_0x8*>(
             w_gate_8x8 + g * nb * sizeof(block_q4_0x8));
         const block_q4_0x8* ub = reinterpret_cast<const block_q4_0x8*>(
@@ -861,6 +858,7 @@ static void gemv_q4_0_fused_ffn_up_8x8_avx2(const float* a_data,
         for (int r = 0; r < RM; ++r)
             o_data[g * RM + r] = silu(gr[r]) * ur[r];
     }
+    });
 }
 // ============================================================================
 // Ported from llama.cpp (ggml/src/ggml-cpu/repack.cpp: make_block_q4_Kx8 and
@@ -1095,8 +1093,8 @@ static void gemv_q4_K_8x8_q8_K_avx2(
     for (int64_t y = 0; y < nr; y++) {
         const block_q8_K* a_ptr = a_ptr_start + (y * nb);
 
-#    pragma omp parallel for schedule(static)
-        for (int64_t x = 0; x < nc / 8; x++) {
+        cpu::parallel_for_chunks((int)((nc / 8)), 1, [&](int pf_b, int pf_e) {
+        for (int64_t x = pf_b; x < pf_e; x++) {
             const block_q4_Kx8* b_ptr = b_ptr_start + (x * b_nb);
 
             __m256 acc_row = _mm256_setzero_ps();
@@ -1227,6 +1225,7 @@ static void gemv_q4_K_8x8_q8_K_avx2(
             acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
             _mm256_storeu_ps(o_data + (y * nr + x * 8), _mm256_sub_ps(acc_row, acc_min_rows));
         }
+        });
     }
 }
 
@@ -1481,8 +1480,8 @@ static void gemm_q4_0_decode_repacked_f16c_avx2(
     scratch_vec<block_q8_0_act> q8_act(nb);
     quantize_row_q8_0_act(a_data, q8_act.data(), (int)K);
 
-    #pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < num_groups; ++g) {
+    cpu::parallel_for_chunks((int)(num_groups), 1, [&](int pf_b, int pf_e) {
+    for (int64_t g = pf_b; g < pf_e; ++g) {
         int64_t n0 = g * RM;
         int64_t rows = std::min(n0 + RM, N) - n0;
 
@@ -1558,6 +1557,7 @@ static void gemm_q4_0_decode_repacked_f16c_avx2(
         if (rows > 2) o_data[n0 + 2] = vdot::hsum_ps256(acc2);
         if (rows > 3) o_data[n0 + 3] = vdot::hsum_ps256(acc3);
     }
+    });
 }
 
 // ============================================================================
@@ -1770,31 +1770,33 @@ static void gemm_q4_0_batch_avx2(
     for (int64_t m = 0; m < M; ++m)
         quantize_row_q8_0_act(a_data + m * K, q8_act.data() + m * nb, (int)K);
 
-    // Tile-level work-stealing
+    // Tile-level parallelism over weight rows (N).
+    //
+    // llama.cpp-style blocking: a worker owns a contiguous range of weight
+    // column tiles and computes EVERY activation-row tile for them, so each
+    // weight block is streamed from RAM exactly once and then reused out of L1
+    // across all m-tiles.
+    //
+    // The previous (m_tiles x n_tiles) work-stealing order swept N fastest
+    // (nt = tile % n_tiles), so every m-tile re-walked the entire weight
+    // matrix. With M=23 -> m_tiles=6, a 23-token prefill read the weights 6x
+    // (ffn_up: 458 MB instead of 76 MB), which is what made prefill ~6x slower
+    // per token than decode.
     const int64_t m_tiles = (M + RM - 1) / RM;
     const int64_t n_tiles = (N + RN - 1) / RN;
-    const int64_t total_tiles = m_tiles * n_tiles;
 
-    std::atomic<int64_t> next_tile{0};
-
-    #pragma omp parallel
-    {
-        while (true) {
-            int64_t tile = next_tile.fetch_add(1, std::memory_order_relaxed);
-            if (tile >= total_tiles) break;
-
-            int64_t mt = tile / n_tiles;
-            int64_t nt = tile % n_tiles;
-
-            int64_t m0 = mt * RM;
-            int64_t n0 = nt * RN;
-            int64_t m_rows = std::min(m0 + RM, M) - m0;
-            int64_t n_cols = std::min(n0 + RN, N) - n0;
-
-            gemm_q4_0_tile_4x4_f16c(q8_act.data(), w_data, o_data, nb,
-                                      m0, m_rows, n0, n_cols, N);
+    cpu::parallel_for_chunks((int)n_tiles, 1, [&](int nt0, int nt1) {
+        for (int64_t nt = nt0; nt < nt1; ++nt) {
+            const int64_t n0 = nt * RN;
+            const int64_t n_cols = std::min(n0 + RN, N) - n0;
+            for (int64_t mt = 0; mt < m_tiles; ++mt) {
+                const int64_t m0 = mt * RM;
+                const int64_t m_rows = std::min(m0 + RM, M) - m0;
+                gemm_q4_0_tile_4x4_f16c(q8_act.data(), w_data, o_data, nb,
+                                          m0, m_rows, n0, n_cols, N);
+            }
         }
-    }
+    });
 }
 
 // ============================================================================
@@ -1894,12 +1896,9 @@ static void gemm_q6_K_avx2(
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
         constexpr int64_t TN = 64;  // weight rows per tile
-        #pragma omp parallel
-        {
-            const int64_t ith = omp_get_thread_num();
-            const int64_t nth = omp_get_num_threads();
-            const int64_t n_begin = (N * ith) / nth;
-            const int64_t n_end = (N * (ith + 1)) / nth;
+        cpu::parallel_for_chunks_ex((int)N, (int)TN, [&](int /*ith*/, int /*nth*/, int i0, int i1) {
+            const int64_t n_begin = i0;
+            const int64_t n_end = i1;
             alignas(32) float acc[TM];
             for (int64_t n0 = n_begin; n0 < n_end; n0 += TN) {
                 const int64_t tn = std::min<int64_t>(TN, n_end - n0);
@@ -1975,7 +1974,7 @@ static void gemm_q6_K_avx2(
                 }
             }
         }
-    }
+    });
 }
 }
 
@@ -2098,12 +2097,9 @@ static void gemm_q4_K_avx2(
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
         constexpr int64_t TN = 64;  // weight rows per tile
-        #pragma omp parallel
-        {
-            const int64_t ith = omp_get_thread_num();
-            const int64_t nth = omp_get_num_threads();
-            const int64_t n_begin = (N * ith) / nth;
-            const int64_t n_end = (N * (ith + 1)) / nth;
+        cpu::parallel_for_chunks_ex((int)N, (int)TN, [&](int /*ith*/, int /*nth*/, int i0, int i1) {
+            const int64_t n_begin = i0;
+            const int64_t n_end = i1;
             alignas(32) float acc[TM];
             for (int64_t n0 = n_begin; n0 < n_end; n0 += TN) {
                 const int64_t tn = std::min<int64_t>(TN, n_end - n0);
@@ -2187,7 +2183,7 @@ static void gemm_q4_K_avx2(
                     }
                 }
             }
-        }
+        });
     }
 }
 // ============================================================================
@@ -2317,12 +2313,9 @@ static void gemm_q5_K_avx2(
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
         constexpr int64_t TN = 64;  // weight rows per tile
-        #pragma omp parallel
-        {
-            const int64_t ith = omp_get_thread_num();
-            const int64_t nth = omp_get_num_threads();
-            const int64_t n_begin = (N * ith) / nth;
-            const int64_t n_end = (N * (ith + 1)) / nth;
+        cpu::parallel_for_chunks_ex((int)N, (int)TN, [&](int /*ith*/, int /*nth*/, int i0, int i1) {
+            const int64_t n_begin = i0;
+            const int64_t n_end = i1;
             alignas(32) float acc[TM];
             for (int64_t n0 = n_begin; n0 < n_end; n0 += TN) {
                 const int64_t tn = std::min<int64_t>(TN, n_end - n0);
@@ -2415,7 +2408,7 @@ sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
                 }
             }
         }
-    }
+    });
 }
 }
 
@@ -2525,12 +2518,9 @@ static void gemm_q2_K_avx2(
         // across k-blocks, then a single store).
         constexpr int64_t TM = 16;  // activation rows per tile
         constexpr int64_t TN = 64;  // weight rows per tile
-        #pragma omp parallel
-        {
-            const int64_t ith = omp_get_thread_num();
-            const int64_t nth = omp_get_num_threads();
-            const int64_t n_begin = (N * ith) / nth;
-            const int64_t n_end = (N * (ith + 1)) / nth;
+        cpu::parallel_for_chunks_ex((int)N, (int)TN, [&](int /*ith*/, int /*nth*/, int i0, int i1) {
+            const int64_t n_begin = i0;
+            const int64_t n_end = i1;
             alignas(32) float acc[TM];
             for (int64_t n0 = n_begin; n0 < n_end; n0 += TN) {
                 const int64_t tn = std::min<int64_t>(TN, n_end - n0);
@@ -2609,7 +2599,7 @@ static void gemm_q2_K_avx2(
                     }
                 }
             }
-        }
+        });
     }
 }
 
@@ -2743,12 +2733,9 @@ static void gemm_q3_K_avx2(
         // Prefill (M > 1): k-blocked GEMM (see gemm_q2_K_avx2 comment)
         constexpr int64_t TM = 16;  // activation rows per tile
         constexpr int64_t TN = 64;  // weight rows per tile
-        #pragma omp parallel
-        {
-            const int64_t ith = omp_get_thread_num();
-            const int64_t nth = omp_get_num_threads();
-            const int64_t n_begin = (N * ith) / nth;
-            const int64_t n_end = (N * (ith + 1)) / nth;
+        cpu::parallel_for_chunks_ex((int)N, (int)TN, [&](int /*ith*/, int /*nth*/, int i0, int i1) {
+            const int64_t n_begin = i0;
+            const int64_t n_end = i1;
             alignas(32) float acc[TM];
             for (int64_t n0 = n_begin; n0 < n_end; n0 += TN) {
                 const int64_t tn = std::min<int64_t>(TN, n_end - n0);
@@ -2846,7 +2833,7 @@ static void gemm_q3_K_avx2(
                     }
                 }
             }
-        }
+        });
     }
 }
 
@@ -2915,8 +2902,8 @@ static FORGE_AVX512_VNNI_ATTR void gemm_q4_0_decode_vnni(
     scratch_vec<block_q8_0_act> q8_act(nb);
     quantize_row_q8_0_act(a_data, q8_act.data(), (int)K);
 
-    #pragma omp parallel for schedule(static)
-    for (int64_t n = 0; n < N; n += RM) {
+    cpu::parallel_for_chunks((int)(N), RM, [&](int pf_b, int pf_e) {
+    for (int64_t n = pf_b; n < pf_e; n += RM) {
         int64_t rows = (n + RM <= N) ? RM : (N - n);
 
         // Float accumulators (one per weight row, 16 lanes for hsum)
@@ -3026,6 +3013,7 @@ static FORGE_AVX512_VNNI_ATTR void gemm_q4_0_decode_vnni(
         if (rows > 2) o_data[n + 2] = hsum_ps512(acc2);
         if (rows > 3) o_data[n + 3] = hsum_ps512(acc3);
     }
+    });
 }
 
 // ============================================================================
@@ -3298,31 +3286,24 @@ static FORGE_AVX512_VNNI_ATTR void gemm_q4_0_batch_vnni(
     for (int64_t m = 0; m < M; ++m)
         quantize_row_q8_0_act(a_data + m * K, q8_act.data() + m * nb, (int)K);
 
-    // Tile-level work-stealing
+    // llama.cpp-style blocking: parallel over weight rows (N), all m-tiles
+    // inside, so each weight block is read from RAM once and reused from L1.
+    // (See gemm_q4_0_batch_avx2 for the full rationale.)
     const int64_t m_tiles = (M + RM - 1) / RM;
     const int64_t n_tiles = (N + RN - 1) / RN;
-    const int64_t total_tiles = m_tiles * n_tiles;
 
-    std::atomic<int64_t> next_tile{0};
-
-    #pragma omp parallel
-    {
-        while (true) {
-            int64_t tile = next_tile.fetch_add(1, std::memory_order_relaxed);
-            if (tile >= total_tiles) break;
-
-            int64_t mt = tile / n_tiles;
-            int64_t nt = tile % n_tiles;
-
-            int64_t m0 = mt * RM;
-            int64_t n0 = nt * RN;
-            int64_t m_rows = std::min(m0 + RM, M) - m0;
-            int64_t n_cols = std::min(n0 + RN, N) - n0;
-
-            gemm_q4_0_tile_4x4_vnni(q8_act.data(), w_data, o_data, nb,
-                                      m0, m_rows, n0, n_cols, N);
+    cpu::parallel_for_chunks((int)n_tiles, 1, [&](int nt0, int nt1) {
+        for (int64_t nt = nt0; nt < nt1; ++nt) {
+            const int64_t n0 = nt * RN;
+            const int64_t n_cols = std::min(n0 + RN, N) - n0;
+            for (int64_t mt = 0; mt < m_tiles; ++mt) {
+                const int64_t m0 = mt * RM;
+                const int64_t m_rows = std::min(m0 + RM, M) - m0;
+                gemm_q4_0_tile_4x4_vnni(q8_act.data(), w_data, o_data, nb,
+                                          m0, m_rows, n0, n_cols, N);
+            }
         }
-    }
+    });
 }
 
 #endif  // USE_AVX512_VNNI

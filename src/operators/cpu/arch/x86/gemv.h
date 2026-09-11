@@ -1,4 +1,5 @@
 #pragma once
+#include "cpu/common/thread_pool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,9 +10,6 @@
 #include "scales.h"
 #include "vec.h"
 #include "forge/host_mem_pool.h"
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 #ifdef USE_AVX2
 #    include <immintrin.h>
 #endif
@@ -77,8 +75,7 @@ static void gemv_q4_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
             _dequant_buf.resize(K);
         float* dq = _dequant_buf.data();
 
-#    pragma omp parallel for schedule(dynamic, 4) if (N > 8)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for_dynamic(N, 4, [&](int n) {
             const uint8_t* w_row = w + (size_t)n * blocks_per_row * BLOCK_BYTES;
 
             // Dequantize entire weight row once
@@ -131,13 +128,13 @@ static void gemv_q4_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
             for (int m = 0; m < M; ++m) {
                 out[m * N + n] = dot_product_avx2(a + m * K, dq, K);
             }
-        }
+            });
     } else if (M == 1) {
         constexpr int NR = 4;
         const float* a_row = a;
 
-#    pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; n += NR) {
+        cpu::parallel_for_chunks(N, NR, [&](int n0, int n1) {
+            for (int n = n0; n < n1; n += NR) {
             int rows = (n + NR <= N) ? NR : (N - n);
 
             __m256 acc0_a = _mm256_setzero_ps(), acc0_b = _mm256_setzero_ps();
@@ -245,6 +242,7 @@ static void gemv_q4_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
             if (rows > 3)
                 out[n + 3] = hsum_avx2(acc3);
         }
+            });
     }
 
 #    undef Q4_0_PROCESS_BLOCK
@@ -260,8 +258,8 @@ static void gemv_fp32_transB_avx2(const float* a, const float* b, float* out, in
     if (M == 1) {
         constexpr int NR = 4;
         const float* a_row = a;
-#    pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; n += NR) {
+        cpu::parallel_for_chunks(N, NR, [&](int n0, int n1) {
+            for (int n = n0; n < n1; n += NR) {
             int rows = (n + NR <= N) ? NR : (N - n);
             __m256 acc0 = _mm256_setzero_ps();
             __m256 acc1 = _mm256_setzero_ps();
@@ -307,9 +305,9 @@ static void gemv_fp32_transB_avx2(const float* a, const float* b, float* out, in
             if (rows > 3)
                 out[n + 3] = finalize(a_row, b_row3, acc3);
         }
+            });
     } else {
-#    pragma omp parallel for schedule(static)
-        for (int m = 0; m < M; ++m) {
+        cpu::parallel_for(M, [&](int m) {
             const float* a_row = a + m * K;
             float* o_row = out + m * N;
             for (int n = 0; n < N; ++n) {
@@ -331,7 +329,7 @@ static void gemv_fp32_transB_avx2(const float* a, const float* b, float* out, in
                     sum += a_row[k] * b_row[k];
                 o_row[n] = sum;
             }
-        }
+            });
     }
 }
 #endif  // USE_AVX2
@@ -379,8 +377,7 @@ static void gemv_q8_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
             _dq.resize(K);
         float* dq = _dq.data();
 
-#    pragma omp parallel for schedule(dynamic, 4) if (N > 8)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for_dynamic(N, 4, [&](int n) {
             const uint8_t* w_row = w + (size_t)n * blocks_per_row * BLOCK_BYTES;
 
             for (int bi = 0; bi < blocks_per_row; ++bi) {
@@ -423,13 +420,13 @@ static void gemv_q8_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
             for (int m = 0; m < M; ++m) {
                 out[m * N + n] = dot_product_avx2(a + m * K, dq, K);
             }
-        }
+            });
     } else {
         constexpr int NR = 4;
         const float* a_row = a;
 
-#    pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; n += NR) {
+        cpu::parallel_for_chunks(N, NR, [&](int n0, int n1) {
+            for (int n = n0; n < n1; n += NR) {
             int rows = (n + NR <= N) ? NR : (N - n);
             __m256 acc0 = _mm256_setzero_ps();
             __m256 acc1 = _mm256_setzero_ps();
@@ -493,6 +490,7 @@ static void gemv_q8_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
             if (rows > 3)
                 out[n + 3] = hsum_avx2(acc3);
         }
+            });
     }
 }
 #endif  // USE_AVX2
@@ -565,8 +563,7 @@ static void gemv_q4_1_transB_avx2(const float* a, const uint8_t* w, float* out, 
             _dq.resize(K);
         float* dq = _dq.data();
 
-#    pragma omp parallel for schedule(dynamic, 4) if (N > 8)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for_dynamic(N, 4, [&](int n) {
             const uint8_t* w_row = w + (size_t)n * blocks_per_row * BLOCK_BYTES;
 
             for (int bi = 0; bi < full_blocks; ++bi) {
@@ -601,13 +598,13 @@ static void gemv_q4_1_transB_avx2(const float* a, const uint8_t* w, float* out, 
             for (int m = 0; m < M; ++m) {
                 out[m * N + n] = dot_product_avx2(a + m * K, dq, K);
             }
-        }
+            });
     } else {
         constexpr int NR = 4;
         const float* a_row = a;
 
-#    pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; n += NR) {
+        cpu::parallel_for_chunks(N, NR, [&](int n0, int n1) {
+            for (int n = n0; n < n1; n += NR) {
             int rows = (n + NR <= N) ? NR : (N - n);
 
             __m256 acc0_p = _mm256_setzero_ps(), acc0_m = _mm256_setzero_ps();
@@ -715,6 +712,7 @@ static void gemv_q4_1_transB_avx2(const float* a, const uint8_t* w, float* out, 
             if (rows > 3)
                 out[n + 3] = hsum_avx2(acc3);
         }
+            });
     }
 
 #    undef Q4_1_PROCESS_BLOCK
@@ -821,24 +819,22 @@ static void gemv_q4_K_transB_avx2(const float* a, const uint8_t* w, float* out, 
         scratch_vec<block_q8_K> q8_buf(nb);
         quantize_row_q8_K(a, q8_buf.data(), K);
 
-#    pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* q4_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
             out[n] = dot_q4_K_q8_K_avx2(q4_row, q8_buf.data(), nb);
-        }
+            });
     } else {
         scratch_vec<block_q8_K> q8_all(M * nb);
         for (int m = 0; m < M; ++m) {
             quantize_row_q8_K(a + m * K, q8_all.data() + m * nb, K);
         }
 
-#    pragma omp parallel for schedule(static)
-        for (int n = 0; n < N; ++n) {
+        cpu::parallel_for(N, [&](int n) {
             const uint8_t* q4_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
             for (int m = 0; m < M; ++m) {
                 out[m * N + n] = dot_q4_K_q8_K_avx2(q4_row, q8_all.data() + m * nb, nb);
             }
-        }
+            });
     }
 }
 
@@ -865,19 +861,19 @@ static void gemv_q4_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
 
 // Accumulators per OpenMP thread, allocated once per call (was per-iteration
     // _mm_malloc inside the parallel loop: N heap alloc/frees per GEMV).
-    const int max_threads = omp_get_max_threads();
+    const int max_threads = cpu::get_num_threads();
     __m256* acc_storage = static_cast<__m256*>(forge::host_mem::allocate(
         static_cast<size_t>(max_threads) * M * sizeof(__m256)));
     __m128* acc_m_storage = static_cast<__m128*>(forge::host_mem::allocate(
         static_cast<size_t>(max_threads) * M * sizeof(__m128)));
 
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; ++n) {
+    cpu::parallel_for_chunks_ex(N, 1, [&](int ith, int nth, int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
         const uint8_t* q4_row = w + (size_t)n * nb * Q4_K_BLOCK_BYTES;
 
         // Per-M accumulators (FP32 for the dot, __m128 for min contribution)
-        __m256* acc_vec = acc_storage + (size_t)omp_get_thread_num() * M;
-        __m128* acc_m_vec = acc_m_storage + (size_t)omp_get_thread_num() * M;
+        __m256* acc_vec = acc_storage + (size_t)ith * M;
+        __m128* acc_m_vec = acc_m_storage + (size_t)ith * M;
         for (int m = 0; m < M; ++m) {
             acc_vec[m] = _mm256_setzero_ps();
             acc_m_vec[m] = _mm_setzero_ps();
@@ -965,6 +961,7 @@ static void gemv_q4_K_transB_batch_avx2(const float* a, const uint8_t* w, float*
             out[m * N + n] = hsum_avx2(acc_vec[m]) + _mm_cvtss_f32(acc_m);
         }
     }
+        });
 
     forge::host_mem::deallocate(acc_storage);
     forge::host_mem::deallocate(acc_m_storage);

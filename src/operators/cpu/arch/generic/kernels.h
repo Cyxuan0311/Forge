@@ -89,6 +89,23 @@ inline void fmadd_f32(float* acc, const float* src, int n, float weight) {
         acc[i] += weight * src[i];
 }
 
+// ---- simd_gemm: C[M x N] += A[M x K] * B[K x N] (row-major, N contiguous) ----
+// Accumulating GEMM used by tiled prefill attention. Scalar fallback; the x86
+// path provides an AVX2 micro-kernel version with identical semantics. No
+// internal memset / no internal OpenMP, so it is safe inside a per-head
+// parallel region.
+inline void simd_gemm(float* C, const float* A, const float* B, int M, int K, int N) {
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = A + (size_t)m * K;
+        float* c_row = C + (size_t)m * N;
+        for (int kk = 0; kk < K; ++kk) {
+            float av = a_row[kk];
+            const float* b_row = B + (size_t)kk * N;
+            for (int n = 0; n < N; ++n) c_row[n] += av * b_row[n];
+        }
+    }
+}
+
 // ---- sampling kernels ----
 
 inline int softcap_and_argmax_f32(float* logits, int n, float cap) {

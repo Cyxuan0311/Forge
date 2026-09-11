@@ -1,4 +1,5 @@
 #pragma once
+#include "cpu/common/thread_pool.h"
 // Architecture-independent quantization block structures and scalar helpers.
 // The SIMD-specific scale-decode helpers (decode_q4_k_scales, get_scale_shuffle*)
 // live in arch/<arch>/kernels.h instead — see src/operators/cpu/simd.h.
@@ -8,9 +9,6 @@
 #include <cstdint>
 #include <vector>
 #include "forge/host_mem_pool.h"
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 
 namespace forge {
 namespace cpu {
@@ -110,28 +108,22 @@ static void quantize_row_q8_K(const float* src, block_q8_K* dst, int k) {
     }
 }
 
-// Round-robin parallel_for
+// Round-robin parallel_for: chunks are handed out by work stealing, so an
+// uneven `fn` cost per chunk still balances across threads.
 template <typename Fn>
 static void parallel_for_steal(int total, int chunk_size, Fn&& fn) {
     if (total <= 0)
         return;
     int n_chunks = (total + chunk_size - 1) / chunk_size;
-#ifdef _OPENMP
-#    pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        int n_threads = omp_get_num_threads();
-        for (int c = tid; c < n_chunks; c += n_threads) {
+cpu::parallel_for_chunks_dynamic(n_chunks, 1, [&](int c0, int c1) {
+        for (int c = c0; c < c1; ++c) {
             int start = c * chunk_size;
             int end = start + chunk_size;
             if (end > total)
                 end = total;
             fn(start, end);
         }
-    }
-#else
-    fn(0, total);
-#endif
+    });
 }
 
 }  // namespace cpu

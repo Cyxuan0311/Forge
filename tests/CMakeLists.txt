@@ -20,6 +20,11 @@
 
 option(FORGE_BUILD_BENCHMARKS "Build the micro-benchmark executables" OFF)
 
+# Tests include src/operators headers through repo-relative paths such as
+# "cpu/common/thread_pool.h"; make sure that base directory is on the include
+# search path for every test target defined in this directory.
+include_directories(${PROJECT_SOURCE_DIR}/src/operators)
+
 # Libraries shared by the native (host-compiled) test executables.
 set(FORGE_TEST_LIBS forge_infer forge_model forge_ops forge_core
                     forge_tokenizer)
@@ -49,8 +54,7 @@ function(forge_link_native target)
   target_link_libraries(
     ${target}
     PRIVATE ${group_open} ${FORGE_TEST_LIBS} ${group_close}
-            $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
-            $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+            $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
   if(CUDAToolkit_FOUND)
     target_compile_definitions(${target} PRIVATE USE_CUDA)
     target_link_libraries(
@@ -126,8 +130,7 @@ else()
 endif()
 target_link_libraries(
   forge-inspect-scanner-test
-  PRIVATE ${group_open} forge_inspect ${FORGE_TEST_LIBS} ${group_close}
-          $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+  PRIVATE ${group_open} forge_inspect ${FORGE_TEST_LIBS} ${group_close})
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge-inspect-scanner-test PRIVATE USE_CUDA)
   target_link_libraries(forge-inspect-scanner-test PRIVATE CUDA::cudart)
@@ -444,6 +447,10 @@ endif()
 # registered with CTest -- run the binaries manually).
 # -----------------------------------------------------------------------------
 if(FORGE_BUILD_BENCHMARKS)
+  # Several benchmarks control threads and do their own timing directly through
+  # OpenMP (omp_set_num_threads / omp_get_wtime), so the OpenMP runtime must be
+  # linked in -- it is not part of the ordinary test link interface.
+  find_package(OpenMP)
   foreach(bench IN ITEMS ffn_q2k moe_multigemv moe_real output_proj_q6k
                          prefill_gemm cpu_decode)
     add_executable(forge-bench-${bench} bench_${bench}.cpp)
@@ -454,5 +461,8 @@ if(FORGE_BUILD_BENCHMARKS)
                                  PRIVATE ${PROJECT_SOURCE_DIR})
     endif()
     forge_link_native(forge-bench-${bench})
+    if(OpenMP_CXX_FOUND)
+      target_link_libraries(forge-bench-${bench} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
   endforeach()
 endif()

@@ -105,8 +105,7 @@ target_include_directories(forge_ops PRIVATE ${OPENBLAS_INCLUDE_DIRS})
 target_link_libraries(
   forge_ops
   PUBLIC forge_core forge_cpu_features
-         $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>
-         $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+         $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
 if(CUDAToolkit_FOUND)
   target_link_libraries(forge_ops PUBLIC $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
 endif()

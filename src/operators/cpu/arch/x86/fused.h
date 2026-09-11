@@ -6,12 +6,9 @@
 
 #include "gemv.h"
 #include "cpu_gemv.h"
-#include "thread_pool.h"
+#include "cpu/common/thread_pool.h"
 #include "vec.h"
 #include "../../common/quant_helpers.h"
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 #ifdef USE_AVX2
 #    include <immintrin.h>
 #endif
@@ -284,8 +281,7 @@ static void gemv_q4_0_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate, c
 
     constexpr int RM = 4;
     constexpr int TILE_NR = 8;
-#    pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; n += TILE_NR) {
+    auto do_tile = [&](int n) {
         int rows = (n + TILE_NR <= N) ? TILE_NR : (N - n);
 
         for (int t = 0; t < rows; t += RM) {
@@ -308,7 +304,12 @@ static void gemv_q4_0_fused_ffn_up_avx2(const float* a, const uint8_t* w_gate, c
             for (int ri = 0; ri < tile_rows; ri++)
                 out[n + t + ri] = silu(gate_tile[ri]) * up_tile[ri];
         }
-    }
+    };
+    // One TILE_NR tile per chunk (schedule(static) equivalent), stolen across
+    // threads so the DRAM streams stay parallel.
+    cpu::parallel_for_chunks(N, TILE_NR, [&](int t0, int t1) {
+        for (int n = t0; n < t1; n += TILE_NR) do_tile(n);
+    });
 }
 
 // ---- Fused FFN gate+up projection for Q4_0 decode, repacked layout ----
@@ -333,8 +334,7 @@ static void gemv_q4_0_fused_ffn_up_repacked_avx2(
 
     auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
 
-#    pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < num_groups; ++g) {
+    auto do_group = [&](int64_t g) {
         int64_t n0 = g * RM;
         int64_t rows = std::min<int64_t>(n0 + RM, N) - n0;
 
@@ -465,7 +465,10 @@ static void gemv_q4_0_fused_ffn_up_repacked_avx2(
             float u3 = vdot::hsum_ps256(au3);
             out[n0 + 3] = silu(g3) * u3;
         }
-    }
+    };
+    // One row group per element; `gi` is int to avoid shadowing the float
+    // accumulators g0..g3 declared inside the body.
+    cpu::parallel_for((int)num_groups, [&](int gi) { do_group((int64_t)gi); });
 }
 #endif  // USE_AVX2
 
