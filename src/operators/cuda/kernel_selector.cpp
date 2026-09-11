@@ -14,7 +14,8 @@
 //     env override; otherwise MMQ -> batched GEMV -> dequant + cuBLAS. FP32
 //     weights go straight to cuBLAS. Q6_K joined in Phase 5-A and Q5_K in
 //     Phase 5-B (Q5_K needed its own FP16 whole-matrix dequant kernel; see
-//     launch_cublas_gemm_quant_fp16).
+//     launch_cublas_gemm_quant_fp16). Q3_K has a dequant kernel too
+//     (Phase 5-D) but stays on MMQ — see tensorcore_eligible().
 //   * MoE: only Q4_0/Q4_K/Q6_K/Q8_0 experts are launchable; anything else is
 //     UNSUPPORTED and the caller skips silently (as before).
 //
@@ -128,6 +129,17 @@ bool tensorcore_eligible(DataType dt) {
     default:
         return false;
     }
+    // Q3_K is deliberately NOT eligible, even though
+    // launch_dequant_q3_k_matrix_fp16() now exists. Measured on RTX 4050
+    // (sm_89, 6 GB) with a 573-token Qwen3-VL-4B Q3_K_M prefill, M == 1:
+    //   MMQ (dp4a)            2699.7 ms   36 layers 2413.8 ms, output_proj  177 ms
+    //   TensorCore (dequant)  8686.6 ms   36 layers 7732.2 ms, output_proj  845 ms
+    // i.e. 3.2x slower. launch_cublas_gemm_quant_fp16() re-dequantizes the
+    // entire weight matrix on every call and the one-thread-per-element
+    // dequant kernels are latency-bound, so the dequant costs far more than
+    // the TensorCore GEMM saves. Revisit once the FP16 dequant is cached per
+    // weight tensor (which also fixes the same 15x gap measured on the
+    // Q6_K/Q8_0 output_proj: 2698 ms TC vs 177 ms MMQ).
 }
 
 int detect_sm_arch() {
@@ -187,6 +199,9 @@ static constexpr TcMinM kTcMinM[] = {
     {DataType::Q4_K, 128}, // measured ~96-110, margin -> 128
     {DataType::Q4_0, 128}, // measured ~96-110, margin -> 128
 };
+// No Q3_K entry: it is not tensorcore_eligible() (see the measurement in
+// tensorcore_eligible()). If the FP16 dequant ever gets cached, add it here
+// at the conservative 128 level and re-measure.
 static constexpr int kTcMinMDefault = 128;  // future eligible dtypes stay at the
                                             // most conservative level
 int tc_min_m(DataType dt) {
@@ -232,12 +247,15 @@ KernelVariant select_gemv(const KernelProblem& p) {
 //
 // auto (Phase 5-C landing state): an eligible dtype goes TensorCore once M
 // reaches *its* conservative threshold (tc_min_m: Q8_0/Q5_K/Q6_K at 96,
-// Q4_K/Q4_0 at 128); everything else DP4A/MMQ. Coverage joined across phases:
-// Q8_0 after Phase 3.5 added its true M>1 MMQ instance (mmq_dispatch[Q8_0]);
-// Q6_K after Phase 5-A (dequant path already existed); Q5_K after Phase 5-B
-// added its missing FP16 whole-matrix dequant. Per-signature override inside /
-// around each threshold is owned by the 4-B autotuner once opted in
-// (FORGE_AUTOTUNE=1); benchmark force envs stay the highest priority.
+// Q4_K/Q4_0 at 128); everything else DP4A/MMQ. Coverage joined across
+// phases: Q8_0 after Phase 3.5 added its true M>1 MMQ instance
+// (mmq_dispatch[Q8_0]); Q6_K after Phase 5-A (dequant path already existed);
+// Q5_K after Phase 5-B added its missing FP16 whole-matrix dequant. Q3_K is
+// not eligible at all (Phase 5-D added launch_dequant_q3_k_matrix_fp16 but
+// measured the route 3.2x slower than MMQ — see tensorcore_eligible()).
+// Per-signature override inside / around each threshold is owned by the 4-B
+// autotuner once opted in (FORGE_AUTOTUNE=1); benchmark force envs stay the
+// highest priority.
 bool prefer_tensor_core(int M, DataType dt) {
 #if !FORGE_USE_CUBLAS
     (void)M;

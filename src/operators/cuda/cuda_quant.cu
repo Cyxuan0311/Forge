@@ -773,6 +773,74 @@ void launch_dequant_q3_k_matrix(const void* q_data, float* out, int N, int K, cu
                                                                out, N, K);
 }
 
+// ---- Q3_K → FP16 Matrix Dequantization ----
+// Same block walk as dequant_q3_k_matrix_kernel, only the store differs, so
+// the FP16-whole-matrix GEMM path (launch_cublas_gemm_quant_fp16) can also
+// serve Q3_K weights.
+//
+// Not auto-selected: the resulting route measured 3.2x slower than the SIMT
+// dp4a MMQ kernel on RTX 4050 (573-token prefill: 8687 ms vs 2700 ms) because
+// this path re-dequantizes the whole weight matrix on every call. See
+// tensorcore_eligible() in kernel_selector.cpp.
+
+__global__ void dequant_q3_k_matrix_fp16_kernel(const uint8_t* __restrict__ q_data,
+                                                __half* __restrict__ out, int N, int K) {
+    const int QK_K = 256;
+    const int Q3_K_BLOCK_SIZE = 110;
+    int blocks_per_row = (K + QK_K - 1) / QK_K;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total)
+        return;
+
+    int row = idx / K;
+    int col = idx % K;
+
+    int bi = col / QK_K;
+    int j_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_data + (size_t)row * blocks_per_row * Q3_K_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * Q3_K_BLOCK_SIZE;
+    const uint8_t* hm = block_ptr;
+    const uint8_t* q = block_ptr + 32;
+    const uint8_t* scales_raw = block_ptr + 96;
+
+    uint16_t d_bits;
+    memcpy(&d_bits, block_ptr + 108, 2);
+    float d_all = __half2float(reinterpret_cast<const __half&>(d_bits));
+
+    int h = j_in_block / 128;
+    int rem = j_in_block % 128;
+    int sub = rem / 32;
+    int l_sub = rem % 32;
+    int shift = sub * 2;
+
+    int bit_pos = h * 4 + sub;
+    uint8_t hm_bit = (hm[l_sub] >> bit_pos) & 1;
+
+    int q_offset = h * 32 + l_sub;
+    int q_val = (q[q_offset] >> shift) & 3;
+    int q_adj = q_val - (hm_bit ? 0 : 4);
+
+    int is = h * 8 + sub * 2 + (l_sub / 16);
+
+    int8_t unpacked[16];
+    q3_k_unpack_scales(scales_raw, unpacked);
+    float dl = d_all * static_cast<float>(unpacked[is] - 32);
+
+    out[idx] = __float2half(dl * static_cast<float>(q_adj));
+}
+
+void launch_dequant_q3_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream) {
+    int total = N * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dequant_q3_k_matrix_fp16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_data), static_cast<__half*>(out), N, K);
+}
+
 // ---- Q5_0 Matrix Dequantization ----
 // Block layout: d[2](fp16) + qh[4](uint32) + qs[16](nibble) = 22 bytes / 32 elements
 
@@ -1269,6 +1337,7 @@ bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q,
     case DataType::Q6_K:
     case DataType::Q8_0:
     case DataType::Q5_K:  // Phase 5-B: FP16 whole-matrix dequant added
+    case DataType::Q3_K:  // Phase 5-D: FP16 whole-matrix dequant added
         break;
     default:
         return false;
@@ -1305,6 +1374,9 @@ bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q,
         break;
     case DataType::Q8_0:
         launch_dequant_q8_0_matrix_fp16(B_q, b_fp16, N, K, stream);
+        break;
+    case DataType::Q3_K:
+        launch_dequant_q3_k_matrix_fp16(B_q, b_fp16, N, K, stream);
         break;
     default:
         return false;  // unreachable (guarded above)

@@ -471,6 +471,14 @@ void launch_dequant_q5_k_matrix_fp16(const void* q_data, void* out, int N, int K
 void launch_dequant_q8_0_matrix_fp16(const void* q_data, void* out, int N, int K,
                                      cudaStream_t stream = 0);
 
+// Q3_K joined the FP16 whole-matrix dequant family in Phase 5-D, so
+// launch_cublas_gemm_quant_fp16() can serve Q3_K weights. It is deliberately
+// not auto-selected: the route measured 3.2x slower than MMQ on sm_89 (see
+// tensorcore_eligible() in kernel_selector.cpp). Kept because caching this
+// dequant per weight tensor is what should flip the decision later.
+void launch_dequant_q3_k_matrix_fp16(const void* q_data, void* out, int N, int K,
+                                     cudaStream_t stream = 0);
+
 void launch_dequant_q4_1_matrix(const void* q_data, float* out, int N, int K,
                                 cudaStream_t stream = 0);
 

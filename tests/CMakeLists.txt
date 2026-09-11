@@ -368,6 +368,14 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-fp8-gemv-bench)
   add_test(NAME fp8-gemv-bench COMMAND forge-fp8-gemv-bench)
 
+  # Phase 5-D: Q3_K FP16 whole-matrix dequant (launch_dequant_q3_k_matrix_fp16)
+  # + the Q3_K -> FP16 -> cuBLAS TensorCore prefill route it unlocks. Parity
+  # against the existing FP32 dequant and a host FP32 GEMM golden. Skips
+  # gracefully without a CUDA device or cuBLAS.
+  add_executable(forge-q3k-dequant-fp16-test test_q3k_dequant_fp16.cu)
+  forge_link_native(forge-q3k-dequant-fp16-test)
+  add_test(NAME q3k-dequant-fp16 COMMAND forge-q3k-dequant-fp16-test)
+
   # Phase 6-C-5.6: minimal deterministic W8A8 FP8 E2E chain (producer -> FP8
   # GEMM/GEMV -> FP32) driven through the ops boundary. Gates: FP32-out parity vs
   # decode golden, bitwise determinism, scale source counters (registry == 0,
