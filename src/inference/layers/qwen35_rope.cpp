@@ -1,3 +1,4 @@
+#include "cpu/common/thread_pool.h"
 #include "forge/inference/layers/qwen35_rope.h"
 
 #include <cmath>
@@ -19,8 +20,7 @@ void Qwen35Rope::apply_cpu(const float* q_data, const float* k_data, float* q_ou
     int q_stride = num_heads * head_dim;
     int k_stride = num_kv_heads * head_dim;
 
-#pragma omp parallel for schedule(static) if (seq_len > 1)
-    for (int s = 0; s < seq_len; ++s) {
+    cpu::parallel_for(seq_len, [&](int s) {
         int64_t pos = start_pos + s;
 
         for (int h = 0; h < num_heads; ++h) {
@@ -66,7 +66,7 @@ void Qwen35Rope::apply_cpu(const float* q_data, const float* k_data, float* q_ou
                 k_dst[d] = k_src[d];
             }
         }
-    }
+        });
 }
 
 }  // namespace forge

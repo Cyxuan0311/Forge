@@ -24,7 +24,13 @@ TensorPtr DeepSeekLayerExecutor::attend_gqa(const TensorPtr& normed,
     auto rope = RopeExecutor::apply_standard(q, k, num_heads, num_kv_heads, head_dim, seq_len,
                                              lctx.start_pos(), cfg.rope_theta, dev);
 
-    kv_cache_.update(layer_idx, lctx.seq_id(), lctx.start_pos(), rope.k_rope, v, seq_len);
+    if (kv_cache_.update(layer_idx, lctx.seq_id(), lctx.start_pos(), rope.k_rope, v, seq_len) < 0) {
+        throw std::runtime_error(
+            "KV cache overflow at layer " + std::to_string(layer_idx) +
+            ": write_pos=" + std::to_string(lctx.start_pos()) +
+            " seq_len=" + std::to_string(seq_len) +
+            " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+    }
 
     if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
         kv_cache_.dequantize_layer(layer_idx);

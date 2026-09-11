@@ -69,7 +69,13 @@ void DflashEngine::precompute_context_kv(const TensorPtr& prefix_embd, int64_t s
             K->dtype(), std::vector<int64_t>{prefix_len, num_heads * head_dim}, dev);
         q_dummy->zero_();
         auto rope = dflash_rope_.apply(q_dummy, K, cfg, start_pos, prefix_len, dev);
-        kv_cache_.update(layer, 0, start_pos, rope.k_rope, V, prefix_len);
+        if (kv_cache_.update(layer, 0, start_pos, rope.k_rope, V, prefix_len) < 0) {
+            throw std::runtime_error(
+                "KV cache overflow at layer " + std::to_string(layer) +
+                ": write_pos=" + std::to_string(start_pos) +
+                " seq_len=" + std::to_string(prefix_len) +
+                " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+        }
     }
 }
 
@@ -143,7 +149,13 @@ TensorPtr DflashEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     TensorPtr q_rope = rope.q_rope, k_rope = rope.k_rope;
 
     // 5. KV cache update (contiguous; the drafter owns a non-paged cache)
-    kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len);
+    if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {
+        throw std::runtime_error(
+            "KV cache overflow at layer " + std::to_string(layer_idx) +
+            ": write_pos=" + std::to_string(start_pos) +
+            " seq_len=" + std::to_string(seq_len) +
+            " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+    }
 
     // 6. Attention. Non-causal during the query-block decode.
     const bool causal = !decode_noncausal_;

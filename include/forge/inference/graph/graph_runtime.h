@@ -45,8 +45,19 @@ public:
 
     void invalidate() {
         graph_.reset();
+        decode_graph_.reset();
         cached_key_ = GraphKey{};
+        decode_cached_key_ = GraphKey{};
         start_pos_slots_.clear();
+        decode_start_pos_slots_.clear();
+#ifdef USE_CUDA
+        if (cuda_graph_runner_) cuda_graph_runner_->invalidate();
+#endif
+    }
+
+    // 仅使 CUDA Graph 捕获失效(因 reset 后 KV 缓存指针可能变化), 保留 CPU 计算图。
+    // decode 图(seq_len==1)独立缓存, 跨 reset_kv_cache 复用, 消除每轮首 token 重建图的开销。
+    void invalidate_cuda_graph() {
 #ifdef USE_CUDA
         if (cuda_graph_runner_) cuda_graph_runner_->invalidate();
 #endif
@@ -57,7 +68,10 @@ public:
                   const ModelConfig& cfg, ModelWeights& weights, KVCache& kv_cache,
                   const std::vector<DeviceTarget>& layer_devices, DeviceType default_device);
 
-    int num_nodes() const { return graph_ ? graph_->num_nodes() : 0; }
+    int num_nodes() const {
+        if (decode_graph_) return decode_graph_->num_nodes();
+        return graph_ ? graph_->num_nodes() : 0;
+    }
 
     // CUDA Graph control (Phase 10). Default off; enable for decode path.
     void set_cuda_graph_enabled(bool v);
@@ -70,13 +84,18 @@ private:
 
     // 把本次请求的 start_pos / seq_id 写入图: 闭包节点通过 runtime_state_ 读,
     // OpDispatch 节点通过回填 op_params 读。
-    void inject_runtime(const ForwardRequest& req);
+    void inject_runtime(ComputeGraph& graph, std::vector<StartPosSlot>& slots,
+                        const ForwardRequest& req);
 
     std::shared_ptr<LayerGraphBuilder> builder_;
     std::unique_ptr<ComputeGraph> graph_;
+    // seq_len==1 的 decode 图独立缓存, 与 prefill 图共存, 跨 reset_kv_cache 复用。
+    std::unique_ptr<ComputeGraph> decode_graph_;
     GraphKey cached_key_;
+    GraphKey decode_cached_key_;
     GraphRuntimeStatePtr runtime_state_;
     std::vector<StartPosSlot> start_pos_slots_;
+    std::vector<StartPosSlot> decode_start_pos_slots_;
     Qwen35RecurrentMemory* recurrent_memory_ = nullptr;
 
     // Phase 10: CUDA Graph runner (lazy-created when enabled)

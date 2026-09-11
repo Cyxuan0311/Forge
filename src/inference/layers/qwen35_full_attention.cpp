@@ -1,3 +1,4 @@
+#include "cpu/common/thread_pool.h"
 #include "forge/inference/layers/qwen35_full_attention.h"
 
 #include <cmath>
@@ -32,9 +33,7 @@ std::vector<float> load_head_norm_weight(const TensorPtr& w, int head_dim) {
 
 void per_head_rms_norm_cpu(float* data, const std::vector<float>& weight, int seq_len,
                            int num_heads, int head_dim, float eps) {
-#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_heads > 4)
-    for (int s = 0; s < seq_len; ++s) {
-        for (int h = 0; h < num_heads; ++h) {
+    cpu::parallel_for2(seq_len, num_heads, [&](int s, int h) {
             float* head_ptr = data + s * num_heads * head_dim + h * head_dim;
             float norm_sq = 0.0f;
             for (int d = 0; d < head_dim; ++d)
@@ -42,8 +41,7 @@ void per_head_rms_norm_cpu(float* data, const std::vector<float>& weight, int se
             float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + eps);
             for (int d = 0; d < head_dim; ++d)
                 head_ptr[d] *= inv_rms * weight[d];
-        }
-    }
+        });
 }
 
 }  // namespace
@@ -116,15 +114,12 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
     float* q_data = static_cast<float*>(q->data());
     float* g_data = static_cast<float*>(gate->data());
 
-#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_heads > 4)
-    for (int s = 0; s < seq_len; ++s) {
-        for (int h = 0; h < num_heads; ++h) {
+    cpu::parallel_for2(seq_len, num_heads, [&](int s, int h) {
             const float* src = qf_data + s * num_heads * head_dim * 2 + h * head_dim * 2;
             std::memcpy(q_data + s * q_dim + h * head_dim, src, head_dim * sizeof(float));
             std::memcpy(g_data + s * q_dim + h * head_dim, src + head_dim,
                         head_dim * sizeof(float));
-        }
-    }
+        });
 
     if (lw.attn_q_norm()) {
         per_head_rms_norm_cpu(static_cast<float*>(q->data()),

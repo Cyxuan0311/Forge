@@ -209,7 +209,13 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
 
         {
             PERF_SCOPE("layer/kv_cache_update");
-            kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len);
+            if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {
+                throw std::runtime_error(
+                    "KV cache overflow at layer " + std::to_string(layer_idx) +
+                    ": write_pos=" + std::to_string(start_pos) +
+                    " seq_len=" + std::to_string(seq_len) +
+                    " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+            }
         }
     } else {
         // 无自有 KV 的层: 只对 Q 应用 RoPE, KV 复用其他层。

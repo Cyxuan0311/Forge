@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -26,6 +27,10 @@ struct GenerationConfig {
     int eos_token_id = -1;
     std::vector<int32_t> stop_token_ids;  // Additional stop tokens beyond eos
     bool reset_kv_cache = true;           // If false, append to existing KV (multi-turn)
+    // When non-null and the pointee becomes true, generate() stops at the next
+    // decode boundary and reports finish_reason "aborted". Owned by the caller
+    // and must outlive the generate() call.
+    const std::atomic<bool>* abort_flag = nullptr;
 };
 
 struct GenerationResult {
@@ -36,6 +41,18 @@ struct GenerationResult {
     bool finished = false;
     std::string finish_reason;
     const SpeculativeStats* spec_stats = nullptr;  // set by Generator after generate()
+
+    // ---- Per-request timing (always populated, independent of FORGE_PROFILING) ----
+    double prefill_ms = 0.0;  // prompt forward + first-token sample
+    double decode_ms = 0.0;   // decode loop (excludes prefill; includes sampling)
+    double prefill_ms_per_1k() const {
+        return num_prompt_tokens > 0 ? prefill_ms * 1000.0 / num_prompt_tokens : 0.0;
+    }
+    double tokens_per_sec() const {
+        // (generated - 1): the first generated token comes out of prefill.
+        const int n = num_generated_tokens - 1;
+        return n > 0 ? n / (decode_ms / 1000.0) : 0.0;
+    }
 };
 
 class Generator {

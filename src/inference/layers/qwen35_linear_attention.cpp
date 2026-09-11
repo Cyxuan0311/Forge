@@ -1,3 +1,4 @@
+#include "cpu/common/thread_pool.h"
 #include "forge/inference/layers/qwen35_linear_attention.h"
 
 #include <cmath>
@@ -60,8 +61,7 @@ void Qwen35LinearAttention::gated_delta_net_step(const float* q, const float* k,
     float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
     int head_repeat = num_v_heads / num_k_heads;
 
-#pragma omp parallel for schedule(static) if (num_v_heads > 1)
-    for (int hv = 0; hv < num_v_heads; ++hv) {
+    cpu::parallel_for(num_v_heads, [&](int hv) {
         int hk = hv / head_repeat;
 
         float* S = state + hv * head_v_dim * head_v_dim;
@@ -101,7 +101,7 @@ void Qwen35LinearAttention::gated_delta_net_step(const float* q, const float* k,
             }
             o[i] = sum * scale;
         }
-    }
+        });
 }
 
 void Qwen35LinearAttention::conv1d_cpu(const float* x_data, const float* weight_data, float* y_data,
@@ -113,8 +113,7 @@ void Qwen35LinearAttention::conv1d_cpu(const float* x_data, const float* weight_
         const float* x_row = x_data + s * conv_channels;
         float* y_row = y_data + s * conv_channels;
 
-#pragma omp parallel for schedule(static) if (conv_channels > 64)
-        for (int c = 0; c < conv_channels; ++c) {
+        cpu::parallel_for(conv_channels, [&](int c) {
             float val = 0.0f;
             for (int k = 0; k < d_conv; ++k) {
                 float x_val;
@@ -131,7 +130,7 @@ void Qwen35LinearAttention::conv1d_cpu(const float* x_data, const float* weight_
                 conv_state[k * conv_channels + c] = conv_state[(k + 1) * conv_channels + c];
             }
             conv_state[(state_len - 1) * conv_channels + c] = x_row[c];
-        }
+            });
     }
 }
 
@@ -258,9 +257,7 @@ TensorPtr Qwen35LinearAttention::apply_cpu(const TensorPtr& normed,
     }
 
     // per-head L2 normalize Q/K
-#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_k_heads > 4)
-    for (int s = 0; s < seq_len; ++s) {
-        for (int h = 0; h < num_k_heads; ++h) {
+    cpu::parallel_for2(seq_len, num_k_heads, [&](int s, int h) {
             float* q_head = q_conv_data + s * key_dim + h * head_k_dim;
             float norm = 0.0f;
             for (int d = 0; d < head_k_dim; ++d)
@@ -276,8 +273,7 @@ TensorPtr Qwen35LinearAttention::apply_cpu(const TensorPtr& normed,
             inv_norm = 1.0f / std::sqrt(norm + cfg.rms_norm_eps);
             for (int d = 0; d < head_k_dim; ++d)
                 k_head[d] *= inv_norm;
-        }
-    }
+        });
 
     // Gated Delta Net 逐 token 递推
     auto delta_net_out = std::make_shared<Tensor>(
@@ -302,9 +298,7 @@ TensorPtr Qwen35LinearAttention::apply_cpu(const TensorPtr& normed,
         }
     }
 
-#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_v_heads > 4)
-    for (int s = 0; s < seq_len; ++s) {
-        for (int h = 0; h < num_v_heads; ++h) {
+    cpu::parallel_for2(seq_len, num_v_heads, [&](int s, int h) {
             float* out_head = dn_out_data + s * value_dim + h * head_v_dim;
             const float* z_head = z_data + s * value_dim + h * head_v_dim;
 
@@ -319,8 +313,7 @@ TensorPtr Qwen35LinearAttention::apply_cpu(const TensorPtr& normed,
                 float gz = z_head[d] / (1.0f + std::exp(-z_head[d]));
                 out_head[d] *= gz;
             }
-        }
-    }
+        });
 
     return ops::matmul_transB(restore_device(delta_net_out, lctx.device), lw.ssm_out());
 }

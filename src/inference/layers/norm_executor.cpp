@@ -1,3 +1,4 @@
+#include "cpu/common/thread_pool.h"
 #include "forge/inference/layers/norm_executor.h"
 
 #include <algorithm>
@@ -8,9 +9,6 @@
 #include "forge/cuda_kernels.h"
 #include "forge/operators.h"
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 
 namespace forge {
 
@@ -76,16 +74,13 @@ TensorPtr NormExecutor::apply_qk_norm(const TensorPtr& x, const TensorPtr& norm_
         std::fill(nw.begin(), nw.end(), 1.0f);
     }
 
-#pragma omp parallel for schedule(static) collapse(2) if (seq_len * num_heads > 4)
-    for (int s = 0; s < seq_len; ++s) {
-        for (int h = 0; h < num_heads; ++h) {
+    cpu::parallel_for2(seq_len, num_heads, [&](int s, int h) {
             float* head_ptr = data + s * num_heads * head_dim + h * head_dim;
             float norm_sq = 0.0f;
             for (int d = 0; d < head_dim; ++d) norm_sq += head_ptr[d] * head_ptr[d];
             float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + eps);
             for (int d = 0; d < head_dim; ++d) head_ptr[d] *= inv_rms * nw[d];
-        }
-    }
+        });
 
     return result;
 }

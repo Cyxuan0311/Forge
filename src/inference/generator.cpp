@@ -24,6 +24,10 @@ static double now_ms() {
         .count();
 }
 
+static bool aborted(const GenerationConfig& config) {
+    return config.abort_flag && config.abort_flag->load(std::memory_order_relaxed);
+}
+
 Generator::Generator(InferenceContext& ctx, const SamplerConfig& sampler_cfg)
     : ctx_(ctx), sampler_(sampler_cfg) {
 #ifdef USE_CUDA
@@ -93,6 +97,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     // ---- Prefill phase ----
     int token_id;
     {
+        const auto prefill_start = std::chrono::steady_clock::now();
         PERF_SCOPE("generator/prefill");
         SET_PERF_CONTEXT(0, "prefill", -1, dev == DeviceType::CUDA ? "cuda" : "cpu", prompt_len);
         auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{prompt_len},
@@ -130,12 +135,19 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
                 result.finished = true;
                 result.finish_reason = "stop";
                 result.num_generated_tokens = 1;
+                result.prefill_ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - prefill_start)
+                                        .count();
                 return result;
             }
         }
+        result.prefill_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - prefill_start)
+                                .count();
     }
 
     int64_t pos = prompt_len;
+    const auto decode_start = std::chrono::steady_clock::now();
 
     // ---- Decode phase (speculative decoding via SpeculativeExecutor) ----
     if (spec_executor_) {
@@ -143,6 +155,9 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     }
 
     for (int step = 1; step < config.max_new_tokens;) {
+        if (aborted(config)) {
+            goto decode_done;
+        }
         // Speculation round: draft -> verify -> accept
         if (spec_executor_ && spec_executor_->valid()) {
             auto out = spec_executor_->step(
@@ -159,6 +174,10 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
                     consumed += 1;
                     if (callback) callback(tok, step - 1);
 
+                    if (aborted(config)) {
+                        stop_gen = true;
+                        break;
+                    }
                     if (config.eos_token_id >= 0 && tok == config.eos_token_id) {
                         result.finished = true;
                         result.finish_reason = "eos";
@@ -234,6 +253,10 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             callback(token_id, step - 1);
         }
 
+        if (aborted(config)) {
+            break;
+        }
+
         if (config.eos_token_id >= 0 && token_id == config.eos_token_id) {
             result.finished = true;
             result.finish_reason = "eos";
@@ -258,10 +281,13 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
 decode_done:
     if (!result.finished) {
         result.finished = true;
-        result.finish_reason = "length";
+        result.finish_reason = aborted(config) ? "aborted" : "length";
     }
 
     result.num_generated_tokens = static_cast<int>(result.token_ids.size());
+    result.decode_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - decode_start)
+                          .count();
     result.spec_stats = spec_executor_ ? &spec_executor_->stats() : nullptr;
     return result;
 }

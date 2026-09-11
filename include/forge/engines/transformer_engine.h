@@ -25,6 +25,10 @@ public:
     void set_gpu_layers(int gpu_layers, const std::vector<int>& gpu_layers_per_dev);
     int gpu_layers() const override { return gpu_layers_; }
     void set_kv_cache_dtype(KVCacheDType dtype) { kv_cache_dtype_ = dtype; }
+    // User-requested KV cache context size (0 = auto: min(model max_seq_len,
+    // KV_MAX_SEQ_CAP)). Larger values let long agent sessions (e.g. opencode)
+    // keep more history; the CUDA free-memory check still shrinks if needed.
+    void set_kv_cache_max_seq_len(int n) { kv_cache_max_seq_len_ = n; }
 
     // ---- Expert-level placement (MoE partial-activation, Phase P0+) ----
     // P0 brings the per-expert physical-location mapping into view and exposes
@@ -159,6 +163,7 @@ protected:
     std::unique_ptr<KVMemory> kv_memory_;
     ModelWeights weights_;
     KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
+    int kv_cache_max_seq_len_ = 0;  // 0 = auto cap
     int gpu_layers_ = -1;
     std::vector<DeviceTarget> layer_devices_;  // per-layer (device_type, device_id) assignment
     // Per-(layer, expert) device assignment for MoE partial activation.

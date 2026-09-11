@@ -37,11 +37,12 @@ cudaStream_t GraphRuntime::capture_stream() {
 GraphRuntime::~GraphRuntime() = default;
 #endif
 
-void GraphRuntime::inject_runtime(const ForwardRequest& req) {
+void GraphRuntime::inject_runtime(ComputeGraph& graph, std::vector<StartPosSlot>& slots,
+                                  const ForwardRequest& req) {
     runtime_state_->start_pos = req.start_pos;
     runtime_state_->seq_id = req.seq_id;
-    for (const auto& slot : start_pos_slots_) {
-        graph_->patch_node_param_i64(slot.node_idx, slot.int32_offset, req.start_pos);
+    for (const auto& slot : slots) {
+        graph.patch_node_param_i64(slot.node_idx, slot.int32_offset, req.start_pos);
     }
 }
 
@@ -113,19 +114,28 @@ TensorPtr GraphRuntime::run(const TensorPtr& hidden, const ForwardRequest& req,
 
     auto t0 = std::chrono::steady_clock::now();
 
-    const bool reuse = graph_ && key == cached_key_;
+    // decode (non-prefill, seq_len==1) 使用独立图槽, 与 prefill 图共存; 跨
+    // reset_kv_cache 复用, 避免每轮首 token 重建 decode 图(1757ms 级别的一次性开销)。
+    const bool is_decode = !key.is_prefill;
+    std::unique_ptr<ComputeGraph>& active_graph = is_decode ? decode_graph_ : graph_;
+    GraphKey& active_cached_key = is_decode ? decode_cached_key_ : cached_key_;
+    std::vector<StartPosSlot>& active_slots = is_decode ? decode_start_pos_slots_ : start_pos_slots_;
+
+    const bool reuse = active_graph && key == active_cached_key;
     if (reuse) {
-        graph_->set_input(0, hidden);
+        active_graph->set_input(0, hidden);
     } else {
         build(hidden, cfg, weights, kv_cache, layer_devices, default_device, req.n_tokens);
-        cached_key_ = key;
+        // build() 写入 graph_ / start_pos_slots_, 搬运到当前槽位。
+        active_graph = std::move(graph_);
+        active_cached_key = key;
+        active_slots = std::move(start_pos_slots_);
 #ifdef USE_CUDA
-        // Graph topology changed — invalidate CUDA Graph
         if (cuda_graph_runner_) cuda_graph_runner_->invalidate();
 #endif
     }
 
-    inject_runtime(req);
+    inject_runtime(*active_graph, active_slots, req);
 
     // Phase 10: Try CUDA Graph replay/capture first.
     // CUDA Graph is only used for decode (non-prefill) on compatible graphs.
@@ -139,10 +149,10 @@ TensorPtr GraphRuntime::run(const TensorPtr& hidden, const ForwardRequest& req,
         cudaStream_t cs = capture_stream();
         if (cs) {
             used_cuda_graph = cuda_graph_runner_->try_replay_or_capture(
-                *graph_, [this, cs]() { graph_->execute(cs); }, cs);
+                *active_graph, [this, cs, g = active_graph.get()]() { g->execute(cs); }, cs);
         } else {
             used_cuda_graph = cuda_graph_runner_->try_replay_or_capture(
-                *graph_, [this]() { graph_->execute(); }, /*stream=*/0);
+                *active_graph, [this, g = active_graph.get()]() { g->execute(); }, /*stream=*/0);
         }
     }
 #endif
@@ -150,9 +160,9 @@ TensorPtr GraphRuntime::run(const TensorPtr& hidden, const ForwardRequest& req,
     TensorPtr result;
     if (!used_cuda_graph) {
         // Normal execution path (fallback or CUDA Graph disabled)
-        result = graph_->execute();
+        result = active_graph->execute();
     } else {
-        result = graph_->last_output();
+        result = active_graph->last_output();
     }
 
     auto t1 = std::chrono::steady_clock::now();

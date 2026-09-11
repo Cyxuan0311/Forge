@@ -15,9 +15,7 @@
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -579,7 +577,13 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
             kv_memory_->storage().write_kv_seq(layer_idx, lctx.seq_id(), start_pos,
                                                seq_len, k_data, v_data);
         } else {
-            kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len);
+            if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {
+                throw std::runtime_error(
+                    "KV cache overflow at layer " + std::to_string(layer_idx) +
+                    ": write_pos=" + std::to_string(start_pos) +
+                    " seq_len=" + std::to_string(seq_len) +
+                    " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+            }
 
             const auto& kv_cfg = kv_cache_.kv_config();
             bool use_fused_decode =
@@ -645,9 +649,7 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
 TensorPtr PhimoeEngine::forward_request(const ForwardRequest& req) {
     const auto& cfg = model_.config();
 
-#ifdef _OPENMP
-    omp_set_num_threads(ctx_.params().n_threads);
-#endif
+    forge::cpu::set_num_threads(ctx_.params().n_threads);
 
     init_kv_cache(cfg);
 

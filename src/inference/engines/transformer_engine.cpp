@@ -22,9 +22,7 @@
 #    include <cuda_runtime.h>
 #endif
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 namespace forge {
 
@@ -46,7 +44,11 @@ void TransformerEngine::reset() {
     }
     layer_hiddens_.clear();
     set_kv_cache_initialized(false);
-    graph_runtime_.invalidate();
+    // 仅使 CUDA Graph 捕获失效; CPU 计算图(含独立缓存的 decode 图)保留, 跨
+    // reset_kv_cache 复用, 避免每轮首 decode token 重建图(一次性 1757ms 级别开销)。
+    // 注意: 图节点只持有 KVCache& / recurrent& 引用, reset 仅清空其内容而不释放对象,
+    // 因此复用是安全的。
+    graph_runtime_.invalidate_cuda_graph();
 }
 
 TensorPtr TransformerEngine::take_layer_hiddens(const std::vector<int>& layers) {
@@ -391,9 +393,7 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
     const auto& cfg = model_.config();
 
     // Decode path: use fewer threads (memory-bandwidth bound)
-#ifdef _OPENMP
-    omp_set_num_threads(ctx_.params().n_threads);
-#endif
+    forge::cpu::set_num_threads(ctx_.params().n_threads);
 
     init_kv_cache(cfg);
 
@@ -443,9 +443,7 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
     const auto& cfg = model_.config();
 
     // Prefill/batch path: use more threads (compute-bound)
-#ifdef _OPENMP
-    omp_set_num_threads(ctx_.params().n_threads_batch);
-#endif
+    forge::cpu::set_num_threads(ctx_.params().n_threads_batch);
 
     init_kv_cache(cfg);
 
@@ -708,7 +706,14 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
 
     int kv_max_seq = cfg.max_seq_len;
     const int KV_MAX_SEQ_CAP = 4096;
-    if (kv_max_seq > KV_MAX_SEQ_CAP) {
+    if (kv_cache_max_seq_len_ > 0) {
+        // User-requested context size (e.g. --ctx-size): honour it (bounded by
+        // the model's trained length); the CUDA free-memory check below still
+        // shrinks the allocation if VRAM runs short.
+        kv_max_seq = std::min(kv_cache_max_seq_len_, cfg.max_seq_len);
+        LOG_INFO("KV cache max_seq_len set to " + std::to_string(kv_max_seq) +
+                 " (user --ctx-size)");
+    } else if (kv_max_seq > KV_MAX_SEQ_CAP) {
         LOG_INFO("Capping KV cache max_seq_len from " + std::to_string(kv_max_seq) + " to " +
                  std::to_string(KV_MAX_SEQ_CAP) + " to avoid OOM");
         kv_max_seq = KV_MAX_SEQ_CAP;

@@ -10,9 +10,7 @@
 #include "forge/perf_profiler.h"
 #include "forge/quant_traits.h"
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
+#include "cpu/common/thread_pool.h"
 
 namespace forge {
 
@@ -54,9 +52,7 @@ TensorPtr GenericEngine::forward_request(const ForwardRequest& req) {
     const auto& cfg = model_.config();
 
     // Decode path: use fewer threads (memory-bandwidth bound)
-#ifdef _OPENMP
-    omp_set_num_threads(ctx_.params().n_threads);
-#endif
+    forge::cpu::set_num_threads(ctx_.params().n_threads);
 
     init_kv_cache(cfg);
 
@@ -223,7 +219,16 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
                                                seq_len, k_data, v_data);
         } else {
             // Contiguous mode: write to KVCache directly
-            kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len);
+            if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {
+                // Overflow (or invalid layer/seq): attention would read
+                // stale/unwritten cells and produce garbage logits. Fail loud
+                // instead of silently corrupting the generation.
+                throw std::runtime_error(
+                    "KV cache overflow at layer " + std::to_string(layer_idx) +
+                    ": write_pos=" + std::to_string(start_pos) +
+                    " seq_len=" + std::to_string(seq_len) +
+                    " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+            }
 
             // Fused decode path: skip dequantize_layer() when the fused attention
             // kernel will read the quantized KV cache directly (Q4_0/F16/Q8_0 on CUDA, seq_len==1).

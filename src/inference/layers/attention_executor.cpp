@@ -1,3 +1,4 @@
+#include "cpu/common/thread_pool.h"
 #include "forge/inference/layers/attention_executor.h"
 
 #include <cstring>
@@ -10,9 +11,6 @@
 #include "forge/dtype_contract.h"
 #include "forge/operators.h"
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 
 namespace forge {
 

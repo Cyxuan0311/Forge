@@ -1,12 +1,10 @@
+#include "cpu/common/thread_pool.h"
 #include "forge/inference/layers/rope_executor.h"
 
 #include <cmath>
 
 #include "forge/cuda_kernels.h"
 
-#ifdef _OPENMP
-#    include <omp.h>
-#endif
 
 namespace forge {
 
@@ -87,8 +85,7 @@ static void apply_rope_mrope_cpu(const float* q_data, const float* k_data, float
     int q_stride = num_heads * head_dim;
     int k_stride = num_kv_heads * head_dim;
 
-#pragma omp parallel for schedule(static) if (seq_len > 1)
-    for (int s = 0; s < seq_len; ++s) {
+    cpu::parallel_for(seq_len, [&](int s) {
         int64_t pos = start_pos + s;
 
         for (int h = 0; h < num_heads; ++h) {
@@ -132,7 +129,7 @@ static void apply_rope_mrope_cpu(const float* q_data, const float* k_data, float
                 k_dst[d] = k_src[d];
             }
         }
-    }
+        });
 }
 
 // Proportional RoPE: same as NeoX but with per-dimension frequency scaling factors.
