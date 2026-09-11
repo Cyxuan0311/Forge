@@ -3809,3 +3809,82 @@ Phase 4
 经核验**不成立**（README 未声明默认值，`docs/dependencies.md:94` 与
 `CMakeLists.txt:87` 一致为 ON），本计划仅保留 `docs/dependencies.md:14`
 的措辞修正（0-E）。
+
+---
+
+## 5. 附加交付记录（非优化 Phase）
+
+### forge-server Phase 1（2026-09-11，OpenAI 兼容本地推理 API，✅ DELIVERED）
+
+**目标**：构建产出 `forge-server`，本地端口提供 OpenAI 兼容推理 API，OpenCode 以
+`@ai-sdk/openai-compatible` provider 接入。参考 llama.cpp server。
+
+**改动表**：
+
+| 文件 | 内容 |
+|---|---|
+| `third_party/cpp-httplib/`（新增） | vendored cpp-httplib（httplib.h + httplib.cpp，MIT，取自 llama.cpp vendor） |
+| `src/server/server.h`（新增） | ServerOptions / ChatCompletionRequest / ServerState（模型+KV 单实例，`inference_mutex_` 串行化推理） |
+| `src/server/server_state.cpp`（新增） | 加载链路镜像 forge-cli 文本路径（tokenizer→model→engine→KV→warmup）；chat 生成复用 `Generator` + `TokenCallback`，UTF-8 安全增量解码；ChatTemplateEngine（jinja）渲染 messages |
+| `src/server/server_routes.cpp`（新增） | GET `/health`、GET `/v1/models`、POST `/v1/chat/completions`（SSE 流式 + 非流式）；OpenAI 错误格式；CORS + OPTIONS 预检 |
+| `src/server/server_main.cpp`（新增） | 参数解析（`-m/--host/--port/-ngl/-t/--kv-cache-dtype/--cuda-graph/--load-mode`）+ SIGINT/SIGTERM 优雅停止 |
+| `CMakeLists.txt` | 新增 `forge_httplib` STATIC 库与 `forge-server` 可执行目标（链接集对齐 forge-cli：infer/model/ops/core/tokenizer/vision + httplib） |
+
+**并发模型**：与 llama.cpp server 相同——httplib 线程池收 HTTP，推理经单 mutex 串行
+（单模型单 KV 实例）。阶段 3 可切换到既有 `RequestScheduler` 做 continuous batching。
+
+**实测验收**（TinyLlama-1.1B Q4_0，沙盒无 GPU → CPU -ngl 0）：
+- `GET /health` → `{"status":"ok"}`；`GET /v1/models` → OpenAI list 格式
+- 非流式 chat：`finish_reason=stop`，usage 正确（26 prompt + 9 completion）
+- 流式 SSE：首 chunk 带 role、逐 delta chunk、`data: [DONE]` 结尾、UTF-8 未拆多字节
+- 多轮 messages（system+user）模板渲染正常；无效 JSON → OpenAI 错误格式 HTTP 400
+- CTest 回归 **48/48 全绿**
+
+**非目标 / Deferred（阶段 2）**：`--api-key`、字符串级 stop sequences、客户端断开中止
+生成（当前断开后生成仍完成）、并发排队上限（429）；阶段 3：RequestScheduler batching。
+
+### forge-server Phase 2（2026-09-11，健壮性四件套，✅ DELIVERED）
+
+**改动表**：
+
+| 文件 | 内容 |
+|---|---|
+| `include/forge/generator.h` / `src/inference/generator.cpp` | `GenerationConfig` 新增 `abort_flag`（`const std::atomic<bool>*`）；decode 主循环边界 + speculative 逐 token + plain 逐 token 三处检查，中止后 `finish_reason="aborted"`（对非 server 调用者零影响，默认 nullptr） |
+| `src/server/server.h` | `ServerOptions` 加 `api_key`/`max_inflight`；`ChatCompletionRequest` 加 `stop`；`ServerState` 加 `try_acquire_slot`/`release_slot`（CAS 计数）；`setup_middleware` 声明 |
+| `src/server/server_state.cpp` | stop-string 检测：UTF-8 flush 前扣留 `max_stop_len-1` 字节（stop 串永不部分流出）+ tail 滑窗匹配 → 命中置 abort；客户端断开（`on_token` 返回 false）置 abort；非流式 text 截断至最早 stop 串；slot 管理 |
+| `src/server/server_routes.cpp` | `setup_middleware`（CORS + OPTIONS + `--api-key` 时全端点 Bearer 校验，401 OpenAI 错误格式）；chat handler 前 `try_acquire_slot`，满 → HTTP 429；**流式 slot 生命周期 bug 修复**：SlotGuard 以 shared_ptr 捕入 chunk provider lambda（handler 先于 provider 返回，栈 guard 会提前释放导致 429 失效），provider 销毁时释放 |
+| `src/server/server_main.cpp` | `--api-key` / `--max-inflight N`（默认 4） |
+
+**实测验收**（TinyLlama-1.1B Q4_0 CPU -ngl 0）：
+- 无/错 api-key → HTTP 401 + OpenAI 错误格式；正确 key → 200
+- stop=`"3."`：content 停在 stop 串前（"1. Blue\n2. Green\n"），提前中止（10/40 token），finish_reason=stop
+- 流式占用 slot 期间第二请求 → HTTP 429；首个流结束后 → 恢复 200（slot 正确释放）
+- 客户端 3s 断开 → 6s 后 slot 已释放（abort 生效；未中止则 150 token 需 40s+）
+- CTest **48/48 全绿**（沙盒内 kv-quant-segment/q8-roundtrip 因沙盒禁 GPU 访问失败，沙盒外全绿，与改动无关）
+
+### forge-server Phase 2.5（2026-09-11，KV overflow 乱码根治 + `--ctx-size`，✅ DELIVERED）
+
+**症状**：opencode 长会话（prompt > 4096 token）输出多语言乱码 token 沙拉（`肌etable ISA...`），单轮/短会话完全正常。
+
+**根因链**（用 4955-token 精确复现）：
+1. `TransformerEngine::init_kv_cache` 把大 ctx 模型的 KV cap 到 4096（防 OOM）；
+2. opencode 会话历史超过 4096 → `KVCache::update` 返回 -1 拒写；
+3. **-1 被静默吞掉**——attention 继续读未写入的 KV 内存 → logits 崩坏 → 乱码。5 个 KV 写点全部同病（generic/gemma4/phimoe/deepseek/dflash）。
+
+**修复（两层）**：
+| 层 | 文件 | 内容 |
+|---|---|---|
+| 防御层 | `src/inference/engines/generic_engine.cpp`、`phimoe_engine.cpp`、`dflash_engine.cpp`（2 处）、`src/inference/layers/gemma4_attention.cpp`、`deepseek_layer_executor.cpp` | 全部 5 个 `kv_cache_.update` 写点改为 `< 0` 即 throw（带 layer/write_pos/seq_len/max 诊断信息）；异常经 server routes catch → HTTP 500 明确报因。**乱码从此不可能静默发生** |
+| 截断层 | `src/server/server_state.cpp` | `chat_completion` 渲染前查真实 KV 容量（`engine->kv_cache()->max_seq_len()`，含 CUDA 自动缩减后的值）；prompt + gen_budget 超容量时**从最旧的非 system 消息开始丢弃**（保 system + 最新轮），逐条重渲染直到装下；连最简组合都装不下（巨型单条 system）→ throw 明确报错（llama.cpp server 同语义） |
+| 能力层 | `transformer_engine.h/.cpp`、`server.h`、`server_state.cpp`、`server_main.cpp` | 新增 `-c/--ctx-size N`：覆盖硬编码 4096 cap（min(N, 模型训练长度)；CUDA 显存检查仍会自动缩减）；KV fp32 下 Qwen3-VL 4B 8192 ctx ≈ 2.3GB，4050 6GB 可容纳 |
+
+**实测验收**（Qwen3-VL-4B Q3_K_M，CPU -ngl 0）：
+- 修复前：4223-token prompt → 乱码（`肌etable...` 与用户报告逐字一致）
+- 修复后默认 cap：T1 超大 system（4223>4096，2 条消息无从截断）→ HTTP 500 `KV cache overflow at layer 0: write_pos=0 seq_len=4223 exceeds max_seq_len=4096`（明确报因，不再乱码）；T2 30 条消息多轮历史 → 自动截断最旧 → 4068 tok 正确答 "4"
+- `-c 8192` 后：T1 → **连贯自我介绍**（"I am Qwen3, the large-scale language model launched by Alibaba Group"）；T2 7764 tok → "4"；T3 正常
+- CTest **48/48 全绿**
+
+**运维**：GPU 显存充足时建议 `--ctx-size 8192 --kv-cache-dtype f16`（KV 减半 ≈1.2GB，16k ctx 也可行）；opencode 的 build agent 单轮 prompt 含 9.6k 字符 system + tools，长会话累积快，截断层保证任何长度下行为正确。
+
+**Deferred**：paged KV 的 overflow 语义、多请求并发下的截断策略共享、`/v1/models` 暴露 ctx 字段。
+
