@@ -676,7 +676,13 @@ private:
             char _perf_name_buf_##__LINE__[256];                              \
             std::snprintf(_perf_name_buf_##__LINE__, sizeof(_perf_name_buf_##__LINE__), \
                           fmt, __VA_ARGS__);                                  \
-            static ::forge::PerfEventId _eid_##__LINE__ =                     \
+            /* NOT static: the formatted name changes per call (e.g. the      \
+               layer index), so the id must be re-resolved against the        \
+               current name. intern_name_fast() keeps a thread-local          \
+               name->id cache, so this stays cheap on the hot path and each   \
+               distinct name lands in its own bucket instead of all sharing   \
+               the first call-site's id (the old static behaviour). */        \
+            ::forge::PerfEventId _eid_##__LINE__ =                            \
                 ::forge::PerfProfiler::instance().intern_name_fast(           \
                     _perf_name_buf_##__LINE__);                               \
             ::forge::PerfScopeTimer _perf_timer_##__LINE__(_eid_##__LINE__)
