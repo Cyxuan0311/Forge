@@ -1,4 +1,7 @@
 #include <type_traits>
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 #include "cuda_common.h"
 #include "forge/cuda_kernels.h"
@@ -1321,13 +1324,22 @@ void launch_cublas_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __n
 #endif
 }
 
+// ---- Phase 6-C / P1: per-weight FP16 dequant cache (defined below) ----
+// Keyed by the constant weight pointer; the dequantized FP16 matrix is
+// computed once and reused by every later call. Capped by
+// FORGE_DEQUANT_CACHE_MB (default 1024); LRU-evicted with cudaFreeAsync. If the
+// working set cannot fit the budget the cache returns nullptr and the caller
+// falls back to transient scratch.
+void* dequant_cache_acquire(DataType dt, const void* key, int N, int K, cudaStream_t stream);
+void* dequant_scratch(size_t b_bytes);
+
 // ---- Phase 3: quantized B [N,K] → FP16 + cuBLAS TensorCore GEMM ----
-// Dequantizes the whole weight matrix into a private grow-only scratch buffer
-// (the same pattern as the A-side buffer inside launch_cublas_gemm_fp16_fp32
-// above) and runs the FP16 × FP16 → FP32 GEMM on Tensor Cores. The scratch only
-// grows when a larger shape shows up, so once a shape has been seen a repeated
-// prefill call never allocates — keeping this call safe inside a CUDA graph
-// capture for every shape it has already handled.
+// Dequantizes the whole weight matrix into FP16 and runs the FP16 × FP16 →
+// FP32 GEMM on Tensor Cores. The FP16 matrix is now cached per weight pointer
+// (see the cache below): constant model weights were being dequantized on
+// every call — the lm_head alone (N=151936, K=2560 → 778 MB fp16) cost a 15x
+// gap versus MMQ because it was re-dequantized on every decode step. The cache
+// computes each weight's FP16 form once and reuses it.
 bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q, float* C, int M,
                                    int K, int N, bool transB, cudaStream_t stream) {
 #if FORGE_USE_CUBLAS
@@ -1343,43 +1355,51 @@ bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q,
         return false;
     }
 
-    static void* b_fp16 = nullptr;
-    static size_t b_fp16_capacity = 0;
-    const size_t b_bytes = (size_t)N * K * sizeof(__half);
-    if (b_bytes > b_fp16_capacity) {
-        if (b_fp16)
-            cudaFree(b_fp16);
-        if (cudaMalloc(&b_fp16, b_bytes) != cudaSuccess) {
-            b_fp16 = nullptr;
-            b_fp16_capacity = 0;
-            return false;
-        }
-        b_fp16_capacity = b_bytes;
-    }
-    if (!b_fp16)
-        return false;
+    // Resolve the FP16 weight buffer. While a CUDA graph is being captured we
+    // must not use the cache: a captured graph owns every buffer reference, and
+    // an evicted cached buffer would dangle under replay. The grow-only scratch
+    // keeps the pre-cache graph behaviour. Otherwise reuse a cached dequant.
+    void* b_fp16 = nullptr;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    const bool capturing =
+        (cudaStreamIsCapturing(stream, &cap) == cudaSuccess &&
+         cap == cudaStreamCaptureStatusActive);
 
-    switch (dt) {
-    case DataType::Q4_0:
-        launch_dequant_q4_0_matrix_fp16(B_q, b_fp16, N, K, stream);
-        break;
-    case DataType::Q4_K:
-        launch_dequant_q4_k_matrix_fp16(B_q, b_fp16, N, K, stream);
-        break;
-    case DataType::Q6_K:
-        launch_dequant_q6_k_matrix_fp16(B_q, b_fp16, N, K, stream);
-        break;
-    case DataType::Q5_K:
-        launch_dequant_q5_k_matrix_fp16(B_q, b_fp16, N, K, stream);
-        break;
-    case DataType::Q8_0:
-        launch_dequant_q8_0_matrix_fp16(B_q, b_fp16, N, K, stream);
-        break;
-    case DataType::Q3_K:
-        launch_dequant_q3_k_matrix_fp16(B_q, b_fp16, N, K, stream);
-        break;
-    default:
-        return false;  // unreachable (guarded above)
+    bool dequant_needed = false;
+    if (!capturing) {
+        b_fp16 = dequant_cache_acquire(dt, B_q, N, K, stream);
+    }
+    if (!b_fp16) {
+        // Cache disabled / over budget / OOM: transient grow-only scratch.
+        b_fp16 = dequant_scratch((size_t)N * K * sizeof(__half));
+        if (!b_fp16)
+            return false;
+        dequant_needed = true;
+    }
+
+    if (dequant_needed) {
+        switch (dt) {
+        case DataType::Q4_0:
+            launch_dequant_q4_0_matrix_fp16(B_q, b_fp16, N, K, stream);
+            break;
+        case DataType::Q4_K:
+            launch_dequant_q4_k_matrix_fp16(B_q, b_fp16, N, K, stream);
+            break;
+        case DataType::Q6_K:
+            launch_dequant_q6_k_matrix_fp16(B_q, b_fp16, N, K, stream);
+            break;
+        case DataType::Q5_K:
+            launch_dequant_q5_k_matrix_fp16(B_q, b_fp16, N, K, stream);
+            break;
+        case DataType::Q8_0:
+            launch_dequant_q8_0_matrix_fp16(B_q, b_fp16, N, K, stream);
+            break;
+        case DataType::Q3_K:
+            launch_dequant_q3_k_matrix_fp16(B_q, b_fp16, N, K, stream);
+            break;
+        default:
+            return false;  // unreachable (guarded above)
+        }
     }
     launch_cublas_gemm_fp16_fp32(A, b_fp16, C, M, K, N, transB, stream);
     return true;
@@ -1395,6 +1415,114 @@ bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q,
     (void)stream;
     return false;
 #endif
+}
+
+// ---- Phase 6-C / P1: per-weight FP16 dequant cache ----
+// Keyed by the constant weight pointer; the dequantized FP16 matrix is
+// computed once and reused by every later call (next decode step, next forward,
+// next prefill). Capped by FORGE_DEQUANT_CACHE_MB (default 1024); LRU-evicted
+// with cudaFreeAsync so eviction never stalls the host. If the working set
+// cannot fit the budget we return nullptr and the caller uses transient
+// scratch instead of thrashing.
+struct DequantCacheEntry {
+    void* ptr = nullptr;
+    size_t bytes = 0;
+    uint64_t last_used = 0;
+    int N = 0;
+    int K = 0;
+};
+
+std::unordered_map<const void*, DequantCacheEntry> g_dequant_cache;
+size_t g_dequant_cache_bytes = 0;
+uint64_t g_dequant_cache_epoch = 0;
+size_t g_dequant_cache_budget = SIZE_MAX;  // resolved lazily from env
+std::mutex g_dequant_cache_mu;
+
+size_t dequant_cache_budget_bytes() {
+    if (g_dequant_cache_budget == SIZE_MAX) {
+        const char* e = std::getenv("FORGE_DEQUANT_CACHE_MB");
+        long mb = e ? std::atol(e) : 1024L;
+        g_dequant_cache_budget = (mb <= 0) ? 0 : static_cast<size_t>(mb) * 1024 * 1024;
+    }
+    return g_dequant_cache_budget;
+}
+
+void dequant_cache_free(void* ptr, cudaStream_t stream) {
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11020
+    (void)cudaFreeAsync(ptr, stream);
+#else
+    (void)cudaFree(ptr);
+#endif
+}
+
+// Grow-only scratch used for graph capture and cache misses/overflow. Mirrors
+// the pre-cache single-buffer behaviour.
+void* dequant_scratch(size_t b_bytes) {
+    static void* b_fp16 = nullptr;
+    static size_t b_fp16_capacity = 0;
+    if (b_bytes > b_fp16_capacity) {
+        if (b_fp16)
+            cudaFree(b_fp16);
+        if (cudaMalloc(&b_fp16, b_bytes) != cudaSuccess) {
+            b_fp16 = nullptr;
+            b_fp16_capacity = 0;
+            return nullptr;
+        }
+        b_fp16_capacity = b_bytes;
+    }
+    return b_fp16;
+}
+
+// Returns a device buffer holding the FP16 dequant of B_q, computing it if this
+// weight has not been seen before. Returns nullptr when caching is disabled or
+// the entry cannot fit the budget (caller falls back to scratch). On a cache
+// miss the dequant is launched under the lock so a concurrent hit on the same
+// key can never read an unpopulated buffer.
+void* dequant_cache_acquire(DataType dt, const void* key, int N, int K, cudaStream_t stream) {
+    const size_t need = static_cast<size_t>(N) * K * sizeof(__half);
+    std::lock_guard<std::mutex> lk(g_dequant_cache_mu);
+
+    auto it = g_dequant_cache.find(key);
+    if (it != g_dequant_cache.end()) {
+        it->second.last_used = ++g_dequant_cache_epoch;
+        return it->second.ptr;
+    }
+
+    if (dequant_cache_budget_bytes() == 0)
+        return nullptr;  // caching disabled
+
+    while (!g_dequant_cache.empty() &&
+           g_dequant_cache_bytes + need > dequant_cache_budget_bytes()) {
+        auto lru = g_dequant_cache.begin();
+        for (auto i = g_dequant_cache.begin(); i != g_dequant_cache.end(); ++i) {
+            if (i->second.last_used < lru->second.last_used)
+                lru = i;
+        }
+        dequant_cache_free(lru->second.ptr, stream);
+        g_dequant_cache_bytes -= lru->second.bytes;
+        g_dequant_cache.erase(lru);
+    }
+
+    if (g_dequant_cache_bytes + need > dequant_cache_budget_bytes())
+        return nullptr;  // still no room: let caller use transient scratch
+
+    void* ptr = nullptr;
+    if (cudaMalloc(&ptr, need) != cudaSuccess)
+        return nullptr;
+
+    switch (dt) {
+    case DataType::Q4_0:  launch_dequant_q4_0_matrix_fp16(key, ptr, N, K, stream); break;
+    case DataType::Q4_K:  launch_dequant_q4_k_matrix_fp16(key, ptr, N, K, stream); break;
+    case DataType::Q6_K:  launch_dequant_q6_k_matrix_fp16(key, ptr, N, K, stream); break;
+    case DataType::Q5_K:  launch_dequant_q5_k_matrix_fp16(key, ptr, N, K, stream); break;
+    case DataType::Q8_0:  launch_dequant_q8_0_matrix_fp16(key, ptr, N, K, stream); break;
+    case DataType::Q3_K:  launch_dequant_q3_k_matrix_fp16(key, ptr, N, K, stream); break;
+    default: break;
+    }
+
+    g_dequant_cache[key] = DequantCacheEntry{ptr, need, ++g_dequant_cache_epoch, N, K};
+    g_dequant_cache_bytes += need;
+    return ptr;
 }
 
 // =========================================================================

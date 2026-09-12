@@ -134,12 +134,16 @@ bool tensorcore_eligible(DataType dt) {
     // (sm_89, 6 GB) with a 573-token Qwen3-VL-4B Q3_K_M prefill, M == 1:
     //   MMQ (dp4a)            2699.7 ms   36 layers 2413.8 ms, output_proj  177 ms
     //   TensorCore (dequant)  8686.6 ms   36 layers 7732.2 ms, output_proj  845 ms
-    // i.e. 3.2x slower. launch_cublas_gemm_quant_fp16() re-dequantizes the
-    // entire weight matrix on every call and the one-thread-per-element
-    // dequant kernels are latency-bound, so the dequant costs far more than
-    // the TensorCore GEMM saves. Revisit once the FP16 dequant is cached per
-    // weight tensor (which also fixes the same 15x gap measured on the
-    // Q6_K/Q8_0 output_proj: 2698 ms TC vs 177 ms MMQ).
+    // i.e. 3.2x slower. The per-weight FP16 dequant cache added in Phase 6-C
+    // fixes the same 15x gap on the Q6_K/Q8_0 output_proj (dequant once, reuse
+    // every decode step), but it does NOT rescue Q3_K here: the Q3_K FFN
+    // weights are the bulk of the model and are already routed through MMQ, so
+    // they never reach launch_cublas_gemm_quant_fp16(); caching them would need
+    // ~2.6 GB of extra VRAM (the whole model dequantized to FP16) which does
+    // not fit a 6 GB card, and within a single prefill each weight is used once
+    // so the cache buys nothing. So Q3_K stays on MMQ until either VRAM allows
+    // caching the full FP16 footprint or the dequant kernels are rewritten to
+    // be compute-bound instead of latency-bound.
 }
 
 int detect_sm_arch() {
