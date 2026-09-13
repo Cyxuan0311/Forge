@@ -1,3 +1,4 @@
+#include <atomic>
 #include <type_traits>
 #include <cstdint>
 #include <mutex>
@@ -1435,16 +1436,59 @@ struct DequantCacheEntry {
 std::unordered_map<const void*, DequantCacheEntry> g_dequant_cache;
 size_t g_dequant_cache_bytes = 0;
 uint64_t g_dequant_cache_epoch = 0;
-size_t g_dequant_cache_budget = SIZE_MAX;  // resolved lazily from env
+std::atomic<size_t> g_dequant_cache_budget{SIZE_MAX};  // resolved lazily from env/CLI
 std::mutex g_dequant_cache_mu;
 
+// CLI/env-controlled budget for the per-weight FP16 dequant cache, in MB.
+// -1  = not set -> resolve from FORGE_DEQUANT_CACHE_MB env (default 1024).
+//  0  = caching disabled (callers fall back to transient scratch).
+//  >0 = explicit budget in MB.
+static std::atomic<long> g_dequant_cache_mb_override(-1);
+
+void set_dequant_cache_budget_mb(long mb) {
+    g_dequant_cache_mb_override.store(mb, std::memory_order_relaxed);
+    // The byte budget is latched on first use, but the memory planner may
+    // tighten it after that (adaptive dequant cache in the Q3_K execution
+    // plan). Re-latch so the next read observes the new cap.
+    g_dequant_cache_budget.store(SIZE_MAX, std::memory_order_relaxed);
+}
+
+long dequant_cache_budget_mb() {
+    long o = g_dequant_cache_mb_override.load(std::memory_order_relaxed);
+    if (o >= 0) return o;
+    const char* e = std::getenv("FORGE_DEQUANT_CACHE_MB");
+    return e ? std::atol(e) : 1024L;
+}
+
 size_t dequant_cache_budget_bytes() {
-    if (g_dequant_cache_budget == SIZE_MAX) {
-        const char* e = std::getenv("FORGE_DEQUANT_CACHE_MB");
-        long mb = e ? std::atol(e) : 1024L;
-        g_dequant_cache_budget = (mb <= 0) ? 0 : static_cast<size_t>(mb) * 1024 * 1024;
+    size_t b = g_dequant_cache_budget.load(std::memory_order_relaxed);
+    if (b == SIZE_MAX) {
+        long mb = dequant_cache_budget_mb();
+        b = (mb <= 0) ? 0 : static_cast<size_t>(mb) * 1024 * 1024;
+        g_dequant_cache_budget.store(b, std::memory_order_relaxed);
     }
-    return g_dequant_cache_budget;
+    return b;
+}
+
+// ---- VRAM-aware dispatch accounting ----
+// Largest single weight's FP16 dequant footprint (grow-only scratch peak) and the
+// total FP16 dequant of all CUDA quantized weights. Set once by the engine after
+// loading weights; dequant_required_bytes() combines them with the cache budget.
+size_t g_dequant_scratch_peak = 0;
+size_t g_dequant_total_fp16 = 0;
+
+void set_dequant_scratch_peak_bytes(size_t bytes) { g_dequant_scratch_peak = bytes; }
+size_t dequant_scratch_peak_bytes() { return g_dequant_scratch_peak; }
+void set_dequant_total_fp16_bytes(size_t bytes) { g_dequant_total_fp16 = bytes; }
+size_t dequant_total_fp16_bytes() { return g_dequant_total_fp16; }
+size_t dequant_required_bytes() {
+    // The cache can hold at most the whole-model FP16 dequant; beyond that it is
+    // bounded by its own budget cap. The working set is that cache contribution
+    // plus the single-weight scratch peak.
+    const size_t cache_part = (g_dequant_total_fp16 < dequant_cache_budget_bytes())
+                                  ? g_dequant_total_fp16
+                                  : dequant_cache_budget_bytes();
+    return cache_part + g_dequant_scratch_peak;
 }
 
 void dequant_cache_free(void* ptr, cudaStream_t stream) {
@@ -1453,6 +1497,34 @@ void dequant_cache_free(void* ptr, cudaStream_t stream) {
 #else
     (void)cudaFree(ptr);
 #endif
+}
+
+void dequant_cache_clear() {
+    std::lock_guard<std::mutex> lk(g_dequant_cache_mu);
+    for (auto& kv : g_dequant_cache)
+        dequant_cache_free(kv.second.ptr, 0);
+    g_dequant_cache.clear();
+    g_dequant_cache_bytes = 0;
+}
+
+size_t dequant_cache_current_bytes() { return g_dequant_cache_bytes; }
+
+size_t dequant_cache_trim_to(size_t budget_bytes) {
+    std::lock_guard<std::mutex> lk(g_dequant_cache_mu);
+    size_t freed = 0;
+    while (g_dequant_cache_bytes > budget_bytes && !g_dequant_cache.empty()) {
+        auto lru = g_dequant_cache.begin();
+        for (auto i = g_dequant_cache.begin(); i != g_dequant_cache.end(); ++i) {
+            if (i->second.last_used < lru->second.last_used)
+                lru = i;
+        }
+        const size_t bytes = lru->second.bytes;
+        dequant_cache_free(lru->second.ptr, 0);
+        g_dequant_cache_bytes -= bytes;
+        g_dequant_cache.erase(lru);
+        freed += bytes;
+    }
+    return freed;
 }
 
 // Grow-only scratch used for graph capture and cache misses/overflow. Mirrors

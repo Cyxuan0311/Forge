@@ -512,6 +512,51 @@ void launch_cublas_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __n
 bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q, float* C, int M,
                                    int K, int N, bool transB, cudaStream_t stream);
 
+// Budget (in MB) for the per-weight FP16 dequant cache used by
+// launch_cublas_gemm_quant_fp16(). Set from the CLI (--dequant-cache-mb); if
+// unset, resolved from the FORGE_DEQUANT_CACHE_MB env var (default 1024). 0
+// disables the cache (callers fall back to transient scratch).
+void set_dequant_cache_budget_mb(long mb);
+long dequant_cache_budget_mb();
+// Resolved byte budget for the per-weight FP16 dequant cache (0 disables it).
+// Lazily derived from the MB budget above (CLI > FORGE_DEQUANT_CACHE_MB env >
+// default 1024); an adaptive plan may re-latch it at runtime via
+// set_dequant_cache_budget_mb().
+size_t dequant_cache_budget_bytes();
+
+// Drop every per-weight FP16 dequant cache entry (freeing device buffers).
+// The cache keys on the raw weight pointer with no content validation, so it
+// MUST be invalidated whenever weight memory can be reallocated to new
+// contents: model unload/reload, and between tests that reuse addresses.
+void dequant_cache_clear();
+
+// Bytes currently resident in the dequant cache. This is the memory the memory
+// planner treats as *reclaimable*: it may be counted as available when choosing
+// an optional cache budget, and released on demand via dequant_cache_trim_to().
+size_t dequant_cache_current_bytes();
+// Free cache entries (least-recently-used first) until the cache holds at most
+// budget_bytes, returning the number of bytes released. Used to hand optional
+// cache memory back before a mandatory (KV / workspace) allocation.
+size_t dequant_cache_trim_to(size_t budget_bytes);
+
+// ---- VRAM-aware dispatch accounting --------------------------------------
+// The TensorCore prefill path keeps a persistent FP16 dequant working set on top
+// of the model + KV weights: a per-weight cache (dequant_cache_budget_bytes) plus
+// a grow-only scratch holding the largest single weight's FP16 form. The engine
+// informs the allocator of those magnitudes once after loading weights; the
+// runtime then feeds them into the GPU memory budget
+// (forge::GpuMemoryBudget) to decide the cache level and whether TC is
+// affordable (see forge::plan_q3k_execution).
+void set_dequant_scratch_peak_bytes(size_t bytes);
+size_t dequant_scratch_peak_bytes();
+// Sum of the FP16 (N*K*2) dequant of every CUDA quantized weight. The persistent
+// cache can never hold more than this, so the cache's contribution to the working
+// set is min(total, budget) -- not the full budget (an upper cap).
+void set_dequant_total_fp16_bytes(size_t bytes);
+size_t dequant_total_fp16_bytes();
+// Total persistent TC dequant footprint = min(total_fp16_dequant, cache_budget) + scratch_peak.
+size_t dequant_required_bytes();
+
 void launch_gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K, bool transB,
                        cudaStream_t stream = 0);
 
