@@ -37,7 +37,7 @@ struct CliArgs {
     int threads = -1;
     int batch_size = 512;
     int n_predict = -1;
-    std::string kv_cache_dtype = "fp32";
+    std::string kv_cache_dtype = "f16";  // fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 | fp8_e5m2
     bool cuda_graph = false;  // Phase 10: CUDA Graph for decode
     bool paged_kv = false;    // Use paged KV cache storage (default: contiguous)
 

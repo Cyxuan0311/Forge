@@ -41,7 +41,9 @@ struct ServerOptions {
     int n_gpu_layers = -1;
     int ctx_size = 0;  // 0 = auto (KV cap 4096 for long-ctx models); >0 = user context size
     int threads = -1;  // -1 = auto (probe fused GEMV on CPU, full GPU offload untouched)
-    std::string kv_cache_dtype = "fp32";  // fp32 | f16 | q8_0 | q4_0
+    // f16 matches llama.cpp's default; fp32 wastes 2x VRAM for no quality gain.
+    // fp8_* are the most VRAM-efficient (1 byte/element, no block overhead).
+    std::string kv_cache_dtype = "f16";  // fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 | fp8_e5m2
     bool cuda_graph = false;
     bool paged_kv = false;  // Use paged KV cache storage (default: contiguous)
     // Budget (MB) for the per-weight FP16 dequant cache used by the TensorCore

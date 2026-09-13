@@ -203,7 +203,8 @@ CliArgs parse_args(int argc, char** argv) {
             }
             args.kv_cache_dtype = argv[i];
             if (args.kv_cache_dtype != "fp32" && args.kv_cache_dtype != "f16" &&
-                args.kv_cache_dtype != "q8_0" && args.kv_cache_dtype != "q4_0") {
+                args.kv_cache_dtype != "q8_0" && args.kv_cache_dtype != "q4_0" &&
+                args.kv_cache_dtype != "fp8_e4m3" && args.kv_cache_dtype != "fp8_e5m2") {
                 std::cerr << "Error: Unsupported KV cache dtype: " << args.kv_cache_dtype << "\n";
                 std::exit(1);
             }

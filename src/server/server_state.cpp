@@ -337,13 +337,19 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
 
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
     if (tfm_eng) {
-        KVCacheDType kv_dtype = KVCacheDType::FP32;
-        if (opt.kv_cache_dtype == "f16")
+        KVCacheDType kv_dtype = KVCacheDType::F16;
+        if (opt.kv_cache_dtype == "fp32")
+            kv_dtype = KVCacheDType::FP32;
+        else if (opt.kv_cache_dtype == "f16")
             kv_dtype = KVCacheDType::F16;
         else if (opt.kv_cache_dtype == "q8_0")
             kv_dtype = KVCacheDType::Q8_0;
         else if (opt.kv_cache_dtype == "q4_0")
             kv_dtype = KVCacheDType::Q4_0;
+        else if (opt.kv_cache_dtype == "fp8_e4m3")
+            kv_dtype = KVCacheDType::FP8_E4M3;
+        else if (opt.kv_cache_dtype == "fp8_e5m2")
+            kv_dtype = KVCacheDType::FP8_E5M2;
         tfm_eng->set_kv_cache_dtype(kv_dtype);
         tfm_eng->set_gpu_layers(opt.n_gpu_layers);
         if (opt.ctx_size > 0) {

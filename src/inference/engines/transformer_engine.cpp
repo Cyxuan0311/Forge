@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -29,6 +30,34 @@
 #include "cpu/common/thread_pool.h"
 
 namespace forge {
+
+namespace {
+
+// Available host RAM in bytes (Linux: /proc/meminfo "MemAvailable").
+// Returns 0 when it cannot be determined, so callers fall back rather than
+// guess -- a wrong guess means either a needlessly short context or an OOM
+// kill of the whole process.
+size_t available_system_memory_bytes() {
+#if defined(__linux__)
+    std::ifstream in("/proc/meminfo");
+    if (!in)
+        return 0;
+    std::string key;
+    unsigned long long kb = 0;
+    std::string unit;
+    while (in >> key >> kb >> unit) {
+        if (key == "MemAvailable:")
+            return static_cast<size_t>(kb) * 1024ull;
+        std::string rest;
+        std::getline(in, rest);  // consume the remainder of this line
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+}  // namespace
 
 TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
     : model_(model),
@@ -769,20 +798,49 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     if (kv_cache_initialized())
         return;
 
-    int kv_max_seq = cfg.max_seq_len;
-    const int KV_MAX_SEQ_CAP = 4096;
+    // A reset() only clears the cache *contents* -- it deliberately keeps the
+    // device buffers allocated so the next turn does not pay the allocation
+    // cost again. If those buffers are still resident, reuse them instead of
+    // allocating a second set: re-allocating doubles the KV footprint and,
+    // because the free-VRAM probe below then sees ~0 free, it would collapse
+    // the freshly computed context length (observed: 17920 -> 256).
+    if (kv_cache_.nbytes() > 0 && kv_cache_.max_seq_len() > 0) {
+        LOG_INFO("KV cache reusing resident buffers: max_seq_len=" +
+                 std::to_string(kv_cache_.max_seq_len()) + ", " +
+                 std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
+        set_kv_cache_initialized(true);
+        return;
+    }
+
+    // ---- Context length decision: native-first ----
+    // Historically this capped the KV cache at 4096 tokens no matter what the
+    // model was trained for, so a 32K model silently ran at 1/8 of its native
+    // context. Following llama.cpp: default to the model's trained context
+    // length, and treat 4096 as a *lower* bound we try not to fall under when
+    // VRAM is tight (a floor, not a cap).
+    const int KV_MIN_SEQ_FLOOR = 4096;
+
+    int kv_max_seq = cfg.max_seq_len;  // native trained length
     if (kv_cache_max_seq_len_ > 0) {
-        // User-requested context size (e.g. --ctx-size): honour it (bounded by
-        // the model's trained length); the CUDA free-memory check below still
-        // shrinks the allocation if VRAM runs short.
-        kv_max_seq = std::min(kv_cache_max_seq_len_, cfg.max_seq_len);
+        // Explicit --ctx-size: honour it verbatim (llama.cpp semantics).
+        // Exceeding the trained length is allowed so RoPE-scaled (YaRN)
+        // extrapolation can be used, but warn since quality may degrade.
+        kv_max_seq = kv_cache_max_seq_len_;
+        if (kv_max_seq > cfg.max_seq_len) {
+            LOG_WARN("Requested context " + std::to_string(kv_max_seq) +
+                     " exceeds the model trained context " + std::to_string(cfg.max_seq_len) +
+                     " -- possible training context overflow (needs RoPE scaling)");
+        }
         LOG_INFO("KV cache max_seq_len set to " + std::to_string(kv_max_seq) +
                  " (user --ctx-size)");
-    } else if (kv_max_seq > KV_MAX_SEQ_CAP) {
-        LOG_INFO("Capping KV cache max_seq_len from " + std::to_string(kv_max_seq) + " to " +
-                 std::to_string(KV_MAX_SEQ_CAP) + " to avoid OOM");
-        kv_max_seq = KV_MAX_SEQ_CAP;
     }
+
+    // Reserve one extra KV layer per MTP nextn block: the draft module reuses
+    // engine attention at layer index cfg.num_layers.
+    // Computed up front so the VRAM fit below accounts for it (previously the
+    // fit used cfg.num_layers and underestimated speculative-decoding models).
+    const int kv_num_layers = cfg.num_layers + std::max(0, cfg.n_nextn_layers);
+    const int kv_dim = cfg.num_kv_heads * cfg.head_dim;
 
     // Determine the primary KV device.
     // When offload_kqv is false, KV cache stays on CPU even if layers are on GPU.
@@ -807,47 +865,88 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         kv_dev = DeviceType::CPU;
     }
 
-    // If CUDA, check available memory and reduce if needed
-    if (kv_dev == DeviceType::CUDA) {
-        const int kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        size_t kv_bytes = (size_t)cfg.num_layers * (size_t)kv_max_seq *
-                          kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim);
-        auto backend = BackendManager::instance().get_cuda_backend();
-        if (backend) {
-            size_t free_mem = backend->device_memory_free();
-            // Leave 256MB headroom for other allocations
-            const size_t headroom = 256 * 1024 * 1024;
-            if (kv_bytes + headroom > free_mem && free_mem > headroom) {
-                size_t available = free_mem - headroom;
-                int reduced_seq =
-                    static_cast<int>(available / ((size_t)cfg.num_layers *
-                                                  kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim)));
-                if (reduced_seq < kv_max_seq) {
-                    // Round down to nearest 256 for alignment
-                    reduced_seq = (reduced_seq / 256) * 256;
-                    if (reduced_seq < 256)
-                        reduced_seq = 256;
-                    LOG_WARN("KV cache needs " + std::to_string(kv_bytes / (1024 * 1024)) +
-                             "MB but only " + std::to_string(free_mem / (1024 * 1024)) +
-                             "MB free, reducing max_seq_len from " + std::to_string(kv_max_seq) +
-                             " to " + std::to_string(reduced_seq));
-                    kv_max_seq = reduced_seq;
-                }
+    // ---- Memory-aware fit (vLLM-style profiling) ----
+    // Compute how many tokens actually fit BEFORE allocating, instead of
+    // reserving the requested length and shrinking after the fact. Uses
+    // kv_num_layers (which includes MTP draft layers) so speculative-decoding
+    // models are no longer underestimated.
+    //
+    // The two paths are symmetric: CUDA probes device free memory, CPU probes
+    // available host RAM. The CPU side matters just as much -- without it a
+    // 256K-native model allocated its entire KV in host memory and was
+    // OOM-killed (observed: 15 GB RSS in the spec-verify test).
+    const size_t per_token_bytes =
+        (size_t)kv_num_layers * kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim);
+    if (per_token_bytes > 0) {
+        // Headroom: a fixed margin plus one micro-batch of prefill
+        // activations (hidden states + attention output), so a long
+        // prefill cannot OOM on top of the KV cache.
+        const int n_ubatch = ctx_.params().n_ubatch > 0 ? ctx_.params().n_ubatch : 256;
+        const size_t activation_bytes =
+            (size_t)n_ubatch *
+            ((size_t)cfg.hidden_dim + (size_t)cfg.num_heads * (size_t)cfg.head_dim) *
+            sizeof(float) * 4;
+        const size_t headroom = 256ull * 1024 * 1024 + activation_bytes;
+
+        size_t usable_mem = 0;
+        if (kv_dev == DeviceType::CUDA) {
+            auto backend = BackendManager::instance().get_cuda_backend();
+            if (backend)
+                usable_mem = backend->device_memory_free();
+        } else {
+            // Host KV competes with the OS page cache and every other process,
+            // so only claim a fraction of what is actually available.
+            const size_t host_ram = available_system_memory_bytes();
+            if (host_ram > 0)
+                usable_mem = host_ram / 2;
+        }
+
+        if (usable_mem > 0) {
+            // Derive the cap from memory UNCONDITIONALLY. Skipping the fit when
+            // usable_mem is below headroom is what let a 256K-native model try
+            // to allocate ~36 GB of KV on a 6 GB card and OOM: once the first
+            // cache was resident, free memory dropped under headroom and the
+            // clamp was bypassed entirely. available may be 0, which collapses
+            // the context to the 256-token minimum instead of crashing.
+            const size_t available = usable_mem > headroom ? usable_mem - headroom : 0;
+            const size_t max_seq_by_mem = available / per_token_bytes;
+            if (max_seq_by_mem < (size_t)kv_max_seq) {
+                size_t reduced = (max_seq_by_mem / 256) * 256;  // 256-align
+                if (reduced < 256)
+                    reduced = 256;
+                LOG_WARN("Memory fits " + std::to_string(max_seq_by_mem) +
+                         " tokens of KV cache but " + std::to_string(kv_max_seq) +
+                         " was requested (" + std::to_string(usable_mem / (1024 * 1024)) +
+                         "MB usable, " + std::to_string(headroom / (1024 * 1024)) +
+                         "MB reserved, dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU") +
+                         ") -- reducing to " + std::to_string(reduced));
+                kv_max_seq = static_cast<int>(reduced);
             }
+        } else if (kv_dev != DeviceType::CUDA && kv_max_seq > KV_MIN_SEQ_FLOOR) {
+            // No host-memory information available: fall back to the floor
+            // rather than trusting a native length that may be enormous.
+            LOG_WARN("Host RAM unknown; capping CPU KV context at " +
+                     std::to_string(KV_MIN_SEQ_FLOOR) + " (model native is " +
+                     std::to_string(cfg.max_seq_len) + ")");
+            kv_max_seq = KV_MIN_SEQ_FLOOR;
+        }
+
+        if (kv_max_seq < KV_MIN_SEQ_FLOOR) {
+            LOG_WARN("KV context " + std::to_string(kv_max_seq) + " is below the " +
+                     std::to_string(KV_MIN_SEQ_FLOOR) +
+                     " floor -- memory is tight; try fewer GPU layers, a lower "
+                     "--kv-cache-dtype, or --paged-kv");
         }
     }
-
-    // Reserve one extra KV layer per MTP nextn block: the draft module reuses
-    // engine attention at layer index cfg.num_layers.
-    const int kv_num_layers = cfg.num_layers + std::max(0, cfg.n_nextn_layers);
 
     LOG_INFO("KV cache init: layers=" + std::to_string(kv_num_layers) + ", kv_heads=" +
              std::to_string(cfg.num_kv_heads) + ", head_dim=" + std::to_string(cfg.head_dim) +
              ", max_seq_len=" + std::to_string(kv_max_seq) +
              ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU"));
-    size_t kv_bytes = (size_t)kv_num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
-                      cfg.head_dim * sizeof(float);
-    LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024 * 1024)) + " MB");
+    const size_t kv_bytes = (size_t)kv_num_layers * (size_t)kv_max_seq *
+                            kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim);
+    LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024 * 1024)) +
+             " MB (native trained context=" + std::to_string(cfg.max_seq_len) + ")");
 
     // Allocate KV cache on the primary device
     // For paged mode, KVCache is still initialized (for transitional compatibility)

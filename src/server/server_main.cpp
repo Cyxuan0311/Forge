@@ -18,6 +18,7 @@
 
 #include <httplib.h>
 
+#include "forge/logger.h"
 #include "server.h"
 
 namespace fsrv = forge;
@@ -82,10 +83,13 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "      --port PORT         Listen port (default: 8080)\n"
                 << "  -ngl, --n-gpu-layers N  Layers to offload to GPU (-1 = max)\n"
                 << "  -c,  --ctx-size N       Context window / KV cache size in tokens\n"
-                << "                          (default: auto, capped at 4096; increase for\n"
-                << "                          long agent sessions, e.g. opencode)\n"
+                << "                          (default: the model's native trained context,\n"
+                << "                          reduced only when VRAM cannot hold it; set\n"
+                << "                          explicitly to go beyond it via RoPE scaling)\n"
                 << "  -t, --threads N         CPU threads (default: auto)\n"
-                << "      --kv-cache-dtype T  fp32 | f16 | q8_0 | q4_0 (default: fp32)\n"
+                << "      --kv-cache-dtype T  fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 |\n"
+                << "                          fp8_e5m2 (default: f16; cheaper dtype =\n"
+                << "                          more context for the same VRAM)\n"
                 << "      --cuda-graph        Enable CUDA Graph for decode\n"
                 << "      --paged-kv          Use paged KV cache storage (default: off)\n"
                 << "      --dequant-cache-mb MB  Per-weight FP16 dequant cache budget in MB\n"
@@ -125,6 +129,25 @@ void handle_signal(int) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Log level: the default (WARN) hides the KV-cache sizing messages that
+    // explain which context length was chosen and why. FORGE_LOG_LEVEL raises
+    // it (error|warn|info|debug|trace) so the decision is observable.
+    if (const char* ll = std::getenv("FORGE_LOG_LEVEL")) {
+        const std::string s = ll;
+        forge::LogLevel lvl = forge::LogLevel::WARN;
+        if (s == "error")
+            lvl = forge::LogLevel::LOG_ERROR;
+        else if (s == "warn")
+            lvl = forge::LogLevel::WARN;
+        else if (s == "info")
+            lvl = forge::LogLevel::INFO;
+        else if (s == "debug")
+            lvl = forge::LogLevel::DEBUG;
+        else if (s == "trace")
+            lvl = forge::LogLevel::TRACE;
+        forge::Logger::instance().set_level(lvl);
+    }
+
     fsrv::ServerOptions opt = parse_args(argc, argv);
 
 #ifdef USE_CUDA
