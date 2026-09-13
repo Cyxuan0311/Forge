@@ -50,6 +50,30 @@ void send_error(httplib::Response& res, int status, const std::string& message,
     res.set_content(j.dump(), "application/json");
 }
 
+// Build the OpenAI tool_calls array from parsed tool calls.
+json build_tool_calls_array(const std::vector<fsrv::ToolCall>& calls) {
+    json tcs = json::array();
+    for (const auto& tc : calls) {
+        tcs.push_back({{"id", tc.id},
+                       {"type", tc.type},
+                       {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}});
+    }
+    return tcs;
+}
+
+// Build the assistant message: tool_calls when present, else plain content.
+json build_assistant_message(const fsrv::ChatCompletionResult& r) {
+    json msg = json::object();
+    msg["role"] = "assistant";
+    if (!r.tool_calls.empty()) {
+        msg["tool_calls"] = build_tool_calls_array(r.tool_calls);
+        msg["content"] = r.text.empty() ? json(nullptr) : json(r.text);
+    } else {
+        msg["content"] = r.text;
+    }
+    return msg;
+}
+
 // ---- Request parsing -------------------------------------------------------
 
 bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRequest& out,
@@ -125,6 +149,35 @@ bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRe
             return false;
         }
     }
+
+    // ---- Function calling: tools / tool_choice ----
+    // OpenAI shape: tools = [{"type":"function","function":{"name",
+    // "description","parameters"}}]; tool_choice = "auto" | "none" |
+    // {"type":"function",...} (a forced function).
+    if (body.contains("tools") && body["tools"].is_array()) {
+        for (const auto& t : body["tools"]) {
+            if (!t.is_object())
+                continue;
+            const json& fn = (t.contains("function") && t["function"].is_object())
+                                 ? t["function"]
+                                 : t;
+            fsrv::ToolSpec spec;
+            spec.name = fn.value("name", "");
+            spec.description = fn.value("description", "");
+            if (fn.contains("parameters") && fn["parameters"].is_object())
+                spec.parameters_json = fn["parameters"].dump();
+            if (!spec.name.empty())
+                out.tools.push_back(std::move(spec));
+        }
+    }
+    if (body.contains("tool_choice")) {
+        if (body["tool_choice"].is_string()) {
+            out.tool_choice = body["tool_choice"].get<std::string>();
+        } else if (body["tool_choice"].is_object()) {
+            // Forced function: keep the raw JSON so the prompt can request it.
+            out.tool_choice = body["tool_choice"].dump();
+        }
+    }
     return true;
 }
 
@@ -194,7 +247,7 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
         out["model"] = state.model_id();
         out["choices"] = json::array({json{
             {"index", 0},
-            {"message", json{{"role", "assistant"}, {"content", r.text}}},
+            {"message", build_assistant_message(r)},
             {"finish_reason", r.finish_reason}}});
         out["usage"] = json{{"prompt_tokens", r.prompt_tokens},
                             {"completion_tokens", r.completion_tokens},
@@ -239,9 +292,16 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
 
             fsrv::ChatCompletionResult r;
             std::string error_text;
+            const bool tools_stream = !creq.tools.empty() && creq.tool_choice != "none";
             auto on_token = [&](const std::string& delta) -> bool {
                 if (!sink.is_writable())
                     return false;
+                if (tools_stream) {
+                    // Tool requests: do not stream raw content (it may contain
+                    // the tool-call wrapper); the tool_calls are delivered in
+                    // the final chunk instead.
+                    return true;
+                }
                 std::string payload = make_chunk(json{{"content", delta}}, nullptr);
                 return sink.write(payload.data(), payload.size());
             };
@@ -259,7 +319,15 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
                     std::string payload = "data: " + jerr.dump() + "\n\n";
                     sink.write(payload.data(), payload.size());
                 } else {
-                    std::string fin = make_chunk(json::object(), r.finish_reason.c_str());
+                    json delta = json::object();
+                    if (!r.tool_calls.empty()) {
+                        delta["tool_calls"] = build_tool_calls_array(r.tool_calls);
+                        delta["content"] = json(nullptr);
+                    } else if (tools_stream) {
+                        // Tools were offered but the model answered in prose.
+                        delta["content"] = r.text;
+                    }
+                    std::string fin = make_chunk(delta, r.finish_reason.c_str());
                     sink.write(fin.data(), fin.size());
                 }
                 const char* done = "data: [DONE]\n\n";

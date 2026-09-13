@@ -60,6 +60,22 @@ struct ServerOptions {
     bool perf_detail = false;
 };
 
+// ---- Tool calling (OpenAI function-calling contract) ----
+
+struct ToolCall {
+    std::string id;          // e.g. "call-<hex>-<n>"
+    std::string type = "function";
+    std::string name;        // function name
+    std::string arguments;   // JSON string (arguments object serialized)
+};
+
+// A tool the client exposes; parsed from the OpenAI `tools` array.
+struct ToolSpec {
+    std::string name;
+    std::string description;
+    std::string parameters_json;  // JSON schema, serialized
+};
+
 // ---- Parsed OpenAI chat-completion request ----
 
 struct ChatCompletionRequest {
@@ -76,13 +92,19 @@ struct ChatCompletionRequest {
     uint64_t seed = 0;
     bool stream = false;
     std::vector<std::string> stop;  // OpenAI stop strings (up to 4, OpenAI spec)
+    // Function calling: OpenAI `tools` (functions) and `tool_choice`.
+    // tool_choice "none" disables calling; any other value ("auto" or a
+    // forced function object) enables it. Best-effort: no grammar constraint.
+    std::vector<ToolSpec> tools;
+    std::string tool_choice = "auto";
 };
 
 struct ChatCompletionResult {
     std::string text;
     int prompt_tokens = 0;
     int completion_tokens = 0;
-    std::string finish_reason;  // normalized to "stop" | "length"
+    std::string finish_reason;  // normalized to "stop" | "length" | "tool_calls"
+    std::vector<ToolCall> tool_calls;  // non-empty -> finish_reason "tool_calls"
 };
 
 // Owns tokenizer / model / inference context. One instance per process.

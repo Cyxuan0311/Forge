@@ -8,10 +8,14 @@
 #include "server.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
+
+#include <nlohmann/json.hpp>
 
 #include "forge/arch_registry.h"
 #include "forge/engines/transformer_engine.h"
@@ -22,6 +26,186 @@
 #include "forge/threads.h"
 
 namespace forge {
+
+namespace {
+
+// Unique id for a parsed tool call (call-<hex-time>-<counter>).
+std::string make_tool_call_id() {
+    static std::atomic<uint64_t> counter{0};
+    auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    std::ostringstream oss;
+    oss << "call-" << std::hex << now << std::dec << "-" << ++counter;
+    return oss.str();
+}
+
+// Render the tool catalogue into a system-prompt block the model can follow.
+std::string build_tools_prompt(const std::vector<forge::ToolSpec>& tools,
+                               const std::string& tool_choice) {
+    std::string p = "You have access to tools. To call one, respond with exactly one block of the form:\n"
+                    "###TOOL###{name: <tool_name>, arguments: <json_object>}###END###\n"
+                    "Only call a tool when it is genuinely needed to answer the user.";
+    if (!tool_choice.empty() && tool_choice != "auto")
+        p += " You MUST call the requested tool.";
+    p += "\n\n# Tools\n";
+    for (const auto& t : tools) {
+        p += "- name: " + t.name + "\n";
+        if (!t.description.empty())
+            p += "  description: " + t.description + "\n";
+        p += "  parameters: " + (t.parameters_json.empty() ? "{}" : t.parameters_json) + "\n";
+    }
+    return p;
+}
+
+// Prepend/append the tool catalogue to the system message.
+std::vector<forge::ChatTemplateMessage> inject_tools_into_messages(
+    const std::vector<forge::ChatTemplateMessage>& msgs,
+    const std::vector<forge::ToolSpec>& tools, const std::string& tool_choice) {
+    if (tools.empty())
+        return msgs;
+    std::vector<forge::ChatTemplateMessage> out = msgs;
+    std::string block = build_tools_prompt(tools, tool_choice);
+    if (!out.empty() && out[0].role == "system") {
+        out[0].content += "\n\n" + block;
+    } else {
+        forge::ChatTemplateMessage sys;
+        sys.role = "system";
+        sys.content = block;
+        out.insert(out.begin(), std::move(sys));
+    }
+    return out;
+}
+
+// Read a scalar field from a possibly-unquoted-key object body, so that a
+// model emitting {name: fn, arguments: {...}} still yields a usable call.
+std::string extract_tool_field(const std::string& body, const std::string& key) {
+    size_t k = body.find(key);
+    if (k == std::string::npos)
+        return "";
+    size_t c = body.find(':', k + key.size());
+    if (c == std::string::npos)
+        return "";
+    size_t s = c + 1;
+    while (s < body.size() && (body[s] == ' ' || body[s] == '\t'))
+        ++s;
+    if (s < body.size() && body[s] == '"') {
+        size_t end = body.find('"', s + 1);
+        if (end == std::string::npos)
+            return "";
+        return body.substr(s + 1, end - s - 1);
+    }
+    size_t end = body.find_first_of(",}", s);
+    if (end == std::string::npos)
+        end = body.size();
+    std::string v = body.substr(s, end - s);
+    size_t a = v.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos)
+        return "";
+    size_t b = v.find_last_not_of(" \t\r\n");
+    return v.substr(a, b - a + 1);
+}
+
+// Read a balanced JSON object field from a possibly-unquoted-key object body.
+std::string extract_tool_object(const std::string& body, const std::string& key) {
+    size_t k = body.find(key);
+    if (k == std::string::npos)
+        return "";
+    size_t s = body.find('{', k + key.size());
+    if (s == std::string::npos)
+        return "";
+    int depth = 0;
+    for (size_t i = s; i < body.size(); ++i) {
+        if (body[i] == '{')
+            ++depth;
+        else if (body[i] == '}') {
+            --depth;
+            if (depth == 0)
+                return body.substr(s, i - s + 1);
+        }
+    }
+    return "";
+}
+
+// Extract tool calls (###TOOL### ... ###END### wrapper) from generated text.
+std::vector<forge::ToolCall> parse_tool_calls(const std::string& text) {
+    std::vector<forge::ToolCall> calls;
+    static const std::string open = "###TOOL###";
+    static const std::string close = "###END###";
+    size_t pos = 0;
+    while (true) {
+        size_t s = text.find(open, pos);
+        if (s == std::string::npos)
+            break;
+        size_t e = text.find(close, s + open.size());
+        if (e == std::string::npos)
+            break;
+        std::string inner = text.substr(s + open.size(), e - (s + open.size()));
+        nlohmann::json j;
+        bool parsed = false;
+        try {
+            j = nlohmann::json::parse(inner);
+            parsed = true;
+        } catch (...) {
+            size_t b = inner.find('{');
+            size_t en = inner.rfind('}');
+            if (b != std::string::npos && en != std::string::npos && en > b) {
+                try {
+                    j = nlohmann::json::parse(inner.substr(b, en - b + 1));
+                    parsed = true;
+                } catch (...) {
+                }
+            }
+        }
+        forge::ToolCall tc;
+        tc.type = "function";
+        if (parsed && j.is_object()) {
+            if (j.contains("name") && j["name"].is_string())
+                tc.name = j["name"].get<std::string>();
+            if (j.contains("arguments")) {
+                const auto& a = j["arguments"];
+                tc.arguments = a.is_string() ? a.get<std::string>() : a.dump();
+            }
+        } else {
+            // Tolerant path: models often emit unquoted keys, e.g.
+            // {name: fn, arguments: {...}}. Recover name/arguments manually.
+            tc.name = extract_tool_field(inner, "name");
+            std::string args = extract_tool_object(inner, "arguments");
+            tc.arguments = args.empty() ? "{}" : args;
+        }
+        if (!tc.name.empty()) {
+            tc.id = make_tool_call_id();
+            calls.push_back(std::move(tc));
+        }
+        pos = e + close.size();
+    }
+    return calls;
+}
+
+// Remove tool-call wrapper blocks from the assistant text.
+std::string strip_tool_call_blocks(const std::string& text) {
+    std::string out = text;
+    static const std::string open = "###TOOL###";
+    static const std::string close = "###END###";
+    size_t pos = 0;
+    while (true) {
+        size_t s = out.find(open, pos);
+        if (s == std::string::npos)
+            break;
+        size_t e = out.find(close, s + open.size());
+        if (e == std::string::npos) {
+            out.erase(s);
+            break;
+        }
+        out.erase(s, e + close.size() - s);
+        pos = s;
+    }
+    size_t a = out.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos)
+        return "";
+    size_t b = out.find_last_not_of(" \t\r\n");
+    return out.substr(a, b - a + 1);
+}
+
+}  // namespace
 
 // ============================================================================
 // Engine & loader registration (same as forge-cli)
@@ -231,26 +415,34 @@ ChatCompletionResult ServerState::chat_completion(
     }
     const int gen_budget = req.max_tokens > 0 ? req.max_tokens : 512;
 
+    // ---- Tool injection (OpenAI function calling) ----
+    // When the client offers tools (and does not forbid calling them), splice a
+    // tool catalogue into the prompt so the model knows what it can invoke.
+    const bool tools_active = !req.tools.empty() && req.tool_choice != "none";
+    std::vector<ChatTemplateMessage> tooled_messages =
+        tools_active ? inject_tools_into_messages(req.messages, req.tools, req.tool_choice)
+                     : req.messages;
+
     ChatTemplateInput input;
-    input.messages = req.messages;
+    input.messages = tooled_messages;
     input.add_generation_prompt = true;
     std::vector<int32_t> prompt_ids = chat_template_->apply(input);
 
     if (kv_capacity > 0 &&
         static_cast<int>(prompt_ids.size()) + gen_budget > kv_capacity &&
-        req.messages.size() > 2) {
+        tooled_messages.size() > 2) {
         // Keep message[0] if it is the system prompt; always keep the final
         // message. Progressively drop the oldest non-system, non-final
         // messages, re-rendering after each drop, until the prompt fits.
-        const bool has_system = req.messages[0].role == "system";
+        const bool has_system = tooled_messages[0].role == "system";
         std::vector<ChatTemplateMessage> kept;
         if (has_system) {
-            kept.push_back(req.messages[0]);
+            kept.push_back(tooled_messages[0]);
         }
         // Candidate droppable messages: everything after the (optional)
         // system prompt except the final message.
         const size_t first_drop_idx = has_system ? 1 : 0;
-        const size_t last_keep_idx = req.messages.size() - 1;  // final message
+        const size_t last_keep_idx = tooled_messages.size() - 1;  // final message
         size_t drop_upto = first_drop_idx;  // drop messages [first_drop_idx, drop_upto)
 
         bool fits = false;
@@ -258,8 +450,8 @@ ChatCompletionResult ServerState::chat_completion(
             ChatTemplateInput trimmed;
             trimmed.messages = kept;
             trimmed.messages.insert(trimmed.messages.end(),
-                                    req.messages.begin() + drop_upto,
-                                    req.messages.end());
+                                    tooled_messages.begin() + drop_upto,
+                                    tooled_messages.end());
             trimmed.add_generation_prompt = true;
             auto ids = chat_template_->apply(trimmed);
             if (static_cast<int>(ids.size()) + gen_budget <= kv_capacity) {
@@ -449,6 +641,17 @@ ChatCompletionResult ServerState::chat_completion(
         }
     }
 
+    // ---- Tool-call extraction (OpenAI function calling) ----
+    // Parse any ###TOOL###...###END### blocks the model emitted into
+    // OpenAI-shaped tool_calls and strip them from the assistant text.
+    if (tools_active) {
+        auto calls = parse_tool_calls(out.text);
+        if (!calls.empty()) {
+            out.text = strip_tool_call_blocks(out.text);
+            out.tool_calls = std::move(calls);
+        }
+    }
+
     out.prompt_tokens = result.num_prompt_tokens;
     out.completion_tokens = result.num_generated_tokens;
 
@@ -462,6 +665,10 @@ ChatCompletionResult ServerState::chat_completion(
         out.finish_reason = "stop";
     } else {
         out.finish_reason = "stop";  // eos / stop token
+    }
+
+    if (!out.tool_calls.empty()) {
+        out.finish_reason = "tool_calls";
     }
 
     // ---- --perf / --perf-detail report (stdout, after every completion) ----
