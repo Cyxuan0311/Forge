@@ -237,6 +237,13 @@ struct DeviceBuffers {
 // deviation and determinism through the out-params.
 bool run_case(const DtypeSpec& spec, int M, int K, int N, std::mt19937& rng,
               double* worst_rel, bool* deterministic, std::string* err) {
+    // The per-weight FP16 dequant cache keys on the raw device pointer with no
+    // content validation. run_case hands freshly-randomized weights to
+    // cudaMalloc'd buffers that the CUDA allocator frequently recycles at the
+    // SAME address across cases, so a stale entry would poison the next case.
+    // Real inference keeps weights immutable for the process lifetime; tests
+    // must invalidate explicitly.
+    forge::cuda::dequant_cache_clear();
     const size_t blocks_per_row =
         (static_cast<size_t>(K) + spec.block_elems - 1) / spec.block_elems;
     const size_t row_bytes = blocks_per_row * spec.block_bytes;

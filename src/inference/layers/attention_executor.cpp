@@ -408,7 +408,7 @@ AttentionExecutor::QKVResult AttentionExecutor::project_qkv(const TensorPtr& x,
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim},               \
             DeviceType::CUDA);                                                                 \
         {                                                                                      \
-            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);    \
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);                       \
             size_t q_row_size = KVCache::block_nbytes(DTYPE, num_kv_heads * head_dim);         \
             cuda::LAUNCH_FN(static_cast<const float*>(q->data()),                              \
                             storage_->d_key_page_ptrs(layer_idx),                              \
@@ -477,6 +477,17 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                 k_out = storage_->read_key(layer_idx);
                 v_out = storage_->read_value(layer_idx);
             }
+            // A CUDA paged storage cannot materialize rows (read_key* return
+            // null by design). If we still ended up here, some path selected a
+            // materialized kernel with paged device KV — fail loud instead of
+            // dereferencing a null tensor downstream.
+            if ((!k_out || !v_out) && dev == DeviceType::CUDA &&
+                storage_->device() == DeviceType::CUDA) {
+                throw std::runtime_error(
+                    "paged CUDA storage cannot materialize K/V for this attention path "
+                    "(layer=" + std::to_string(layer_idx) + ", seq=" + std::to_string(seq_id) +
+                    ", seq_len=" + std::to_string(seq_len) + ")");
+            }
         } else {
             k_out = kv_cache_.get_key_filled(layer_idx);
             v_out = kv_cache_.get_value_filled(layer_idx);
@@ -511,6 +522,23 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         mask_row = mask_data;
     }
 
+    // Paged kernel dispatch helper: resolves the per-(seq, layer) device page
+    // table and fails loud if it is unusable (e.g. storage not on CUDA, or the
+    // sequence has no pages). Launching a paged kernel with null tables is an
+    // illegal memory access — never do it silently.
+    auto paged_tables = [&](int layer, int seq) -> const int32_t* {
+        const void* k_pages = storage_->d_key_page_ptrs(layer);
+        const void* v_pages = storage_->d_value_page_ptrs(layer);
+        const int32_t* ids = storage_->upload_seq_page_table(layer, seq);
+        if (k_pages == nullptr || v_pages == nullptr || ids == nullptr) {
+            throw std::runtime_error(
+                "paged attention: null page table (storage not on CUDA or seq has no pages) "
+                "layer=" +
+                std::to_string(layer) + " seq=" + std::to_string(seq));
+        }
+        return ids;
+    };
+
     // ---- Build problem descriptor and select path ----
     AttentionProblem problem;
     problem.device = dev;
@@ -523,7 +551,15 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     // Quantized KV state for path selection.
     // - Paged CUDA decode: KV lives in pages; the storage reports the dtype.
     // - Contiguous CUDA decode: query the KVCache's quantized device pointers.
-    if (dev == DeviceType::CUDA && seq_len == 1 && paged) {
+    // The paged fast path additionally requires the STORAGE to live on the
+    // attention device. A paged storage on CPU (weights on GPU, KV on CPU) must
+    // take the materialized paths below — the paged CUDA kernels would
+    // otherwise receive null page tables (illegal memory access). It must also
+    // NOT consult kv_cache_'s quantized pointers: in paged mode the contiguous
+    // cache is allocated but never written (its d_q_* would be all-zero data).
+    const bool paged_cuda =
+        paged && dev == DeviceType::CUDA && storage_->device() == DeviceType::CUDA;
+    if (dev == DeviceType::CUDA && seq_len == 1 && paged_cuda) {
         problem.paged = true;
         problem.seq_id = seq_id;
         problem.has_quantized_kv = true;  // paged CUDA always quantized-or-FP32
@@ -536,26 +572,26 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         const auto& kv_cfg = kv_cache_.kv_config();
         problem.kv_type_k = kv_cfg.type_k;
         problem.kv_type_v = kv_cfg.type_v;
-    } else if (dev == DeviceType::CUDA && seq_len > 1) {
+    } else if (dev == DeviceType::CUDA && seq_len > 1 && paged_cuda) {
         // Prefill (Phase 2-B): quantized KV is read directly by the fused
         // prefill kernel — no FP32 materialization. Paged KV resolves rows
-        // through the sequence page table; contiguous KV reads the cache's
-        // quantized device pointers.
-        if (paged) {
-            problem.paged = true;
-            problem.seq_id = seq_id;
-            problem.has_quantized_kv = true;
-            problem.kv_type_k = storage_->kv_type_k();
-            problem.kv_type_v = storage_->kv_type_v();
-        } else {
-            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
-            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
-            problem.has_quantized_kv = (d_q_K != nullptr && d_q_V != nullptr);
-            const auto& kv_cfg = kv_cache_.kv_config();
-            problem.kv_type_k = kv_cfg.type_k;
-            problem.kv_type_v = kv_cfg.type_v;
-        }
+        // through the sequence page table.
+        problem.paged = true;
+        problem.seq_id = seq_id;
+        problem.has_quantized_kv = true;
+        problem.kv_type_k = storage_->kv_type_k();
+        problem.kv_type_v = storage_->kv_type_v();
+    } else if (dev == DeviceType::CUDA && seq_len > 1 && !paged) {
+        // Contiguous KV reads the cache's quantized device pointers.
+        void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
+        void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
+        problem.has_quantized_kv = (d_q_K != nullptr && d_q_V != nullptr);
+        const auto& kv_cfg = kv_cache_.kv_config();
+        problem.kv_type_k = kv_cfg.type_k;
+        problem.kv_type_v = kv_cfg.type_v;
     }
+    // paged storage on CPU + CUDA attention (and any other combination) falls
+    // through: plain FP32 materialized path via get_kv_on_device().
 
     AttentionPath path = choose_attention_path(problem);
 
@@ -992,7 +1028,7 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
         {
-            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
             size_t q_row_size = KVCache::block_nbytes(KVCacheDType::Q4_0, num_kv_heads * head_dim);
             cuda::launch_paged_flash_attention_gqa_decode_q4_0(
                 static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),
@@ -1015,7 +1051,7 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
         {
-            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
             size_t q_row_size = KVCache::block_nbytes(KVCacheDType::F16, num_kv_heads * head_dim);
             cuda::launch_paged_flash_attention_gqa_decode_f16(
                 static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),
@@ -1038,7 +1074,7 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
         {
-            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
             size_t q_row_size = KVCache::block_nbytes(KVCacheDType::Q8_0, num_kv_heads * head_dim);
             cuda::launch_paged_flash_attention_gqa_decode_q8_0(
                 static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),
@@ -1061,7 +1097,7 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
         {
-            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
             size_t q_row_size =
                 KVCache::block_nbytes(KVCacheDType::FP8_E4M3, num_kv_heads * head_dim);
             cuda::launch_paged_flash_attention_gqa_decode_fp8_e4m3(
@@ -1085,7 +1121,7 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
         {
-            const int32_t* d_page_ids = storage_->upload_seq_page_table(layer_idx, seq_id);
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
             size_t q_row_size =
                 KVCache::block_nbytes(KVCacheDType::FP8_E5M2, num_kv_heads * head_dim);
             cuda::launch_paged_flash_attention_gqa_decode_fp8_e5m2(

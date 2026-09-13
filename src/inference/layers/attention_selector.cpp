@@ -41,8 +41,13 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
     // GQA decode (seq_len == 1): prefer fused quantized KV if available
     if (p.seq_len == 1) {
         // Paged KV cache (Phase 4): traverse the page table directly.
-        // Only quantized paged KV has a dedicated kernel; FP32 paged falls
-        // through to the materialize-then-attend FP32 decode path.
+        // Quantized paged KV has a dedicated decode kernel. FP32 paged has no
+        // dedicated decode kernel AND the CUDA paged storage cannot materialize
+        // rows (read_key* return null by design) — so route it to the paged
+        // prefill kernel, which handles seq_len==1 + causal correctly (the
+        // single query attends to all kv_len rows). Previously FP32 paged fell
+        // through to CUDA_FP32_DECODE, which materializes from the contiguous
+        // cache and crashed (null K/V) with a paged CUDA storage.
         if (p.paged && p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
             switch (p.kv_type_k) {
             case KVCacheDType::Q4_0:
@@ -55,6 +60,8 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
                 return AttentionPath::CUDA_PAGED_FP8_E4M3_DECODE;
             case KVCacheDType::FP8_E5M2:
                 return AttentionPath::CUDA_PAGED_FP8_E5M2_DECODE;
+            case KVCacheDType::FP32:
+                return AttentionPath::CUDA_PAGED_FP32_PREFILL;
             default:
                 break;  // Unsupported symmetric type → FP32 fallback
             }

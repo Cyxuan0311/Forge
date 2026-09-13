@@ -25,18 +25,25 @@
 // KV format is a compile-time policy (Dequant), so the SAME template serves
 // FP32, F16, Q8_0 and FP8 (E4M3/E5M2), contiguous or paged (Phase 2-B).
 //
-// ===== EXPERIMENTAL STATUS (2026-09-05, bench_tiled_attn on RTX 4050) =====
-// Full-KV tiling measured SLOWER than the streaming/vectorized reference on
-// consumer GPUs: decode 0.25-0.60x, FP32 prefill ~0.44-0.49x, Q8_0 ~0.60x.
-// The register savings (REG 33-48 vs 255) and occupancy gain (~70% vs ~12%)
-// are outweighed by global->shared staging, extra barriers and reduced
-// per-warp work on a latency/instruction-limited workload. Performance
-// tuning is FROZEN. Do NOT route the common FP32/F16 path here by default.
-// Keep this kernel for paged/quantized prefill paths where avoiding
-// materialization is structurally required. Evidence: docs/optimization_plan_zh.md.
+// ===== STATUS (2026-09-13) =====
+// The *per-(qi,h)* kernel below (fused_attn_tiled_prefill_kernel) is the
+// original Phase 2-B design: one thread-block per (query position, head),
+// looping over the entire KV. It has no K/V reuse across query positions, so
+// KV traffic is O(q_len * num_heads) and it dominated prefill latency on
+// consumer GPUs (bench: 8.9 s for a 1702-tok prefill on RTX 4050).
+//
+// fused_attn_qtiled_v2_kernel (QUERY-TILED, the active FUSED prefill path)
+// flips the loop order: one block covers BLOCK_M query rows of ONE head and
+// stages each K/V tile into shared memory ONCE, reused by all BLOCK_M rows.
+// KV traffic drops by ~num_heads*BLOCK_M (=~256x for 32 heads, BLOCK_M=8),
+// and each warp owns HEAD_DIM/32 accumulator elements (not 128), so occupancy
+// stays high. This is the llama.cpp fattn-tile design. See rewrite notes in
+// the analysis. The KV-tiled kernel is retained for fallback / paged paths.
 // =========================================================================
 
 #include <cstdio>
+#include <cstdlib>
+#include <type_traits>
 
 #include <cuda_fp16.h>
 
@@ -54,7 +61,29 @@ namespace cuda {
 // `scales` is the per-(row, kv_head) FP8 scale buffer, or nullptr otherwise.
 // =========================================================================
 
-struct DqFp32 {
+// Staging policy for the query-tiled v2 kernel: tiles are staged into shared
+// memory once per block. Quantized KV formats (<=16-bit storage) stage as
+// __half — lossless w.r.t. their own storage precision. FP32 KV MUST stage as
+// float: routing FP32 through __half truncates the 24-bit mantissa to 11 bits
+// (~5e-4 relative) and violates the 1e-6 tiled-vs-reference contract
+// (test tiled-attn-formats, FP32 paged cases).
+// kMaxQtiledHD = largest HEAD_DIM whose float-staged tiles still fit the 48KB
+// static shared limit ((s_k+s_v) BLOCK_N*HD*4*2 + s_q BLOCK_M*HD*4).
+struct StageHalf {
+    using StageT = __half;
+    static constexpr int kMaxQtiledHD = 512;
+    __device__ __forceinline__ static float stage(float v) { return __float2half(v); }
+    __device__ __forceinline__ static float load(StageT v) { return __half2float(v); }
+};
+
+struct StageFull {
+    using StageT = float;
+    static constexpr int kMaxQtiledHD = 128;
+    __device__ __forceinline__ static float stage(float v) { return v; }
+    __device__ __forceinline__ static float load(StageT v) { return v; }
+};
+
+struct DqFp32 : StageFull {
     static constexpr int kMinHeadDim = 16;
     template <int HEAD_DIM>
     __device__ __forceinline__ static size_t head_offset(int kv_h) {
@@ -68,7 +97,7 @@ struct DqFp32 {
     }
 };
 
-struct DqF16 {
+struct DqF16 : StageHalf {
     static constexpr int kMinHeadDim = 16;
     template <int HEAD_DIM>
     __device__ __forceinline__ static size_t head_offset(int kv_h) {
@@ -84,7 +113,7 @@ struct DqF16 {
 
 // Q8_0: 32-element blocks, each = fp16 d (2B) + int8 qs[32] (32B) = 34B.
 // Requires HEAD_DIM >= 32 (a head must hold at least one whole block).
-struct DqQ8_0 {
+struct DqQ8_0 : StageHalf {
     static constexpr int kMinHeadDim = 32;
     template <int HEAD_DIM>
     __device__ __forceinline__ static size_t head_offset(int kv_h) {
@@ -107,7 +136,7 @@ struct DqQ8_0 {
 
 // Q4_0: 32-element blocks, each = fp16 d (2B) + 16B nibble-packed (4b/element),
 // values stored as unsigned 4-bit minus 8. Requires HEAD_DIM >= 32.
-struct DqQ4_0 {
+struct DqQ4_0 : StageHalf {
     static constexpr int kMinHeadDim = 32;
     template <int HEAD_DIM>
     __device__ __forceinline__ static size_t head_offset(int kv_h) {
@@ -132,7 +161,7 @@ struct DqQ4_0 {
 
 // FP8 (E4M3 / E5M2): 1 byte/element, no block; per-(row, kv_head) fp32 scale.
 template <typename FMT>
-struct DqFp8 {
+struct DqFp8 : StageHalf {
     static constexpr int kMinHeadDim = 16;
     template <int HEAD_DIM>
     __device__ __forceinline__ static size_t head_offset(int kv_h) {
@@ -327,6 +356,346 @@ __global__ void fused_attn_tiled_prefill_kernel(
 }
 
 // =========================================================================
+// Query-TILED flash-attention PREFILL (v2) — the active high-perf FUSED path.
+//
+// Block = one head h x BLOCK_M query rows. Each K/V tile is staged into shared
+// memory ONCE and reused by all BLOCK_M query rows, removing the O(q_len *
+// num_heads) redundant KV re-reads that made the per-(qi,h) kernel the prefill
+// bottleneck. One warp = one query row; the 32 lanes hold HEAD_DIM/32 elements
+// of Q and of the FP32 running accumulator (occupancy stays high). K/V tiles
+// are dequantized (via the Dequant policy) and staged as __half. Causal and
+// explicit (non-causal) masks are both supported.
+// =========================================================================
+
+template <typename Dequant, bool PAGED, int HEAD_DIM, int BLOCK_M, int BLOCK_N>
+__global__ void fused_attn_qtiled_v2_kernel(
+    const float* __restrict__ Q, const uint8_t* __restrict__ K, const uint8_t* __restrict__ V,
+    float* __restrict__ O, int q_len, int kv_len, int num_heads, int num_kv_heads,
+    size_t row_bytes, const float* __restrict__ mask, bool causal,
+    void* const* k_pages, void* const* v_pages, const int32_t* page_ids, int page_size,
+    const float* k_scales, const float* v_scales) {
+    const int h = blockIdx.y;
+    if (h >= num_heads) return;
+    const int kv_groups = num_heads / num_kv_heads;
+    const int kv_h = h / kv_groups;
+
+    const int m0 = blockIdx.x * BLOCK_M;
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int qi = m0 + warp_id;
+    const bool active = (qi < q_len);
+
+    // Absolute KV position of this query (prefix-cache aware).
+    const int q_pos = kv_len - q_len + qi;
+    const float attn_scale = 1.0f / sqrtf((float)HEAD_DIM);
+
+    constexpr int DPT = HEAD_DIM / 32;   // dims per lane (HEAD_DIM multiple of 32)
+    const int base_d = lane * DPT;
+
+    __shared__ typename Dequant::StageT s_k[BLOCK_N * HEAD_DIM];
+    __shared__ typename Dequant::StageT s_v[BLOCK_N * HEAD_DIM];
+    __shared__ float s_q[BLOCK_M * HEAD_DIM];
+
+    // Cooperative Q load for this block's query tile.
+    for (int i = threadIdx.x; i < BLOCK_M * HEAD_DIM; i += blockDim.x) {
+        const int qrow = i / HEAD_DIM;
+        const int d = i % HEAD_DIM;
+        float val = 0.0f;
+        if (m0 + qrow < q_len) val = Q[(m0 + qrow) * num_heads * HEAD_DIM + h * HEAD_DIM + d];
+        s_q[i] = val;
+    }
+    __syncthreads();
+
+    float acc[DPT];
+#pragma unroll
+    for (int i = 0; i < DPT; ++i) acc[i] = 0.0f;
+
+    float m_g = -1e30f;
+    float l_g = 0.0f;
+
+    const KvView<Dequant, PAGED, HEAD_DIM> kv{
+        K, V, k_pages, v_pages, page_ids, page_size, row_bytes,
+        Dequant::template head_offset<HEAD_DIM>(kv_h), kv_h, num_kv_heads, k_scales, v_scales};
+
+    for (int t0 = 0; t0 < kv_len; t0 += BLOCK_N) {
+        const int tile_end = (t0 + BLOCK_N <= kv_len) ? BLOCK_N : (kv_len - t0);
+
+        // Stage K/V tile into shared memory (dequant -> half) once for the block.
+        for (int i = threadIdx.x; i < BLOCK_N * HEAD_DIM; i += blockDim.x) {
+            const int jj = i / HEAD_DIM;
+            const int d = i % HEAD_DIM;
+            if (jj < tile_end) {
+                const int j = t0 + jj;
+                const uint8_t* krow = kv.krow(j);
+                const uint8_t* vrow = kv.vrow(j);
+                s_k[jj * HEAD_DIM + d] = Dequant::stage(Dequant::deq<HEAD_DIM>(krow, d, j, kv_h, num_kv_heads, k_scales));
+                s_v[jj * HEAD_DIM + d] = Dequant::stage(Dequant::deq<HEAD_DIM>(vrow, d, j, kv_h, num_kv_heads, v_scales));
+            }
+        }
+        __syncthreads();
+
+        // Score for this lane's KV position.
+        float s_self = -1e30f;
+        if (active && lane < tile_end) {
+            const int j = t0 + lane;
+            bool skip = false;
+            float mval = 0.0f;
+            if (mask) {
+                mval = mask[qi * kv_len + j];
+                if (mval < -1e20f) skip = true;
+            } else if (causal && j > q_pos) {
+                skip = true;
+            }
+            if (!skip) {
+                // Full dot product Q[qi] · K[j] over all HEAD_DIM dims (Q and K
+                // both resident in shared). Each lane owns one KV position jj=lane.
+                float dot = 0.0f;
+                for (int d = 0; d < HEAD_DIM; ++d)
+                    dot += s_q[warp_id * HEAD_DIM + d] * Dequant::load(s_k[lane * HEAD_DIM + d]);
+                dot *= attn_scale;
+                if (mask) dot += mval;
+                s_self = dot;
+            }
+        }
+
+        const float m_tile = warp_reduce_max(s_self);
+        // Fully-masked tile: no contribution, but keep the SAME sync path (no
+        // early continue) to avoid cross-warp __syncthreads divergence.
+        const float w_self = (s_self > -1e29f && m_tile > -1e29f) ? expf(s_self - m_tile) : 0.0f;
+        const float l_tile = warp_reduce_sum(w_self);
+
+        const float m_new = fmaxf(m_g, m_tile);
+        const float rg = expf(m_g - m_new);
+        const float rt = (m_tile > -1e29f) ? expf(m_tile - m_new) : 0.0f;
+        l_g = l_g * rg + l_tile * rt;
+        m_g = m_new;
+#pragma unroll
+        for (int i = 0; i < DPT; ++i) acc[i] *= rg;
+
+        // P·V: gather every weight via warp shuffle (no shared-weight collision).
+        // Scale by rt = exp(m_tile - m_new) to fold this tile into the running
+        // max m_g (online softmax). Omitting rt over-weights later tiles.
+        for (int j = 0; j < tile_end; ++j) {
+            const float wj = rt * __shfl_sync(0xffffffff, w_self, j);
+            if (wj > 0.0f) {
+                const typename Dequant::StageT* vrow = &s_v[j * HEAD_DIM];
+#pragma unroll
+                for (int i = 0; i < DPT; ++i) acc[i] += wj * Dequant::load(vrow[base_d + i]);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (active) {
+        const float inv = (l_g > 0.0f) ? (1.0f / l_g) : 0.0f;
+        float* o_row = O + qi * num_heads * HEAD_DIM + h * HEAD_DIM;
+#pragma unroll
+        for (int i = 0; i < DPT; ++i) o_row[base_d + i] = acc[i] * inv;
+    }
+}
+
+// Per-case qtiled_v2 launch. enable_if keeps HD > DEQ::kMaxQtiledHD
+// instantiations (e.g. FP32-staged HD=256/512, over the 48KB static shared
+// limit) from compiling the kernel at all; the launcher's runtime guard never
+// reaches those cases.
+template <typename DEQ, bool PAGED, int HD, int BM, int BN,
+          typename std::enable_if<(HD <= DEQ::kMaxQtiledHD), int>::type = 0>
+static inline void qtiled_v2_case(const float* Q, const uint8_t* K, const uint8_t* V, float* O,
+                                  int q_len, int kv_len, int num_heads, int num_kv_heads,
+                                  size_t row_bytes, const float* mask, bool causal,
+                                  void* const* k_pages, void* const* v_pages,
+                                  const int32_t* page_ids, int page_size,
+                                  const float* k_scales, const float* v_scales, dim3 grid,
+                                  dim3 block, cudaStream_t stream) {
+    fused_attn_qtiled_v2_kernel<DEQ, PAGED, HD, BM, BN><<<grid, block, 0, stream>>>(
+        Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, row_bytes, mask, causal, k_pages,
+        v_pages, page_ids, page_size, k_scales, v_scales);
+}
+
+template <typename DEQ, bool PAGED, int HD, int BM, int BN,
+          typename std::enable_if<(HD > DEQ::kMaxQtiledHD), int>::type = 0>
+static inline void qtiled_v2_case(const float*, const uint8_t*, const uint8_t*, float*, int, int,
+                                  int, int, size_t, const float*, bool, void* const*,
+                                  void* const*, const int32_t*, int, const float*, const float*,
+                                  dim3, dim3, cudaStream_t) {
+    fprintf(stderr, "[ERROR] qtiled_v2: hd=%d exceeds staged shared budget (max %d)\n", HD,
+            DEQ::kMaxQtiledHD);
+}
+
+#define QTILED_V2_CASE(DEQ, PAGED, HD, BM, BN)                                                 \
+    qtiled_v2_case<DEQ, PAGED, HD, BM, BN>(                                                    \
+        Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, row_bytes, mask, causal, k_pages,  \
+        v_pages, page_ids, page_size, k_scales, v_scales, grid, block, stream)
+
+// Forward declaration so launch_qtiled can fall back to the original kernel.
+template <typename DEQ>
+static inline void launch_quant(const float* Q, const void* q_K, const void* q_V, float* O,
+                                int q_len, int kv_len, int num_heads, int num_kv_heads,
+                                int head_dim, size_t row_bytes, const float* mask, bool causal,
+                                const float* k_scales, const float* v_scales, cudaStream_t stream,
+                                const char* tag);
+
+// ---- Query-tiled (v2) contiguous launch (FUSED paths) ----
+template <typename DEQ>
+static inline void launch_qtiled(const float* Q, const void* q_K, const void* q_V, float* O,
+                                 int q_len, int kv_len, int num_heads, int num_kv_heads,
+                                 int head_dim, size_t row_bytes, const float* mask, bool causal,
+                                 const float* k_scales, const float* v_scales, cudaStream_t stream,
+                                 const char* tag) {
+    // HEAD_DIM must be a multiple of 32 and fit the staged shared-memory budget;
+    // otherwise fall back.
+    if (head_dim % 32 != 0 || head_dim > DEQ::kMaxQtiledHD) {
+        launch_quant<DEQ>(Q, q_K, q_V, O, q_len, kv_len, num_heads, num_kv_heads, head_dim,
+                          row_bytes, mask, causal, k_scales, v_scales, stream, tag);
+        return;
+    }
+    const uint8_t* K = reinterpret_cast<const uint8_t*>(q_K);
+    const uint8_t* V = reinterpret_cast<const uint8_t*>(q_V);
+    void* const* k_pages = nullptr;
+    void* const* v_pages = nullptr;
+    const int32_t* page_ids = nullptr;
+    const int page_size = 0;
+    int bm, bn;
+    if (head_dim <= 128) {
+        bm = 8;
+        bn = 32;
+    } else if (head_dim <= 256) {
+        bm = 4;
+        bn = 32;
+    } else {
+        bm = 2;
+        bn = 16;
+    }
+    dim3 grid((q_len + bm - 1) / bm, num_heads);
+    dim3 block(bm * 32);
+
+    switch (head_dim) {
+    case 32:  QTILED_V2_CASE(DEQ, false, 32,  8, 32); break;
+    case 64:  QTILED_V2_CASE(DEQ, false, 64,  8, 32); break;
+    case 96:  QTILED_V2_CASE(DEQ, false, 96,  8, 32); break;
+    case 128: QTILED_V2_CASE(DEQ, false, 128, 8, 32); break;
+    case 256: QTILED_V2_CASE(DEQ, false, 256, 4, 32); break;
+    case 512: QTILED_V2_CASE(DEQ, false, 512, 2, 16); break;
+    default:  launch_quant<DEQ>(Q, q_K, q_V, O, q_len, kv_len, num_heads, num_kv_heads, head_dim, row_bytes, mask, causal, k_scales, v_scales, stream, tag); break;
+    }
+
+    // Optional numeric self-check against the original (per-(qi,h)) kernel.
+    // O now holds the new kernel's output; we run the old kernel into Oref and
+    // compare. (This is purely a verification aid; it does not affect O.)
+    if (getenv("FORGE_QTILED_CHECK")) {
+        float* Oref = nullptr;
+        cudaMalloc(&Oref, (size_t)q_len * num_heads * head_dim * sizeof(float));
+        launch_quant<DEQ>(Q, q_K, q_V, Oref, q_len, kv_len, num_heads, num_kv_heads, head_dim,
+                          row_bytes, mask, causal, k_scales, v_scales, stream, tag);
+        float* h_new = (float*)malloc((size_t)q_len * num_heads * head_dim * sizeof(float));
+        float* h_ref = (float*)malloc((size_t)q_len * num_heads * head_dim * sizeof(float));
+        cudaMemcpy(h_new, O, (size_t)q_len * num_heads * head_dim * sizeof(float),
+                  cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_ref, Oref, (size_t)q_len * num_heads * head_dim * sizeof(float),
+                  cudaMemcpyDeviceToHost);
+        float maxerr = 0.0f, maxref = 0.0f;
+        const size_t n = (size_t)q_len * num_heads * head_dim;
+        for (size_t i = 0; i < n; ++i) {
+            maxerr = fmaxf(maxerr, fabsf(h_new[i] - h_ref[i]));
+            maxref = fmaxf(maxref, fabsf(h_ref[i]));
+        }
+        fprintf(stderr,
+                "[qtiled-check] %s hd=%d q=%d kv=%d max|new-ref|=%.3e max|ref|=%.3e rel=%.3e\n",
+                tag, head_dim, q_len, kv_len, maxerr, maxref,
+                maxref > 0.0f ? maxerr / maxref : 0.0f);
+        free(h_new);
+        free(h_ref);
+        cudaFree(Oref);
+    }
+}
+
+// Forward declaration (defined later, below launch_paged).
+template <typename DEQ>
+static inline void launch_paged(const float* Q, void* const* k_pages, void* const* v_pages,
+                                const int32_t* page_ids, float* O, int q_len, int kv_len,
+                                int num_heads, int num_kv_heads, int head_dim, int page_size,
+                                size_t row_bytes, const float* mask, bool causal,
+                                const float* k_scales, const float* v_scales,
+                                cudaStream_t stream, const char* tag);
+
+// =========================================================================
+// Query-tiled (v2) PAGED launch (FUSED paths, paged KV).
+// Mirrors launch_qtiled but resolves K/V through the page table: K/V base
+// pointers are unused (KvView::paged reads via k_pages/v_pages/page_ids).
+// This is the fix that makes the server's paged-KV prefill use the
+// query-tiled v2 kernel instead of the per-(qi,h) tiled kernel.
+// =========================================================================
+template <typename DEQ>
+static inline void launch_qtiled_paged(const float* Q, void* const* k_pages,
+                                       void* const* v_pages, const int32_t* page_ids,
+                                       float* O, int q_len, int kv_len, int num_heads,
+                                       int num_kv_heads, int head_dim, int page_size,
+                                       size_t row_bytes, const float* mask, bool causal,
+                                       const float* k_scales, const float* v_scales,
+                                       cudaStream_t stream, const char* tag) {
+    // HEAD_DIM must be a multiple of 32 and fit the staged shared-memory budget
+    // (float-staged FP32 KV caps at 128); otherwise fall back.
+    if (head_dim % 32 != 0 || head_dim > DEQ::kMaxQtiledHD) {
+        launch_paged<DEQ>(Q, k_pages, v_pages, page_ids, O, q_len, kv_len, num_heads,
+                          num_kv_heads, head_dim, page_size, row_bytes, mask, causal,
+                          k_scales, v_scales, stream, tag);
+        return;
+    }
+    const uint8_t* K = nullptr;  // unused when PAGED; KvView resolves via page table
+    const uint8_t* V = nullptr;
+    int bm, bn;
+    if (head_dim <= 128) {
+        bm = 8;
+        bn = 32;
+    } else if (head_dim <= 256) {
+        bm = 4;
+        bn = 32;
+    } else {
+        bm = 2;
+        bn = 16;
+    }
+    dim3 grid((q_len + bm - 1) / bm, num_heads);
+    dim3 block(bm * 32);
+
+    switch (head_dim) {
+    case 32:  QTILED_V2_CASE(DEQ, true, 32,  8, 32); break;
+    case 64:  QTILED_V2_CASE(DEQ, true, 64,  8, 32); break;
+    case 96:  QTILED_V2_CASE(DEQ, true, 96,  8, 32); break;
+    case 128: QTILED_V2_CASE(DEQ, true, 128, 8, 32); break;
+    case 256: QTILED_V2_CASE(DEQ, true, 256, 4, 32); break;
+    case 512: QTILED_V2_CASE(DEQ, true, 512, 2, 16); break;
+    default:  launch_paged<DEQ>(Q, k_pages, v_pages, page_ids, O, q_len, kv_len, num_heads, num_kv_heads, head_dim, page_size, row_bytes, mask, causal, k_scales, v_scales, stream, tag); break;
+    }
+
+    // Optional numeric self-check against the original paged (per-(qi,h)) kernel.
+    if (getenv("FORGE_QTILED_CHECK")) {
+        float* Oref = nullptr;
+        cudaMalloc(&Oref, (size_t)q_len * num_heads * head_dim * sizeof(float));
+        launch_paged<DEQ>(Q, k_pages, v_pages, page_ids, Oref, q_len, kv_len, num_heads,
+                          num_kv_heads, head_dim, page_size, row_bytes, mask, causal,
+                          k_scales, v_scales, stream, tag);
+        float* h_new = (float*)malloc((size_t)q_len * num_heads * head_dim * sizeof(float));
+        float* h_ref = (float*)malloc((size_t)q_len * num_heads * head_dim * sizeof(float));
+        cudaMemcpy(h_new, O, (size_t)q_len * num_heads * head_dim * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_ref, Oref, (size_t)q_len * num_heads * head_dim * sizeof(float), cudaMemcpyDeviceToHost);
+        float maxerr = 0.0f, maxref = 0.0f;
+        const size_t n = (size_t)q_len * num_heads * head_dim;
+        for (size_t i = 0; i < n; ++i) {
+            float d = h_new[i] - h_ref[i]; if (d < 0.0f) d = -d; if (d > maxerr) maxerr = d;
+            float r = h_ref[i]; if (r < 0.0f) r = -r; if (r > maxref) maxref = r;
+        }
+        fprintf(stderr,
+                "[qtiled-check-paged] %s hd=%d q=%d kv=%d max|new-ref|=%.3e max|ref|=%.3e rel=%.3e\n",
+                tag, head_dim, q_len, kv_len, maxerr, maxref,
+                maxref > 0.0f ? maxerr / maxref : 0.0f);
+        free(h_new);
+        free(h_ref);
+        cudaFree(Oref);
+    }
+}
+
+// =========================================================================
 // Launch helpers
 // =========================================================================
 
@@ -450,16 +819,26 @@ void launch_fused_flash_attention_gqa_prefill_fp32(const float* Q, const float* 
               int num_kv_heads, int head_dim, int page_size, size_t row_bytes,                 \
               const float* mask, bool causal, const float* k_scales, const float* v_scales,    \
               cudaStream_t stream) {                                                           \
-        launch_paged<DEQ>(Q, k_pages, v_pages, page_ids, O, q_len, kv_len, num_heads,          \
-                          num_kv_heads, head_dim, page_size, row_bytes, mask, causal,          \
-                          k_scales, v_scales, stream, TAG);                                    \
+        launch_qtiled_paged<DEQ>(Q, k_pages, v_pages, page_ids, O, q_len, kv_len, num_heads,   \
+                                 num_kv_heads, head_dim, page_size, row_bytes, mask, causal,    \
+                                 k_scales, v_scales, stream, TAG);                               \
     }
 
-DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q4_0, DqQ4_0, "q4_0")
-DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_f16, DqF16, "f16")
-DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q8_0, DqQ8_0, "q8_0")
-DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e4m3, DqFp8<Fp8E4M3>, "fp8_e4m3")
-DEFINE_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e5m2, DqFp8<Fp8E5M2>, "fp8_e5m2")
+// FUSED (contiguous) prefill paths now route to the query-tiled v2 kernel.
+#define DEFINE_QUANT_PREFILL_QTILED(NAME, DEQ, TAG)                                             \
+    void NAME(const float* Q, const void* q_K, const void* q_V, float* O, int q_len, int kv_len, \
+              int num_heads, int num_kv_heads, int head_dim, size_t row_bytes,                 \
+              const float* mask, bool causal, const float* k_scales, const float* v_scales,    \
+              cudaStream_t stream) {                                                              \
+        launch_qtiled<DEQ>(Q, q_K, q_V, O, q_len, kv_len, num_heads, num_kv_heads, head_dim,   \
+                           row_bytes, mask, causal, k_scales, v_scales, stream, TAG);            \
+    }
+
+DEFINE_QUANT_PREFILL_QTILED(launch_fused_flash_attention_gqa_prefill_q4_0, DqQ4_0, "q4_0")
+DEFINE_QUANT_PREFILL_QTILED(launch_fused_flash_attention_gqa_prefill_f16, DqF16, "f16")
+DEFINE_QUANT_PREFILL_QTILED(launch_fused_flash_attention_gqa_prefill_q8_0, DqQ8_0, "q8_0")
+DEFINE_QUANT_PREFILL_QTILED(launch_fused_flash_attention_gqa_prefill_fp8_e4m3, DqFp8<Fp8E4M3>, "fp8_e4m3")
+DEFINE_QUANT_PREFILL_QTILED(launch_fused_flash_attention_gqa_prefill_fp8_e5m2, DqFp8<Fp8E5M2>, "fp8_e5m2")
 
 // Paged FP32: previously the only paged KV layout that materialized; the tiled
 // kernel reads FP32 pages directly through the page table.

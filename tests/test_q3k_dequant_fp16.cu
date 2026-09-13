@@ -210,23 +210,40 @@ static void test_tc_gemm_parity() {
     cudaFree(d_c);
 }
 
-// ---- 3. KernelSelector keeps Q3_K on MMQ -----------------------------------
+// ---- 3. KernelSelector wiring: Q3_K MMQ below the TC threshold, TC above ---
 
 static void test_selector_wiring() {
-    // Regression lock: Q3_K must stay on the SIMT dp4a MMQ path. The
-    // TensorCore route is available (check 2) but measured 3.2x slower on
-    // sm_89, so a well-meant whitelist addition must not slip back in.
+    // Regression lock (Phase 6-MMQ contract): the M==1 decode route stays on
+    // dp4a GEMV, small-M prefill stays on MMQ, and prefill at/above
+    // tc_min_m(Q3_K)=256 dequantizes to FP16 once and runs the cuBLAS TC GEMM
+    // (the old 3.2x-slower measurement was decode-shaped M==1 and does not
+    // apply at prefill M). Both sides of the threshold are locked.
     forge::KernelProblem p;
     p.domain = forge::KernelDomain::MatMul;
     p.dtype = forge::DataType::Q3_K;
-    p.M = 256;
     p.K = 512;
     p.N = 512;
     p.sm_arch = 89;
-    const forge::KernelVariant variant = forge::select_kernel(p);
-    std::printf("  selector: Q3_K M=256 -> variant=%d (MMQ=%d)\n", static_cast<int>(variant),
+
+    p.M = 1;
+    const forge::KernelVariant gemv = forge::select_kernel(p);
+    std::printf("  selector: Q3_K M=1 -> variant=%d\n", static_cast<int>(gemv));
+    check(gemv != forge::KernelVariant::MMQ_TENSORCORE,
+          "Q3_K decode (M==1) never routes to TensorCore");
+
+    p.M = 128;
+    const forge::KernelVariant small_m = forge::select_kernel(p);
+    std::printf("  selector: Q3_K M=128 -> variant=%d (MMQ=%d)\n", static_cast<int>(small_m),
                 static_cast<int>(forge::KernelVariant::MMQ));
-    check(variant == forge::KernelVariant::MMQ, "Q3_K prefill stays on MMQ (not TensorCore)");
+    check(small_m == forge::KernelVariant::MMQ,
+          "Q3_K small-M prefill stays on MMQ (below tc_min_m=256)");
+
+    p.M = 256;
+    const forge::KernelVariant prefill = forge::select_kernel(p);
+    std::printf("  selector: Q3_K M=256 -> variant=%d (MMQ_TENSORCORE=%d)\n",
+                static_cast<int>(prefill), static_cast<int>(forge::KernelVariant::MMQ_TENSORCORE));
+    check(prefill == forge::KernelVariant::MMQ_TENSORCORE,
+          "Q3_K prefill at M>=tc_min_m=256 routes to TensorCore");
 }
 
 int main() {

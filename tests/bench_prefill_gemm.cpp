@@ -308,12 +308,12 @@ static int run_gpu(int iters, bool large) {
     // "large") traces the TC-vs-dp4a curve past the threshold plateau for all
     // five auto-rule dtypes.
     static constexpr int MAX_M = 16;
-    const DataType types_def[] = {DataType::Q4_K, DataType::Q4_0, DataType::Q8_0, DataType::Q6_K,
-                                  DataType::Q5_K};
+    const DataType types_def[] = {DataType::Q4_K, DataType::Q4_0, DataType::Q8_0,
+                                  DataType::Q6_K, DataType::Q5_K};
     const char* names_def[] = {"Q4_K", "Q4_0", "Q8_0", "Q6_K", "Q5_K"};
     const int Ms_def[] = {8, 26, 32, 64, 96, 112, 128, 144, 160, 200};
-    const DataType types_lg[] = {DataType::Q4_K, DataType::Q4_0, DataType::Q8_0, DataType::Q6_K,
-                                 DataType::Q5_K};
+    const DataType types_lg[] = {DataType::Q4_K, DataType::Q4_0, DataType::Q8_0,
+                                 DataType::Q6_K, DataType::Q5_K};
     const char* names_lg[] = {"Q4_K", "Q4_0", "Q8_0", "Q6_K", "Q5_K"};
     const int Ms_lg[] = {128, 256, 384, 512, 768, 1024};
     const DataType* types = large ? types_lg : types_def;
