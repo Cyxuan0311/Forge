@@ -39,6 +39,7 @@ struct CliArgs {
     int n_predict = -1;
     std::string kv_cache_dtype = "fp32";
     bool cuda_graph = false;  // Phase 10: CUDA Graph for decode
+    bool paged_kv = false;    // Use paged KV cache storage (default: contiguous)
 
     // Memory / load tuning
     std::string load_mode;          // "mmap" (default), "mlock", "mmap_mlock"

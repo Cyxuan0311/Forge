@@ -24,6 +24,7 @@ namespace fsrv = forge;
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
+#    include "forge/cuda_kernels.h"
 #endif
 
 namespace {
@@ -57,6 +58,10 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             opt.kv_cache_dtype = value_of(i, "--kv-cache-dtype");
         } else if (arg == "--cuda-graph") {
             opt.cuda_graph = true;
+        } else if (arg == "--paged-kv") {
+            opt.paged_kv = true;
+        } else if (arg == "--dequant-cache-mb") {
+            opt.dequant_cache_mb = std::stol(value_of(i, "--dequant-cache-mb"));
         } else if (arg == "--load-mode") {
             opt.load_mode = value_of(i, "--load-mode");
         } else if (arg == "--api-key") {
@@ -82,6 +87,10 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "  -t, --threads N         CPU threads (default: auto)\n"
                 << "      --kv-cache-dtype T  fp32 | f16 | q8_0 | q4_0 (default: fp32)\n"
                 << "      --cuda-graph        Enable CUDA Graph for decode\n"
+                << "      --paged-kv          Use paged KV cache storage (default: off)\n"
+                << "      --dequant-cache-mb MB  Per-weight FP16 dequant cache budget in MB\n"
+                << "                          (default 1024; 0 disables the cache; env\n"
+                << "                          FORGE_DEQUANT_CACHE_MB also honored)\n"
                 << "      --load-mode MODE    mmap | mlock | mmap_mlock (default: mmap)\n"
                 << "      --api-key KEY       Require 'Authorization: Bearer KEY' (default: off)\n"
                 << "      --max-inflight N    Max queued inference requests (default: 4,\n"
@@ -117,6 +126,15 @@ void handle_signal(int) {
 
 int main(int argc, char** argv) {
     fsrv::ServerOptions opt = parse_args(argc, argv);
+
+#ifdef USE_CUDA
+    // Apply the dequant-cache budget before any weight is loaded/used, so the
+    // very first launch_cublas_gemm_quant_fp16 call honors --dequant-cache-mb
+    // (or falls back to FORGE_DEQUANT_CACHE_MB env / 1024 MB default).
+    if (opt.dequant_cache_mb >= 0) {
+        forge::cuda::set_dequant_cache_budget_mb(opt.dequant_cache_mb);
+    }
+#endif
 
     fsrv::ServerState state;
     std::string error;

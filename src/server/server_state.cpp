@@ -141,6 +141,10 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         std::cout << "CPU threads auto-detected: " << t << "\n";
     }
 
+    if (opt.paged_kv) {
+        ctx_->params_mut().kv_storage_mode = KVStorageMode::Paged;
+        std::cout << "Paged KV cache storage enabled\n";
+    }
     auto engine = EngineRegistry::instance().create(cfg.arch_type, *model_, *ctx_);
     if (!engine) {
         error = "No matching engine for architecture: " + cfg.arch_type;

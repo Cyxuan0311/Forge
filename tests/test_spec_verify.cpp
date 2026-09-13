@@ -300,7 +300,10 @@ static std::vector<float> forward_rows(InferenceEngine* engine,
         std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{(int64_t)tokens.size()},
                                  DeviceType::CPU);
     std::memcpy(ids->data(), tokens.data(), tokens.size() * sizeof(int32_t));
-    auto logits = engine->forward_request(ForwardRequest::from_ids(ids, pos));
+    // Mirror SpeculativeExecutor::verify: this helper needs every row.
+    auto req = ForwardRequest::from_ids(ids, pos);
+    req.return_all_logits = true;
+    auto logits = engine->forward_request(req);
     if (!logits || logits->ndim() < 2) return {};
     logits->to_device(DeviceType::CPU);
     int vocab = static_cast<int>(logits->shape()[1]);

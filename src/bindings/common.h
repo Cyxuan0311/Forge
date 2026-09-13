@@ -274,7 +274,10 @@ public:
         if (!engine)
             throw std::runtime_error("No inference engine available");
 
-        auto logits = engine->forward_request(ForwardRequest::from_ids(ids_tensor, start_pos));
+        // Keep the historical full-logits contract for the Python surface.
+        auto req = ForwardRequest::from_ids(ids_tensor, start_pos);
+        req.return_all_logits = true;
+        auto logits = engine->forward_request(req);
         return tensor_to_numpy(logits);
     }
 
@@ -300,7 +303,10 @@ public:
         if (!engine)
             throw std::runtime_error("No inference engine available");
 
-        auto logits = engine->forward_request(ForwardRequest::from_ids(ids_tensor, start_pos));
+        // Keep the historical full-logits contract for the Python surface.
+        auto req = ForwardRequest::from_ids(ids_tensor, start_pos);
+        req.return_all_logits = true;
+        auto logits = engine->forward_request(req);
 
         SamplerConfig sampler_cfg;
         sampler_cfg.temperature = temperature;

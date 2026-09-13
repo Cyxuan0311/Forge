@@ -33,6 +33,7 @@ static void print_usage(const char* prog) {
            "  -b,  --batch-size N        Prompt processing batch size (default: 512)\n"
            "       --kv-cache-dtype TYPE KV cache dtype: fp32, f16, q8_0, q4_0 (default: fp32)\n"
            "       --cuda-graph          Enable CUDA Graph for decode (default: off)\n"
+           "       --paged-kv            Use paged KV cache storage (default: off, contiguous)\n"
            "\n"
            "Memory:\n"
             "       --load-mode MODE      Memory mapping mode: mmap (default), mlock, mmap_mlock\n"
@@ -266,6 +267,8 @@ CliArgs parse_args(int argc, char** argv) {
             args.system_prompt = argv[i];
         } else if (arg == "--cuda-graph") {
             args.cuda_graph = true;
+        } else if (arg == "--paged-kv") {
+            args.paged_kv = true;
         } else if (arg == "--load-mode") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";

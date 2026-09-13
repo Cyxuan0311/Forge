@@ -206,7 +206,12 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     TensorPtr logits_all;
     {
         PERF_SCOPE("speculative/verify_forward");
-        logits_all = engine->forward_request(ForwardRequest::from_ids(input_ids, in.pos));
+        // Verify consumes one logits row per draft token (+1 for resample);
+        // opt in explicitly instead of relying on the engine returning the
+        // full [n_tokens, vocab] buffer by default.
+        auto verify_req = ForwardRequest::from_ids(input_ids, in.pos);
+        verify_req.return_all_logits = true;
+        logits_all = engine->forward_request(verify_req);
     }
 
     if (!logits_all || logits_all->ndim() < 2 || logits_all->shape()[0] < n_rows) {

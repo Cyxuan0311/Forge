@@ -43,6 +43,11 @@ struct ServerOptions {
     int threads = -1;  // -1 = auto (probe fused GEMV on CPU, full GPU offload untouched)
     std::string kv_cache_dtype = "fp32";  // fp32 | f16 | q8_0 | q4_0
     bool cuda_graph = false;
+    bool paged_kv = false;  // Use paged KV cache storage (default: contiguous)
+    // Budget (MB) for the per-weight FP16 dequant cache used by the TensorCore
+    // matmul path. -1 = default (1024 MB); 0 = cache disabled (callers fall
+    // back to transient scratch); >0 = explicit budget.
+    long dequant_cache_mb = -1;
     std::string load_mode;   // "" = default (mmap)
     std::string api_key;     // "" = no auth; otherwise "Authorization: Bearer <key>" required
     int max_inflight = 4;    // max queued inference requests (excess -> 429)

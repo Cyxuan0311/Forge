@@ -182,12 +182,9 @@ RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seq
     : model_(model), ctx_(model), sampler_(SamplerConfig{}), max_num_seqs_(max_num_seqs) {
     (void)block_size;  // block_size no longer needed with engine KVCache
 
-    // Check for paged storage mode (same env var as PyModel::create_context).
-    const char* storage_mode_env = std::getenv("FORGE_KV_STORAGE_MODE");
-    if (storage_mode_env && std::string(storage_mode_env) == "paged") {
-        ctx_.params_mut().kv_storage_mode = KVStorageMode::Paged;
-        paged_mode_ = true;
-    }
+    // Paged mode is selected via the InferenceContext param, set from the
+    // --paged-kv CLI flag (or Python API) before the scheduler is constructed.
+    paged_mode_ = (ctx_.params().kv_storage_mode == KVStorageMode::Paged);
 
     auto engine = EngineRegistry::instance().create(model_.config().arch_type, model_, ctx_);
     if (engine) {

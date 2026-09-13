@@ -129,7 +129,13 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
 
         auto logits = engine->forward_request(ForwardRequest::from_ids(input_ids, prefix_len));
 
-        auto last_logits = std::make_shared<Tensor>(logits->slice(0, fwd_len - 1, fwd_len));
+        // The engine may return sparse logits ([1, vocab]: prefill projects only
+        // the final row) or the legacy full [fwd_len, vocab] buffer; the row we
+        // sample from is the last one either way. Slicing with fwd_len-1 here
+        // used to read past the end of the sparse buffer (garbage token / SEGV).
+        const int64_t logits_rows = logits->shape()[0];
+        auto last_logits =
+            std::make_shared<Tensor>(logits->slice(0, logits_rows - 1, logits_rows));
 
         {
             PERF_SCOPE("generator/prefill_sampler");

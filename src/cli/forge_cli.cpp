@@ -32,6 +32,7 @@
 #include "forge/inference/forward_request.h"
 #include "forge/kv_cache.h"
 #include "forge/logger.h"
+
 #include "forge/model.h"
 #include "forge/perf_profiler.h"
 #include "forge/tensor.h"
@@ -516,6 +517,10 @@ int main(int argc, char** argv) {
         ctx.params_mut().n_threads = t;
         ctx.params_mut().n_threads_batch = t;
         std::cout << "CPU threads auto-detected: " << t << "\n";
+    }
+    if (args.paged_kv) {
+        ctx.params_mut().kv_storage_mode = KVStorageMode::Paged;
+        std::cout << "Paged KV cache storage enabled\n";
     }
     auto engine = EngineRegistry::instance().create(cfg.arch_type, model, ctx);
     if (!engine) {
