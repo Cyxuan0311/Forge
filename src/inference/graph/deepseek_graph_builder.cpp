@@ -301,14 +301,15 @@ int DeepSeekGraphBuilder::build_mla_layer(const GraphBuildContext& bctx) {
 }
 
 int DeepSeekGraphBuilder::build_output(ComputeGraph& graph, int hidden_idx,
-                                       const ModelWeights& weights, const ModelConfig& cfg) {
+                                       const ModelWeights& weights, const ModelConfig& cfg,
+                                       DeviceType dev) {
     int32_t eps_params[OP_PARAMS_MAX_SIZE / sizeof(int32_t)] = {};
     float out_eps = cfg.rms_norm_eps;
     std::memcpy(eps_params, &out_eps, sizeof(float));
 
     int out_norm_w_idx = graph.add_input(weights.output_norm);
-    int norm_idx =
-        graph.add_node("output_norm", OpType::RMS_NORM, {ref(hidden_idx), out_norm_w_idx}, eps_params);
+    int norm_idx = graph.add_node("output_norm", OpType::RMS_NORM,
+                                  {ref(hidden_idx), out_norm_w_idx}, eps_params, dev);
 
     auto output_weight = weights.output_weight;
     if (!output_weight && cfg.tie_embeddings) {
@@ -316,7 +317,7 @@ int DeepSeekGraphBuilder::build_output(ComputeGraph& graph, int hidden_idx,
     }
     int out_w_idx = graph.add_input(output_weight);
     return graph.add_node("output_proj", OpType::MUL_MAT_TRANSB, {ref(norm_idx), out_w_idx},
-                          nullptr);
+                          nullptr, dev);
 }
 
 }  // namespace forge

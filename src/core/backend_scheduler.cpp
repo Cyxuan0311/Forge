@@ -36,6 +36,18 @@ size_t BackendScheduler::estimate_node_size(const GraphNode& node) {
     return 0;
 }
 
+namespace {
+// Map a DeviceType to its index in the device list (first match). Falls back to
+// device 0 when the requested type is unavailable.
+int device_index_for_type(const std::vector<DeviceInfo>& devices, DeviceType want) {
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (devices[i].type == want)
+            return static_cast<int>(i);
+    }
+    return 0;
+}
+}  // namespace
+
 std::vector<int> BackendScheduler::greedy_assign(const ComputeGraph& graph,
                                                  const std::vector<DeviceInfo>& devices,
                                                  std::vector<size_t>& node_sizes) {
@@ -82,8 +94,14 @@ std::vector<int> BackendScheduler::greedy_assign(const ComputeGraph& graph,
     // Assign each node to best device
     for (int node_idx : order) {
         if (node_sizes[node_idx] == 0) {
-            // Small/unknown-sized nodes: keep on CPU by default
-            assignments[node_idx] = 0;
+            // Size unknown at schedule time: resolved_inputs are only populated at
+            // execute time, so estimate_node_size() cannot see them here. Preserve
+            // the builder-assigned device (e.g. CUDA for GPU-offloaded layers)
+            // instead of forcing CPU (device 0). Forcing GPU-resident weights onto
+            // the CPU kernel crashes (GPU pointer dereferenced from CPU) and is
+            // slower than the imperative path.
+            assignments[node_idx] =
+                device_index_for_type(devices, graph.node(node_idx).device);
             continue;
         }
         assignments[node_idx] = pick_device(node_idx, assignments, node_sizes, devices,

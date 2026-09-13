@@ -13,7 +13,7 @@ public:
     int build_layer(const GraphBuildContext& bctx) override;
 
     int build_output(ComputeGraph& graph, int hidden_idx, const ModelWeights& weights,
-                     const ModelConfig& cfg) override;
+                     const ModelConfig& cfg, DeviceType dev) override;
 
 private:
     int build_full_attn_layer(const GraphBuildContext& bctx);

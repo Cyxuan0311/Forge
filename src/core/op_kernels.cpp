@@ -464,19 +464,41 @@ void rope_kernel_dst(const std::vector<TensorPtr>& inputs, TensorPtr dst, const 
     int is_q = params[0];
     int num_h = params[1];
     int head_dim = params[2];
-    int seq_len = params[3];
+    // 6-A-fix: derive seq_len from the actual tensor, NOT params[3]. The builder
+    // packs bctx.seq_len (the max context window) into params[3], but at decode
+    // time the input holds only 1 token. Using the max context to size the launch
+    // grid overflows the 1D grid dimension limit (cudaErrorInvalidConfiguration)
+    // and reads OOB. Match ops::rope, which uses x->shape()[0] (= real token count).
+    int seq_len = static_cast<int>(x->shape()[0]);
     int64_t start_pos;
     std::memcpy(&start_pos, params + 4, sizeof(int64_t));
     float rope_theta;
     std::memcpy(&rope_theta, params + 6, sizeof(float));
+#ifdef USE_CUDA
+    {
+        static const bool dbg = (std::getenv("FORGE_DEBUG_ROPE") != nullptr);
+        if (dbg) {
+            std::string shp;
+            for (size_t d = 0; d < x->shape().size(); ++d) {
+                shp += std::to_string(x->shape()[d]);
+                if (d + 1 < x->shape().size()) shp += ",";
+            }
+            fprintf(stderr, "[rope_dbg] is_q=%d x_shape=[%s] params[3]=%d num_h=%d head_dim=%d start_pos=%lld\n",
+                    is_q, shp.c_str(), params[3], num_h, head_dim, (long long)start_pos);
+        }
+    }
+#endif
     DeviceType dev = (params[9] == 1) ? DeviceType::CUDA : DeviceType::CPU;
 
     if (dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
         if (is_q) {
-            cuda::launch_rope_gqa(static_cast<const float*>(x->data()), nullptr, nullptr,
-                                  static_cast<float*>(dst->data()), num_h, 0, head_dim,
-                                  seq_len, start_pos, rope_theta, stream);
+            // 6-A-fix: q-path must write to dst (q_out=dst, k_out=nullptr). The
+            // previous (x, nullptr, nullptr, dst, ...) passed q_out=nullptr, so the
+            // q kernel wrote through a null pointer -> cudaErrorIllegalAddress.
+            cuda::launch_rope_gqa(static_cast<const float*>(x->data()), nullptr,
+                                  static_cast<float*>(dst->data()), nullptr, num_h, 0,
+                                  head_dim, seq_len, start_pos, rope_theta, stream);
         } else {
             cuda::launch_rope_gqa(nullptr, static_cast<const float*>(x->data()), nullptr,
                                   static_cast<float*>(dst->data()), 0, num_h, head_dim, seq_len,

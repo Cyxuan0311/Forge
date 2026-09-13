@@ -34,9 +34,14 @@ public:
     // Subclasses can override for true batched computation.
     virtual TensorPtr forward_batch(const InferenceBatch& batch);
 
-    virtual TensorPtr forward_from_hidden(const TensorPtr& hidden, int64_t start_pos) {
+    // return_all_logits: when false, engines may return only the final
+    // position's logits row (sparse-logits prefill). Default true keeps the
+    // historical full [seq, vocab] contract for hidden-state callers.
+    virtual TensorPtr forward_from_hidden(const TensorPtr& hidden, int64_t start_pos,
+                                          bool return_all_logits = true) {
         (void)hidden;
         (void)start_pos;
+        (void)return_all_logits;
         throw std::runtime_error("forward_from_hidden not implemented for this engine");
     }
     // Post-final-norm hidden state from the most recent forward_request

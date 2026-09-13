@@ -171,13 +171,14 @@ int Qwen35GraphBuilder::build_linear_attn_layer(const GraphBuildContext& bctx) {
 }
 
 int Qwen35GraphBuilder::build_output(ComputeGraph& graph, int hidden_idx,
-                                     const ModelWeights& weights, const ModelConfig& cfg) {
+                                     const ModelWeights& weights, const ModelConfig& cfg,
+                                     DeviceType dev) {
     int out_norm_w_idx = graph.add_input(weights.output_norm);
     float out_eps = cfg.rms_norm_eps;
     int32_t out_eps_params[OP_PARAMS_MAX_SIZE / sizeof(int32_t)] = {};
     std::memcpy(out_eps_params, &out_eps, sizeof(float));
     int norm_idx = graph.add_node("output_norm", OpType::RMS_NORM, {ref(hidden_idx), out_norm_w_idx},
-                                  out_eps_params);
+                                  out_eps_params, dev);
 
     auto output_weight = weights.output_weight;
     if (!output_weight && cfg.tie_embeddings) {
@@ -185,7 +186,7 @@ int Qwen35GraphBuilder::build_output(ComputeGraph& graph, int hidden_idx,
     }
     int out_w_idx = graph.add_input(output_weight);
     return graph.add_node("output_proj", OpType::MUL_MAT_TRANSB, {ref(norm_idx), out_w_idx},
-                          nullptr);
+                          nullptr, dev);
 }
 
 }  // namespace forge

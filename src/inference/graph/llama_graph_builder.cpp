@@ -95,9 +95,12 @@ int LlamaGraphBuilder::build_layer(const GraphBuildContext& bctx) {
             const std::vector<TensorPtr>& inputs) -> TensorPtr {
             kv_cache.update(layer_idx, runtime->seq_id, runtime->start_pos, inputs[0], inputs[1],
                             seq_len);
-            if (kv_cache.kv_dtype() == KVCacheDType::Q4_0) {
-                kv_cache.dequantize_layer(layer_idx);
-            }
+            // 6-A-fix: dequantize for ANY non-FP32 KV cache dtype (FP16, Q8_0, Q4_0, ...),
+            // not just Q4_0. get_key_filled/get_value_filled return the FP32 dequantized
+            // tensor which is only created here; for FP16 it was never allocated -> the
+            // get_k/get_v lambdas dereferenced a null tensor and segfaulted. dequantize_layer
+            // early-returns for FP32, so calling it unconditionally is safe.
+            kv_cache.dequantize_layer(layer_idx);
             return std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1}, dev);
         },
         dev);
@@ -294,13 +297,14 @@ int LlamaGraphBuilder::build_layer(const GraphBuildContext& bctx) {
 }
 
 int LlamaGraphBuilder::build_output(ComputeGraph& graph, int hidden_idx,
-                                    const ModelWeights& weights, const ModelConfig& cfg) {
+                                    const ModelWeights& weights, const ModelConfig& cfg,
+                                    DeviceType dev) {
     int out_norm_w_idx = graph.add_input(weights.output_norm);
     float out_eps = cfg.rms_norm_eps;
     int32_t out_eps_params[OP_PARAMS_MAX_SIZE / sizeof(int32_t)] = {};
     std::memcpy(out_eps_params, &out_eps, sizeof(float));
     int norm_idx = graph.add_node("output_norm", OpType::RMS_NORM, {ref(hidden_idx), out_norm_w_idx},
-                                  out_eps_params);
+                                  out_eps_params, dev);
 
     return graph.add_node(
         "output_proj", "mul_mat_transB", {ref(norm_idx)},
@@ -323,7 +327,8 @@ int LlamaGraphBuilder::build_output(ComputeGraph& graph, int hidden_idx,
                 return logits;
             }
             return ops::matmul_transB(inputs[0], output_weight);
-        });
+        },
+        dev);
 }
 
 }  // namespace forge

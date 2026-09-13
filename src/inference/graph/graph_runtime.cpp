@@ -66,7 +66,12 @@ void GraphRuntime::build(const TensorPtr& hidden, const ModelConfig& cfg, ModelW
         cur_idx = builder_->build_layer(bctx);
     }
 
-    int output_idx = builder_->build_output(*graph_, cur_idx, weights, cfg);
+    // 输出段跟随最后一层设备: hidden 已驻留该设备, 落到别处会引入跨设备拷贝,
+    // 且 CPU output_norm 会直接解引用 GPU 权重指针 (segmentation fault)。
+    DeviceType out_dev = (!layer_devices.empty())
+                             ? layer_devices.back().type
+                             : default_device;
+    int output_idx = builder_->build_output(*graph_, cur_idx, weights, cfg, out_dev);
     (void)output_idx;
 
     BackendScheduler scheduler;

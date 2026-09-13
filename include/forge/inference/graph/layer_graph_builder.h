@@ -60,9 +60,11 @@ public:
     // 返回本层输出节点在图中的下标。
     virtual int build_layer(const GraphBuildContext& bctx) = 0;
 
-    // 输出头(output norm + projection)。不涉及运行期状态, 保持简单签名。
+    // 输出头(output norm + projection)。不涉及运行期状态。
+    // dev: 输出段设备, 调用方传最后一层的设备——hidden 已驻留该设备, 把输出段
+    // 落到别处(如默认 CPU)会插入跨设备拷贝并让 CPU kernel 读到 GPU 权重指针。
     virtual int build_output(ComputeGraph& graph, int hidden_idx, const ModelWeights& weights,
-                            const ModelConfig& cfg) = 0;
+                            const ModelConfig& cfg, DeviceType dev) = 0;
 };
 
 // 显式创建内建 graph builder。返回 nullptr 表示该架构不支持 graph 执行。

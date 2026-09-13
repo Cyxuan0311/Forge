@@ -229,7 +229,69 @@ TensorPtr ComputeGraph::execute(cudaStream_t stream) {
         }
     }
 
-    for (int i = 0; i < static_cast<int>(nodes_.size()); ++i) {
+    // 6-A-fix: insert_copy_nodes() appends cross-device copy nodes at the END of the
+    // node list and rewires their consumers to reference them. Linear index order is
+    // then no longer topological: a consumer at index i can depend on a copy node at
+    // index > i, which has not executed yet when the consumer resolves its inputs
+    // (null deref at resolved_inputs[0]->dtype()). Detect forward references and, if
+    // present, execute in topological order instead. Nodes are NOT moved (external
+    // index users like start_pos_slots_ stay valid); only the iteration order changes.
+    std::vector<int> exec_order(static_cast<int>(nodes_.size()));
+    {
+        bool forward_ref = false;
+        for (int i = 0; i < static_cast<int>(nodes_.size()) && !forward_ref; ++i) {
+            for (int idx : nodes_[i].input_indices) {
+                if (idx < 0 && (-idx - 1) > i) {
+                    forward_ref = true;
+                    break;
+                }
+            }
+        }
+        if (!forward_ref) {
+            for (int i = 0; i < static_cast<int>(nodes_.size()); ++i)
+                exec_order[i] = i;
+        } else {
+            // Kahn's algorithm; stable (index-ascending) among ready nodes.
+            std::vector<int> indegree(static_cast<int>(nodes_.size()), 0);
+            std::vector<std::vector<int>> consumers(static_cast<int>(nodes_.size()));
+            for (int i = 0; i < static_cast<int>(nodes_.size()); ++i) {
+                for (int idx : nodes_[i].input_indices) {
+                    if (idx < 0) {
+                        int p = -idx - 1;
+                        if (p >= 0 && p < static_cast<int>(nodes_.size())) {
+                            indegree[i]++;
+                            consumers[p].push_back(i);
+                        }
+                    }
+                }
+            }
+            std::vector<int> ready;
+            for (int i = 0; i < static_cast<int>(nodes_.size()); ++i)
+                if (indegree[i] == 0)
+                    ready.push_back(i);
+            size_t head = 0;
+            int out = 0;
+            while (head < ready.size()) {
+                int i = ready[head++];
+                exec_order[out++] = i;
+                for (int c : consumers[i])
+                    if (--indegree[c] == 0)
+                        ready.push_back(c);
+            }
+            // Cycle/unreachable fallback: fill remaining nodes in index order
+            // (should never happen for a DAG; defensive only).
+            if (out < static_cast<int>(nodes_.size())) {
+                std::vector<char> placed(static_cast<int>(nodes_.size()), 0);
+                for (int k = 0; k < out; ++k)
+                    placed[exec_order[k]] = 1;
+                for (int i = 0; i < static_cast<int>(nodes_.size()); ++i)
+                    if (!placed[i])
+                        exec_order[out++] = i;
+            }
+        }
+    }
+
+    for (int i : exec_order) {
         auto& node = nodes_[i];
         bool use_dst = false;
 
@@ -258,9 +320,26 @@ TensorPtr ComputeGraph::execute(cudaStream_t stream) {
             node.resolved_inputs.push_back(input_tensor);
         }
 
+        {
+            static const bool trace = (std::getenv("FORGE_NODE_TRACE") != nullptr);
+            if (trace) {
+                std::string ptrs;
+                for (auto& t : node.resolved_inputs)
+                    ptrs += " " + (t ? std::to_string(reinterpret_cast<uintptr_t>(t->data())) : std::string("NULL"));
+                std::string idxs;
+                for (int idx : node.input_indices)
+                    idxs += " " + std::to_string(idx);
+                fprintf(stderr, "[node %d] %s op=%d inputs=%zu idxs=[%s ] ptrs=[%s ]\n", i,
+                        node.name.c_str(), static_cast<int>(node.op_type),
+                        node.resolved_inputs.size(), idxs.c_str(), ptrs.c_str());
+            }
+        }
+
         // Execute
         if (node.compute_fn) {
             node.output = node.compute_fn(node.resolved_inputs);
+            if (getenv("FORGE_NODE_TRACE"))
+                fprintf(stderr, "[node %d done] fn\n", i);
         } else if (node.op_type != OpType::NONE) {
             // Phase 3: prefer dst injection when a dst kernel is registered
             bool has_dst = OpDispatch::instance().has_dst_kernel(node.op_type, node.device);
@@ -310,6 +389,14 @@ TensorPtr ComputeGraph::execute(cudaStream_t stream) {
                       (!inputs_fp16 || dst_fp16_capable) &&
                       (!inputs_bf16 || dst_bf16_capable) &&
                       (!inputs_fp8 || dst_fp8_capable);
+
+            // DEBUG (set FORGE_NO_DST=1): disable dst injection to test whether the
+            // illegal-access crash is caused by under-sized pre-allocated dst buffers.
+            {
+                static const bool no_dst = (std::getenv("FORGE_NO_DST") != nullptr);
+                if (no_dst)
+                    use_dst = false;
+            }
 
             if (use_dst) {
                 // Construct dst view into the pre-allocated per-backend buffer, with the
@@ -365,11 +452,32 @@ TensorPtr ComputeGraph::execute(cudaStream_t stream) {
                     }
                 }
             }
+            if (getenv("FORGE_NODE_TRACE"))
+                fprintf(stderr, "[node %d done] dispatch\n", i);
         }
 
         // Track peak memory
         if (node.output) {
             peak_memory_ += node.output->nbytes();
+        }
+
+        // DEBUG (set FORGE_GRAPH_SYNCEACH=1): per-node CUDA sync + error check to
+        // localize illegal-memory-access / OOB kernels in the GraphRuntime path.
+        {
+            static const bool dbg_sync =
+                (std::getenv("FORGE_GRAPH_SYNCEACH") != nullptr);
+            if (dbg_sync && node.device == DeviceType::CUDA) {
+#ifdef USE_CUDA
+                static bool reported = false;
+                cudaError_t e = cudaStreamSynchronize(stream);
+                if (e != cudaSuccess && !reported) {
+                    reported = true;
+                    LOG_ERROR("GraphRuntime: first CUDA error at node " + std::to_string(i) +
+                              " (" + node.name + ") — prior kernel likely OOB. " +
+                              cudaGetErrorString(e));
+                }
+#endif
+            }
         }
 
         // Phase 6-A-6: record dtype flow (catches silent FP16 -> FP32 materialization)
@@ -392,14 +500,20 @@ TensorPtr ComputeGraph::execute(cudaStream_t stream) {
                 if (idx < 0) {
                     int dep_idx = -idx - 1;
                     ref_count[dep_idx]--;
-                    if (ref_count[dep_idx] == 0 && dep_idx < i) {
+                    // Topological exec order guarantees the dep already ran when its
+                    // last consumer finishes (no index-order assumption here).
+                    if (ref_count[dep_idx] == 0) {
                         nodes_[dep_idx].output.reset();
                         nodes_[dep_idx].resolved_inputs.clear();
                     }
                 }
             }
         }
+        if (getenv("FORGE_NODE_TRACE"))
+            fprintf(stderr, "[node %d done] release\n", i);
     }
+    if (getenv("FORGE_NODE_TRACE"))
+        fprintf(stderr, "[execute] loop finished, returning last_output\n");
 
     return last_output();
 }
