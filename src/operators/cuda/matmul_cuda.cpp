@@ -10,6 +10,8 @@
 
 #    include <algorithm>
 #    include <atomic>
+#    include <cmath>
+#    include <cstdio>
 #    include <cstdlib>
 #    include <cstring>
 #    include <functional>
@@ -237,6 +239,11 @@ bool prefill_override_env_active() {
 KernelVariant autotune_prefill(const KernelProblem& problem, const float* a_data,
                                const TensorPtr& b, float* o_data, int M, int K, int N) {
     const DataType dt = b->dtype();
+    // Phase 2: if the VRAM-aware policy already pinned Q3_K to MMQ, do not probe
+    // the TensorCore path (it would thrash under memory pressure). Respect the
+    // resolved policy instead of re-measuring on real tensors.
+    if (is_quant_tc_dtype(dt) && quant_matmul_policy(dt) == QuantMatmulPolicy::MMQ)
+        return select_kernel(problem);
     auto mmq = lookup_mmq(dt);
     if (!mmq)
         return select_kernel(problem);  // unreachable on the eligible slice; be safe
@@ -281,6 +288,46 @@ KernelVariant autotune_prefill(const KernelProblem& problem, const float* a_data
     return best;
 }
 
+// FORGE_TC_CHECK=1: numeric self-check of the TensorCore (dequant-FP16 +
+// cuBLAS) result against the dp4a MMQ reference for the same dtype. Lets us
+// confirm the Q3_K prefill tensor-core path (and any other TC-eligible dtype)
+// is bit-faithful before trusting it. No overhead unless the env var is set.
+static void tc_numeric_selfcheck(DataType dt, const float* a_data, const void* b_data,
+                                 const float* o_tc, int M, int K, int N) {
+    auto mmq = lookup_mmq(dt);
+    if (!mmq) return;
+    const size_t bytes = (size_t)M * N * sizeof(float);
+    float* ref = nullptr;
+    if (cudaMalloc(&ref, bytes) != cudaSuccess) return;
+    mmq(a_data, b_data, ref, M, K, N, 0);
+    float* h_tc = static_cast<float*>(malloc(bytes));
+    float* h_ref = static_cast<float*>(malloc(bytes));
+    if (!h_tc || !h_ref) {
+        free(h_tc);
+        free(h_ref);
+        cudaFree(ref);
+        return;
+    }
+    cudaMemcpy(h_tc, o_tc, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ref, ref, bytes, cudaMemcpyDeviceToHost);
+    float maxerr = 0.0f, maxref = 0.0f;
+    const size_t n = (size_t)M * N;
+    for (size_t i = 0; i < n; ++i) {
+        float d = h_tc[i] - h_ref[i];
+        if (d < 0.0f) d = -d;
+        if (d > maxerr) maxerr = d;
+        float r = h_ref[i];
+        if (r < 0.0f) r = -r;
+        if (r > maxref) maxref = r;
+    }
+    fprintf(stderr,
+            "[tc-check] %s M=%d N=%d K=%d max|tc-mmq|=%.4e max|mmq|=%.4e rel=%.4e\n",
+            dtype_name(dt).c_str(), M, N, K, maxerr, maxref, maxref > 0.0f ? maxerr / maxref : 0.0f);
+    free(h_tc);
+    free(h_ref);
+    cudaFree(ref);
+}
+
 // M > 1 (prefill / speculative verification) dispatch.
 void matmul_multi_row(const TensorPtr& a, const TensorPtr& b, float* o_data, int M, int K, int N) {
     const float* a_data = static_cast<const float*>(a->data());
@@ -315,6 +362,12 @@ void matmul_multi_row(const TensorPtr& a, const TensorPtr& b, float* o_data, int
         // below (identical to the pre-Phase-4 TC probe + DP4A fall-through).
         if (cuda::launch_cublas_gemm_quant_fp16(dt, a_data, b->data(), o_data, M, K, N,
                                                 /*transB=*/true, 0)) {
+            // FORGE_TC_CHECK=1: verify the TC result against the dp4a MMQ
+            // reference for this dtype (numeric self-check, no perf impact when
+            // unset). Primarily to validate the Q3_K prefill TC path.
+            if (std::getenv("FORGE_TC_CHECK")) {
+                tc_numeric_selfcheck(dt, a_data, b->data(), o_data, M, K, N);
+            }
             return;
         }
         [[fallthrough]];

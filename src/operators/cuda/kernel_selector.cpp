@@ -14,8 +14,8 @@
 //     env override; otherwise MMQ -> batched GEMV -> dequant + cuBLAS. FP32
 //     weights go straight to cuBLAS. Q6_K joined in Phase 5-A and Q5_K in
 //     Phase 5-B (Q5_K needed its own FP16 whole-matrix dequant kernel; see
-//     launch_cublas_gemm_quant_fp16). Q3_K has a dequant kernel too
-//     (Phase 5-D) but stays on MMQ — see tensorcore_eligible().
+//     launch_cublas_gemm_quant_fp16). Q3_K is now also eligible for the
+//     prefill tensor-core path (Phase 6-MMQ, see tensorcore_eligible()).
 //   * MoE: only Q4_0/Q4_K/Q6_K/Q8_0 experts are launchable; anything else is
 //     UNSUPPORTED and the caller skips silently (as before).
 //
@@ -35,10 +35,12 @@
 #    include <cstring>
 #    include <map>
 #    include <mutex>
+#    include <unordered_map>
 
 #    include <cuda_runtime.h>
 
 #    include "forge/cuda_kernels.h"
+#    include "forge/logger.h"
 #    include "forge/quant_traits.h"
 #    include "matmul_dispatch.h"
 
@@ -107,6 +109,28 @@ DequantMatrixFn lookup_dequant_matrix(DataType dt) {
 }  // namespace internal
 }  // namespace ops
 
+// Per-dtype resolved matmul policy (VRAM-aware dispatch). Auto until
+// resolve_quant_execution_plan() runs for a dtype; only registered dtypes
+// consult it (today: Q3_K). File-scope statics (internal linkage) shared by both
+// the anonymous-namespace helpers (prefer_tensor_core) and the public API below.
+static std::unordered_map<DataType, QuantMatmulPolicy> g_quant_policy;
+// Registered dtypes that may take the dequant-FP16 + cuBLAS TensorCore path and
+// therefore participate in VRAM-aware TC/MMQ selection. Q3_K is seeded by
+// ensure_quant_tc_dtypes(); more formats are added via register_quant_tc_dtype()
+// with no further change -- they reuse the shared rule chain.
+static std::unordered_map<DataType, std::string> g_quant_tc_dtypes;
+// The single shared execution plan (the global dequant-cache working set).
+static QuantExecutionPlan g_quant_plan;
+
+static void ensure_quant_tc_dtypes() {
+    if (g_quant_tc_dtypes.empty()) {
+        g_quant_tc_dtypes.emplace(DataType::Q3_K, "q3k");
+        // To enable a new format (e.g. Q4_K) in VRAM-aware dispatch, add it here
+        // or call register_quant_tc_dtype() at startup -- nothing else changes.
+        // g_quant_tc_dtypes.emplace(DataType::Q4_K, "q4k");
+    }
+}
+
 namespace {
 
 using ops::internal::lookup_dequant_matrix;
@@ -125,25 +149,27 @@ bool tensorcore_eligible(DataType dt) {
     case DataType::Q5_K:
     case DataType::Q6_K:
     case DataType::Q8_0:
+    case DataType::Q3_K:  // Phase 6-MMQ: Q3_K now eligible for PREFILL tensor cores.
         return true;
     default:
         return false;
     }
-    // Q3_K is deliberately NOT eligible, even though
-    // launch_dequant_q3_k_matrix_fp16() now exists. Measured on RTX 4050
-    // (sm_89, 6 GB) with a 573-token Qwen3-VL-4B Q3_K_M prefill, M == 1:
-    //   MMQ (dp4a)            2699.7 ms   36 layers 2413.8 ms, output_proj  177 ms
-    //   TensorCore (dequant)  8686.6 ms   36 layers 7732.2 ms, output_proj  845 ms
-    // i.e. 3.2x slower. The per-weight FP16 dequant cache added in Phase 6-C
-    // fixes the same 15x gap on the Q6_K/Q8_0 output_proj (dequant once, reuse
-    // every decode step), but it does NOT rescue Q3_K here: the Q3_K FFN
-    // weights are the bulk of the model and are already routed through MMQ, so
-    // they never reach launch_cublas_gemm_quant_fp16(); caching them would need
-    // ~2.6 GB of extra VRAM (the whole model dequantized to FP16) which does
-    // not fit a 6 GB card, and within a single prefill each weight is used once
-    // so the cache buys nothing. So Q3_K stays on MMQ until either VRAM allows
-    // caching the full FP16 footprint or the dequant kernels are rewritten to
-    // be compute-bound instead of latency-bound.
+    // Q3_K was previously excluded because a M==1 (decode) measurement showed
+    // the dequant-FP16 + cuBLAS path 3.2x slower than dp4a MMQ (the cuBLAS
+    // GEMM has no tensor-core occupancy at M==1). But select_matmul only routes
+    // M>1 (prefill / speculative) here, and at prefill M the FP16 GEMM on
+    // tensor cores wins clearly — exactly the regime where Q4_K/Q8_0 use TC.
+    // The dequant is paid once per weight and amortized over all M rows, so it
+    // is negligible versus the GEMM. The launcher falls back to dp4a MMQ if the
+    // TC path is unavailable, and FORGE_AUTOTUNE=1 measures MMQ vs TC per
+    // signature and keeps the faster one, so there is no silent regression.
+    // NOTE: on memory-constrained GPUs the per-weight FP16 dequant cache
+    // (FORGE_DEQUANT_CACHE_MB, default 1024 MB) cannot hold the whole-model
+    // working set, so the dequant re-runs per forward. Combined with large-M
+    // activation memory pressure this can thrash (see dequant_cache_acquire
+    // churn); keep an eye on prefill at high M.
+    // cached. Re-enable Q3_K TC only behind a VRAM/cache-fit check plus a fast
+    // dequant kernel.
 }
 
 int detect_sm_arch() {
@@ -202,10 +228,9 @@ static constexpr TcMinM kTcMinM[] = {
     {DataType::Q6_K, 96},  // measured ~80,     margin -> 96
     {DataType::Q4_K, 128}, // measured ~96-110, margin -> 128
     {DataType::Q4_0, 128}, // measured ~96-110, margin -> 128
+    {DataType::Q3_K, 256}, // Phase 6-MMQ: prefill-only TC (M==1 was 3.2x slower,
+                           // so keep a wide margin above the other 4-BPW types).
 };
-// No Q3_K entry: it is not tensorcore_eligible() (see the measurement in
-// tensorcore_eligible()). If the FP16 dequant ever gets cached, add it here
-// at the conservative 128 level and re-measure.
 static constexpr int kTcMinMDefault = 128;  // future eligible dtypes stay at the
                                             // most conservative level
 int tc_min_m(DataType dt) {
@@ -255,8 +280,8 @@ KernelVariant select_gemv(const KernelProblem& p) {
 // phases: Q8_0 after Phase 3.5 added its true M>1 MMQ instance
 // (mmq_dispatch[Q8_0]); Q6_K after Phase 5-A (dequant path already existed);
 // Q5_K after Phase 5-B added its missing FP16 whole-matrix dequant. Q3_K is
-// not eligible at all (Phase 5-D added launch_dequant_q3_k_matrix_fp16 but
-// measured the route 3.2x slower than MMQ — see tensorcore_eligible()).
+// now eligible for prefill tensor cores since Phase 6-MMQ (the old M==1
+// 3.2x-slower measurement does not apply to M>1; see tensorcore_eligible()).
 // Per-signature override inside / around each threshold is owned by the 4-B
 // autotuner once opted in (FORGE_AUTOTUNE=1); benchmark force envs stay the
 // highest priority.
@@ -281,6 +306,13 @@ bool prefer_tensor_core(int M, DataType dt) {
         return true;
     const char* fmq = std::getenv("FORGE_FORCE_MMQ");
     if (fmq && fmq[0] == '1')
+        return false;
+    // VRAM-aware resolved policy: a registered dtype may have been pinned to MMQ
+    // (VRAM too tight for TensorCore), in which case we short-circuit so we don't
+    // probe a path that would thrash under memory pressure. Env overrides above
+    // already returned. Extending to more dtypes is a register_quant_tc_dtype()
+    // call, not a rewrite of this function.
+    if (is_quant_tc_dtype(dt) && quant_matmul_policy(dt) == QuantMatmulPolicy::MMQ)
         return false;
     // Conservative per-dtype thresholds (see kTcMinM); the eligibility gate
     // above already excluded the rest.
@@ -374,6 +406,268 @@ CacheState& cache_state() {
 }
 
 }  // namespace
+
+// ===========================================================================
+// Phase 2: Q3_K prefill matmul policy (VRAM-aware dispatch)
+//
+// Decision = a prioritized *chain of rules* (chain of responsibility), not a
+// monolithic if-else. Each rule is a pure function of Q3KPolicyFacts returning an
+// optional decision; the first concrete answer wins. Adding a new input (GPU
+// capability tier, batch-size awareness, a CLI flag, a per-request override)
+// means writing a q3k_rule_*() function and registering it in kQ3KPolicyRules[]
+// at the right priority -- zero edits to the dispatch body. Facts are gathered
+// once (gather_q3k_policy_facts) and handed to the pure rules, so the policy
+// logic is unit-testable with synthetic facts (no GPU needed).
+// ===========================================================================
+
+namespace {
+
+// Optional dequant-cache ladder (MiB). The auto planner walks it top-down and
+// takes the largest level that still fits after the mandatory reservations.
+// 0 means "no cache at all", which the TensorCore path still supports (it then
+// falls back to the grow-only scratch), so 0 is a valid plan rather than a
+// failure: trading the performance cache away is always preferable to trading
+// the TensorCore path away.
+constexpr size_t kQuantCacheStepsMib[] = {1024, 768, 512, 384, 256, 128, 64, 0};
+
+// Gather every input the planner may need exactly once. Decoupled from the
+// planning logic so plan_quant_*() never reads env / probes VRAM itself (keeps
+// them pure and unit-testable against synthetic budgets).
+QuantPolicyFacts gather_quant_policy_facts(DataType dt, size_t kv_cache_bytes_missing,
+                                           size_t safety_margin) {
+    QuantPolicyFacts f;
+    f.dtype = dt;
+    const char* e = std::getenv("FORGE_MATMUL_PATH");
+    f.matmul_path = e ? e : "";
+    const char* ftc = std::getenv("FORGE_FORCE_TC");
+    f.force_tc = ftc && ftc[0] == '1';
+    const char* fmq = std::getenv("FORGE_FORCE_MMQ");
+    f.force_mmq = fmq && fmq[0] == '1';
+    f.dequant_total_fp16 = cuda::dequant_total_fp16_bytes();
+    f.configured_cache_bytes = cuda::dequant_cache_budget_bytes();
+    f.budget.mandatory_workspace_bytes = cuda::dequant_scratch_peak_bytes();
+    f.budget.kv_cache_bytes = kv_cache_bytes_missing;
+    f.budget.safety_margin_bytes = safety_margin;
+    // Already-resident cache entries are optional, so they count as reclaimable
+    // rather than spent: the decision is made against that total and
+    // apply_quant_execution_plan() then actually hands the memory back.
+    f.budget.reclaimable_bytes = cuda::dequant_cache_current_bytes();
+    size_t free_mem = 0, total_mem = 0;
+    if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
+        f.cuda_available = true;
+        f.budget.free_bytes = free_mem;
+        f.vram_total = total_mem;
+    }
+    return f;
+}
+
+// One-line rationale, emitted verbatim so VRAM regressions are diagnosable from
+// a plain server log.
+std::string quant_plan_summary(const QuantPolicyFacts& f, const QuantExecutionPlan& p) {
+    const size_t mib = 1024 * 1024;
+    const char* tag = quant_tc_dtype_tag(f.dtype);
+    return std::string(tag) + " path=" + quant_matmul_policy_name(p.path) + " source=" + p.source +
+           " cache=" + std::to_string(p.dequant_cache_bytes / mib) + "MB" +
+           (p.cache_reduced ? "(reduced)" : "") +
+           " scratch=" + std::to_string(p.mandatory_workspace_bytes / mib) + "MB" +
+           " headroom=" + std::to_string(p.available_bytes / mib) + "MB" +
+           " vram_free=" + std::to_string(f.budget.free_bytes / mib) + "MB" +
+           " reclaimable=" + std::to_string(f.budget.reclaimable_bytes / mib) + "MB" +
+           " kv_pending=" + std::to_string(f.budget.kv_cache_bytes / mib) + "MB" +
+           " safety=" + std::to_string(f.budget.safety_margin_bytes / mib) + "MB";
+}
+
+}  // namespace
+
+std::optional<QuantMatmulPolicy> quant_rule_env_matmul_path(const QuantPolicyFacts& f) {
+    const std::string& e = f.matmul_path;
+    if (e == "tc")
+        return QuantMatmulPolicy::TensorCore;
+    if (e == "mmq" || e == "dp4a")
+        return QuantMatmulPolicy::MMQ;
+    return std::nullopt;  // "auto" or unset: let lower-priority rules decide
+}
+
+std::optional<QuantMatmulPolicy> quant_rule_env_force_tc(const QuantPolicyFacts& f) {
+    if (f.force_tc)
+        return QuantMatmulPolicy::TensorCore;
+    return std::nullopt;
+}
+
+std::optional<QuantMatmulPolicy> quant_rule_env_force_mmq(const QuantPolicyFacts& f) {
+    if (f.force_mmq)
+        return QuantMatmulPolicy::MMQ;
+    return std::nullopt;
+}
+
+// VRAM-fit rule, kept for the rule-chain API: TensorCore when some (possibly
+// reduced) optional cache level still fits, MMQ otherwise. Prefer
+// plan_quant_execution(), which also reports the cache budget it settled on.
+std::optional<QuantMatmulPolicy> quant_rule_vram_aware(const QuantPolicyFacts& f) {
+    return plan_quant_auto(f).path;
+}
+
+QuantExecutionPlan plan_quant_pinned(QuantMatmulPolicy policy, const QuantPolicyFacts& f,
+                                     const char* source) {
+    QuantExecutionPlan p;
+    p.path = policy;
+    p.mandatory_workspace_bytes = f.budget.mandatory_workspace_bytes;
+    p.available_bytes = f.budget.available_for_optional();
+    p.source = source;
+    if (policy == QuantMatmulPolicy::TensorCore) {
+        // Honour the requested cap verbatim. An explicit request must never be
+        // second-guessed -- silently shrinking it would make benchmarks measure
+        // something other than what was asked for.
+        p.dequant_cache_bytes =
+            f.configured_cache_bytes < f.dequant_total_fp16 ? f.configured_cache_bytes
+                                                            : f.dequant_total_fp16;
+    }
+    return p;
+}
+
+QuantExecutionPlan plan_quant_auto(const QuantPolicyFacts& f) {
+    QuantExecutionPlan p;
+    p.mandatory_workspace_bytes = f.budget.mandatory_workspace_bytes;
+    p.available_bytes = f.budget.available_for_optional();
+    p.source = "vram:auto";
+
+    if (!f.cuda_available) {
+        p.path = QuantMatmulPolicy::MMQ;  // no TC path without CUDA
+        p.source = "vram:no_cuda";
+        return p;
+    }
+
+    const size_t configured = f.configured_cache_bytes;
+    auto take = [&](size_t level_bytes) {
+        // The cache can never usefully exceed the whole FP16 model.
+        const size_t cap = level_bytes < f.dequant_total_fp16 ? level_bytes : f.dequant_total_fp16;
+        if (cap > p.available_bytes)
+            return false;
+        p.path = QuantMatmulPolicy::TensorCore;
+        p.dequant_cache_bytes = cap;
+        p.cache_reduced = cap < configured;
+        return true;
+    };
+
+    // 1) The configured cap first; cache_reduced here means the model itself is
+    //    smaller than the cap, which is not a memory-pressure degradation.
+    if (take(configured)) {
+        p.source = p.cache_reduced ? "vram:tc_capped_by_model" : "vram:tc";
+        return p;
+    }
+    // 2) Walk the ladder down. Giving up optional cache is always preferable to
+    //    giving up TensorCore, so try every level -- including 0 -- first.
+    for (size_t step : kQuantCacheStepsMib) {
+        if (step >= configured)
+            continue;  // already tried, or above the user's cap
+        if (take(step)) {
+            p.source = "vram:tc_reduced_cache";
+            return p;
+        }
+    }
+    // 3) Even a 0-byte cache does not fit: MMQ is the only safe option left.
+    p.path = QuantMatmulPolicy::MMQ;
+    p.dequant_cache_bytes = 0;
+    p.cache_reduced = true;
+    p.source = "vram:mmq_no_room";
+    return p;
+}
+
+QuantExecutionPlan plan_quant_execution(const QuantPolicyFacts& f) {
+    if (auto d = quant_rule_env_matmul_path(f))
+        return plan_quant_pinned(*d, f, "env:FORGE_MATMUL_PATH");
+    if (auto d = quant_rule_env_force_tc(f))
+        return plan_quant_pinned(*d, f, "env:FORGE_FORCE_TC");
+    if (auto d = quant_rule_env_force_mmq(f))
+        return plan_quant_pinned(*d, f, "env:FORGE_FORCE_MMQ");
+    return plan_quant_auto(f);
+}
+
+// Ordered rule chain: env overrides outrank the VRAM auto rule. First concrete
+// answer wins. Register new rules here -- no dispatch-body edits needed.
+static const QuantPolicyRule kQuantPolicyRules[] = {
+    {"env:FORGE_MATMUL_PATH", quant_rule_env_matmul_path},
+    {"env:FORGE_FORCE_TC", quant_rule_env_force_tc},
+    {"env:FORGE_FORCE_MMQ", quant_rule_env_force_mmq},
+    {"vram_aware", quant_rule_vram_aware},
+};
+
+QuantPolicyDecision resolve_quant_policy(const QuantPolicyFacts& facts, QuantMatmulPolicy fallback) {
+    for (const auto& r : kQuantPolicyRules) {
+        if (auto d = r.fn(facts))
+            return {*d, r.name};
+    }
+    return {fallback, "fallback"};
+}
+
+// ---- Per-dtype registry ----
+void register_quant_tc_dtype(DataType dt, const char* tag) {
+    g_quant_tc_dtypes[dt] = tag ? tag : "";
+}
+
+bool is_quant_tc_dtype(DataType dt) {
+    ensure_quant_tc_dtypes();
+    return g_quant_tc_dtypes.find(dt) != g_quant_tc_dtypes.end();
+}
+
+const char* quant_tc_dtype_tag(DataType dt) {
+    ensure_quant_tc_dtypes();
+    auto it = g_quant_tc_dtypes.find(dt);
+    if (it != g_quant_tc_dtypes.end() && !it->second.empty())
+        return it->second.c_str();
+    return dtype_name(dt).c_str();  // fallback: the enum name (e.g. "Q3_K")
+}
+
+// ---- State surface ----
+void set_quant_matmul_policy(DataType dt, QuantMatmulPolicy policy) {
+    g_quant_policy[dt] = policy;
+}
+
+QuantMatmulPolicy quant_matmul_policy(DataType dt) {
+    auto it = g_quant_policy.find(dt);
+    if (it != g_quant_policy.end())
+        return it->second;
+    return QuantMatmulPolicy::Auto;  // not yet resolved
+}
+
+// Apply only the shared cache budget. The per-dtype PATH is recorded by the
+// resolver (below), not here -- the dequant cache is a single working set keyed
+// by weight pointer, so its budget is format-agnostic.
+void apply_quant_execution_plan(const QuantExecutionPlan& plan) {
+    if (plan.path != QuantMatmulPolicy::TensorCore)
+        return;  // MMQ: leave the global cap alone, other dtypes still cache via TC
+    if (plan.dequant_cache_bytes >= cuda::dequant_cache_budget_bytes())
+        return;  // nothing to tighten
+    cuda::set_dequant_cache_budget_mb(static_cast<long>(plan.dequant_cache_bytes / (1024 * 1024)));
+    // The budget is only a ceiling; the buffers are already resident. Actually
+    // release them, otherwise the memory the planner just promised to the KV
+    // cache stays locked in the optional cache.
+    cuda::dequant_cache_trim_to(plan.dequant_cache_bytes);
+}
+
+QuantExecutionPlan resolve_quant_execution_plan(DataType dt, size_t kv_cache_bytes_missing,
+                                                size_t safety_margin_bytes) {
+    ensure_quant_tc_dtypes();
+    QuantPolicyFacts facts = gather_quant_policy_facts(dt, kv_cache_bytes_missing, safety_margin_bytes);
+    QuantExecutionPlan plan = plan_quant_execution(facts);
+    g_quant_plan = plan;
+    set_quant_matmul_policy(dt, plan.path);  // record the per-dtype resolved path
+    apply_quant_execution_plan(plan);        // tighten the shared cache budget
+    // Degradations (shrunk cache, MMQ fallback) are operationally relevant and
+    // must be visible at the default log level; the happy path stays at INFO.
+    const std::string msg = "execution plan: " + quant_plan_summary(facts, plan);
+    if (plan.cache_reduced || plan.path != QuantMatmulPolicy::TensorCore)
+        LOG_WARN(msg);
+    else
+        LOG_INFO(msg);
+    return plan;
+}
+
+void resolve_quant_policy_vram_aware(DataType dt, size_t safety_margin_bytes) {
+    (void)resolve_quant_execution_plan(dt, 0, safety_margin_bytes);
+}
+
+QuantExecutionPlan quant_execution_plan() { return g_quant_plan; }
 
 bool kernel_autotune_eligible(const KernelProblem& problem) {
     return cacheable_prefill(problem);

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -14,9 +15,12 @@
 #include "forge/cuda_kernels.h"
 #include "forge/inference_batch.h"
 #include "forge/kv_memory.h"
+#include "forge/kernel_selector.h"
+#include "forge/kv_sizing.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
+#include "forge/quant_traits.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -32,7 +36,8 @@ TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
       plan_(build_execution_plan(model.config().arch_type, model.config())),
       memory_(ctx.memory()),
       kv_cache_(*ctx.memory().kv()),
-      kv_memory_(std::make_unique<KVMemory>(*ctx.memory().kv(), ctx.params().kv_storage_mode)) {
+      kv_memory_(std::make_unique<KVMemory>(*ctx.memory().kv(),
+                                            ctx.params().kv_storage_mode)) {
     LOG_INFO("Execution plan: " + plan_.plan_id());
     graph_runtime_.set_builder(plan_.graph_builder);
 }
@@ -436,6 +441,41 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
     return forward_layers(hidden, req);
 }
 
+namespace {
+// Diagnostic switch (FORGE_NO_SPARSE_LOGITS=1): fall back to the full
+// [seq_len, vocab] projection. Used to A/B the sparse-logits path.
+bool sparse_logits_disabled() {
+    static const bool disabled = std::getenv("FORGE_NO_SPARSE_LOGITS") != nullptr;
+    return disabled;
+}
+
+// Sparse-logits helper: gather the few rows that need lm_head projection.
+// hidden is FP32 [N, H]; rows index into dim 0. Result lives on hidden's device.
+TensorPtr gather_rows(const TensorPtr& hidden, const std::vector<int64_t>& rows) {
+    const int64_t H = hidden->shape()[1];
+    auto out = std::make_shared<Tensor>(
+        DataType::FP32, std::vector<int64_t>{static_cast<int64_t>(rows.size()), H},
+        hidden->device());
+    const size_t row_bytes = static_cast<size_t>(H) * sizeof(float);
+    uint8_t* dst = static_cast<uint8_t*>(out->data());
+    const uint8_t* src = static_cast<const uint8_t*>(hidden->data());
+#ifdef USE_CUDA
+    if (hidden->device() == DeviceType::CUDA) {
+        for (size_t r = 0; r < rows.size(); ++r) {
+            cudaMemcpyAsync(dst + r * row_bytes, src + rows[r] * row_bytes, row_bytes,
+                            cudaMemcpyDeviceToDevice);
+        }
+    } else
+#endif
+    {
+        for (size_t r = 0; r < rows.size(); ++r) {
+            std::memcpy(dst + r * row_bytes, src + rows[r] * row_bytes, row_bytes);
+        }
+    }
+    return out;
+}
+}  // namespace
+
 TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
     if (batch.empty())
         return nullptr;
@@ -598,13 +638,39 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
             output_weight = weights_.token_embedding;
         }
 
+        // Sparse logits: split_batch marks only each sequence's final chunk with
+        // logits=true, so normally exactly one row per sequence needs the lm_head
+        // projection. Projecting the whole [total_tokens, vocab] GEMM (plus the
+        // full FP32 logits buffer and its D2H copy) used to dominate prefill cost
+        // on large-vocab models and spike VRAM. The full projection is kept only
+        // for all_logits mode (or the degenerate all-rows case).
+        auto offsets = ubatch.token_offsets();
+        std::vector<int64_t> wanted_rows;  // row index within this ubatch's hidden
+        std::vector<int> wanted_items;     // matching ubatch.items index
+        const bool sparse_logits = !batch.all_logits && !sparse_logits_disabled();
+        if (sparse_logits) {
+            for (int i = 0; i < ubatch.size(); i++) {
+                if (!ubatch.items[i].logits)
+                    continue;
+                const int seq_len = static_cast<int>(ubatch.items[i].tokens.size());
+                wanted_rows.push_back(offsets[i] + seq_len - 1);
+                wanted_items.push_back(i);
+            }
+        }
+
         TensorPtr logits;
         {
             PERF_SCOPE("forward_batch/output_proj");
             if (output_weight) {
                 hidden = transfer_hidden(hidden, output_weight->device());
             }
-            logits = ops::matmul_transB(hidden, output_weight);
+            if (batch.all_logits || !sparse_logits ||
+                wanted_rows.size() == static_cast<size_t>(total_tokens)) {
+                logits = ops::matmul_transB(hidden, output_weight);
+            } else if (!wanted_rows.empty()) {
+                auto selected = gather_rows(hidden, wanted_rows);       // [R, H]
+                logits = ops::matmul_transB(selected, output_weight);  // [R, vocab]
+            }
         }
 
         // ==== Step 4: Extract logits ====
@@ -641,14 +707,10 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
 
         vocab_size = static_cast<int>(logits_cpu->shape().back());
         const float* logits_data = static_cast<const float*>(logits_cpu->data());
-        auto offsets = ubatch.token_offsets();
 
-        for (int i = 0; i < ubatch.size(); i++) {
-            if (!ubatch.items[i].logits)
-                continue;
-
-            int seq_len = static_cast<int>(ubatch.items[i].tokens.size());
-            int last_row = offsets[i] + seq_len - 1;
+        // Sparse path: `logits` has exactly one row per wanted entry, same order.
+        for (int k = 0; k < static_cast<int>(wanted_items.size()); k++) {
+            const int i = wanted_items[k];
 
             // Find original batch index
             int batch_idx = -1;
@@ -662,8 +724,8 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
             SeqResult res;
             res.batch_idx = batch_idx;
             res.vocab_size = vocab_size;
-            res.logits.assign(logits_data + last_row * vocab_size,
-                              logits_data + (last_row + 1) * vocab_size);
+            res.logits.assign(logits_data + static_cast<int64_t>(k) * vocab_size,
+                              logits_data + (static_cast<int64_t>(k) + 1) * vocab_size);
             results.push_back(std::move(res));
         }
     }
@@ -691,13 +753,16 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
     return result;
 }
 
-TensorPtr TransformerEngine::forward_from_hidden(const TensorPtr& hidden, int64_t start_pos) {
+TensorPtr TransformerEngine::forward_from_hidden(const TensorPtr& hidden, int64_t start_pos,
+                                                 bool return_all_logits) {
     const auto& cfg = model_.config();
     int seq_len = static_cast<int>(hidden->shape()[0]);
 
     init_kv_cache(cfg);
 
-    return forward_layers(hidden, ForwardRequest::from_hidden(seq_len, start_pos, /*seq_id=*/0));
+    auto req = ForwardRequest::from_hidden(seq_len, start_pos, /*seq_id=*/0);
+    req.return_all_logits = return_all_logits;
+    return forward_layers(hidden, req);
 }
 
 void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
@@ -722,17 +787,31 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     // Determine the primary KV device.
     // When offload_kqv is false, KV cache stays on CPU even if layers are on GPU.
     // This enables "weights on GPU, KV on CPU" for long-context scenarios.
+    // NOTE: gpu_layers_ == -1 means "auto = ALL layers on GPU" (see set_gpu_layers,
+    // which builds every layer_devices_[i] as cuda(0)); comparing -1 against
+    // cfg.num_layers here used to misplace the KV storage on CPU while attention
+    // still executed on CUDA (paged kernels then dereferenced null page tables).
+    // layer_devices_ (filled by set_gpu_layers) is the source of truth: KV goes
+    // to CUDA only when EVERY layer lives on CUDA.
     DeviceType kv_dev;
     if (ctx_.params().offload_kqv) {
-        kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
+        bool all_layers_cuda = !layer_devices_.empty();
+        for (const auto& t : layer_devices_) {
+            if (!t.is_cuda()) {
+                all_layers_cuda = false;
+                break;
+            }
+        }
+        kv_dev = all_layers_cuda ? DeviceType::CUDA : DeviceType::CPU;
     } else {
         kv_dev = DeviceType::CPU;
     }
 
     // If CUDA, check available memory and reduce if needed
     if (kv_dev == DeviceType::CUDA) {
-        size_t kv_bytes = (size_t)cfg.num_layers * 2 * (size_t)kv_max_seq * cfg.num_kv_heads *
-                          cfg.head_dim * sizeof(float);
+        const int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        size_t kv_bytes = (size_t)cfg.num_layers * (size_t)kv_max_seq *
+                          kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim);
         auto backend = BackendManager::instance().get_cuda_backend();
         if (backend) {
             size_t free_mem = backend->device_memory_free();
@@ -741,8 +820,8 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
             if (kv_bytes + headroom > free_mem && free_mem > headroom) {
                 size_t available = free_mem - headroom;
                 int reduced_seq =
-                    static_cast<int>(available / ((size_t)cfg.num_layers * 2 * cfg.num_kv_heads *
-                                                  cfg.head_dim * sizeof(float)));
+                    static_cast<int>(available / ((size_t)cfg.num_layers *
+                                                  kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim)));
                 if (reduced_seq < kv_max_seq) {
                     // Round down to nearest 256 for alignment
                     reduced_seq = (reduced_seq / 256) * 256;
@@ -832,6 +911,71 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     set_kv_cache_initialized(true);
     LOG_INFO("KV cache initialized successfully, actual size: " +
              std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
+
+#ifdef USE_CUDA
+    // Phase 2: VRAM-aware Q3_K prefill policy. Model + KV are now resident, so
+    // probe CUDA free memory and decide once whether the TensorCore dequant
+    // working set (per-weight cache + grow-only scratch) still fits alongside the
+    // KV cache. If not, Q3_K prefill falls back to MMQ/dp4a so a memory-constrained
+    // GPU (e.g. 6 GB at long context) does not thrash. Env overrides
+    // (FORGE_MATMUL_PATH / FORGE_FORCE_*) win and are applied inside the resolver.
+    {
+        bool any_cuda = false;
+        int prim_dev = 0;
+        for (const auto& d : layer_devices_) {
+            if (d.is_cuda()) {
+                any_cuda = true;
+                prim_dev = d.device_id;
+                break;
+            }
+        }
+        if (any_cuda) {
+            cudaSetDevice(prim_dev);
+            // Push this model's dequant footprint to the allocator before probing,
+            // so dequant_required_bytes() reflects the loaded model, not a stale one.
+            estimate_dequant_scratch_peak_bytes();
+            resolve_quant_policy_vram_aware(DataType::Q3_K, /*safety_margin_bytes=*/256ULL * 1024 * 1024);
+        }
+    }
+#endif
+}
+
+size_t TransformerEngine::estimate_dequant_scratch_peak_bytes() {
+#ifdef USE_CUDA
+    size_t peak = 0;
+    size_t total = 0;
+    // Accumulate the FP16 (N*K*2) dequant footprint of every CUDA quantized
+    // weight: the max is the grow-only scratch high-water mark, the sum bounds
+    // the persistent per-weight cache. Only CUDA weights can drive the TC path.
+    auto consider = [&](const TensorPtr& t) {
+        if (!t || t->device() != DeviceType::CUDA)
+            return;
+        if (!is_quantized_type(t->dtype()))
+            return;
+        const auto& shape = t->shape();
+        if (shape.size() < 2)
+            return;
+        const int64_t n = shape[0];
+        const int64_t k = shape[1];
+        if (n <= 0 || k <= 0)
+            return;
+        const size_t bytes = static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(uint16_t);
+        if (bytes > peak)
+            peak = bytes;
+        total += bytes;
+    };
+    consider(weights_.token_embedding);
+    consider(weights_.output_weight);
+    for (const auto& layer : weights_.layers) {
+        for (const auto& kv : layer.weights)
+            consider(kv.second);
+    }
+    cuda::set_dequant_scratch_peak_bytes(peak);
+    cuda::set_dequant_total_fp16_bytes(total);
+    return peak;
+#else
+    return 0;
+#endif
 }
 
 LayerExecutionContext TransformerEngine::make_layer_context(int layer_idx,
@@ -868,6 +1012,13 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     // Imperative execution (original path)
     const auto& cfg = model_.config();
     auto t0 = std::chrono::steady_clock::now();
+#ifdef USE_CUDA
+    if (std::getenv("FORGE_DEBUG_LAYERS")) {
+        fprintf(stderr, "[DBG] forward_layers begin seq_len=%d n_layers=%d\n",
+                req.n_tokens, cfg.num_layers);
+        fflush(stderr);
+    }
+#endif
 
     auto cur_hidden = hidden;
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
@@ -891,8 +1042,41 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             fflush(stderr);
             return nullptr;
         }
+#ifdef USE_CUDA
+        // Two independent diagnostics, split so the expensive device sync is not
+        // forced onto every debug run:
+        //   FORGE_DEBUG_LAYERS=1     -> per-layer begin/end markers only (cheap)
+        //   FORGE_DEBUG_CUDA_SYNC=1  -> cudaGetLastError + cudaDeviceSynchronize
+        //                               to surface which layer's kernels fail/hang
+        //                               under a given matmul path (e.g. dp4a MMQ)
+        if (std::getenv("FORGE_DEBUG_LAYERS")) {
+            fprintf(stderr, "[DBG] layer %d done (seq_len=%d)\n", layer, seq_len);
+            fflush(stderr);
+        }
+        if (std::getenv("FORGE_DEBUG_CUDA_SYNC")) {
+            cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                fprintf(stderr, "[DBG] layer %d CUDA error after forward_layer: %s\n",
+                        layer, cudaGetErrorString(e));
+                fflush(stderr);
+            }
+            cudaError_t s = cudaDeviceSynchronize();
+            if (s != cudaSuccess) {
+                fprintf(stderr, "[DBG] layer %d cudaDeviceSynchronize FAILED: %s\n",
+                        layer, cudaGetErrorString(s));
+                fflush(stderr);
+                return nullptr;
+            }
+        }
+#endif
     }
 
+#ifdef USE_CUDA
+    if (std::getenv("FORGE_DEBUG_LAYERS")) {
+        fprintf(stderr, "[DBG] forward_layers loop done; entering output_norm+logits\n");
+        fflush(stderr);
+    }
+#endif
     // Use unified weights for output norm and projection
     auto output_norm = weights_.output_norm;
     {
@@ -944,6 +1128,15 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
                 logits = ops::matmul_transB(cur_hidden, output_weight);
             }
 #endif
+        } else if (!req.return_all_logits && seq_len > 1 && !sparse_logits_disabled()) {
+            // Sparse logits (prefill): only the final position's row is ever
+            // consumed. Projecting all seq_len rows costs seq_len× the GEMM
+            // FLOPs and materializes a [seq_len, vocab] FP32 buffer (≈5 GB at
+            // 8k ctx / 151936 vocab) before a full D2H copy. Callers that need
+            // every row (spec-decode verify, Python surface) set
+            // return_all_logits explicitly.
+            auto last_row = gather_rows(cur_hidden, {static_cast<int64_t>(seq_len) - 1});
+            logits = ops::matmul_transB(last_row, output_weight);
         } else {
             logits = ops::matmul_transB(cur_hidden, output_weight);
         }

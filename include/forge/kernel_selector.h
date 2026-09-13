@@ -15,7 +15,11 @@
 
 #pragma once
 
+#include "forge/gpu_memory_planner.h"
 #include "forge/types.h"
+
+#include <optional>
+#include <string>
 
 namespace forge {
 
@@ -230,5 +234,165 @@ void kernel_cache_record(const KernelProblem& problem, KernelVariant best);
 
 KernelCacheStats kernel_cache_stats();
 void kernel_cache_reset();
+
+// ===========================================================================
+// Quantized-weight prefill matmul policy (VRAM-aware dispatch)
+//
+// Any quantized dtype that offers a dequant-FP16 + cuBLAS TensorCore prefill
+// path can join this dispatch; today only Q3_K is registered, and adding
+// Q4_K / Q5_K / ... is a single register_quant_tc_dtype() call, not a rewrite of
+// the machinery. The rule chain, the optional-cache ladder and the memory
+// budget are all dtype-agnostic -- they operate on QuantPolicyFacts, never on a
+// concrete format.
+//
+// Two responsibilities stay separate:
+//   * GpuMemoryPlanner (forge/gpu_memory_planner.h) owns how much VRAM the
+//     process may claim and what is left for an OPTIONAL dequant cache.
+//   * This layer owns which matmul PATH a dtype runs (TensorCore vs MMQ) and
+//     applies the shared optional cache budget. It never manages VRAM itself.
+//
+// KV cache + the TensorCore scratch are MANDATORY; the per-weight dequant cache
+// is OPTIONAL and reclaimable. The auto rule therefore walks a fixed cache
+// ladder down to 0 before ever falling back to MMQ, so a performance cache can
+// never starve the KV cache.
+//
+// The policy is resolved ONCE after model + KV init from a VRAM-fit estimate,
+// not per GEMM. Env overrides (FORGE_MATMUL_PATH / FORGE_FORCE_TC /
+// FORGE_FORCE_MMQ) win and pin a value.
+//
+// Extensibility: the decision is a *sequence of prioritized rules* (a chain of
+// responsibility), not a monolithic if-else. Each rule is a pure function of the
+// gathered facts and returns an optional decision; the first concrete answer wins.
+// To add a new input (GPU capability tier, batch-size awareness, a CLI flag, a
+// per-request override) write a quant_rule_*() function and register it in
+// kQuantPolicyRules[] (see kernel_selector.cpp) at the right priority -- zero
+// edits to the dispatch body. The same machinery backs every registered dtype.
+// ===========================================================================
+
+// The matmul path a quantized weight can take. Universal across dtypes; only
+// the registration (which dtypes may use it) is per-format.
+enum class QuantMatmulPolicy {
+    Auto,        // resolve from VRAM fit at init (default)
+    TensorCore,  // force the dequant-FP16 + cuBLAS path
+    MMQ,         // force the dp4a/MMQ SIMT path
+};
+
+inline const char* quant_matmul_policy_name(QuantMatmulPolicy p) {
+    switch (p) {
+    case QuantMatmulPolicy::Auto: return "auto";
+    case QuantMatmulPolicy::TensorCore: return "tc";
+    case QuantMatmulPolicy::MMQ: return "mmq";
+    }
+    return "?";
+}
+
+// Facts gathered once at resolution time, shared by every quantized dtype.
+// Keeping them in a struct (rather than re-reading env / probing VRAM inside
+// each rule) decouples the *sources of information* from the *policy logic* and
+// makes every rule unit-testable with synthetic facts (no GPU needed).
+struct QuantPolicyFacts {
+    DataType dtype = DataType::Q3_K;  // which dtype this resolution is for (logging only)
+    bool cuda_available = false;
+    // Memory budget: KV + workspace are mandatory, the dequant cache is optional
+    // and reclaimable. See forge/gpu_memory_planner.h for field semantics.
+    GpuMemoryBudget budget;
+    size_t vram_total = 0;
+    size_t dequant_total_fp16 = 0;      // sum of FP16 dequant over CUDA quantized weights
+    size_t configured_cache_bytes = 0;  // CLI/env cap on the per-weight dequant cache
+    // env snapshot (read once)
+    std::string matmul_path;       // FORGE_MATMUL_PATH ("" if unset)
+    bool force_tc = false;         // FORGE_FORCE_TC == "1"
+    bool force_mmq = false;        // FORGE_FORCE_MMQ == "1"
+};
+
+// The outcome of memory planning: which path to run *and* the optional cache
+// budget that goes with it. Kept as a value rather than a bare enum so the
+// decision carries its own rationale -- this is the main debug surface for
+// VRAM-related regressions (log it verbatim). The cache budget is shared across
+// all registered dtypes (the dequant cache is keyed by weight pointer); the PATH
+// is recorded per-dtype via set_quant_matmul_policy().
+struct QuantExecutionPlan {
+    QuantMatmulPolicy path = QuantMatmulPolicy::Auto;
+    size_t dequant_cache_bytes = 0;        // optional cache budget for this plan
+    size_t mandatory_workspace_bytes = 0;  // FP16 dequant scratch peak (not shrinkable)
+    size_t available_bytes = 0;            // headroom the decision was made against
+    bool cache_reduced = false;            // cache had to shrink below the configured cap
+    const char* source = "unresolved";     // winning rule / rationale, for logging
+};
+
+// Decide the execution plan for a synthetic or probed budget. Pure: no GPU
+// probing, no allocation, so it is fully unit-testable without a device.
+QuantExecutionPlan plan_quant_execution(const QuantPolicyFacts& facts);
+// Auto path: take the largest optional cache level that still fits, walking a
+// fixed ladder down to 0 before ever giving up on TensorCore.
+QuantExecutionPlan plan_quant_auto(const QuantPolicyFacts& facts);
+// Pinned path (env override / explicit CLI): honours the requested path and the
+// configured cache cap verbatim -- never silently degrades to the other path.
+QuantExecutionPlan plan_quant_pinned(QuantMatmulPolicy policy, const QuantPolicyFacts& facts,
+                                     const char* source);
+
+// Apply a plan's cache budget: for TensorCore, tighten the dequant cache budget,
+// releasing entries that no longer fit so the memory is actually available to
+// the mandatory allocations. (The per-dtype PATH is recorded by the resolver,
+// not here -- the cache budget is a single shared working set.)
+void apply_quant_execution_plan(const QuantExecutionPlan& plan);
+
+// The shared plan (the global dequant-cache working set) decided by the most
+// recent resolve_quant_execution_plan() call.
+QuantExecutionPlan quant_execution_plan();
+
+// A rule: a pure function of QuantPolicyFacts returning an optional decision.
+// Carries its own name for logging. Register in kQuantPolicyRules[] (see
+// kernel_selector.cpp) to add a decision input without touching the resolver.
+struct QuantPolicyRule {
+    const char* name;
+    std::optional<QuantMatmulPolicy> (*fn)(const QuantPolicyFacts&);
+};
+
+// Built-in rules (each a focused, independently testable unit).
+std::optional<QuantMatmulPolicy> quant_rule_env_matmul_path(const QuantPolicyFacts&);
+std::optional<QuantMatmulPolicy> quant_rule_env_force_tc(const QuantPolicyFacts&);
+std::optional<QuantMatmulPolicy> quant_rule_env_force_mmq(const QuantPolicyFacts&);
+std::optional<QuantMatmulPolicy> quant_rule_vram_aware(const QuantPolicyFacts&);
+
+struct QuantPolicyDecision {
+    QuantMatmulPolicy policy;
+    const char* source;  // winning rule name, for logging
+};
+
+// Apply the rule chain; returns the first concrete decision, else fallback.
+QuantPolicyDecision resolve_quant_policy(const QuantPolicyFacts& facts,
+                                          QuantMatmulPolicy fallback = QuantMatmulPolicy::MMQ);
+
+// ---- Per-dtype registry: which dtypes participate in TC dispatch ----
+// Registering a dataType adds it to VRAM-aware TC/MMQ selection; it then reuses
+// the shared rule chain with no dtype-specific code. Q3_K is registered by
+// default (see kernel_selector.cpp). To support a new format (e.g. Q4_K), call
+// this once at startup -- no other change is required.
+void register_quant_tc_dtype(DataType dt, const char* tag = nullptr);
+bool is_quant_tc_dtype(DataType dt);
+const char* quant_tc_dtype_tag(DataType dt);
+
+// ---- Public state surface (integration point) ----
+// Pin / read the resolved policy for a dtype (Auto until resolved).
+void set_quant_matmul_policy(DataType dt, QuantMatmulPolicy policy);
+QuantMatmulPolicy quant_matmul_policy(DataType dt);
+
+// Resolve the execution plan once, after the weights are loaded and before the
+// KV cache is (re)sized. kv_cache_bytes_missing is the KV memory the process
+// still has to claim: the planner reserves it ahead of any optional dequant
+// cache, so a performance cache can never starve the KV. safety_margin_bytes
+// absorbs activation/workspace growth between this probe and the first forward.
+//
+// Ordering matters: call this BEFORE the KV sizing decision and BEFORE warmup
+// has a chance to fill the dequant cache, otherwise the cache is sized against
+// a free-memory reading that already excludes the KV it is supposed to host.
+// Updates the shared cache budget and records the resolved path for dt.
+QuantExecutionPlan resolve_quant_execution_plan(DataType dt, size_t kv_cache_bytes_missing,
+                                                size_t safety_margin_bytes);
+
+// Legacy entry point: resolve with no outstanding KV request. Prefer the
+// explicit resolve_quant_execution_plan() above.
+void resolve_quant_policy_vram_aware(DataType dt, size_t safety_margin_bytes);
 
 }  // namespace forge
