@@ -8,6 +8,7 @@
 #include "server.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <iomanip>
@@ -36,6 +37,36 @@ std::string make_tool_call_id() {
     std::ostringstream oss;
     oss << "call-" << std::hex << now << std::dec << "-" << ++counter;
     return oss.str();
+}
+
+// Find a tool-call open marker. The catalogue instructs the model to emit
+// "###TOOL###", but quantized models routinely drop a '#' and emit
+// "###TOOL##" (or add extras). We therefore match "###TOOL" followed by one
+// or more '#'. Returns the position of the "###TOOL" prefix, or npos;
+// `inner_start` is set just past the trailing '#'s (where the JSON begins).
+size_t find_tool_open(const std::string& t, size_t from, size_t& inner_start) {
+    static const std::string prefix = "###TOOL";
+    size_t p = t.find(prefix, from);
+    if (p == std::string::npos)
+        return std::string::npos;
+    size_t i = p + prefix.size();
+    while (i < t.size() && t[i] == '#')
+        ++i;
+    inner_start = i;
+    return p;
+}
+
+// Normalize a tool name for fuzzy matching against the registered catalogue:
+// lowercase and strip everything but alphanumerics, so "get_weather",
+// "getWeather" and "getweather" all collapse to "getweather" and match.
+std::string normalize_tool_name(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (char c : s) {
+        if (std::isalnum(static_cast<unsigned char>(c)))
+            o += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return o;
 }
 
 // Render the tool catalogue into a system-prompt block the model can follow.
@@ -125,20 +156,26 @@ std::string extract_tool_object(const std::string& body, const std::string& key)
     return "";
 }
 
-// Extract tool calls (###TOOL### ... ###END### wrapper) from generated text.
-std::vector<forge::ToolCall> parse_tool_calls(const std::string& text) {
+// Extract tool calls (###TOOL[#]...###END### wrapper) from generated text.
+// `allowed`, when non-null and non-empty, is the set of tool names registered
+// by the client; a name the model emitted (often mangled, e.g. "getweather"
+// for "get_weather") is normalized and fuzzy-matched back to a registered
+// name so the upstream caller receives a valid tool id. Calls that cannot be
+// resolved to any registered tool are dropped.
+std::vector<forge::ToolCall> parse_tool_calls(
+    const std::string& text, const std::vector<std::string>* allowed = nullptr) {
     std::vector<forge::ToolCall> calls;
-    static const std::string open = "###TOOL###";
     static const std::string close = "###END###";
     size_t pos = 0;
     while (true) {
-        size_t s = text.find(open, pos);
+        size_t s = 0, inner_start = 0;
+        s = find_tool_open(text, pos, inner_start);
         if (s == std::string::npos)
             break;
-        size_t e = text.find(close, s + open.size());
+        size_t e = text.find(close, inner_start);
         if (e == std::string::npos)
             break;
-        std::string inner = text.substr(s + open.size(), e - (s + open.size()));
+        std::string inner = text.substr(inner_start, e - inner_start);
         nlohmann::json j;
         bool parsed = false;
         try {
@@ -171,10 +208,35 @@ std::vector<forge::ToolCall> parse_tool_calls(const std::string& text) {
             std::string args = extract_tool_object(inner, "arguments");
             tc.arguments = args.empty() ? "{}" : args;
         }
-        if (!tc.name.empty()) {
-            tc.id = make_tool_call_id();
-            calls.push_back(std::move(tc));
+        if (tc.name.empty())
+            break;
+        // Resolve the (possibly mangled) name against the registered catalogue.
+        if (allowed && !allowed->empty()) {
+            bool resolved = false;
+            const std::string norm = normalize_tool_name(tc.name);
+            if (!norm.empty()) {
+                for (const auto& a : *allowed) {
+                    if (a == tc.name) {
+                        tc.name = a;
+                        resolved = true;
+                        break;
+                    }
+                }
+                if (!resolved) {
+                    for (const auto& a : *allowed) {
+                        if (normalize_tool_name(a) == norm) {
+                            tc.name = a;
+                            resolved = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!resolved)
+                break;  // not a known tool: drop this block
         }
+        tc.id = make_tool_call_id();
+        calls.push_back(std::move(tc));
         pos = e + close.size();
     }
     return calls;
@@ -183,14 +245,14 @@ std::vector<forge::ToolCall> parse_tool_calls(const std::string& text) {
 // Remove tool-call wrapper blocks from the assistant text.
 std::string strip_tool_call_blocks(const std::string& text) {
     std::string out = text;
-    static const std::string open = "###TOOL###";
     static const std::string close = "###END###";
     size_t pos = 0;
     while (true) {
-        size_t s = out.find(open, pos);
+        size_t s = 0, inner_start = 0;
+        s = find_tool_open(out, pos, inner_start);
         if (s == std::string::npos)
             break;
-        size_t e = out.find(close, s + open.size());
+        size_t e = out.find(close, inner_start);
         if (e == std::string::npos) {
             out.erase(s);
             break;
@@ -651,7 +713,11 @@ ChatCompletionResult ServerState::chat_completion(
     // Parse any ###TOOL###...###END### blocks the model emitted into
     // OpenAI-shaped tool_calls and strip them from the assistant text.
     if (tools_active) {
-        auto calls = parse_tool_calls(out.text);
+        std::vector<std::string> tool_names;
+        tool_names.reserve(req.tools.size());
+        for (const auto& t : req.tools)
+            tool_names.push_back(t.name);
+        auto calls = parse_tool_calls(out.text, &tool_names);
         if (!calls.empty()) {
             out.text = strip_tool_call_blocks(out.text);
             out.tool_calls = std::move(calls);
