@@ -20,6 +20,9 @@ extern void dequantize_iq4_nl_row(const uint8_t*, float*, int, int);
 extern void dequantize_iq2_xs_row(const uint8_t*, float*, int, int);
 extern void dequantize_iq3_s_row(const uint8_t*, float*, int, int);
 extern void dequantize_iq4_xs_row(const uint8_t*, float*, int, int);
+extern void dequantize_iq1_s_row(const uint8_t*, float*, int, int);
+extern void dequantize_iq3_xxs_row(const uint8_t*, float*, int, int);
+extern void dequantize_iq1_m_row(const uint8_t*, float*, int, int);
 }  // namespace ops
 }  // namespace forge
 
@@ -32,7 +35,10 @@ namespace forge {
 //   2. Add one row to this table
 //   3. Implement the dequant kernel
 // MSVC does not support C99 designated initializers, so use positional initialization.
-// Order must match the DataType enum values (0..17) exactly.
+// Order must match the DataType enum values (0..24) exactly: the row position IS
+// the enum value. A misplaced row silently reroutes another dtype's dequant fn
+// and block size (this table once had FP8_E4M3 appended last, which shifted
+// IQ1_S/IQ3_XXS/IQ1_M into each other's slots).
 const DataTypeTraits data_type_traits[] = {
     /*  0 FP32     */ { "fp32",     4, 1,   0,   false, nullptr },
     /*  1 FP16     */ { "fp16",     2, 1,   0,   false, nullptr },
@@ -56,6 +62,9 @@ const DataTypeTraits data_type_traits[] = {
     /* 19 IQ3_S    */ { "iq3_s",    0, 256, 110, true,  ops::dequantize_iq3_s_row },
     /* 20 IQ4_XS   */ { "iq4_xs",   0, 256, 136, true,  ops::dequantize_iq4_xs_row },
     /* 21 FP8_E4M3 */ { "fp8_e4m3", 1, 1,   0,   false, nullptr },
+    /* 22 IQ1_S    */ { "iq1_s",    0, 256, 50,  true,  ops::dequantize_iq1_s_row },
+    /* 23 IQ3_XXS  */ { "iq3_xxs",  0, 256, 98,  true,  ops::dequantize_iq3_xxs_row },
+    /* 24 IQ1_M    */ { "iq1_m",    0, 256, 56,  true,  ops::dequantize_iq1_m_row },
 };
 
 }  // namespace forge

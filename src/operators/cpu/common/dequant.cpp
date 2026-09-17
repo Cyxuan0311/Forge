@@ -8,6 +8,7 @@
 #include "dequant.h"
 #include "quant_helpers.h"
 #include "quant_tables.h"
+#include "quant_tables_iq13.h"
 #include "scalar.h"
 
 namespace forge {
@@ -596,6 +597,112 @@ void dequantize_iq3_s_row(const uint8_t* q_data, float* out, int K, int row) {
     }
 }
 
+
+}  // namespace ops
+}  // namespace forge
+
+// ---------------------------------------------------------------------------
+// IQ1_S / IQ3_XXS / IQ1_M dequantization (ported from llama.cpp ggml-quants.c)
+// Block layouts:
+//   block_iq1_s   : ggml_half d; uint8_t qs[QK_K/8=32]; uint8_t qh[QK_K/16=16]
+//   block_iq3_xxs : ggml_half d; uint8_t qs[3*QK_K/8=96]
+//   block_iq1_m   : uint8_t qs[QK_K/8=32]; uint8_t qh[QK_K/16=16]; uint8_t scales[QK_K/32=8]
+// ---------------------------------------------------------------------------
+
+namespace forge {
+namespace ops {
+
+void dequantize_iq1_s_row(const uint8_t* q_data, float* out, int K, int row) {
+    const int IQ1_S_BLOCK_SIZE = 50;
+    const int blocks_per_row = (K + QK_K - 1) / QK_K;
+    const uint8_t* row_ptr = q_data + row * blocks_per_row * IQ1_S_BLOCK_SIZE;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const uint8_t* block_ptr = row_ptr + bi * IQ1_S_BLOCK_SIZE;
+        const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block_ptr));
+        const uint8_t* qs = block_ptr + 2;                  // 32 bytes
+        const uint16_t* qh = reinterpret_cast<const uint16_t*>(block_ptr + 2 + 32);  // 8 x uint16
+        float* y = out + bi * QK_K;
+        for (int sib = 0; sib < 8; ++sib) {
+            const float dl = d * (2 * ((qh[sib] >> 12) & 7) + 1);
+            const float delta = (qh[sib] & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (int l = 0; l < 4; ++l) {
+                const int grid = qs[4 * sib + l] | (((qh[sib] >> (3 * l)) & 7) << 8);
+                const int8_t* g = reinterpret_cast<const int8_t*>(iq1s_grid + grid);
+                for (int j = 0; j < 8; ++j) y[j] = dl * (g[j] + delta);
+                y += 8;
+            }
+        }
+    }
+}
+
+void dequantize_iq3_xxs_row(const uint8_t* q_data, float* out, int K, int row) {
+    const int IQ3_XXS_BLOCK_SIZE = 98;
+    const int blocks_per_row = (K + QK_K - 1) / QK_K;
+    const uint8_t* row_ptr = q_data + row * blocks_per_row * IQ3_XXS_BLOCK_SIZE;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const uint8_t* block_ptr = row_ptr + bi * IQ3_XXS_BLOCK_SIZE;
+        const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block_ptr));
+        const uint8_t* qs = block_ptr + 2;                       // 96 bytes
+        const uint8_t* scales_and_signs = qs + QK_K / 4;         // bytes 64..96 (32 bytes)
+        float* y = out + bi * QK_K;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const uint32_t aux32 = *reinterpret_cast<const uint32_t*>(scales_and_signs + 4 * ib32);
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            const uint8_t* qp = qs + 8 * ib32;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(iq3xxs_grid + qp[2 * l + 0]);
+                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(iq3xxs_grid + qp[2 * l + 1]);
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db * static_cast<float>(grid1[j]) * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                    y[j + 4] = db * static_cast<float>(grid2[j]) * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+        }
+    }
+}
+
+void dequantize_iq1_m_row(const uint8_t* q_data, float* out, int K, int row) {
+    const int IQ1_M_BLOCK_SIZE = 56;
+    const int blocks_per_row = (K + QK_K - 1) / QK_K;
+    const uint8_t* row_ptr = q_data + row * blocks_per_row * IQ1_M_BLOCK_SIZE;
+    for (int bi = 0; bi < blocks_per_row; ++bi) {
+        const uint8_t* block_ptr = row_ptr + bi * IQ1_M_BLOCK_SIZE;
+        const uint8_t* qs = block_ptr + 0;                 // 32 bytes
+        const uint8_t* qh = block_ptr + 32;                // 16 bytes
+        const uint8_t* scales = block_ptr + 32 + 16;       // 8 bytes
+        float* y = out + bi * QK_K;
+        const uint16_t* sc = reinterpret_cast<const uint16_t*>(scales);
+        uint16_t scale_u16 = static_cast<uint16_t>((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                                    ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+        const float d = fp16_to_fp32(scale_u16);
+        for (int sib = 0; sib < 8; ++sib) {
+            const float dl1 = d * (2 * ((sc[sib / 2] >> (6 * (sib % 2) + 0)) & 0x7) + 1);
+            const float dl2 = d * (2 * ((sc[sib / 2] >> (6 * (sib % 2) + 3)) & 0x7) + 1);
+            const uint8_t b1 = qh[2 * sib + 0];
+            const uint8_t b2 = qh[2 * sib + 1];
+            int idx[4];
+            idx[0] = qs[0] | ((b1 << 8) & 0x700);
+            idx[1] = qs[1] | ((b1 << 4) & 0x700);
+            idx[2] = qs[2] | ((b2 << 8) & 0x700);
+            idx[3] = qs[3] | ((b2 << 4) & 0x700);
+            float delta[4];
+            delta[0] = (b1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[1] = (b1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[2] = (b2 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[3] = (b2 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (int l = 0; l < 4; ++l) {
+                const float dl = (l < 2) ? dl1 : dl2;
+                const int8_t* g = reinterpret_cast<const int8_t*>(iq1s_grid + idx[l]);
+                for (int j = 0; j < 8; ++j) y[j] = dl * (g[j] + delta[l]);
+                y += 8;
+            }
+            qs += 4;
+            qh += 2;
+        }
+    }
+}
 
 }  // namespace ops
 }  // namespace forge

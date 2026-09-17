@@ -12,6 +12,8 @@ add_library(
   cpu/rope.cpp
   cpu/elementwise.cpp
   cpu/attention.cpp
+  cpu/conv.cpp
+  cpu/gdn.cpp
   cpu/common/dequant.cpp
   cpu/common/quant_tables.cpp
 )# 6-C-5.7: interim FP8 scale registry (fp8_scale_registry.cpp) deleted

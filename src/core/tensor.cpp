@@ -195,6 +195,10 @@ void Tensor::allocate() {
     if (nbytes_ == 0)
         return;
 
+    // Timed: the decode hot path allocates/frees tensors every step. If the
+    // device allocator has to reclaim or sync, that cost lands here and shows up
+    // as per-step time that grows as VRAM fills -- the "unattributed" share of
+    // decode/forward. The profiler reports both the count (n) and total.
     if (device_ == DeviceType::CPU) {
         data_ = host_mem::allocate(nbytes_);
         if (!data_)

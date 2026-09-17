@@ -14,8 +14,10 @@
 //     env override; otherwise MMQ -> batched GEMV -> dequant + cuBLAS. FP32
 //     weights go straight to cuBLAS. Q6_K joined in Phase 5-A and Q5_K in
 //     Phase 5-B (Q5_K needed its own FP16 whole-matrix dequant kernel; see
-//     launch_cublas_gemm_quant_fp16). Q3_K is now also eligible for the
-//     prefill tensor-core path (Phase 6-MMQ, see tensorcore_eligible()).
+//     launch_cublas_gemm_quant_fp16). Q3_K is NOT TC-eligible by default: its
+//     block/scale dequant is slower than dp4a MMQ on shipping GPUs (RTX 4050
+//     measured ~2.6x slower prefill), so it stays on MMQ; FORGE_AUTOTUNE=1 can
+//     still opt it into TC per-signature.
 //   * MoE: only Q4_0/Q4_K/Q6_K/Q8_0 experts are launchable; anything else is
 //     UNSUPPORTED and the caller skips silently (as before).
 //
@@ -149,8 +151,14 @@ bool tensorcore_eligible(DataType dt) {
     case DataType::Q5_K:
     case DataType::Q6_K:
     case DataType::Q8_0:
-    case DataType::Q3_K:  // Phase 6-MMQ: Q3_K now eligible for PREFILL tensor cores.
         return true;
+    // Q3_K is intentionally NOT TC-eligible. Phase 6-MMQ briefly claimed Q3_K
+    // wins on the dequant-FP16 + cuBLAS path at prefill M, but measured on
+    // shipping GPUs (e.g. RTX 4050, Ada) the TC path is ~2.6x SLOWER than the
+    // dp4a MMQ path for Q3_K prefill (and ~3.2x slower at decode, M==1) -- the
+    // Q3_K block/scale dequant does not amortize well on tensor cores there.
+    // Default to MMQ; FORGE_AUTOTUNE=1 still measures per-signature and can
+    // opt Q3_K back into TC where it actually wins.
     default:
         return false;
     }
@@ -280,8 +288,8 @@ KernelVariant select_gemv(const KernelProblem& p) {
 // phases: Q8_0 after Phase 3.5 added its true M>1 MMQ instance
 // (mmq_dispatch[Q8_0]); Q6_K after Phase 5-A (dequant path already existed);
 // Q5_K after Phase 5-B added its missing FP16 whole-matrix dequant. Q3_K is
-// now eligible for prefill tensor cores since Phase 6-MMQ (the old M==1
-// 3.2x-slower measurement does not apply to M>1; see tensorcore_eligible()).
+// intentionally NOT TC-eligible (its dequant is slower than dp4a MMQ on
+// shipping GPUs at both prefill and decode M); FORGE_AUTOTUNE can override.
 // Per-signature override inside / around each threshold is owned by the 4-B
 // autotuner once opted in (FORGE_AUTOTUNE=1); benchmark force envs stay the
 // highest priority.
@@ -428,7 +436,10 @@ namespace {
 // falls back to the grow-only scratch), so 0 is a valid plan rather than a
 // failure: trading the performance cache away is always preferable to trading
 // the TensorCore path away.
+// NOTE: values are MiB and are converted to bytes at the use site (see the
+// ladder loop in plan_quant_auto) -- do NOT pass them to size_t-byte APIs raw.
 constexpr size_t kQuantCacheStepsMib[] = {1024, 768, 512, 384, 256, 128, 64, 0};
+constexpr size_t kMiB = 1024u * 1024u;
 
 // Gather every input the planner may need exactly once. Decoupled from the
 // planning logic so plan_quant_*() never reads env / probes VRAM itself (keeps
@@ -537,6 +548,15 @@ QuantExecutionPlan plan_quant_auto(const QuantPolicyFacts& f) {
         return p;
     }
 
+    // A dtype that cannot use the TensorCore path must not reserve the optional
+    // dequant cache (it would sit unused and starve the KV cache). Go straight
+    // to MMQ without touching the budget.
+    if (!tensorcore_eligible(f.dtype)) {
+        p.path = QuantMatmulPolicy::MMQ;
+        p.source = "vram:not_tc_eligible";
+        return p;
+    }
+
     const size_t configured = f.configured_cache_bytes;
     auto take = [&](size_t level_bytes) {
         // The cache can never usefully exceed the whole FP16 model.
@@ -557,10 +577,14 @@ QuantExecutionPlan plan_quant_auto(const QuantPolicyFacts& f) {
     }
     // 2) Walk the ladder down. Giving up optional cache is always preferable to
     //    giving up TensorCore, so try every level -- including 0 -- first.
+    //    Ladder values are MiB; convert to bytes before comparing against the
+    //    byte-sized budget (the previous raw-byte use capped the cache at ~1 KiB,
+    //    defeating the persistent dequant cache and thrashing prefill).
     for (size_t step : kQuantCacheStepsMib) {
-        if (step >= configured)
+        const size_t level = step * kMiB;
+        if (level >= configured)
             continue;  // already tried, or above the user's cap
-        if (take(step)) {
+        if (take(level)) {
             p.source = "vram:tc_reduced_cache";
             return p;
         }

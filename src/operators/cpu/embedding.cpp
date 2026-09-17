@@ -1,4 +1,6 @@
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -444,6 +446,19 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
     } else {
         vocab_size = static_cast<int>(weight->shape()[0]);
         embed_dim = static_cast<int>(weight->shape()[1]);
+    }
+
+    if (std::getenv("FORGE_EMB_DEBUG")) {
+        const bool tr =
+            (weight->shape().size() >= 2 && weight->shape()[0] < weight->shape()[1]);
+        std::fprintf(stderr,
+                     "[EMB] dtype=%d ndim=%zu s0=%lld s1=%lld embed_dim=%d vocab=%d "
+                     "transposed=%d quantized=%d cache=%s dev=%d\n",
+                     (int)weight->dtype(), weight->shape().size(),
+                     (long long)(weight->shape().size() > 0 ? weight->shape()[0] : -1),
+                     (long long)(weight->shape().size() > 1 ? weight->shape()[1] : -1),
+                     embed_dim, vocab_size, (int)tr, (int)is_quantized_type(weight->dtype()),
+                     fp32_cache ? "yes" : "no", (int)weight->device());
     }
 
     auto out = std::make_shared<Tensor>(
