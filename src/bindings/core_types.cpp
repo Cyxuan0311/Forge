@@ -24,6 +24,9 @@ void register_core_types(py::module_& m) {
         .value("IQ2_XS", DataType::IQ2_XS)
         .value("IQ3_S", DataType::IQ3_S)
         .value("IQ4_XS", DataType::IQ4_XS)
+        .value("IQ1_S", DataType::IQ1_S)
+        .value("IQ3_XXS", DataType::IQ3_XXS)
+        .value("IQ1_M", DataType::IQ1_M)
         .value("BF16", DataType::BF16)
         .value("FP8_E4M3", DataType::FP8_E4M3);
 
