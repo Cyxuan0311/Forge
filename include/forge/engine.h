@@ -84,6 +84,12 @@ public:
     // state) if it has not been allocated yet. InferenceContext calls this so
     // that callers can query cache stats before the first forward.
     virtual void init_memory() {}
+
+    // vLLM-style post-warmup re-sizing: grow the paged KV pool to the device
+    // budget measured AFTER warmup committed the runtime's real VRAM usage
+    // (init-time free memory is transiently low and under-sizes the pool).
+    // Engines without a paged pool return true (no-op).
+    virtual bool resize_paged_kv_pool() { return true; }
 };
 
 using EngineCreator = std::function<std::unique_ptr<InferenceEngine>(Model&, InferenceContext&)>;

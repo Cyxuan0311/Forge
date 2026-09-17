@@ -910,7 +910,17 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
             // the context to the 256-token minimum instead of crashing.
             const size_t available = usable_mem > headroom ? usable_mem - headroom : 0;
             const size_t max_seq_by_mem = available / per_token_bytes;
-            if (max_seq_by_mem < (size_t)kv_max_seq) {
+            // Paged mode never allocates this contiguous cache: its pages are
+            // allocated lazily and PagedKVStorage sizes its own pool from free
+            // device memory. Clamping here would size the pool from a budget we
+            // never consume -- and the measurement is taken before warmup, when
+            // free VRAM is transiently low (observed: 330MB here vs 2742MB after
+            // warmup), which previously crippled the pool to a few hundred tokens
+            // and made every real prompt exhaust it. vLLM has the same principle:
+            // the KV budget is what remains after profiling what is ACTUALLY
+            // allocated, not a phantom reservation.
+            const bool paged_mode = kv_memory_ && kv_memory_->is_paged();
+            if (!paged_mode && max_seq_by_mem < (size_t)kv_max_seq) {
                 size_t reduced = (max_seq_by_mem / 256) * 256;  // 256-align
                 if (reduced < 256)
                     reduced = 256;
@@ -948,40 +958,50 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024 * 1024)) +
              " MB (native trained context=" + std::to_string(cfg.max_seq_len) + ")");
 
-    // Allocate KV cache on the primary device
-    // For paged mode, KVCache is still initialized (for transitional compatibility)
-    // but PagedKVStorage is the primary storage backend.
-    kv_cache_.init_quantized(kv_num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq, kv_dev,
-                             kv_cache_dtype_);
+    const bool paged = kv_memory_ && kv_memory_->is_paged();
 
-    // Phase 6: set per-layer memory policies from arch config.
-    // SlidingWindow layers use ring buffer eviction; Full layers grow linearly.
-    if (cfg.n_swa > 0) {
-        std::vector<KVLayerPolicy> policies(kv_num_layers, KVLayerPolicy::Full);
-        bool has_swa_layers = false;
-        for (int i = 0; i < cfg.num_layers; ++i) {
-            if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1) {
-                policies[i] = KVLayerPolicy::SlidingWindow;
-                has_swa_layers = true;
+    // In paged mode the PagedKVStorage is the sole KV backend, so allocating the
+    // contiguous KVCache as well would waste ~max_seq_len*layers*head_dim bytes of
+    // VRAM that the paged page pool needs to size itself from free device memory.
+    // Skipping it frees that budget; the engine never reads kv_cache_ on the paged
+    // path (generic_engine/phimoe_engine branch on kv_memory_->is_paged()).
+    if (!paged) {
+        // Allocate KV cache on the primary device.
+        kv_cache_.init_quantized(kv_num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq,
+                                 kv_dev, kv_cache_dtype_);
+
+        // Phase 6: set per-layer memory policies from arch config.
+        // SlidingWindow layers use ring buffer eviction; Full layers grow linearly.
+        if (cfg.n_swa > 0) {
+            std::vector<KVLayerPolicy> policies(kv_num_layers, KVLayerPolicy::Full);
+            bool has_swa_layers = false;
+            for (int i = 0; i < cfg.num_layers; ++i) {
+                if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1) {
+                    policies[i] = KVLayerPolicy::SlidingWindow;
+                    has_swa_layers = true;
+                }
             }
+            // If swa_layers is empty but n_swa > 0, treat as uniform SWA (all layers)
+            if (!has_swa_layers) {
+                policies.assign(cfg.num_layers, KVLayerPolicy::SlidingWindow);
+            }
+            kv_cache_.set_layer_policies(policies, cfg.n_swa);
         }
-        // If swa_layers is empty but n_swa > 0, treat as uniform SWA (all layers)
-        if (!has_swa_layers) {
-            policies.assign(cfg.num_layers, KVLayerPolicy::SlidingWindow);
-        }
-        kv_cache_.set_layer_policies(policies, cfg.n_swa);
-    }
 
-    // Place each layer's KV cache on the corresponding device.
-    // When offload_kqv is false, skip per-layer device placement so KV stays on CPU
-    // even if the layer weights are on GPU.
-    if (!layer_devices_.empty() && ctx_.params().offload_kqv) {
-        kv_cache_.set_layer_devices(layer_devices_);
+        // Place each layer's KV cache on the corresponding device.
+        // When offload_kqv is false, skip per-layer device placement so KV stays on CPU
+        // even if the layer weights are on GPU.
+        if (!layer_devices_.empty() && ctx_.params().offload_kqv) {
+            kv_cache_.set_layer_devices(layer_devices_);
+        }
     }
 
     // Initialize paged storage if paged mode is enabled
-    if (kv_memory_ && kv_memory_->is_paged()) {
-        std::vector<int> kv_dims(cfg.num_layers, cfg.num_kv_heads * cfg.head_dim);
+    if (paged) {
+        // Size for kv_num_layers (== num_layers + n_nextn) to match the
+        // contiguous path: MTP's trailing attention layer writes KV at index
+        // num_layers and must have a real paged pool, not an out-of-bounds slot.
+        std::vector<int> kv_dims(kv_num_layers, cfg.num_kv_heads * cfg.head_dim);
         // Roadmap 1.2: both knobs come from ContextParams. page_size defaults to
         // 16; max_num_seqs == 0 lets PagedKVStorage derive the limit from the
         // free device memory instead of the historical hard-coded 32.
@@ -1001,7 +1021,7 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         }
         // Paged storage follows the KV cache device: CUDA engine → CUDA pages,
         // CPU engine → CPU pages (Phase 3 behavior).
-        if (!kv_memory_->init_storage(cfg.num_layers, kv_dims, kv_max_seq, kv_dev, kv_config,
+        if (!kv_memory_->init_storage(kv_num_layers, kv_dims, kv_max_seq, kv_dev, kv_config,
                                       page_size, max_num_seqs)) {
             LOG_ERROR("Failed to initialize paged KV storage");
         }
@@ -1037,6 +1057,12 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         }
     }
 #endif
+}
+
+bool TransformerEngine::resize_paged_kv_pool() {
+    if (!kv_memory_ || !kv_memory_->is_paged())
+        return true;  // contiguous mode: nothing to re-size
+    return kv_memory_->resize_storage();
 }
 
 size_t TransformerEngine::estimate_dequant_scratch_peak_bytes() {

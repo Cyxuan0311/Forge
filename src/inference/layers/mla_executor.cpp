@@ -36,7 +36,11 @@ TensorPtr MlaExecutor::attend(const TensorPtr& normed, const LayerExecutionConte
 
     kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, rope.k_rope, v_latent, seq_len);
 
-    if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
+    // Quantized KV (Q4_0 / Q8_0 / Q4_K) must be dequantized to FP32 before the
+    // CPU attention kernel; FP32 needs no dequant. Mirrors qwen35_full_attention.
+    const auto kv_dt = kv_cache_.kv_dtype();
+    if (kv_dt == KVCacheDType::Q4_0 || kv_dt == KVCacheDType::Q8_0 ||
+        kv_dt == KVCacheDType::Q4_K) {
         kv_cache_.dequantize_layer(layer_idx);
     }
 

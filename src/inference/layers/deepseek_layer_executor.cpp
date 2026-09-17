@@ -32,7 +32,11 @@ TensorPtr DeepSeekLayerExecutor::attend_gqa(const TensorPtr& normed,
             " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
     }
 
-    if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
+    // Quantized KV (Q4_0 / Q8_0 / Q4_K) must be dequantized to FP32 before the
+    // CPU attention kernel; FP32 needs no dequant. Mirrors qwen35_full_attention.
+    const auto kv_dt = kv_cache_.kv_dtype();
+    if (kv_dt == KVCacheDType::Q4_0 || kv_dt == KVCacheDType::Q8_0 ||
+        kv_dt == KVCacheDType::Q4_K) {
         kv_cache_.dequantize_layer(layer_idx);
     }
 

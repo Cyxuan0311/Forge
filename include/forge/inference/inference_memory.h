@@ -14,6 +14,7 @@
 // 和 recurrent state 的架构使用 HybridMemory, 单纯 KV cache 的继续用 KvMemory。
 
 #include "forge/inference/layers/qwen35_recurrent_memory.h"
+#include "forge/inference/layers/bailingmoe3_recurrent_memory.h"
 #include "forge/kv_cache.h"
 
 namespace forge {
@@ -38,6 +39,10 @@ public:
     // recurrent state 的架构返回 nullptr。
     virtual Qwen35RecurrentMemory* recurrent() { return nullptr; }
     virtual const Qwen35RecurrentMemory* recurrent() const { return nullptr; }
+
+    // BailingMoE3 (Ling 3.0) GDN/KDA recurrent state。没有则 nullptr。
+    virtual Bailingmoe3RecurrentMemory* bailingmoe3_recurrent() { return nullptr; }
+    virtual const Bailingmoe3RecurrentMemory* bailingmoe3_recurrent() const { return nullptr; }
 };
 
 // 标准 KV cache memory。Gemma4 的 per-layer KV 布局同样使用它,
@@ -81,6 +86,30 @@ public:
 private:
     KVCache cache_;
     Qwen35RecurrentMemory recurrent_;
+    bool initialized_ = false;
+};
+
+// 同时持有 KV cache 和 BailingMoE3 GDN/KDA recurrent state 的 memory。
+class Bailingmoe3Memory final : public InferenceMemory {
+public:
+    void reset() override {
+        cache_.reset();
+        recurrent_.reset();
+        initialized_ = false;
+    }
+
+    bool initialized() const override { return initialized_; }
+    void set_initialized(bool v) override { initialized_ = v; }
+
+    KVCache* kv() override { return &cache_; }
+    const KVCache* kv() const override { return &cache_; }
+
+    Bailingmoe3RecurrentMemory* bailingmoe3_recurrent() override { return &recurrent_; }
+    const Bailingmoe3RecurrentMemory* bailingmoe3_recurrent() const override { return &recurrent_; }
+
+private:
+    KVCache cache_;
+    Bailingmoe3RecurrentMemory recurrent_;
     bool initialized_ = false;
 };
 

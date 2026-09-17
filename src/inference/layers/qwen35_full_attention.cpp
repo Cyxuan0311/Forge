@@ -53,6 +53,12 @@ TensorPtr Qwen35FullAttention::attend(const TensorPtr& normed, const LayerExecut
                   " missing required attention weights");
         return nullptr;
     }
+    // Keep the attention backend's storage binding in sync with the live KV
+    // memory (paged vs contiguous). The mode is fixed for the engine's lifetime,
+    // but binding it here makes the layer robust to construction ordering.
+    if (kv_memory_) {
+        attn_.set_storage(kv_memory_->is_paged() ? &kv_memory_->storage() : nullptr);
+    }
     if (lctx.device == DeviceType::CUDA) {
 #ifdef USE_CUDA
         return attend_cuda(normed, lctx);
@@ -140,38 +146,37 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
                           static_cast<float*>(k_rope->data()), seq_len, num_heads, num_kv_heads,
                           head_dim, n_rot, lctx.start_pos(), cfg.rope_theta);
 
-    kv_cache_.update(lctx.layer_idx, lctx.seq_id(), lctx.start_pos(), k_rope, v, seq_len);
-    if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
-        kv_cache_.dequantize_layer(lctx.layer_idx);
+    // ---- KV write (storage-aware: paged PagedKVStorage or contiguous KVCache) ----
+    if (kv_memory_) {
+        if (!kv_memory_->write_kv(lctx.layer_idx, lctx.seq_id(), lctx.start_pos(), seq_len, k_rope,
+                                  v)) {
+            throw std::runtime_error(
+                "qwen35: KV write failed at layer " + std::to_string(lctx.layer_idx) +
+                " (paged page pool exhausted or invalid seq — reduce --ctx-size / free VRAM)");
+        }
+    } else {
+        if (kv_cache_.update(lctx.layer_idx, lctx.seq_id(), lctx.start_pos(), k_rope, v, seq_len) <
+            0) {
+            throw std::runtime_error(
+                "qwen35: KV cache overflow at layer " + std::to_string(lctx.layer_idx) +
+                ": write_pos=" + std::to_string(lctx.start_pos()) +
+                " seq_len=" + std::to_string(seq_len) +
+                " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+        }
     }
 
-    const int total_len = kv_cache_.filled(lctx.layer_idx);
-    TensorPtr k_expanded = kv_cache_.get_key_filled(lctx.layer_idx);
-    TensorPtr v_expanded = kv_cache_.get_value_filled(lctx.layer_idx);
-    if (num_kv_heads < num_heads) {
-        k_expanded = AttentionExecutor::expand_kv_heads(
-            ensure_cpu(k_expanded), total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
-        v_expanded = AttentionExecutor::expand_kv_heads(
-            ensure_cpu(v_expanded), total_len, num_heads, num_kv_heads, head_dim, DeviceType::CPU);
-    }
-
-    // dev 为 CPU 时这三个搬运都是 no-op; 保留是为了兼容"CUDA 但走 CPU 前处理"的情形。
-    auto q_attn = restore_device(q_rope, lctx.device);
-    k_expanded = restore_device(k_expanded, lctx.device);
-    v_expanded = restore_device(v_expanded, lctx.device);
-
-    auto attn_out = ops::scaled_dot_product_attention_2d(
-        q_attn, k_expanded, v_expanded, seq_len, total_len, num_heads, head_dim, nullptr, true);
+    // ---- Attention (delegated to the shared, storage-aware executor) ----
+    TensorPtr attn_out = attn_.attend(q_rope, cfg, lctx.layer_idx, seq_len, DeviceType::CPU,
+                                      nullptr, lctx.seq_id(), /*causal=*/true);
 
     // Gated attention: output = sigmoid(gate) * attn_out
-    auto attn_out_cpu = ensure_cpu(attn_out);
-    float* attn_data = static_cast<float*>(attn_out_cpu->data());
+    float* attn_data = static_cast<float*>(attn_out->data());
     const float* gate_data = static_cast<const float*>(gate->data());
     for (int i = 0; i < seq_len * q_dim; ++i) {
         attn_data[i] *= 1.0f / (1.0f + std::exp(-gate_data[i]));
     }
 
-    return ops::matmul_transB(restore_device(attn_out_cpu, lctx.device), lw.attn_output());
+    return ops::matmul_transB(attn_out, lw.attn_output());
 }
 
 #ifdef USE_CUDA
@@ -223,80 +228,30 @@ TensorPtr Qwen35FullAttention::attend_cuda(const TensorPtr& normed,
         static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), num_heads,
         num_kv_heads, head_dim, seq_len, lctx.start_pos(), cfg.rope_theta, stream);
 
-    kv_cache_.update(lctx.layer_idx, lctx.seq_id(), lctx.start_pos(), k_rope, v, seq_len);
-    const int total_len = kv_cache_.filled(lctx.layer_idx);
-
-    // ---- Phase 0 / 0.1: fused decode for quantized KV (skip FP32 staging) ----
-    // For decode (seq_len==1) with symmetric quantized KV, read the cache
-    // directly inside the attention kernel instead of materializing FP32.
-    void* d_q_K = kv_cache_.d_q_key_cache(lctx.layer_idx);
-    void* d_q_V = kv_cache_.d_q_value_cache(lctx.layer_idx);
-    const auto kv_cfg = kv_cache_.kv_config();
-    const bool fused_kv =
-        (seq_len == 1 && d_q_K != nullptr && d_q_V != nullptr && kv_cfg.type_k == kv_cfg.type_v);
-    if (fused_kv) {
-        auto attn_out = std::make_shared<Tensor>(
-            DataType::FP32, std::vector<int64_t>{seq_len, q_dim}, DeviceType::CUDA);
-        size_t q_row_size = KVCache::block_nbytes(kv_cfg.type_k, num_kv_heads * head_dim);
-        const float* Q = static_cast<const float*>(q_rope->data());
-        float* O = static_cast<float*>(attn_out->data());
-        bool ok = true;
-        switch (kv_cfg.type_k) {
-        case KVCacheDType::F16:
-            cuda::launch_fused_flash_attention_gqa_decode_f16(Q, d_q_K, d_q_V, O, total_len,
-                                                              num_heads, num_kv_heads, head_dim,
-                                                              q_row_size, nullptr, stream);
-            break;
-        case KVCacheDType::Q8_0:
-            cuda::launch_fused_flash_attention_gqa_decode_q8_0(Q, d_q_K, d_q_V, O, total_len,
-                                                               num_heads, num_kv_heads, head_dim,
-                                                               q_row_size, nullptr, stream);
-            break;
-        case KVCacheDType::Q4_0:
-            cuda::launch_fused_flash_attention_gqa_decode_q4_0(Q, d_q_K, d_q_V, O, total_len,
-                                                               num_heads, num_kv_heads, head_dim,
-                                                               q_row_size, nullptr, stream);
-            break;
-        case KVCacheDType::FP8_E4M3:
-            cuda::launch_fused_flash_attention_gqa_decode_fp8_e4m3(
-                Q, d_q_K, d_q_V, O, total_len, num_heads, num_kv_heads, head_dim, q_row_size,
-                nullptr, static_cast<const float*>(kv_cache_.d_q_key_scale(lctx.layer_idx)),
-                static_cast<const float*>(kv_cache_.d_q_value_scale(lctx.layer_idx)), stream);
-            break;
-        case KVCacheDType::FP8_E5M2:
-            cuda::launch_fused_flash_attention_gqa_decode_fp8_e5m2(
-                Q, d_q_K, d_q_V, O, total_len, num_heads, num_kv_heads, head_dim, q_row_size,
-                nullptr, static_cast<const float*>(kv_cache_.d_q_key_scale(lctx.layer_idx)),
-                static_cast<const float*>(kv_cache_.d_q_value_scale(lctx.layer_idx)), stream);
-            break;
-        default:
-            ok = false;
-            break;
+    // ---- KV write (storage-aware: paged PagedKVStorage or contiguous KVCache) ----
+    if (kv_memory_) {
+        if (!kv_memory_->write_kv(lctx.layer_idx, lctx.seq_id(), lctx.start_pos(), seq_len, k_rope,
+                                  v)) {
+            throw std::runtime_error(
+                "qwen35: KV write failed at layer " + std::to_string(lctx.layer_idx) +
+                " (paged page pool exhausted or invalid seq — reduce --ctx-size / free VRAM)");
         }
-        if (ok) {
-            forge::cuda::launch_sigmoid_multiply(static_cast<const float*>(gate->data()), O,
-                                                 seq_len * q_dim, stream);
-            return ops::matmul_transB(attn_out, lw.attn_output());
+    } else {
+        if (kv_cache_.update(lctx.layer_idx, lctx.seq_id(), lctx.start_pos(), k_rope, v, seq_len) <
+            0) {
+            throw std::runtime_error(
+                "qwen35: KV cache overflow at layer " + std::to_string(lctx.layer_idx) +
+                ": write_pos=" + std::to_string(lctx.start_pos()) +
+                " seq_len=" + std::to_string(seq_len) +
+                " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
         }
     }
 
-    // ---- Fallback: dequantize then standard attention (prefill, FP32, asymmetric) ----
-    if (kv_cache_.kv_dtype() == KVCacheDType::Q4_0) {
-        kv_cache_.dequantize_layer(lctx.layer_idx);
-    }
+    // ---- Attention (delegated to the shared, storage-aware executor) ----
+    TensorPtr attn_out = attn_.attend(q_rope, cfg, lctx.layer_idx, seq_len, DeviceType::CUDA,
+                                      nullptr, lctx.seq_id(), /*causal=*/true);
 
-    TensorPtr k_expanded = kv_cache_.get_key_filled(lctx.layer_idx);
-    TensorPtr v_expanded = kv_cache_.get_value_filled(lctx.layer_idx);
-    if (num_kv_heads < num_heads) {
-        k_expanded = AttentionExecutor::expand_kv_heads(k_expanded, total_len, num_heads,
-                                                        num_kv_heads, head_dim, DeviceType::CUDA);
-        v_expanded = AttentionExecutor::expand_kv_heads(v_expanded, total_len, num_heads,
-                                                        num_kv_heads, head_dim, DeviceType::CUDA);
-    }
-
-    auto attn_out = ops::scaled_dot_product_attention_2d(
-        q_rope, k_expanded, v_expanded, seq_len, total_len, num_heads, head_dim, nullptr, true);
-
+    // Gated attention: output = sigmoid(gate) * attn_out
     forge::cuda::launch_sigmoid_multiply(static_cast<const float*>(gate->data()),
                                          static_cast<float*>(attn_out->data()), seq_len * q_dim,
                                          stream);

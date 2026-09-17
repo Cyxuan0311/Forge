@@ -170,6 +170,22 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
                           int max_num_seqs) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // ---- Re-init guard (vLLM: size once, never shrink) ----
+    // A second init() happens when warmup's reset_kv_cache() clears the
+    // initialized flag and the first real request rebuilds the memory. At that
+    // point the freshly measured free memory is an artifact of the EXISTING
+    // pages still being allocated (observed: budget 264 MB -> 221 pages while
+    // the live pool held 1929), so shrinking here would cripple the pool for
+    // every subsequent long prompt. If the geometry is unchanged, keep the
+    // larger of old and new page caps; the pages themselves are still
+    // allocated (reset() returned them to the free lists), so an unchanged
+    // target needs no reallocation at all.
+    const bool reinit_same_geometry =
+        !layer_pages_.empty() && layer_pages_[0].size() > 0 && num_layers_ == num_layers &&
+        max_seq_len_ == max_seq_len && device_ == device && page_size_ == (page_size > 0 ? page_size : 16) &&
+        kv_config_.type_k == kv_config.type_k && kv_config_.type_v == kv_config.type_v;
+    const int old_max_seqs = max_num_seqs_;
+
     num_layers_ = num_layers;
     kv_dims_ = kv_dims;
     max_seq_len_ = max_seq_len;
@@ -201,7 +217,13 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
                 sp.swa_window = std::max(sp.swa_window, layer_pools_[l].window_size);
         }
 
-        const KVSizingResult sizing = auto_size_kv_for_device(sp);
+        // Same conservative share of free memory as resize_to_budget() (see the
+        // comment there). Without it init takes ~90% of free VRAM -- 2.28 GB on
+        // a 6 GB card -- leaving vram_free=0: warmup can then no longer grow the
+        // pool ("no device budget available") and every activation allocation in
+        // the forward pass has to fight the allocator, which showed up as decode
+        // steps degrading 18 ms -> 541 ms while the context only grew 7%.
+        const KVSizingResult sizing = auto_size_kv_for_device(sp, 0.65);
         if (sizing.auto_sized) {
             max_num_seqs_ = sizing.max_num_seqs;
             auto_max_pages = sizing.max_pages_per_layer;
@@ -209,10 +231,15 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
                      std::to_string(sizing.per_seq_bytes / (1024 * 1024)) +
                      " MB, budget=" + std::to_string(sizing.budget_bytes / (1024 * 1024)) +
                      " MB -> max_seqs=" + std::to_string(max_num_seqs_) +
-                     ", max_pages=" + std::to_string(auto_max_pages));
+                     ", max_pages=" + std::to_string(auto_max_pages) +
+                     (reinit_same_geometry ? " (re-init; existing pool may be larger)" : ""));
         } else {
-            // No usable memory information (CPU backend or query failed).
-            max_num_seqs_ = 32;
+            // No usable device free-memory information (CPU backend, or the query
+            // returned nothing e.g. a headless/background CUDA context). Size for a
+            // small number of sequences so the pool can still hold real prompts;
+            // the small init pool keeps VRAM free for warmup, and warmup's
+            // resize_to_budget() grows the pools once the real budget is known.
+            max_num_seqs_ = 2;
         }
     }
 
@@ -226,13 +253,43 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     } else if ((int)layer_pools_.size() < num_layers_) {
         layer_pools_.resize(num_layers_, LayerPoolInfo{});
     }
-    int theoretical_max = (max_num_seqs_ * max_seq_len_ + page_size_ - 1) / page_size_;
-    // Historical ceiling for the explicit-override path. It exists so a manual
-    // max_num_seqs cannot accidentally request an unbounded page pool. The
-    // auto-sized path already bounds pages by the device memory budget, so it
-    // uses its own derived cap instead.
-    const int MAX_PAGES_CAP = 256;
-    const int page_cap = auto_max_pages > 0 ? auto_max_pages : MAX_PAGES_CAP;
+    // vLLM-style pool sizing. The page pool below is FULLY allocated up front
+    // (one cudaMalloc per page, see allocate_page_pools_locked), so the cap
+    // must come from the device memory budget — never from max_seq_len.
+    // vLLM does the same: num_gpu_blocks derives from post-profile free
+    // memory, while max_model_len only validates individual requests.
+    // Sizing the pool to max_num_seqs * max_seq_len (the historical
+    // "fallback_pages") made a 256K-native model try to reserve ~16384 pages
+    // per layer and OOM on a 6 GB card.
+    //
+    // The budget query runs before warmup, when free VRAM is transiently low
+    // (observed: 330 MB vs 2742 MB after warmup), so auto_max_pages can be 0
+    // or tiny. init therefore reserves only a small floor (enough for warmup
+    // and short prompts); InferenceContext::warmup() calls resize_to_budget()
+    // afterwards — vLLM's profile_run → determine_num_available_blocks
+    // sequence — to grow the pools to the real budget.
+    constexpr int kMinPagedPages = 64;  // 1024 tokens @ page_size 16
+    int page_cap;
+    if (device_ == DeviceType::CPU) {
+        // Host pages are cheap and the auto-sizing query returns no budget for
+        // CPU (query_free_device_bytes is CUDA-only). Size the pool to hold
+        // each admitted sequence at a practical 8K-token length instead of the
+        // model's full (possibly 256K) native context — no artificial floor.
+        const int cpu_floor = (max_num_seqs_ * std::min(max_seq_len_, 8192) + page_size_ - 1) /
+                              page_size_;
+        page_cap = std::max(auto_max_pages, cpu_floor);
+    } else {
+        page_cap = std::max(auto_max_pages, kMinPagedPages);
+    }
+    // Re-init: never shrink below the existing pool (see comment at function top).
+    if (reinit_same_geometry) {
+        max_num_seqs_ = std::max(max_num_seqs_, old_max_seqs);
+        int old_cap = 0;
+        for (const auto& p : layer_pools_)
+            old_cap = std::max(old_cap, p.max_pages);
+        page_cap = std::max(page_cap, old_cap);
+    }
+    bool unchanged = reinit_same_geometry;
     for (int l = 0; l < num_layers_; ++l) {
         auto& pool = layer_pools_[l];
         if (pool.policy == KVLayerPolicy::SlidingWindow && pool.window_size > 0) {
@@ -240,14 +297,35 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
             // SWA needs a few extra pages for the wrap-around cursor
             pool.max_pages = std::min(swa_pages + 1, page_cap);
         } else {
-            pool.max_pages = std::min(theoretical_max, page_cap);
+            pool.max_pages = page_cap;
         }
+        if (unchanged && pool.max_pages != layer_pages_[l].size())
+            unchanged = false;
+    }
+    if (unchanged) {
+        // Same geometry and same per-layer pool sizes: the pages are still
+        // allocated and reset() has returned them all to the free lists —
+        // skip the (multi-GB) zero_fill re-allocation entirely.
+        LOG_INFO("PagedKVStorage re-init: geometry unchanged, keeping " +
+                 std::to_string(max_pages_) + " pages/layer without reallocation");
+        return true;
     }
     // max_pages_ = max across layers (for backward-compat in some log messages)
     max_pages_ = 0;
     for (const auto& p : layer_pools_)
         max_pages_ = std::max(max_pages_, p.max_pages);
 
+    if (!allocate_page_pools_locked())
+        return false;
+
+    LOG_INFO("PagedKVStorage init: layers=" + std::to_string(num_layers_) + ", page_size=" +
+             std::to_string(page_size_) + ", max_pages=" + std::to_string(max_pages_) +
+             ", max_seqs=" + std::to_string(max_num_seqs_) +
+             ", dev=" + (device_ == DeviceType::CUDA ? "CUDA" : "CPU"));
+    return true;
+}
+
+bool PagedKVStorage::allocate_page_pools_locked() {
     // Allocate page pools per layer
     layer_pages_.resize(num_layers_);
     for (int l = 0; l < num_layers_; ++l) {
@@ -324,10 +402,86 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     }
 #endif
 
-    LOG_INFO("PagedKVStorage init: layers=" + std::to_string(num_layers_) + ", page_size=" +
-             std::to_string(page_size_) + ", max_pages=" + std::to_string(max_pages_) +
-             ", max_seqs=" + std::to_string(max_num_seqs_) +
+    LOG_INFO("PagedKVStorage page pools allocated: layers=" + std::to_string(num_layers_) +
+             ", page_size=" + std::to_string(page_size_) + ", max_pages=" +
+             std::to_string(max_pages_) + ", max_seqs=" + std::to_string(max_num_seqs_) +
              ", dev=" + (device_ == DeviceType::CUDA ? "CUDA" : "CPU"));
+    return true;
+}
+
+bool PagedKVStorage::resize_to_budget() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (num_layers_ <= 0 || layer_pools_.empty())
+        return false;
+
+    // Re-derive the per-layer page budget from the CURRENT device free memory.
+    // Same params as init(); layer_pools_ (policies/windows) is unchanged, so
+    // SWA pools keep their window-derived sizes below.
+    KVSizingParams sp;
+    sp.num_layers = num_layers_;
+    sp.kv_dims = kv_dims_;
+    sp.max_seq_len = max_seq_len_;
+    sp.page_size = page_size_;
+    sp.device = device_;
+    sp.type_k = kv_config_.type_k;
+    sp.type_v = kv_config_.type_v;
+    sp.policies.resize(num_layers_);
+    for (int l = 0; l < num_layers_; ++l)
+        sp.policies[l] = layer_pools_[l].policy;
+    for (int l = 0; l < num_layers_ && l < (int)sp.policies.size(); ++l) {
+        if (sp.policies[l] == KVLayerPolicy::SlidingWindow)
+            sp.swa_window = std::max(sp.swa_window, layer_pools_[l].window_size);
+    }
+
+    // Fraction of the post-warmup free memory handed to the page pool.
+    // vLLM's gpu_memory_utilization is a share of TOTAL memory and the KV gets
+    // only what remains after weights + activations; here the queried "free"
+    // already excludes the weights, so taking 0.9 of it left just ~10%
+    // (≈505 MB on this 6 GB card) for activations and workspace — while the
+    // execution plan needs a 741 MB scratch — and the request died mid-flight
+    // with "CUDA malloc failed". Reserve a third of free memory for the
+    // forward pass instead.
+    constexpr double kKvShareOfFree = 0.65;
+    const KVSizingResult sizing = auto_size_kv_for_device(sp, kKvShareOfFree);
+    if (!sizing.auto_sized) {
+        LOG_INFO("PagedKVStorage resize_to_budget: no device budget available, keeping " +
+                 std::to_string(max_pages_) + " pages/layer");
+        return true;
+    }
+
+    int new_cap = sizing.max_pages_per_layer;
+    // Never shrink: the pool may already back live traffic, and growing is the
+    // only post-init adjustment this path makes (vLLM sizes once, we grow once).
+    int cur_cap = 0;
+    for (const auto& p : layer_pools_)
+        cur_cap = std::max(cur_cap, p.max_pages);
+    if (new_cap <= cur_cap) {
+        LOG_INFO("PagedKVStorage resize_to_budget: budget " + std::to_string(new_cap) +
+                 " pages <= current " + std::to_string(cur_cap) + ", keeping current");
+        return true;
+    }
+
+    for (int l = 0; l < num_layers_; ++l) {
+        auto& pool = layer_pools_[l];
+        if (pool.policy == KVLayerPolicy::SlidingWindow && pool.window_size > 0) {
+            int swa_pages = (pool.window_size + page_size_ - 1) / page_size_;
+            pool.max_pages = std::min(swa_pages + 1, new_cap);
+        } else {
+            pool.max_pages = new_cap;
+        }
+    }
+    max_pages_ = 0;
+    for (const auto& p : layer_pools_)
+        max_pages_ = std::max(max_pages_, p.max_pages);
+
+    if (!allocate_page_pools_locked())
+        return false;
+
+    LOG_INFO("PagedKVStorage resize_to_budget: " + std::to_string(cur_cap) + " -> " +
+             std::to_string(new_cap) + " pages/layer (" +
+             std::to_string((long long)max_pages_ * page_size_) + " tokens capacity, budget " +
+             std::to_string(sizing.budget_bytes / (1024 * 1024)) + " MB)");
     return true;
 }
 
@@ -908,11 +1062,6 @@ void PagedKVStorage::release(int seq_id) {
     seq_tables_.erase(it);
 }
 
-bool PagedKVStorage::has_seq(int seq_id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return seq_tables_.find(seq_id) != seq_tables_.end();
-}
-
 size_t PagedKVStorage::nbytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     size_t total = 0;
@@ -959,6 +1108,19 @@ int PagedKVStorage::num_free_pages() const {
     for (const auto& pool : layer_pools_)
         total += (int)pool.free_page_ids.size();
     return total;
+}
+
+int PagedKVStorage::free_pages_full() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int min_free = -1;
+    for (const auto& pool : layer_pools_) {
+        if (pool.max_pages < max_pages_)
+            continue;  // SWA pool: recycles a fixed window, never binds
+        const int f = (int)pool.free_page_ids.size();
+        if (min_free < 0 || f < min_free)
+            min_free = f;
+    }
+    return min_free < 0 ? 0 : min_free;
 }
 
 void PagedKVStorage::reset() {

@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "forge/logger.h"
+#include "forge/inference/tensor_device_utils.h"
 
 namespace forge {
 
@@ -28,12 +29,60 @@ bool KVMemory::init_storage(int num_layers, const std::vector<int>& kv_dims, int
                           max_num_seqs);
 }
 
+bool KVMemory::write_kv(int layer, int seq_id, int64_t pos, int seq_len, const TensorPtr& k,
+                        const TensorPtr& v) {
+    if (is_paged()) {
+        // Paged path: write into the sequence's pages. CUDA-backed storage takes
+        // device pointers directly (no D2H); CPU-backed storage needs the data on
+        // the host, so stage it there if it currently lives on the device.
+        KVStorage& st = storage();
+        TensorPtr kc = k, vc = v;
+        if (st.device() == DeviceType::CPU && kc->device() == DeviceType::CUDA) {
+            kc = ensure_cpu(k);
+            vc = ensure_cpu(v);
+        }
+        const float* kd = static_cast<const float*>(kc->data());
+        const float* vd = static_cast<const float*>(vc->data());
+        return st.write_kv_seq(layer, seq_id, pos, seq_len, kd, vd);
+    }
+    // Contiguous path: write to the KVCache directly (handles device placement
+    // internally). Returns the new filled length, or < 0 on overflow/invalid.
+    return cache().update(layer, seq_id, pos, k, v, seq_len) >= 0;
+}
+
 void KVMemory::set_layer_policies(const std::vector<KVLayerPolicy>& policies, int swa_window) {
     if (storage_->is_paged()) {
         auto* paged = dynamic_cast<PagedKVStorage*>(storage_.get());
         if (paged)
             paged->set_layer_policies(policies, swa_window);
     }
+}
+
+bool KVMemory::resize_storage() {
+    if (storage_->is_paged()) {
+        auto* paged = dynamic_cast<PagedKVStorage*>(storage_.get());
+        if (paged)
+            return paged->resize_to_budget();
+    }
+    return true;
+}
+
+int KVMemory::max_pool_tokens() const {
+    if (storage_->is_paged()) {
+        auto* paged = dynamic_cast<const PagedKVStorage*>(storage_.get());
+        if (paged)
+            return paged->max_pool_tokens();
+    }
+    return 0;
+}
+
+int KVMemory::free_pages_full() const {
+    if (storage_->is_paged()) {
+        auto* paged = dynamic_cast<const PagedKVStorage*>(storage_.get());
+        if (paged)
+            return paged->free_pages_full();
+    }
+    return -1;
 }
 
 KVReadView KVMemory::view(int layer, int seq_id) const {

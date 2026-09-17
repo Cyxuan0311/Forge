@@ -215,8 +215,16 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
                 k_data = static_cast<const float*>(k_cpu->data());
                 v_data = static_cast<const float*>(v_cpu->data());
             }
-            kv_memory_->storage().write_kv_seq(layer_idx, lctx.seq_id(), start_pos,
-                                               seq_len, k_data, v_data);
+            if (!kv_memory_->storage().write_kv_seq(layer_idx, lctx.seq_id(), start_pos,
+                                                    seq_len, k_data, v_data)) {
+                // Paged pages are sized from free VRAM at init; an exhausted pool means
+                // the requested context no longer fits. Fail loudly instead of leaving
+                // unwritten KV pages that would corrupt every later token with garbage.
+                throw std::runtime_error(
+                    "Paged KV write failed at layer " + std::to_string(layer_idx) +
+                    ": pos=" + std::to_string(start_pos) + " seq_len=" + std::to_string(seq_len) +
+                    " (page pool exhausted — reduce --ctx-size or free VRAM)");
+            }
         } else {
             // Contiguous mode: write to KVCache directly
             if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {

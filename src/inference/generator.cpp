@@ -29,6 +29,66 @@ static bool aborted(const GenerationConfig& config) {
     return config.abort_flag && config.abort_flag->load(std::memory_order_relaxed);
 }
 
+// ---- Prefill-only profiler snapshot (FORGE_PERF_PREFILL=1) ----
+// The PerfProfiler is reset at the start of every request by the server, so at
+// the moment right after the prefill forward returns (and before any decode
+// step) its thread-local buffers hold *only* prefill work. Flushing the
+// deferred CUDA events and dumping the summary here yields a clean prefill-only
+// breakdown, isolated from the decode phase that would otherwise dominate the
+// per-request --perf-detail totals for long generations.
+static void dump_prefill_profile(double prefill_ms, int n_tokens) {
+    auto& prof = forge::PerfProfiler::instance();
+#ifdef USE_CUDA
+    prof.flush_deferred();
+#endif
+    auto rows = prof.summary();
+    if (rows.empty()) {
+        fprintf(stderr,
+                "[prefill-profile] no operator data. Build with -DFORGE_PROFILING=ON and "
+                "run with --perf-detail (or just FORGE_PERF_PREFILL=1) to capture it.\n");
+        return;
+    }
+
+    // Split layer-scoped records (forward/layer_*) from everything else so we can
+    // print layers in index order and the rest sorted by cost.
+    std::vector<std::pair<std::string, forge::PerfRecord>> layers, others;
+    for (auto& r : rows) {
+        if (r.first.rfind("forward/layer_", 0) == 0)
+            layers.push_back(r);
+        else
+            others.push_back(r);
+    }
+    std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) {
+        int la = 0, lb = 0;
+        sscanf(a.first.c_str(), "forward/layer_%d", &la);
+        sscanf(b.first.c_str(), "forward/layer_%d", &lb);
+        return la < lb;
+    });
+    std::sort(others.begin(), others.end(),
+              [](const auto& a, const auto& b) { return a.second.total_ms > b.second.total_ms; });
+
+    double layer_total = 0.0;
+    for (auto& l : layers)
+        layer_total += l.second.total_ms;
+
+    fprintf(stderr, "\n===== PREFILL-ONLY PROFILE (snapshot before decode) =====\n");
+    fprintf(stderr, "[prefill-profile] wall prefill = %.1f ms (%d tokens)\n", prefill_ms, n_tokens);
+    fprintf(stderr, "[prefill-profile] layers total = %.1f ms across %zu layer(s)\n", layer_total,
+            layers.size());
+    fprintf(stderr, "[prefill-profile] per-layer (ms):\n");
+    for (auto& l : layers)
+        fprintf(stderr, "  %-22s %9.2f ms\n", l.first.c_str(), l.second.total_ms);
+    fprintf(stderr, "[prefill-profile] top other operators (by total ms):\n");
+    for (size_t i = 0; i < others.size() && i < 16; ++i) {
+        const auto& [name, rec] = others[i];
+        double avg = rec.count > 0 ? rec.total_ms / rec.count : 0.0;
+        fprintf(stderr, "  %-38s n=%-6lld total=%9.2f ms avg=%8.3f ms\n", name.c_str(),
+                (long long)rec.count, rec.total_ms, avg);
+    }
+    fprintf(stderr, "==========================================================\n\n");
+    fflush(stderr);
+}
+
 Generator::Generator(InferenceContext& ctx, const SamplerConfig& sampler_cfg)
     : ctx_(ctx), sampler_(sampler_cfg) {
 #ifdef USE_CUDA
@@ -118,6 +178,21 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         const auto prefill_start = std::chrono::steady_clock::now();
         PERF_SCOPE("generator/prefill");
         SET_PERF_CONTEXT(0, "prefill", -1, dev == DeviceType::CUDA ? "cuda" : "cpu", fwd_len);
+
+        // ---- Prefill-only profiler snapshot (FORGE_PERF_PREFILL=1) ----
+        // Turn the PerfProfiler on (CUDA-event accurate) so we can dump a clean
+        // prefill-only breakdown right after this forward, before decode starts.
+        // The server resets the profiler per request, so at dump time the buffers
+        // hold only prefill work.
+        if (std::getenv("FORGE_PERF_PREFILL")) {
+            forge::PerfProfiler::instance().enable();
+            forge::PerfProfiler::instance().set_use_cuda_events(true);
+        }
+        auto dump_prefill_if_enabled = [&]() {
+            if (std::getenv("FORGE_PERF_PREFILL")) {
+                dump_prefill_profile(result.prefill_ms, fwd_len);
+            }
+        };
         auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{fwd_len},
                                                   DeviceType::CPU);
         std::memcpy(input_ids->data(), prompt_tokens.data() + prefix_len,
@@ -152,6 +227,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             result.finished = true;
             result.finish_reason = "eos";
             result.num_generated_tokens = 1;
+            dump_prefill_if_enabled();
             return result;
         }
         // Check additional stop tokens
@@ -163,12 +239,14 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
                 result.prefill_ms = std::chrono::duration<double, std::milli>(
                                         std::chrono::steady_clock::now() - prefill_start)
                                         .count();
+                dump_prefill_if_enabled();
                 return result;
             }
         }
         result.prefill_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - prefill_start)
                                 .count();
+        dump_prefill_if_enabled();
     }
 
     int64_t pos = prompt_len;
@@ -269,6 +347,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         result.token_ids.push_back(token_id);
         pos += 1;
         step++;
+
 
         if (spec_executor_ && spec_executor_->valid()) {
             spec_executor_->notify_confirmed(token_id);

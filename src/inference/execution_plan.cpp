@@ -17,6 +17,7 @@ const char* to_string(EngineKind k) {
         case EngineKind::Qwen35Hybrid: return "qwen35_hybrid";
         case EngineKind::Gemma4:       return "gemma4";
         case EngineKind::Phimoe:       return "phimoe";
+        case EngineKind::Bailingmoe3:  return "bailingmoe3";
     }
     return "?";
 }
@@ -116,6 +117,7 @@ const char* engine_name_for(EngineKind kind) {
         case EngineKind::Qwen35Hybrid: return "qwen35";
         case EngineKind::Gemma4:       return "gemma4";
         case EngineKind::Phimoe:       return "phimoe";
+        case EngineKind::Bailingmoe3:  return "bailingmoe3";
     }
     return "llama";
 }
@@ -131,7 +133,14 @@ ExecutionPlan build_execution_plan(const std::string& arch, const ModelConfig& c
 
     // ---- attention / engine / memory ----
     // 三者一起决定, 不允许只看单个 bool 做 fallback。
-    if (cap.use_ssm || cfg.use_ssm) {
+    if (arch == "bailingmoe3") {
+        // BailingMoE3 (Ling 3.0): hybrid of absorbed MLA + GDN/KDA recurrent
+        // layers, with a MoE FFN. It declares both use_mla and use_ssm, so it
+        // must be selected explicitly before the generic SSM/MLA branches below.
+        plan.attention_kind = AttentionKind::HybridSSM;
+        plan.engine_kind = EngineKind::Bailingmoe3;
+        plan.memory_kind = MemoryKind::Hybrid;
+    } else if (cap.use_ssm || cfg.use_ssm) {
         plan.attention_kind = AttentionKind::HybridSSM;
         plan.engine_kind = EngineKind::Qwen35Hybrid;
         plan.memory_kind = MemoryKind::Hybrid;

@@ -780,7 +780,7 @@ void launch_paged_flash_attention_gqa_decode_fp8_e4m3(
 void launch_paged_flash_attention_gqa_decode_fp8_e5m2(
     const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs, const int32_t* page_ids,
     float* O, int kv_len, int num_heads, int num_kv_heads, int head_dim, int page_size,
-    size_t q_row_size, const float* mask_row = nullptr, cudaStream_t stream = 0);
+    size_t q_row_size,         const float* mask_row = nullptr, cudaStream_t stream = 0);
 
 // ---- MoE Router ----
 void launch_moe_router(const float* logits, int* expert_indices, float* expert_weights,

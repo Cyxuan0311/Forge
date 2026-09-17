@@ -67,7 +67,12 @@ size_t query_free_device_bytes(DeviceType device) {
     if (device != DeviceType::CUDA)
         return 0;
 
-    auto backend = Backend::create_cuda();
+    // Use the shared BackendManager CUDA backend: it is the same instance the
+    // contiguous KV path queries (and the one that actually reports free memory).
+    // A freshly created Backend via Backend::create_cuda() can report 0 here,
+    // which would make auto_size_kv bail out and fall back to the tiny
+    // MAX_PAGES_CAP (256 pages = 4K tokens) — unusable for real prompts.
+    auto backend = BackendManager::instance().get_cuda_backend();
     if (!backend)
         return 0;
 

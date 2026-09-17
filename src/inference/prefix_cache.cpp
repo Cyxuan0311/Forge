@@ -63,7 +63,7 @@ RadixNode* PrefixCache::lookup_deepest(RadixNode* cur, const std::vector<int32_t
     int pos = 0;
     int n = static_cast<int>(tokens.size());
     RadixNode* deepest = nullptr;
-    int deepest_pages = 0;
+    int matched = 0;  // cumulative token length matched from the root
 
     while (pos < n) {
         RadixNode* child = find_matching_child(cur, tokens, pos, page_size);
@@ -90,17 +90,17 @@ RadixNode* PrefixCache::lookup_deepest(RadixNode* cur, const std::vector<int32_t
         if (i == cmp_pages) {
             // All comparable pages matched.
             if (seg_pages == avail_pages) {
+                matched += seg_pages * page_size;
                 deepest = child;
-                deepest_pages = seg_pages;
                 break;
             } else if (seg_pages < avail_pages) {
-                deepest = child;
-                deepest_pages = seg_pages;
+                matched += seg_pages * page_size;
+                deepest = child;  // last fully-matched interior node (kept if descent stops)
                 pos += seg_pages * page_size;
                 cur = child;
             } else {  // request is a prefix of child's segment
+                matched += avail_pages * page_size;
                 deepest = child;
-                deepest_pages = avail_pages;
                 break;
             }
         } else {
@@ -108,14 +108,17 @@ RadixNode* PrefixCache::lookup_deepest(RadixNode* cur, const std::vector<int32_t
             // prefix; page i differs (its KV depends on the differing token) so it
             // must NOT be shared.
             if (i > 0) {
+                matched += i * page_size;
                 deepest = child;
-                deepest_pages = i;
             }
             break;
         }
     }
 
-    matched_len = deepest_pages * page_size;
+    // The deepest node's owner holds KV pages [0, node->cumulative_len), which
+    // subsumes every ancestor's prefix, so the cumulative matched length is the
+    // correct amount to share (NOT just the deepest node's own segment).
+    matched_len = matched;
     return deepest;
 }
 
@@ -131,15 +134,12 @@ int PrefixCache::try_lookup(const std::vector<int32_t>& tokens, int dst_seq_id,
     RadixNode* node = lookup_deepest(&root_, tokens, page_size, matched_len);
     if (!node || matched_len < page_size) {
         misses_++;
-        LOG_DEBUG("PrefixCache MISS: dst=" + std::to_string(dst_seq_id) +
-                  " prompt_len=" + std::to_string(tokens.size()));
         return 0;
     }
 
     // Share [0, matched_len) from the deepest matched node's owner in ONE call.
-    if (!storage.seq_share(node->owner_seq_id, dst_seq_id, 0, matched_len)) {
-        LOG_WARN("PrefixCache: seq_share failed for owner=" + std::to_string(node->owner_seq_id) +
-                 " dst=" + std::to_string(dst_seq_id));
+    bool shared = storage.seq_share(node->owner_seq_id, dst_seq_id, 0, matched_len);
+    if (!shared) {
         misses_++;
         return 0;
     }
@@ -150,8 +150,6 @@ int PrefixCache::try_lookup(const std::vector<int32_t>& tokens, int dst_seq_id,
     seq_node_[dst_seq_id] = node;
 
     hits_++;
-    LOG_DEBUG("PrefixCache HIT: dst=" + std::to_string(dst_seq_id) + " prefix_len=" +
-              std::to_string(matched_len) + " owner=" + std::to_string(node->owner_seq_id));
     return matched_len;
 }
 
@@ -287,9 +285,6 @@ void PrefixCache::register_prefix(const std::vector<int32_t>& tokens, int src_se
     // Release the source request's prefix pages; they are now owned by the
     // per-node cache seq_ids (page references are shared, KV is not copied).
     storage.seq_remove(src_seq_id, 0, total);
-
-    LOG_DEBUG("PrefixCache REGISTER: src=" + std::to_string(src_seq_id) +
-              " total=" + std::to_string(total) + " nodes=" + std::to_string(count_nodes(&root_)));
 }
 
 void PrefixCache::release_prefix(int seq_id, KVStorage& storage) {
@@ -299,19 +294,14 @@ void PrefixCache::release_prefix(int seq_id, KVStorage& storage) {
 
     int len = it->second;
     auto nit = seq_node_.find(seq_id);
-    if (nit != seq_node_.end() && nit->second) {
-        if (nit->second->ref_count > 0)
-            nit->second->ref_count--;
-    }
+    if (nit != seq_node_.end() && nit->second && nit->second->ref_count > 0)
+        nit->second->ref_count--;
 
     seq_matched_.erase(it);
     seq_node_.erase(seq_id);
 
     if (len > 0)
         storage.seq_remove(seq_id, 0, len);
-
-    LOG_DEBUG("PrefixCache RELEASE: seq=" + std::to_string(seq_id) +
-              " prefix_len=" + std::to_string(len));
 }
 
 void PrefixCache::evict_lru(size_t max_entries, KVStorage& storage) {

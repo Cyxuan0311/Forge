@@ -102,6 +102,10 @@ public:
     // 使 CLI/bindings 可以在推理前读取 cache 统计信息。
     void init_memory() override { init_kv_cache(model_.config()); }
 
+    // Post-warmup: grow the paged KV pool to the post-warmup device budget
+    // (no-op for contiguous mode).
+    bool resize_paged_kv_pool() override;
+
     // Access to unified model weights
     const ModelWeights& weights() const { return weights_; }
     ModelWeights& weights() { return weights_; }
@@ -170,7 +174,7 @@ protected:
     bool capture_layer_hiddens_ = false;    // opt-in flag flipped on by a draft provider
     std::unique_ptr<KVMemory> kv_memory_;
     ModelWeights weights_;
-    KVCacheDType kv_cache_dtype_ = KVCacheDType::FP32;
+    KVCacheDType kv_cache_dtype_ = KVCacheDType::Q8_0;
     int kv_cache_max_seq_len_ = 0;  // 0 = auto cap
     int gpu_layers_ = -1;
     std::vector<DeviceTarget> layer_devices_;  // per-layer (device_type, device_id) assignment

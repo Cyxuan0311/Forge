@@ -23,6 +23,9 @@ namespace {
 // 其余架构只需 KV cache。
 std::unique_ptr<InferenceMemory> make_memory(const Model& model) {
     const auto& cfg = model.config();
+    if (cfg.arch_type == "bailingmoe3") {
+        return std::make_unique<Bailingmoe3Memory>();
+    }
     if (cfg.use_ssm) {
         return std::make_unique<HybridMemory>();
     }
@@ -191,6 +194,16 @@ void InferenceContext::warmup() {
 
     // Reset state after warmup
     reset_kv_cache();
+
+    // vLLM-style post-profile sizing: warmup has now committed the runtime's
+    // real VRAM usage (activations, workspaces, kernel caches), so the free
+    // memory measured here is the honest KV budget — init-time queries run
+    // before warmup and under-report by gigabytes (observed 330 MB vs 2742 MB).
+    // Grows the paged page pools once; no-op for contiguous KV.
+    if (!engine_->resize_paged_kv_pool()) {
+        LOG_WARN("InferenceContext::warmup: paged KV pool re-sizing failed; "
+                 "long prompts may exhaust the pool");
+    }
 
     // Restore profiler
     if (profiler_was_enabled) {

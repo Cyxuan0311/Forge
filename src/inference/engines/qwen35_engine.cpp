@@ -17,7 +17,7 @@ namespace forge {
 Qwen35Engine::Qwen35Engine(Model& model, InferenceContext& ctx)
     : TransformerEngine(model, ctx),
       recurrent_memory_(*memory_.recurrent()),
-      full_attention_(kv_cache_),
+      full_attention_(kv_cache_, kv_memory_.get()),
       linear_attention_(recurrent_memory_) {
     if (!init_weights()) {
         throw std::runtime_error("Qwen35Engine: failed to initialize weights");
@@ -34,6 +34,12 @@ bool Qwen35Engine::init_weights() {
 void Qwen35Engine::reset() {
     kv_cache_.reset();
     set_kv_cache_initialized(false);
+    // Paged KV storage must be cleared here too (the base class reset that does
+    // this is overridden by qwen35). Without it, a second generation reuses stale
+    // pages and corrupts attention.
+    if (kv_memory_) {
+        kv_memory_->storage().reset();
+    }
     // recurrent state 由 InferenceContext 的 memory 持有, 但 engine 仍需触发 reset。
     // memory_->reset() 会在 context 层调用, 这里不需要重复。
 }

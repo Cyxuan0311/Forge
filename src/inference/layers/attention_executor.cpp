@@ -10,6 +10,7 @@
 #include "forge/cuda_kernels.h"
 #include "forge/dtype_contract.h"
 #include "forge/operators.h"
+#include "forge/perf_profiler.h"
 
 
 namespace forge {
@@ -491,6 +492,17 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         } else {
             k_out = kv_cache_.get_key_filled(layer_idx);
             v_out = kv_cache_.get_value_filled(layer_idx);
+            // Quantized KV (Q4_0 / Q8_0 / Q4_K) is materialized to FP32 only on
+            // demand. If the dequantized buffer is missing (some engines don't
+            // pre-dequantize), populate it now so the attention kernels (which
+            // read float*) have a valid tensor. Engines that dequantize ahead of
+            // time make this a no-op. Without it, get_key_filled returns nullptr
+            // and the attention call dereferences a null tensor.
+            if (!k_out || !v_out) {
+                kv_cache_.dequantize_layer(layer_idx);
+                k_out = kv_cache_.get_key_filled(layer_idx);
+                v_out = kv_cache_.get_value_filled(layer_idx);
+            }
         }
         if (dev == DeviceType::CUDA && k_out && k_out->device() == DeviceType::CPU) {
             auto k_cuda =
@@ -529,7 +541,12 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     auto paged_tables = [&](int layer, int seq) -> const int32_t* {
         const void* k_pages = storage_->d_key_page_ptrs(layer);
         const void* v_pages = storage_->d_value_page_ptrs(layer);
-        const int32_t* ids = storage_->upload_seq_page_table(layer, seq);
+        // Timed separately (FORGE_DEBUG/perf): this runs once per (layer, step)
+        // on the decode hot path and syncs the sequence's page table to device.
+        const int32_t* ids = [&] {
+            PERF_SCOPE("attn/page_table_upload");
+            return storage_->upload_seq_page_table(layer, seq);
+        }();
         if (k_pages == nullptr || v_pages == nullptr || ids == nullptr) {
             throw std::runtime_error(
                 "paged attention: null page table (storage not on CUDA or seq has no pages) "
