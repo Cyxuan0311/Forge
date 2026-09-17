@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <iomanip>
@@ -16,14 +17,18 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "forge/logger.h"
+
 #include <nlohmann/json.hpp>
 
 #include "forge/arch_registry.h"
 #include "forge/engines/transformer_engine.h"
 #include "forge/gguf_model.h"
+#include "forge/kv_memory.h"
 #include "forge/model_loader.h"
 #include "forge/ninf_model.h"
 #include "forge/perf_profiler.h"
+#include "forge/prefix_cache.h"
 #include "forge/threads.h"
 
 namespace forge {
@@ -156,6 +161,58 @@ std::string extract_tool_object(const std::string& body, const std::string& key)
     return "";
 }
 
+// Lenient JSON repair: some quantized models emit invalid string escapes
+// (e.g. \' or \. inside a JSON string) that strict parsers reject with
+// "Invalid escape character". We cannot re-train the model, so repair the
+// text: any backslash that does NOT begin a valid JSON escape is turned into
+// a literal backslash (\\), which is valid JSON and preserves the character
+// content. Only string literals are touched; structure outside quotes is left
+// untouched so balanced-brace recovery still works.
+std::string repair_json_invalid_escapes(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool in_str = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (in_str) {
+            if (c == '\\') {
+                bool valid = false;
+                if (i + 1 < s.size()) {
+                    char n = s[i + 1];
+                    valid = (n == '"' || n == '\\' || n == '/' || n == 'b' ||
+                             n == 'f' || n == 'n' || n == 'r' || n == 't');
+                    if (n == 'u' && i + 5 < s.size() &&
+                        std::isxdigit(static_cast<unsigned char>(s[i + 2])) &&
+                        std::isxdigit(static_cast<unsigned char>(s[i + 3])) &&
+                        std::isxdigit(static_cast<unsigned char>(s[i + 4])) &&
+                        std::isxdigit(static_cast<unsigned char>(s[i + 5]))) {
+                        valid = true;
+                    }
+                }
+                if (!valid) {
+                    // Escape the offending backslash so the following character
+                    // stays literal; the result is valid JSON and survives parse.
+                    out += '\\';
+                    out += '\\';
+                    if (i + 1 < s.size()) {
+                        out += s[i + 1];
+                        ++i;  // consume the escaped character
+                    }
+                    continue;
+                }
+            } else if (c == '"') {
+                in_str = false;
+            }
+            out += c;
+        } else {
+            if (c == '"')
+                in_str = true;
+            out += c;
+        }
+    }
+    return out;
+}
+
 // Extract tool calls (###TOOL[#]...###END### wrapper) from generated text.
 // `allowed`, when non-null and non-empty, is the set of tool names registered
 // by the client; a name the model emitted (often mangled, e.g. "getweather"
@@ -176,6 +233,10 @@ std::vector<forge::ToolCall> parse_tool_calls(
         if (e == std::string::npos)
             break;
         std::string inner = text.substr(inner_start, e - inner_start);
+        // Repair invalid escapes (e.g. \') that strict parsers reject, so a
+        // model-emitted tool call is not silently dropped (and so the client
+        // does not choke re-parsing the arguments JSON).
+        inner = repair_json_invalid_escapes(inner);
         nlohmann::json j;
         bool parsed = false;
         try {
@@ -474,8 +535,24 @@ ChatCompletionResult ServerState::chat_completion(
     // requested generation budget fits.
     int kv_capacity = 0;
     if (auto* eng = ctx_->engine()) {
-        if (auto* kvc = eng->kv_cache()) {
+        // Paged mode: the pool is the real token capacity (it is fully
+        // allocated up front) while the contiguous cache is never allocated —
+        // reading kv_cache() here returned an uninitialized 0 and fell through
+        // to the model's native max_seq_len (e.g. 262144), disabling the
+        // truncation below entirely. Combine the pool bound with max_seq_len
+        // like vLLM's min(max_model_len, num_gpu_blocks * block_size) check.
+        if (auto* mem = eng->kv_memory(); mem && mem->is_paged()) {
+            kv_capacity = std::min(mem->max_seq_len(), mem->max_pool_tokens());
+            LOG_WARN("[capacity-check] paged storage: max_seq=" +
+                     std::to_string(mem->max_seq_len()) + " pool_tokens=" +
+                     std::to_string(mem->max_pool_tokens()) + " -> capacity=" +
+                     std::to_string(kv_capacity));
+        } else if (auto* kvc = eng->kv_cache()) {
             kv_capacity = kvc->max_seq_len();
+            LOG_WARN("[capacity-check] contiguous cache: capacity=" +
+                     std::to_string(kv_capacity));
+        } else {
+            LOG_WARN("[capacity-check] no kv_memory and no kv_cache");
         }
     }
     if (kv_capacity <= 0) {
@@ -496,54 +573,160 @@ ChatCompletionResult ServerState::chat_completion(
     input.add_generation_prompt = true;
     std::vector<int32_t> prompt_ids = chat_template_->apply(input);
 
+    // ---- DEBUG (set FORGE_DEBUG_TEMPLATE=1 to enable) ----
+    // Dumps the rendered chat-template prompt so we can see whether the VLM
+    // template is bloating text-only turns with <|image_pad|> placeholders or
+    // otherwise mis-rendering (which would starve generation / produce no answer).
+    if (std::getenv("FORGE_DEBUG_TEMPLATE")) {
+        std::string dbg_render = chat_template_->render(input);
+        size_t img_pad = 0, p = 0;
+        while ((p = dbg_render.find("image_pad", p)) != std::string::npos) { ++img_pad; p += 9; }
+        size_t vision = 0; p = 0;
+        while ((p = dbg_render.find("vision", p)) != std::string::npos) { ++vision; p += 6; }
+        std::cerr << "[debug-template] messages=" << input.messages.size()
+                  << " jinja=" << (chat_template_->uses_jinja() ? 1 : 0)
+                  << " rendered_len=" << dbg_render.size()
+                  << " prompt_tokens=" << prompt_ids.size()
+                  << " 'image_pad'=" << img_pad << " 'vision'=" << vision << "\n";
+        for (size_t mi = 0; mi < input.messages.size(); ++mi) {
+            std::cerr << "[debug-template]   msg[" << mi << "] role=" << input.messages[mi].role
+                      << " content_len=" << input.messages[mi].content.size() << "\n";
+        }
+        std::string head = dbg_render.size() > 1600 ? dbg_render.substr(0, 1600) : dbg_render;
+        std::cerr << "[debug-template] RENDER_HEAD:\n" << head << "\n"
+                  << "[debug-template] RENDER_TAIL:\n"
+                  << (dbg_render.size() > 400 ? dbg_render.substr(dbg_render.size() - 400) : dbg_render)
+                  << "\n";
+    }
+
     if (kv_capacity > 0 &&
         static_cast<int>(prompt_ids.size()) + gen_budget > kv_capacity &&
         tooled_messages.size() > 2) {
-        // Keep message[0] if it is the system prompt; always keep the final
-        // message. Progressively drop the oldest non-system, non-final
-        // messages, re-rendering after each drop, until the prompt fits.
-        const bool has_system = tooled_messages[0].role == "system";
-        std::vector<ChatTemplateMessage> kept;
-        if (has_system) {
-            kept.push_back(tooled_messages[0]);
-        }
-        // Candidate droppable messages: everything after the (optional)
-        // system prompt except the final message.
-        const size_t first_drop_idx = has_system ? 1 : 0;
-        const size_t last_keep_idx = tooled_messages.size() - 1;  // final message
-        size_t drop_upto = first_drop_idx;  // drop messages [first_drop_idx, drop_upto)
+        // ---- Context shift (llama.cpp `n_keep` semantics) ----
+        // Keep the leading prefix fixed and discard the oldest history until the
+        // rendered prompt plus the generation budget fits the KV cache. This is a
+        // pure structural shift (no semantic summary): the surviving prefix is
+        // re-attended on the next turn via the existing session prefix-reuse
+        // (vLLM-style prefix caching). Mirrors llama.cpp's token-level context
+        // shift + n_keep and vLLM's eviction of out-of-window tokens.
+        const bool has_system = !tooled_messages.empty() && tooled_messages[0].role == "system";
 
+        // Protected prefix boundary: the first `n_keep` tokens are never evicted
+        // (llama.cpp semantics). n_keep<=0 protects only the system prompt.
+        int protected_idx = has_system ? 1 : 0;
+        if (opt_.n_keep > 0) {
+            int cum = 0;
+            for (size_t i = 0; i < tooled_messages.size(); ++i) {
+                ChatTemplateInput one;
+                one.messages = {tooled_messages[i]};
+                one.add_generation_prompt = false;
+                cum += static_cast<int>(chat_template_->apply(one).size());
+                if (cum >= opt_.n_keep) {
+                    protected_idx = static_cast<int>(i) + 1;
+                    break;
+                }
+            }
+        }
+        const size_t first_drop_idx = static_cast<size_t>(protected_idx);
+        const size_t last_keep_idx = tooled_messages.size() - 1;  // always keep final message
+
+        std::vector<ChatTemplateMessage> kept(tooled_messages.begin(),
+                                             tooled_messages.begin() + first_drop_idx);
+
+        auto render = [&](const std::vector<ChatTemplateMessage>& msgs) {
+            ChatTemplateInput inp;
+            inp.messages = msgs;
+            inp.add_generation_prompt = true;
+            return chat_template_->apply(inp);
+        };
+        // Token-granular trim: keep the most-recent `keep` tokens of a boundary
+        // message's content (llama.cpp discards the *oldest* tokens, so we keep
+        // its tail) instead of dropping the whole message.
+        auto trim_tail = [&](const ChatTemplateMessage& m, int keep) -> std::string {
+            std::vector<int32_t> toks = tokenizer_->encode(m.content, false, false, false);
+            if (static_cast<int>(toks.size()) <= keep)
+                return m.content;
+            std::vector<int32_t> tail(toks.end() - keep, toks.end());
+            return tokenizer_->decode(tail, false, false);
+        };
+
+        size_t drop_upto = first_drop_idx;
         bool fits = false;
+        bool trimmed = false;
         while (drop_upto <= last_keep_idx) {
-            ChatTemplateInput trimmed;
-            trimmed.messages = kept;
-            trimmed.messages.insert(trimmed.messages.end(),
-                                    tooled_messages.begin() + drop_upto,
-                                    tooled_messages.end());
-            trimmed.add_generation_prompt = true;
-            auto ids = chat_template_->apply(trimmed);
+            std::vector<ChatTemplateMessage> candidate = kept;
+            candidate.insert(candidate.end(), tooled_messages.begin() + drop_upto,
+                             tooled_messages.end());
+            auto ids = render(candidate);
             if (static_cast<int>(ids.size()) + gen_budget <= kv_capacity) {
                 prompt_ids = std::move(ids);
                 fits = true;
                 break;
             }
+            // Whole-message drop still overflows. Before discarding message
+            // `drop_upto` entirely, try trimming its tail to free just enough
+            // (preserves more of the boundary turn than a wholesale drop).
+            if (drop_upto < last_keep_idx) {
+                const auto& m = tooled_messages[drop_upto];
+                int overflow =
+                    static_cast<int>(ids.size()) + gen_budget - kv_capacity;
+                int m_tok = static_cast<int>(
+                    tokenizer_->encode(m.content, false, false, false).size());
+                int keep = m_tok - overflow;
+                if (keep > 0) {
+                    ChatTemplateMessage tm = m;
+                    tm.content = trim_tail(m, keep);
+                    std::vector<ChatTemplateMessage> cand2 = kept;
+                    cand2.push_back(std::move(tm));
+                    cand2.insert(cand2.end(), tooled_messages.begin() + drop_upto + 1,
+                                 tooled_messages.end());
+                    auto ids2 = render(cand2);
+                    if (static_cast<int>(ids2.size()) + gen_budget <= kv_capacity) {
+                        prompt_ids = std::move(ids2);
+                        fits = true;
+                        trimmed = true;
+                        break;
+                    }
+                }
+            }
             ++drop_upto;
         }
 
         if (fits) {
-            std::cout << "[server] prompt truncated to fit KV capacity "
-                      << kv_capacity << " (dropped " << (drop_upto - first_drop_idx)
-                      << " oldest history messages)\n";
+            std::cout << "[server] context shifted to fit KV capacity " << kv_capacity
+                      << " (kept " << first_drop_idx << " prefix message(s)"
+                      << (trimmed ? ", token-trimmed 1 boundary message" : "")
+                      << ", dropped " << (drop_upto - first_drop_idx)
+                      << " oldest history message(s))\n";
         } else {
-            // Even the minimal message set does not fit (huge system prompt or
-            // single enormous message). Fail loudly instead of corrupting KV.
-            throw std::runtime_error(
+            // Even the minimal message set does not fit. Fail loudly instead of
+            // corrupting the KV cache.
+            throw ContextLengthExceededError(
                 "prompt exceeds model context capacity (" +
                 std::to_string(prompt_ids.size()) + " tokens > " +
                 std::to_string(kv_capacity - gen_budget) +
                 " available after reserving " + std::to_string(gen_budget) +
                 " generation tokens)");
         }
+    }
+
+    // vLLM-style hard admission check: a prompt that still exceeds capacity
+    // after optional history truncation is rejected up front. Without this,
+    // single oversized messages (message count <= 2 never enters the context
+    // shift above — e.g. opencode pasting one large file) run the whole
+    // prefill and die mid-write on page-pool exhaustion (a 500 after burning
+    // the full prefill compute) instead of an immediate 400.
+    if (kv_capacity > 0 &&
+        static_cast<int>(prompt_ids.size()) + gen_budget > kv_capacity) {
+        LOG_WARN("[capacity-check] REJECTING: prompt=" + std::to_string(prompt_ids.size()) +
+                 " budget=" + std::to_string(gen_budget) + " capacity=" +
+                 std::to_string(kv_capacity));
+        throw ContextLengthExceededError(
+            "This model's maximum context length is " + std::to_string(kv_capacity) +
+            " tokens, but the request is " +
+            std::to_string(static_cast<int>(prompt_ids.size()) + gen_budget) +
+            " tokens (prompt " + std::to_string(prompt_ids.size()) + " + generation " +
+            std::to_string(gen_budget) + ")");
     }
 
     // OpenAI default: temperature=0 means greedy; other defaults are the
@@ -636,28 +819,109 @@ ChatCompletionResult ServerState::chat_completion(
     };
 
     // ---- Session prefix reuse ----
-    // Chat front-ends resend the whole conversation on every turn. When the KV
-    // cache still holds a prefix of this prompt, forward only the tail: the
-    // cached positions hold exactly these token ids, so reusing them is exact,
-    // not an approximation. A mismatch (compaction, edited history, a different
-    // conversation) just yields a short prefix and falls back to a full
-    // prefill once the reuse is not worth it.
+    // Two storage backends, two reuse strategies:
+    //  * Contiguous: a single-entry mirror of the last prompt+output; on a
+    //    matching prefix we forward the tail and let generate() rollback().
+    //  * Paged: the radix PrefixCache (same machinery as the Python
+    //    RequestScheduler). Each request's working set is seq_id 0; cached
+    //    prefixes live in dedicated cache seq_ids whose KV pages are
+    //    reference-counted. On a hit, try_lookup() shares the cached prefix
+    //    pages into seq 0 via one seq_share (ref_count++) and we skip prefilling
+    //    those tokens. We must NOT call ctx_.reset_kv_cache() — that resets the
+    //    whole KV cache, wiping the radix cache's cache seq_ids — so instead we
+    //    release the previous request's working set (freeing only its unique
+    //    suffix pages; cached prefix pages survive via their cache seq_ids).
+    //    This mirrors vLLM's free(request) + per-block ref_count eviction.
     int prefix_len = 0;
-    if (ctx_->params().kv_storage_mode == KVStorageMode::Contiguous &&
-        !cached_kv_tokens_.empty()) {
-        const size_t lim = std::min(cached_kv_tokens_.size(), prompt_ids.size());
-        size_t m = 0;
-        while (m < lim && cached_kv_tokens_[m] == prompt_ids[m]) {
-            ++m;
+    const bool paged_mode = (ctx_->params().kv_storage_mode == KVStorageMode::Paged);
+    if (paged_mode) {
+        if (auto* km = ctx_->engine()->kv_memory()) {
+            // Drop the previous request's radix-node reference and working set
+            // so seq 0 starts empty (register_prefix() may have left a trailing
+            // unaligned page). The RequestScheduler calls release_prefix() when
+            // a request finishes; the server path must do it here — otherwise
+            // the matched node keeps ref_count >= 1 forever and its pages can
+            // never be evicted.
+            prefix_cache_.release_prefix(0, km->storage());
+            km->storage().release(0);
+            prefix_len = prefix_cache_.try_lookup(prompt_ids, 0, km->storage());
+            // vLLM-style on-demand eviction before prefill. Cached prefixes
+            // hold pages after register_prefix(); a new sequence needs
+            // ceil((prompt_tail + gen_budget) / page_size) fresh pages in every
+            // Full-attention pool. When free pages run short, evict unused
+            // cached prefixes (LRU) first; refuse only when even a fully
+            // evicted pool cannot hold the sequence — before any prefill work,
+            // so the client gets a clean 400 instead of a mid-prefill 500.
+            const int page = km->storage().page_size();
+            const long tail = (long)prompt_ids.size() - prefix_len;
+            const int need_pages = (int)((tail + gen_budget + page - 1) / page);
+            const int free_pages = km->free_pages_full();
+            if (free_pages >= 0 && free_pages < need_pages) {
+                prefix_cache_.evict_lru(0, km->storage());
+                const int free_after = km->free_pages_full();
+                if (free_after < need_pages) {
+                    // The rejection is driven by *free* pages, not the pool's
+                    // total capacity — the cached prefix and prior working sets
+                    // already occupy most of the pool. Report both so the user
+                    // understands it is a fragmentation/occupancy problem, not a
+                    // raw-capacity one.
+                    const long free_tokens = (long)free_after * page;
+                    throw ContextLengthExceededError(
+                        "This model's paged KV pool holds " +
+                        std::to_string(km->max_pool_tokens()) +
+                        " tokens total, but only " + std::to_string(free_tokens) +
+                        " are free after evicting cached prefixes; the request "
+                        "needs " +
+                        std::to_string(tail + gen_budget) +
+                        " new tokens (prompt " + std::to_string(prompt_ids.size()) +
+                        " - cached prefix " + std::to_string(prefix_len) +
+                        " + max_tokens " + std::to_string(gen_budget) +
+                        "). Reduce the input length, lower max_tokens, or enlarge "
+                        "the KV pool (free VRAM for the 741MB Q3K scratch via a "
+                        "tensor-core-eligible quant, or raise --max-num-seqs).");
+                }
+            }
         }
-        prefix_len = static_cast<int>(m);
+        gen_cfg.prefix_len = prefix_len;
+        // Keep reset_kv_cache false: seq 0 was cleared above; a true reset would
+        // also nuke the radix cache. On a miss seq 0 is already empty.
+        gen_cfg.reset_kv_cache = false;
+    } else {
+        // Contiguous single-entry mirror (behavior unchanged).
+        if (!cached_kv_tokens_.empty()) {
+            const size_t lim = std::min(cached_kv_tokens_.size(), prompt_ids.size());
+            size_t m = 0;
+            while (m < lim && cached_kv_tokens_[m] == prompt_ids[m]) {
+                ++m;
+            }
+            prefix_len = static_cast<int>(m);
+        }
+        gen_cfg.prefix_len = prefix_len;
+        gen_cfg.reset_kv_cache = (prefix_len == 0);
+        if (prefix_len == 0) {
+            // generate() resets the KV cache on this path; keep the mirror honest
+            // so a later request cannot reuse rows that no longer exist.
+            cached_kv_tokens_.clear();
+        }
     }
-    gen_cfg.prefix_len = prefix_len;
-    gen_cfg.reset_kv_cache = (prefix_len == 0);
-    if (prefix_len == 0) {
-        // generate() resets the KV cache on this path; keep the mirror honest
-        // so a later request cannot reuse rows that no longer exist.
-        cached_kv_tokens_.clear();
+    if (opt_.log_prompt_prefix) {
+        // Diagnostic: emit FNV-1a hashes of the leading prompt at several depths.
+        // Diff consecutive turns — the deepest depth whose hash is identical
+        // across turns marks the stable prefix; the next depth is where the
+        // agent's prompt starts to diverge (the cache-break point).
+        const int depths[] = {64, 256, 1024, 4096, 8192, 16384};
+        std::string hs;
+        for (int d : depths) {
+            const size_t n = std::min((size_t)d, prompt_ids.size());
+            uint32_t h = 2166136261u;
+            for (size_t k = 0; k < n; ++k) {
+                h ^= static_cast<uint32_t>(prompt_ids[k]);
+                h *= 16777619u;
+            }
+            hs += " " + std::to_string(n) + ":" + std::to_string(h);
+        }
+        LOG_WARN("[prompt-prefix] len=" + std::to_string(prompt_ids.size()) +
+                 " hit=" + std::to_string(prefix_len) + " hashes" + hs);
     }
     if (opt_.perf && prefix_len > 0) {
         std::cout << "[server] prefix reuse: " << prefix_len << "/" << prompt_ids.size()
@@ -671,19 +935,37 @@ ChatCompletionResult ServerState::chat_completion(
     } catch (...) {
         // A failed request can leave the KV cache partially overwritten, so the
         // recorded prefix no longer describes what is resident. Drop the mirror
-        // and let the next request start from a clean cache.
+        // and let the next request start from a clean cache. In paged mode also
+        // release seq 0's working set (its prefix pages are shared with the radix
+        // cache, which survives) so the next request does not append onto stale KV.
+        if (paged_mode) {
+            if (auto* km = ctx_->engine()->kv_memory()) {
+                km->storage().release(0);
+            }
+        }
         cached_kv_tokens_.clear();
         throw;
     }
 
-    // Mirror what the KV cache now holds: this prompt plus whatever was
-    // generated. Drop it when it can no longer fit beside a generation budget,
-    // otherwise the next request would overflow the cache.
-    cached_kv_tokens_ = prompt_ids;
-    cached_kv_tokens_.insert(cached_kv_tokens_.end(), result.token_ids.begin(),
-                             result.token_ids.end());
-    if (static_cast<int>(cached_kv_tokens_.size()) + gen_budget > kv_capacity) {
-        cached_kv_tokens_.clear();
+    // Record what the KV cache now holds, per backend.
+    if (paged_mode) {
+        // Register this request's full prompt KV into the radix cache so future
+        // requests can reuse it, then evict LRU leaf nodes beyond capacity.
+        // register_prefix() transfers seq 0's prefix pages into per-node cache
+        // seq_ids (ref-counted, no copy) and releases seq 0's own reference; the
+        // cached copy survives. Short prompts are handled internally (no-op).
+        if (auto* km = ctx_->engine()->kv_memory()) {
+            prefix_cache_.register_prefix(prompt_ids, 0, km->storage());
+            prefix_cache_.evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
+        }
+    } else {
+        // Contiguous single-entry mirror.
+        cached_kv_tokens_ = prompt_ids;
+        cached_kv_tokens_.insert(cached_kv_tokens_.end(), result.token_ids.begin(),
+                                 result.token_ids.end());
+        if (static_cast<int>(cached_kv_tokens_.size()) + gen_budget > kv_capacity) {
+            cached_kv_tokens_.clear();
+        }
     }
 
     if (on_token && !stop_hit && !pending.empty()) {

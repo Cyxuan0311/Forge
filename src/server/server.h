@@ -24,6 +24,7 @@
 #include "forge/chat_template.h"
 #include "forge/generator.h"
 #include "forge/model.h"
+#include "forge/prefix_cache.h"
 #include "forge/tokenizer.h"
 
 namespace httplib {
@@ -40,12 +41,17 @@ struct ServerOptions {
     int port = 8080;
     int n_gpu_layers = -1;
     int ctx_size = 0;  // 0 = auto (KV cap 4096 for long-ctx models); >0 = user context size
+    int n_keep = 0;    // llama.cpp-style: leading tokens never evicted on context shift
+                        // (0 = keep only the system prompt; >0 = keep that many prefix tokens)
     int threads = -1;  // -1 = auto (probe fused GEMV on CPU, full GPU offload untouched)
-    // f16 matches llama.cpp's default; fp32 wastes 2x VRAM for no quality gain.
-    // fp8_* are the most VRAM-efficient (1 byte/element, no block overhead).
-    std::string kv_cache_dtype = "f16";  // fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 | fp8_e5m2
+    // q8_0 is the default: ~2x less VRAM than f16 (4x vs fp32) for a ~0.1%
+    // accuracy loss (cosine >= 0.999 vs healthy f16), which roughly doubles the
+    // context length a fixed VRAM budget can hold. f16 / fp8_* remain available
+    // for quality- or throughput-critical setups.
+    std::string kv_cache_dtype = "q8_0";  // fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 | fp8_e5m2
     bool cuda_graph = false;
     bool paged_kv = false;  // Use paged KV cache storage (default: contiguous)
+    bool log_prompt_prefix = false;  // Diagnostic: per-depth prompt-prefix hashes
     // Budget (MB) for the per-weight FP16 dequant cache used by the TensorCore
     // matmul path. -1 = default (1024 MB); 0 = cache disabled (callers fall
     // back to transient scratch); >0 = explicit budget.
@@ -109,6 +115,14 @@ struct ChatCompletionResult {
     std::vector<ToolCall> tool_calls;  // non-empty -> finish_reason "tool_calls"
 };
 
+// Thrown before prefill when the rendered prompt + generation budget exceeds
+// the KV capacity (paged pool tokens or contiguous max_seq_len). Routes map it
+// to HTTP 400 invalid_request_error — a client-fixable request, not a server
+// fault (vLLM: `This model's maximum context length is N tokens...`).
+struct ContextLengthExceededError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // Owns tokenizer / model / inference context. One instance per process.
 class ServerState {
 public:
@@ -148,6 +162,12 @@ private:
     // starts with exactly these ids and only the tail has to be prefilled.
     // Guarded by inference_mutex_.
     std::vector<int32_t> cached_kv_tokens_;
+
+    // ---- Paged-mode radix prefix cache ----
+    // Mirrors the RequestScheduler's page-level prefix sharing. Each request's
+    // working set is seq_id 0; cached prefixes live in dedicated cache seq_ids
+    // whose KV pages are reference-counted. Guarded by inference_mutex_.
+    PrefixCache prefix_cache_;
 };
 
 // CORS + OPTIONS preflight + optional Bearer api-key auth (server_routes.cpp).

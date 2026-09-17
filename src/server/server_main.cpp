@@ -12,6 +12,7 @@
  *       "models": { "<model-file-stem>": {} } } } }
  */
 
+#include <atomic>
 #include <csignal>
 #include <iostream>
 #include <string>
@@ -53,6 +54,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             opt.n_gpu_layers = std::stoi(value_of(i, "--n-gpu-layers"));
         } else if (arg == "-c" || arg == "--ctx-size") {
             opt.ctx_size = std::stoi(value_of(i, "--ctx-size"));
+        } else if (arg == "--n-keep") {
+            opt.n_keep = std::stoi(value_of(i, "--n-keep"));
         } else if (arg == "-t" || arg == "--threads") {
             opt.threads = std::stoi(value_of(i, "--threads"));
         } else if (arg == "--kv-cache-dtype") {
@@ -61,6 +64,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             opt.cuda_graph = true;
         } else if (arg == "--paged-kv") {
             opt.paged_kv = true;
+        } else if (arg == "--log-prefix") {
+            opt.log_prompt_prefix = true;
         } else if (arg == "--dequant-cache-mb") {
             opt.dequant_cache_mb = std::stol(value_of(i, "--dequant-cache-mb"));
         } else if (arg == "--load-mode") {
@@ -119,9 +124,14 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
 }
 
 httplib::Server* g_svr = nullptr;
+std::atomic<bool> g_stopping{false};
 
 void handle_signal(int) {
-    if (g_svr) {
+    // Idempotent: stop() must run at most once. A second SIGINT (e.g. a double
+    // Ctrl-C) before the listen loop unwinds would otherwise re-enter stop()
+    // while is_running_ is still true but svr_sock_ is already INVALID_SOCKET,
+    // tripping httplib's assertion in Server::stop() and aborting the process.
+    if (g_svr && !g_stopping.exchange(true)) {
         g_svr->stop();
     }
 }

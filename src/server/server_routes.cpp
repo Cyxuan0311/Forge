@@ -234,6 +234,11 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
         fsrv::ChatCompletionResult r;
         try {
             r = state.chat_completion(creq, nullptr);
+        } catch (const fsrv::ContextLengthExceededError& e) {
+            // Client-fixable request: reject with 400 before any prefill work,
+            // mirroring vLLM's max-context admission error.
+            send_error(res, 400, e.what(), "invalid_request_error", "400");
+            return;
         } catch (const std::exception& e) {
             send_error(res, 500, std::string("Inference failed: ") + e.what(), "server_error",
                        "500");
@@ -292,6 +297,7 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
 
             fsrv::ChatCompletionResult r;
             std::string error_text;
+            std::string error_type;  // non-empty => client-fixable (mapped verbatim)
             const bool tools_stream = !creq.tools.empty() && creq.tool_choice != "none";
             auto on_token = [&](const std::string& delta) -> bool {
                 if (!sink.is_writable())
@@ -307,6 +313,9 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
             };
             try {
                 r = state.chat_completion(creq, on_token);
+            } catch (const fsrv::ContextLengthExceededError& e) {
+                error_text = e.what();
+                error_type = "invalid_request_error";
             } catch (const std::exception& e) {
                 error_text = e.what();
             }
@@ -314,8 +323,10 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
             if (sink.is_writable()) {
                 if (!error_text.empty()) {
                     json jerr;
-                    jerr["error"]["message"] = "Inference failed: " + error_text;
-                    jerr["error"]["type"] = "server_error";
+                    jerr["error"]["message"] =
+                        error_type.empty() ? ("Inference failed: " + error_text) : error_text;
+                    jerr["error"]["type"] =
+                        error_type.empty() ? "server_error" : error_type;
                     std::string payload = "data: " + jerr.dump() + "\n\n";
                     sink.write(payload.data(), payload.size());
                 } else {
