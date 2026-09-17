@@ -32,7 +32,7 @@
   <img src="https://img.shields.io/badge/Custom-Kernels-76B900?style=flat-square&labelColor=18181B" alt="Custom Kernels">
 </p>
 
----
+
 
 ## 简介
 
@@ -49,7 +49,7 @@
 * **可选 BLAS** — cuBLAS / OpenBLAS
 * **多模型架构** — LLaMA、DeepSeek、Qwen3.5、Qwen3-VL、Gemma4、MiniCPM-V
 
----
+
 
 ## 架构
 
@@ -73,7 +73,7 @@ Hardware
 
 详细设计请参考[架构设计](docs/architecture_zh.md)。
 
----
+
 
 ## 演示
 
@@ -81,7 +81,7 @@ Hardware
   <img src="resource/demo.png" alt="Forge 演示" width="90%">
 </p>
 
----
+
 
 ## 快速开始
 
@@ -125,7 +125,7 @@ python examples/qwen_inference.py \
 
 详细的构建和使用说明请参考[文档](#文档)。
 
----
+
 
 ## 支持的模型
 
@@ -139,7 +139,7 @@ python examples/qwen_inference.py \
 
 具体实现请参考[模型支持](docs/models_zh.md)。
 
----
+
 
 ## 性能
 
@@ -165,7 +165,7 @@ python -m report.runner
 
 详细结果和测试方法见 `resource/reports/`。
 
----
+
 
 ## 文档
 
@@ -178,7 +178,7 @@ python -m report.runner
 | [模型支持](docs/models_zh.md)           | 模型架构支持    |
 | [架构设计](docs/architecture_zh.md)     | 内部架构与设计   |
 
----
+
 
 ## 贡献
 
@@ -186,7 +186,7 @@ python -m report.runner
 
 详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
----
+
 
 ## License
 

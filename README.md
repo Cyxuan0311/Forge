@@ -32,7 +32,7 @@
   <img src="https://img.shields.io/badge/Custom-Kernels-76B900?style=flat-square&labelColor=18181B" alt="Custom Kernels">
 </p>
 
----
+
 
 ## Overview
 
@@ -49,7 +49,7 @@ It provides a minimal, transparent, and high-performance inference stack without
 * **Optional BLAS** — cuBLAS / OpenBLAS
 * **Multiple architectures** — LLaMA, DeepSeek, Qwen3.5, Qwen3-VL, Gemma4, MiniCPM-V
 
----
+
 
 ## Architecture
 
@@ -73,7 +73,7 @@ Hardware
 
 See [Architecture](docs/architecture.md) for the detailed design.
 
----
+
 
 ## Demo
 
@@ -81,7 +81,7 @@ See [Architecture](docs/architecture.md) for the detailed design.
   <img src="resource/demo.png" alt="Forge Demo" width="90%">
 </p>
 
----
+
 
 ## Quick Start
 
@@ -125,7 +125,7 @@ python examples/qwen_inference.py \
 
 For detailed build and usage instructions, see the [documentation](#documentation).
 
----
+
 
 ## Supported Models
 
@@ -139,7 +139,7 @@ For detailed build and usage instructions, see the [documentation](#documentatio
 
 See [Supported Models](docs/models.md) for details.
 
----
+
 
 ## Performance
 
@@ -165,7 +165,7 @@ python -m report.runner
 
 Detailed results and methodology are available under `resource/reports/`.
 
----
+
 
 ## Documentation
 
@@ -178,7 +178,7 @@ Detailed results and methodology are available under `resource/reports/`.
 | [Supported Models](docs/models.md)   | Model architecture support       |
 | [Architecture](docs/architecture.md) | Internal architecture and design |
 
----
+
 
 ## Contributing
 
@@ -186,7 +186,7 @@ Issues, optimizations, new operators, and model support are welcome.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
----
+
 
 ## License
 

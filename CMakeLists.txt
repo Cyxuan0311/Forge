@@ -266,6 +266,7 @@ add_library(
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/gemma4_engine.cpp
   src/inference/engines/phimoe_engine.cpp
+  src/inference/engines/bailingmoe3_engine.cpp
   src/inference/engines/generic_engine.cpp
   src/inference/layers/norm_executor.cpp
   src/inference/layers/rope_executor.cpp
@@ -278,6 +279,7 @@ add_library(
   src/inference/layers/gemma4_attention.cpp
   src/inference/layers/gemma4_moe.cpp
   src/inference/layers/qwen35_recurrent_memory.cpp
+  src/inference/layers/bailingmoe3_recurrent_memory.cpp
   src/inference/layers/qwen35_rope.cpp
   src/inference/layers/qwen35_full_attention.cpp
   src/inference/layers/qwen35_linear_attention.cpp
