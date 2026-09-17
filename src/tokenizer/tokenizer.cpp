@@ -118,6 +118,14 @@ struct GgufMetaReader {
         return v;
     }
 
+    uint8_t read_u8() {
+        if (!check(1))
+            return 0;
+        uint8_t v = data[offset];
+        offset += 1;
+        return v;
+    }
+
     int32_t read_i32() {
         if (!check(4))
             return 0;
@@ -311,6 +319,11 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
             pad_id_ = static_cast<int32_t>(reader.read_u32());
         } else if (key == "tokenizer.ggml.unknown_token_id") {
             unk_id_ = static_cast<int32_t>(reader.read_u32());
+        } else if (key == "tokenizer.ggml.add_bos_token" || key == "llama.add_bos_token") {
+            // GGUF BOOL is a single byte (vtype 7).
+            add_bos_token_ = (reader.read_u8() != 0);
+        } else if (key == "tokenizer.ggml.add_eos_token" || key == "llama.add_eos_token") {
+            add_eos_token_ = (reader.read_u8() != 0);
         } else if (key == "tokenizer.chat_template") {
             chat_template_ = reader.read_str();
         } else {
