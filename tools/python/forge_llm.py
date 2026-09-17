@@ -942,7 +942,7 @@ class VisionLLM:
     """
 
     def __init__(
-        self, model_path, mmproj_path=None, device="cuda", kv_cache_dtype="fp32", gpu_layers=-1
+        self, model_path, mmproj_path=None, device="cuda", kv_cache_dtype="q8_0", gpu_layers=-1
     ):
         self._mm = forge.MultimodalModel()
         if mmproj_path:
@@ -959,7 +959,7 @@ class VisionLLM:
 
     @classmethod
     def from_gguf(
-        cls, model_path, mmproj_path=None, device="cuda", kv_cache_dtype="fp32", gpu_layers=-1
+        cls, model_path, mmproj_path=None, device="cuda", kv_cache_dtype="q8_0", gpu_layers=-1
     ) -> "VisionLLM":
         """Load a multimodal model from GGUF file(s).
 

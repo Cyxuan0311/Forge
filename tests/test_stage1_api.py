@@ -62,7 +62,7 @@ class TestGenerationConfig:
 class TestContextConfig:
     def test_default_construction(self):
         cfg = forge.ContextConfig()
-        assert cfg.kv_cache_dtype == "fp32"
+        assert cfg.kv_cache_dtype == "q8_0"
         assert cfg.page_size == 16
         assert cfg.max_seq_len == 4096
         assert cfg.device == "cuda"

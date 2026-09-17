@@ -33,6 +33,12 @@ EXPECTED_BLOCK_DEFS = {
     forge.DataType.IQ2_S:   (256, 82),
     forge.DataType.IQ2_XXS: (256, 66),
     forge.DataType.IQ4_NL:  (32,  18),
+    forge.DataType.IQ2_XS:  (256, 74),
+    forge.DataType.IQ3_S:   (256, 110),
+    forge.DataType.IQ4_XS:  (256, 136),
+    forge.DataType.IQ1_S:   (256, 50),
+    forge.DataType.IQ3_XXS: (256, 98),
+    forge.DataType.IQ1_M:   (256, 56),
 }
 
 

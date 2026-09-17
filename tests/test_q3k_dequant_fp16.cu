@@ -213,11 +213,13 @@ static void test_tc_gemm_parity() {
 // ---- 3. KernelSelector wiring: Q3_K MMQ below the TC threshold, TC above ---
 
 static void test_selector_wiring() {
-    // Regression lock (Phase 6-MMQ contract): the M==1 decode route stays on
-    // dp4a GEMV, small-M prefill stays on MMQ, and prefill at/above
-    // tc_min_m(Q3_K)=256 dequantizes to FP16 once and runs the cuBLAS TC GEMM
-    // (the old 3.2x-slower measurement was decode-shaped M==1 and does not
-    // apply at prefill M). Both sides of the threshold are locked.
+    // Regression lock (Q3_K MMQ-default contract): the M==1 decode route stays
+    // on dp4a GEMV and ALL prefill M stays on MMQ. Phase 6-MMQ briefly claimed
+    // Q3_K wins on the dequant-FP16 + cuBLAS TC path at prefill M, but measured
+    // on shipping GPUs (RTX 4050) the TC path is ~2.6x SLOWER there (the Q3_K
+    // block/scale dequant does not amortize on tensor cores), so Q3_K is
+    // intentionally not TC-eligible by default; FORGE_AUTOTUNE=1 can still opt
+    // it back in per-signature where it actually wins.
     forge::KernelProblem p;
     p.domain = forge::KernelDomain::MatMul;
     p.dtype = forge::DataType::Q3_K;
@@ -240,10 +242,10 @@ static void test_selector_wiring() {
 
     p.M = 256;
     const forge::KernelVariant prefill = forge::select_kernel(p);
-    std::printf("  selector: Q3_K M=256 -> variant=%d (MMQ_TENSORCORE=%d)\n",
-                static_cast<int>(prefill), static_cast<int>(forge::KernelVariant::MMQ_TENSORCORE));
-    check(prefill == forge::KernelVariant::MMQ_TENSORCORE,
-          "Q3_K prefill at M>=tc_min_m=256 routes to TensorCore");
+    std::printf("  selector: Q3_K M=256 -> variant=%d (MMQ=%d)\n", static_cast<int>(prefill),
+                static_cast<int>(forge::KernelVariant::MMQ));
+    check(prefill == forge::KernelVariant::MMQ,
+          "Q3_K prefill at M>=tc_min_m=256 stays on MMQ (TC disabled by default)");
 }
 
 int main() {

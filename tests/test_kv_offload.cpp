@@ -244,9 +244,10 @@ void test_release_and_reset_drop_host(PagedKVStorage& storage) {
     const size_t pool_before = storage.host_pool_bytes();
     check(pool_before > 0, "host pool holds data before cleanup");
 
-    // Releasing seq0 frees its evicted pages; free_page() drops the host copy.
+    // Releasing seq0 erases its sequence table entry entirely, so it owns no
+    // pages any more (it held 4 before). free_page() drops the host copy.
     storage.release(0);
-    check(!storage.has_seq(0), "seq0 is gone");
+    check(storage.seq_num_pages(0) == 0, "seq0 is gone");
     check(storage.num_device_pages_in_use() == 2, "only seq1 pages remain in use");
     const size_t after_release = storage.host_pool_bytes();
     check(after_release < pool_before, "release(seq0) dropped its host copies");

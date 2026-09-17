@@ -110,6 +110,27 @@ add_executable(forge-qwen35-recurrent-test test_qwen35_recurrent.cpp)
 forge_link_native(forge-qwen35-recurrent-test)
 add_test(NAME qwen35-recurrent COMMAND forge-qwen35-recurrent-test)
 
+# GDN (KDA gated delta net) reference cross-check: compares forge's
+# gdn_recurrence() against hand-computed values derived from llama.cpp's
+# ggml_compute_forward_gated_delta_net (KDA branch), and pins down that the
+# recurrent state is carried correctly across step-by-step decode calls.
+add_executable(forge-gdn-reference-test test_gdn_reference.cpp)
+forge_link_native(forge-gdn-reference-test)
+target_include_directories(
+  forge-gdn-reference-test
+  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME gdn-reference COMMAND forge-gdn-reference-test)
+
+# Depthwise causal conv1d reference cross-check (sliding-window tap order + the
+# requirement that the conv state keeps the RAW pre-conv projection, matching
+# llama.cpp's conv_x snapshot of x_proj).
+add_executable(forge-conv1d-reference-test test_conv1d_reference.cpp)
+forge_link_native(forge-conv1d-reference-test)
+target_include_directories(
+  forge-conv1d-reference-test
+  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME conv1d-reference COMMAND forge-conv1d-reference-test)
+
 # Roadmap 2.5: prefill whole-segment quantized write (requires CUDA).
 add_executable(forge-kv-quant-segment-test test_kv_quant_segment.cpp)
 forge_link_native(forge-kv-quant-segment-test)
@@ -367,6 +388,14 @@ if(CUDAToolkit_FOUND)
   add_executable(forge-fp8-gemv-bench test_fp8_gemv_cuda.cu)
   forge_link_native(forge-fp8-gemv-bench)
   add_test(NAME fp8-gemv-bench COMMAND forge-fp8-gemv-bench)
+
+  # Q3_K / Q2_K decode (M==1) GEMV — bandwidth + correctness audit. Exercises the
+  # production CUDA GEMV kernels (launch_gemv_q3_k_smem / launch_gemv_q2_k_q8_1)
+  # against a CPU dequant golden. Used to measure the effect of bandwidth tuning
+  # (e.g. the __ldg change in cuda_gemv_common.cuh). Skips without an Ada GPU.
+  add_executable(forge-q3k-gemv-bench test_q3k_gemv_cuda.cu)
+  forge_link_native(forge-q3k-gemv-bench)
+  add_test(NAME q3k-gemv-bench COMMAND forge-q3k-gemv-bench)
 
   # Phase 5-D: Q3_K FP16 whole-matrix dequant (launch_dequant_q3_k_matrix_fp16)
   # + the Q3_K -> FP16 -> cuBLAS TensorCore prefill route it unlocks. Parity
