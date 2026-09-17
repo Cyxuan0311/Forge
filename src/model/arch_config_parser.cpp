@@ -257,6 +257,92 @@ ModelConfig parse_qwen35_config(ModelLoader& loader, const std::string& arch) {
     return cfg;
 }
 
+// ============================================================================
+// BailingMoE3 (Ling 3.0): hybrid MoE + MLA + SSM/KDA recurrent attention.
+// Per-layer `attention.head_count_kv`: 0 => SSM/KDA recurrent branch,
+// >0 => MLA branch (kv heads = 1). Rope is NORM-style (interleaved pairs).
+// ============================================================================
+ModelConfig parse_bailingmoe3_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    cfg.tie_embeddings = true;
+    cfg.ffn_type = FFNType::MoE;
+    cfg.ffn_activation = ActivationType::SiLU_GELU;
+    cfg.use_neox_rope = false;
+    cfg.rope_type = RopeType::Standard;
+
+    // Hybrid layer topology from the per-layer head_count_kv array.
+    auto kv_heads = loader.get_metadata_int_array(arch + ".attention.head_count_kv", {});
+    cfg.head_count_kv.assign(kv_heads.begin(), kv_heads.end());
+    if (cfg.head_count_kv.empty()) {
+        cfg.head_count_kv.assign(cfg.num_layers, 1);  // scalar fallback: all MLA
+    }
+    cfg.num_kv_heads = 1;  // MLA layers use a single compressed-KV "head"
+    cfg.use_mla = true;
+    cfg.use_ssm = true;
+
+    // MLA low-rank dims
+    cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".attention.kv_lora_rank", 0));
+    cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".attention.q_lora_rank", 0));
+    cfg.mla_key_dim = static_cast<int>(loader.get_metadata_int(arch + ".attention.key_length_mla", 0));
+    cfg.mla_value_dim = static_cast<int>(loader.get_metadata_int(arch + ".attention.value_length_mla", 0));
+    // RoPE dim of the MLA pe part (n_rot in llama.cpp terms)
+    cfg.rope_dimension_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+
+    // SSM / KDA recurrent branch
+    cfg.ssm_conv_kernel = static_cast<int>(loader.get_metadata_int(arch + ".ssm.conv_kernel", 4));
+    cfg.kda_head_dim = static_cast<int>(loader.get_metadata_int(arch + ".kda.head_dim", 0));
+    // kda.safe_gate 在 GGUF 中是 BOOL（加载器归入 int 表），默认 true。
+    cfg.kda_safe_gate = static_cast<float>(loader.get_metadata_int(arch + ".kda.safe_gate", 1));
+    cfg.kda_gate_lower_bound =
+        static_cast<float>(loader.get_metadata_float(arch + ".kda.gate_lower_bound", 0.0f));
+
+    // MoE routing / expert dims
+    cfg.n_expert = static_cast<int>(loader.get_metadata_int(arch + ".expert_count", 0));
+    cfg.n_expert_used = static_cast<int>(loader.get_metadata_int(arch + ".expert_used_count", 0));
+    cfg.moe_group_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_group_count", 0));
+    cfg.moe_group_used_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_group_used_count", 0));
+    cfg.moe_gating_func =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_gating_func", 1));
+    cfg.moe_weights_scale =
+        static_cast<float>(loader.get_metadata_float(arch + ".expert_weights_scale", 0.0f));
+    cfg.moe_weights_norm = loader.get_metadata_int(arch + ".expert_weights_norm", 0) != 0;
+    // expert_feed_forward_length may be scalar or per-layer array (uniform in practice)
+    cfg.expert_feed_forward_length =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_feed_forward_length", 0));
+    if (cfg.expert_feed_forward_length == 0) {
+        auto arr = loader.get_metadata_int_array(arch + ".expert_feed_forward_length", {});
+        if (!arr.empty())
+            cfg.expert_feed_forward_length = static_cast<int>(arr[0]);
+    }
+    cfg.expert_shared_feed_forward_length = static_cast<int>(
+        loader.get_metadata_int(arch + ".expert_shared_feed_forward_length", 0));
+    if (cfg.expert_shared_feed_forward_length == 0) {
+        cfg.expert_shared_feed_forward_length =
+            cfg.expert_feed_forward_length * std::max(1, static_cast<int>(
+                loader.get_metadata_int(arch + ".expert_shared_count", 1)));
+    }
+    cfg.expert_shared_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_shared_count", 1));
+    cfg.leading_dense_block_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".leading_dense_block_count", 0));
+
+    // DeepSeek-MTP style trailing NextN block(s), if present
+    cfg.n_nextn_layers =
+        static_cast<int>(loader.get_metadata_int(arch + ".nextn_predict_layers", 0));
+    if (cfg.n_nextn_layers > 0 && cfg.num_layers > cfg.n_nextn_layers) {
+        LOG_INFO("bailingmoe3: " + std::to_string(cfg.n_nextn_layers) +
+                 " nextn MTP layer(s) present; trunk layers = " +
+                 std::to_string(cfg.num_layers - cfg.n_nextn_layers));
+        cfg.num_layers -= cfg.n_nextn_layers;
+    } else {
+        cfg.n_nextn_layers = 0;
+    }
+    return cfg;
+}
+
 ModelConfig parse_phi3_config(ModelLoader& loader, const std::string& arch) {
     auto cfg = parse_common_gguf_config(loader, arch);
     cfg.use_neox_rope = true;

@@ -72,7 +72,7 @@ inline bool parse_kv_cache_precision(const std::string& s, KVCachePrecision& out
 // Maps to InferenceContext::ContextParams but uses string-based enums
 // so Python users don't need to import C++ enum types.
 struct ContextConfig {
-    std::string kv_cache_dtype = "fp32";      // "fp32"|"f16"|"q8_0"|"q4_0"|"q4_k"
+    std::string kv_cache_dtype = "q8_0";      // "fp32"|"f16"|"q8_0"|"q4_0"|"q4_k"
     std::string kv_cache_precision = "auto";  // "auto"|"high_accuracy"|"high_throughput"
     std::string kv_cache_type_k = "";         // if empty, use kv_cache_dtype
     std::string kv_cache_type_v = "";         // if empty, use kv_cache_dtype

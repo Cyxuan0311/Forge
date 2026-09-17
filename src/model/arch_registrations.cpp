@@ -17,6 +17,7 @@
 #include "forge/arch_registry.h"
 #include "forge/arch_weight_inits.h"
 #include "forge/engine.h"
+#include "forge/engines/bailingmoe3_engine.h"
 #include "forge/engines/deepseek_engine.h"
 #include "forge/engines/dflash_engine.h"
 #include "forge/engines/gemma4_engine.h"
@@ -208,6 +209,28 @@ static ConfigParserAutoRegister _cfg_qwen35("qwen35", parse_qwen35_config);
 static WeightInitAutoRegister _winit_qwen35("qwen35", init_qwen35_layer_weights);
 static ArchCapabilityAutoRegister _cap_qwen35("qwen35",
                                               ArchCapability{.use_ssm = true, .use_mrope = true});
+
+// ============================================================================
+// BailingMoE3 (Ling 3.0: hybrid MoE + MLA + SSM/KDA recurrent attention)
+// ============================================================================
+// The engine is registered here (like every other architecture) rather than via
+// FORGE_REGISTER_ENGINE inside bailingmoe3_engine.cpp: registering centrally
+// also references Bailingmoe3Engine's constructor, which force-links that
+// translation unit. Left to self-registration alone, the linker drops
+// bailingmoe3_engine.o from static-library builds and the engine never
+// registers ("resolves to engine 'bailingmoe3' but that engine is not
+// registered").
+
+static EngineAutoRegister _eng_bailingmoe3(
+    "bailingmoe3", [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        return std::make_unique<Bailingmoe3Engine>(m, c);
+    });
+static ConfigParserAutoRegister _cfg_bailingmoe3("bailingmoe3", parse_bailingmoe3_config);
+static WeightInitAutoRegister _winit_bailingmoe3("bailingmoe3",
+                                                 init_bailingmoe3_layer_weights);
+static ArchCapabilityAutoRegister _cap_bailingmoe3(
+    "bailingmoe3",
+    ArchCapability{.use_mla = true, .use_ssm = true});
 
 // ============================================================================
 // DFlash / DSPark (standalone lightweight drafter for speculative decoding)

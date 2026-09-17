@@ -132,6 +132,11 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
                 is_full_attn = true;
             }
             lw.layer_type = is_full_attn ? LayerType::FullAttention : LayerType::LinearAttention;
+        } else if (config.arch_type == "bailingmoe3") {
+            // Ling 3.0: head_count_kv[i]==0 => GDN recurrent, >0 => absorbed MLA
+            bool is_recurrent = (i < (int)config.head_count_kv.size()) &&
+                                config.head_count_kv[i] == 0;
+            lw.layer_type = is_recurrent ? LayerType::LinearAttention : LayerType::MLA;
         } else if (config.use_mla) {
             lw.layer_type = LayerType::MLA;
         } else {

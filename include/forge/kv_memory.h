@@ -78,6 +78,14 @@ public:
     // Storage mode query
     bool is_paged() const { return storage_->is_paged(); }
 
+    // ---- Storage-aware KV write (single facade for attention layers) ----
+    // Routes to PagedKVStorage (with device staging) when paged, otherwise to the
+    // contiguous KVCache. This is the single write entry point attention layers
+    // should use so they never need to know which storage backend is active.
+    // Returns false on failure (e.g. paged page pool exhausted).
+    bool write_kv(int layer, int seq_id, int64_t pos, int seq_len, const TensorPtr& k,
+                  const TensorPtr& v);
+
     // Initialize paged storage (called by engine during init_kv_cache).
     // No-op for contiguous mode.
     bool init_storage(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
@@ -87,6 +95,20 @@ public:
     // Phase 6: set per-layer policies (must be called before init_storage for
     // paged mode to size SWA pools correctly).
     void set_layer_policies(const std::vector<KVLayerPolicy>& policies, int swa_window);
+
+    // vLLM-style post-warmup pool re-sizing (paged mode only): re-derives the
+    // page budget from current device free memory and grows the pools.
+    // No-op (true) for contiguous mode.
+    bool resize_storage();
+
+    // Total tokens the paged page pool can hold; 0 for contiguous mode.
+    // Callers combine it with max_seq_len() to validate prompt capacity.
+    int max_pool_tokens() const;
+
+    // Free pages in the Full-attention pools (paged mode); -1 for contiguous.
+    // The binding constraint for admitting a new sequence (see
+    // PagedKVStorage::free_pages_full).
+    int free_pages_full() const;
 
     // ---- View for attention ----
     KVReadView view(int layer, int seq_id) const;

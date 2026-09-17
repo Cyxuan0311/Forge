@@ -296,6 +296,25 @@ public:
     // Total page capacity across all per-layer pools.
     int total_page_capacity() const;
 
+    // Tokens the page pool can hold at most. The pool is fully allocated at
+    // init time (NOT lazily), so max_pages_ * page_size_ is real reserved
+    // capacity — used to reject over-long prompts up front with a clear error
+    // instead of running the prefill and dying (partially) when the pool runs
+    // dry — vLLM's `if prompt_len >= max_model_len: error` behaviour.
+    int max_pool_tokens() const { return max_pages_ * page_size_; }
+
+    // Free pages in the Full-attention pools (pools sized == max_pages_). Every
+    // Full layer appends the same pages for a sequence, so the MIN free count
+    // across those pools is the binding admission constraint; SWA pools recycle
+    // a fixed window and never bind. 0 when no pools are initialized.
+    int free_pages_full() const;
+
+    // vLLM-style post-profile re-sizing. Re-queries the device memory budget
+    // and grows the page pools to match (never shrinks). Safe to call after
+    // warmup's reset: the pool is empty and no sequence tables are live.
+    // No-op when the derived budget does not exceed the current capacity.
+    bool resize_to_budget();
+
     // Lock-free internals (mutex_ must be held by the caller).
     bool offload_to_host_unlocked(int layer, int page_id);
     bool bring_back_unlocked(int layer, int page_id);
@@ -308,7 +327,6 @@ public:
 
     // ---- Paged-specific accessors ----
     int max_num_seqs() const { return max_num_seqs_; }
-    bool has_seq(int seq_id) const;
     DeviceType device() const override { return device_; }
     bool is_cuda() const override { return device_ == DeviceType::CUDA; }
     const KVCacheTypeConfig& kv_config() const { return kv_config_; }
@@ -341,6 +359,10 @@ private:
     const int32_t* upload_seq_page_table_unlocked(int layer, int seq_id);
     // Phase 6: max page count for a given layer's pool.
     int layer_max_pages(int layer) const;
+    // Allocate every layer's page pool + free list + CUDA pointer tables from
+    // the layer_pools_[l].max_pages values. Shared by init() and
+    // resize_to_budget(); caller must hold mutex_.
+    bool allocate_page_pools_locked();
 
     int num_layers_ = 0;
     std::vector<int> kv_dims_;  // per-layer kv_dim

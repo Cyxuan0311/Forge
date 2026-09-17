@@ -26,6 +26,9 @@ enum class DataType : uint32_t {
     IQ2_XS = 18,   // 74 bytes/block, 256 elements/block (2.3125 bpw)
     IQ3_S = 19,    // 110 bytes/block, 256 elements/block (3.4375 bpw)
     IQ4_XS = 20,   // 136 bytes/block, 256 elements/block (non-linear 4-bit)
+    IQ1_S = 22,    // 50 bytes/block, 256 elements/block (1.5625 bpw)
+    IQ3_XXS = 23,  // 98 bytes/block, 256 elements/block (3.0625 bpw)
+    IQ1_M = 24,    // 56 bytes/block, 256 elements/block (1.75 bpw)
     FP8_E4M3 = 21, // e4m3, 1 byte/element (Forge codec: bias 7, max finite 240,
                    // no NaN). Phase 6-C W8A8 storage dtype. KV cache uses the
                    // separate KVCacheDType::FP8_E4M3 -- two independent systems.

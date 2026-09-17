@@ -103,6 +103,25 @@ struct ModelConfig {
     int target_hidden_size = 0;           // hidden size of the paired target model
     int n_embd_inp_enc = 0;               // encoder input width = |target_layers| * hidden_dim
     int parallel_drafting_token_id = -1;  // MASK/noise token of the parallel query block
+
+    // ---- BailingMoE3 (Ling 3.0) hybrid MoE + MLA + SSM/KDA ----
+    int kda_head_dim = 0;               // attention.key_length (576) for the SSM/linear branch
+    int kda_value_dim = 0;              // attention.value_length (128)
+    int mla_key_dim = 0;                // attention.key_length_mla (192)
+    int mla_value_dim = 0;              // attention.value_length_mla (128)
+    int moe_group_count = 0;            // expert_group_count (8)
+    int moe_group_used_count = 0;       // expert_group_used_count (4)
+    int moe_gating_func = 0;            // expert_gating_func (2)
+    float moe_weights_scale = 0.0f;     // expert_weights_scale (2.5)
+    bool moe_weights_norm = false;      // expert_weights_norm
+    int expert_feed_forward_length = 0;  // expert_feed_forward_length (512)
+    int expert_shared_feed_forward_length = 0; // expert_shared_feed_forward_length (512)
+    int leading_dense_block_count = 0;   // leading_dense_block_count (1)
+    bool has_routing_bias = false;      // exp_probs_b bias present
+    float kda_safe_gate = 0.0f;         // kda.safe_gate (-5.0)
+    float kda_gate_lower_bound = 0.0f;  // kda.gate_lower_bound
+    std::vector<int32_t> head_count_kv; // per-layer KV heads: 0 => SSM/linear branch, >0 => MLA
+    int expert_shared_count = 0;         // shared expert count (derived; usually 1)
 };
 
 class WeightStore {
@@ -218,6 +237,25 @@ struct LayerWeights {
     TensorPtr ssm_beta() const { return get("ssm_beta"); }
     TensorPtr ssm_norm() const { return get("ssm_norm"); }
     TensorPtr ssm_out() const { return get("ssm_out"); }
+
+    // BailingMoE3 (Ling 3.0) GDN recurrent branch
+    TensorPtr ssm_conv1d_q() const { return get("ssm_conv1d_q"); }
+    TensorPtr ssm_conv1d_k() const { return get("ssm_conv1d_k"); }
+    TensorPtr ssm_conv1d_v() const { return get("ssm_conv1d_v"); }
+    TensorPtr ssm_f_a() const { return get("ssm_f_a"); }
+    TensorPtr ssm_g_a() const { return get("ssm_g_a"); }
+
+    // BailingMoE3 absorbed MLA branch (per-head k_b/v_b + output gate)
+    TensorPtr attn_q_a_norm() const { return get("attn_q_a_norm"); }
+    TensorPtr kv_a_norm() const { return get("kv_a_norm"); }
+    TensorPtr attn_k_b() const { return get("attn_k_b"); }
+    TensorPtr attn_v_b() const { return get("attn_v_b"); }
+
+    // BailingMoE3 MoE (sigmoid routing + shared expert)
+    TensorPtr ffn_exp_probs_b() const { return get("ffn_exp_probs_b"); }
+    TensorPtr ffn_gate_shexp() const { return get("ffn_gate_shexp"); }
+    TensorPtr ffn_up_shexp() const { return get("ffn_up_shexp"); }
+    TensorPtr ffn_down_shexp() const { return get("ffn_down_shexp"); }
 
     // Gemma4 attention norms
     TensorPtr attn_post_norm() const { return get("attn_post_norm"); }

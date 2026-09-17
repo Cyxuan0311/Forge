@@ -24,5 +24,6 @@ ModelConfig parse_gemma2_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_falcon_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch);
 ModelConfig parse_dflash_config(ModelLoader& loader, const std::string& arch);
+ModelConfig parse_bailingmoe3_config(ModelLoader& loader, const std::string& arch);
 
 }  // namespace forge

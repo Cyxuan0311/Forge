@@ -620,6 +620,50 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 set_if(base + ".wo", blk + ".attn_output.weight");
                 set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
                 set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
+            } else if (config_.arch_type == "bailingmoe3") {
+                // Ling 3.0 hybrid: head_count_kv[i]==0 => GDN recurrent branch,
+                // >0 => absorbed MLA branch (per llama.cpp bailingmoe3.cpp).
+                bool is_recurrent = (i < (int)config_.head_count_kv.size()) &&
+                                    config_.head_count_kv[i] == 0;
+                if (is_recurrent) {
+                    // GDN: 3x conv1d + QKV projections (all d_inner) + f/beta/a/dt/g_a + norm
+                    set_if(base + ".ssm_conv1d_q", blk + ".ssm_conv1d_q.weight");
+                    set_if(base + ".ssm_conv1d_k", blk + ".ssm_conv1d_k.weight");
+                    set_if(base + ".ssm_conv1d_v", blk + ".ssm_conv1d_v.weight");
+                    set_if(base + ".attn_q", blk + ".attn_q.weight");
+                    set_if(base + ".attn_k", blk + ".attn_k.weight");
+                    set_if(base + ".attn_v", blk + ".attn_v.weight");
+                    set_if(base + ".ssm_f_a", blk + ".ssm_f_a.weight");
+                    set_if(base + ".ssm_beta", blk + ".ssm_beta.weight");
+                    set_if(base + ".ssm_a", blk + ".ssm_a");
+                    set_if(base + ".ssm_dt", blk + ".ssm_dt.bias");
+                    set_if(base + ".ssm_g_a", blk + ".ssm_g_a.weight");
+                    set_if(base + ".ssm_norm", blk + ".ssm_norm.weight");
+                    set_if(base + ".wo", blk + ".attn_output.weight");
+                } else {
+                    // Absorbed MLA: low-rank q/kv + per-head k_b/v_b + output gate
+                    set_if(base + ".wq_a", blk + ".attn_q_a.weight");
+                    set_if(base + ".attn_q_a_norm", blk + ".attn_q_a_norm.weight");
+                    set_if(base + ".wq_b", blk + ".attn_q_b.weight");
+                    set_if(base + ".kv_a_proj", blk + ".attn_kv_a_mqa.weight");
+                    set_if(base + ".kv_a_norm", blk + ".attn_kv_a_norm.weight");
+                    set_if(base + ".attn_k_b", blk + ".attn_k_b.weight");
+                    set_if(base + ".attn_v_b", blk + ".attn_v_b.weight");
+                    set_if(base + ".attn_gate", blk + ".attn_gate.weight");
+                    set_if(base + ".wo", blk + ".attn_output.weight");
+                }
+                // FFN: leading dense blocks use the common gate/up/down above;
+                // remaining layers are MoE (sigmoid routing + shared expert).
+                if (i >= config_.leading_dense_block_count) {
+                    set_if(base + ".ffn_gate_inp", blk + ".ffn_gate_inp.weight");
+                    set_if(base + ".ffn_exp_probs_b", blk + ".ffn_exp_probs_b.bias");
+                    set_if(base + ".ffn_gate_exps", blk + ".ffn_gate_exps.weight");
+                    set_if(base + ".ffn_up_exps", blk + ".ffn_up_exps.weight");
+                    set_if(base + ".ffn_down_exps", blk + ".ffn_down_exps.weight");
+                    set_if(base + ".ffn_gate_shexp", blk + ".ffn_gate_shexp.weight");
+                    set_if(base + ".ffn_up_shexp", blk + ".ffn_up_shexp.weight");
+                    set_if(base + ".ffn_down_shexp", blk + ".ffn_down_shexp.weight");
+                }
             } else if (config_.use_mla) {
                 set_if(base + ".wq_a", blk + ".attn_q_a.weight");
                 set_if(base + ".wq_b", blk + ".attn_q_b.weight");

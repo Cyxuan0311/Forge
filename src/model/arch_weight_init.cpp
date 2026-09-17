@@ -203,4 +203,62 @@ void init_phimoe_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "ffn_down_exps", base + ".ffn_down_exps");
 }
 
+void init_bailingmoe3_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+
+    // Per-layer branch: head_count_kv[i]==0 => GDN recurrent, >0 => absorbed MLA.
+    bool is_recurrent = (ctx.layer_idx < (int)ctx.config.head_count_kv.size()) &&
+                        ctx.config.head_count_kv[ctx.layer_idx] == 0;
+    if (is_recurrent) {
+        load_if_present(store, lw, "ssm_conv1d_q", base + ".ssm_conv1d_q");
+        load_if_present(store, lw, "ssm_conv1d_k", base + ".ssm_conv1d_k");
+        load_if_present(store, lw, "ssm_conv1d_v", base + ".ssm_conv1d_v");
+        load_if_present(store, lw, "attn_q", base + ".attn_q");
+        load_if_present(store, lw, "attn_k", base + ".attn_k");
+        load_if_present(store, lw, "attn_v", base + ".attn_v");
+        load_if_present(store, lw, "ssm_f_a", base + ".ssm_f_a");
+        load_if_present(store, lw, "ssm_beta", base + ".ssm_beta");
+        load_if_present(store, lw, "ssm_a", base + ".ssm_a");
+        load_if_present(store, lw, "ssm_dt", base + ".ssm_dt");
+        load_if_present(store, lw, "ssm_g_a", base + ".ssm_g_a");
+        load_if_present(store, lw, "ssm_norm", base + ".ssm_norm");
+        load_if_present(store, lw, "wo", base + ".wo");
+    } else {
+        load_if_present(store, lw, "wq_a", base + ".wq_a");
+        load_if_present(store, lw, "attn_q_a_norm", base + ".attn_q_a_norm");
+        load_if_present(store, lw, "wq_b", base + ".wq_b");
+        load_if_present(store, lw, "kv_a_proj", base + ".kv_a_proj");
+        load_if_present(store, lw, "kv_a_norm", base + ".kv_a_norm");
+        load_if_present(store, lw, "attn_k_b", base + ".attn_k_b");
+        load_if_present(store, lw, "attn_v_b", base + ".attn_v_b");
+        load_if_present(store, lw, "attn_gate", base + ".attn_gate");
+        load_if_present(store, lw, "wo", base + ".wo");
+    }
+
+    // FFN: leading dense blocks vs MoE (sigmoid routing + shared expert)
+    if (ctx.layer_idx >= ctx.config.leading_dense_block_count) {
+        load_if_present(store, lw, "ffn_gate_inp", base + ".ffn_gate_inp");
+        load_if_present(store, lw, "ffn_exp_probs_b", base + ".ffn_exp_probs_b");
+        load_if_present(store, lw, "ffn_gate_exps", base + ".ffn_gate_exps");
+        load_if_present(store, lw, "ffn_up_exps", base + ".ffn_up_exps");
+        load_if_present(store, lw, "ffn_down_exps", base + ".ffn_down_exps");
+        load_if_present(store, lw, "ffn_gate_shexp", base + ".ffn_gate_shexp");
+        load_if_present(store, lw, "ffn_up_shexp", base + ".ffn_up_shexp");
+        load_if_present(store, lw, "ffn_down_shexp", base + ".ffn_down_shexp");
+    } else {
+        // Dense FFN. The GGUF loader canonicalizes blk.N.ffn_{gate,down,up}.weight
+        // into the common {gate_proj,down_proj,up_proj} store keys (model.cpp), NOT
+        // "ffn_gate" — mapping against the raw GGUF names left w1/w2/w3 null and
+        // silently zeroed the dense layer's FFN contribution.
+        load_if_present(store, lw, "w1", base + ".gate_proj");
+        load_if_present(store, lw, "w2", base + ".down_proj");
+        load_if_present(store, lw, "w3", base + ".up_proj");
+    }
+}
+
 }  // namespace forge

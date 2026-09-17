@@ -57,6 +57,14 @@ public:
     TokenizerModelType model_type() const { return model_type_; }
     const std::string& chat_template() const { return chat_template_; }
 
+    /// Whether the model metadata requests a BOS token to be prepended on raw
+    /// text encoding. Defaults to true (llama.cpp's default for models that omit
+    /// the key); set to false when GGUF `tokenizer.ggml.add_bos_token` = false.
+    bool add_bos_token() const { return add_bos_token_; }
+    /// Whether the model metadata requests an EOS token to be appended on raw
+    /// text encoding. Defaults to false.
+    bool add_eos_token() const { return add_eos_token_; }
+
     /// Look up token ID by string.
     int32_t token_to_id(const std::string& token) const;
 
@@ -107,6 +115,11 @@ private:
     int32_t eos_id_ = -1;
     int32_t pad_id_ = -1;
     int32_t unk_id_ = -1;
+
+    // Raw text encoding flags from GGUF metadata (tokenizer.ggml.add_*_token).
+    // Defaults mirror llama.cpp: BOS on, EOS off, for models that omit the key.
+    bool add_bos_token_ = true;
+    bool add_eos_token_ = false;
 
     std::string chat_template_;
     bool loaded_ = false;
