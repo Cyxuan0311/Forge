@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "forge/chat_template.h"
+#include "forge/prefix_cache.h"
 #include "forge/speculative.h"
 
 // Forward declarations
@@ -124,13 +125,15 @@ GenerationStats generate_streaming(forge::InferenceContext& ctx, const forge::To
                                    const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                    float temperature, int top_k, float top_p, float repeat_penalty,
                                    int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
-                                   const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{});
+                                   const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{},
+                                   forge::PrefixCache* prefix_cache = nullptr);
 
 GenerationStats generate_batch(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
                                const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                float temperature, int top_k, float top_p, float repeat_penalty,
                                int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
-                               const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{});
+                               const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{},
+                               forge::PrefixCache* prefix_cache = nullptr);
 
 // ============================================================================
 // Interactive chat

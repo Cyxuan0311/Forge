@@ -584,17 +584,34 @@ int main(int argc, char** argv) {
     ctx.params_mut().offload_embedding = model.offload_embedding();
     ctx.init_kv_cache();
     if (tfm_eng) {
-        const KVCache* cache = tfm_eng->kv_cache();
-        const char* kv_dtype_name = "fp32";
-        switch (cache->kv_dtype()) {
-        case KVCacheDType::F16:  kv_dtype_name = "f16";  break;
-        case KVCacheDType::Q8_0: kv_dtype_name = "q8_0"; break;
-        case KVCacheDType::Q4_0: kv_dtype_name = "q4_0"; break;
-        default: break;
+        // In paged mode the contiguous KVCache is intentionally left
+        // uninitialized (transformer_engine.cpp skips kv_cache_.init_quantized
+        // when paged), so reading kv_cache() would report fp32/0B/0. Report the
+        // active backend instead: the PagedKVStorage when paged, else the
+        // contiguous KVCache.
+        auto kv_dtype_to_name = [](KVCacheDType t) -> const char* {
+            switch (t) {
+            case KVCacheDType::F16:      return "f16";
+            case KVCacheDType::Q8_0:     return "q8_0";
+            case KVCacheDType::Q4_0:     return "q4_0";
+            case KVCacheDType::FP8_E4M3: return "fp8_e4m3";
+            case KVCacheDType::FP8_E5M2: return "fp8_e5m2";
+            default:                     return "fp32";
+            }
+        };
+        auto* kv_mem = tfm_eng->kv_memory();
+        if (kv_mem && kv_mem->storage().is_paged()) {
+            const auto& st = static_cast<const PagedKVStorage&>(kv_mem->storage());
+            std::cout << "KV Cache (paged): dtype=" << kv_dtype_to_name(st.kv_type_k())
+                      << ", size=" << format_bytes(st.nbytes())
+                      << ", max_seq=" << st.max_seq_len()
+                      << " (pool_tokens=" << st.max_pool_tokens() << ")\n";
+        } else {
+            const KVCache* cache = tfm_eng->kv_cache();
+            std::cout << "KV Cache: dtype=" << kv_dtype_to_name(cache->kv_dtype())
+                      << ", size=" << format_bytes(cache->nbytes())
+                      << ", max_seq=" << cache->max_seq_len() << "\n";
         }
-        std::cout << "KV Cache: dtype=" << kv_dtype_name
-                  << ", size=" << format_bytes(cache->nbytes())
-                  << ", max_seq=" << cache->max_seq_len() << "\n";
     }
 
     if (model.device() == DeviceType::CUDA) {
@@ -623,7 +640,10 @@ int main(int argc, char** argv) {
 
     // ---- Text completion mode ----
     if (!args.interactive) {
-        auto prompt_ids = tokenizer.encode(args.prompt, true, false);
+        // Respect the model's tokenizer metadata (tokenizer.ggml.add_bos_token /
+        // add_eos_token) instead of unconditionally prepending BOS.
+        auto prompt_ids = tokenizer.encode(args.prompt, tokenizer.add_bos_token(),
+                                           tokenizer.add_eos_token());
         std::cout << "\n";
 
         GenerationStats stats;

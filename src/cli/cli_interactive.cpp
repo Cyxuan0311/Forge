@@ -13,6 +13,7 @@
 #include "forge/engines/transformer_engine.h"
 #include "forge/kv_cache.h"
 #include "forge/model.h"
+#include "forge/prefix_cache.h"
 #include "forge/tokenizer.h"
 #include "forge/types.h"
 #include "forge/vision_encoder.h"
@@ -57,7 +58,57 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
     std::cout << "  Commands: /quit, /clear, /system, /image, /save, /help\n";
     std::cout << "\n";
 
-    std::unique_ptr<InferenceContext> ctx;
+    // Create the inference context + engine ONCE and reuse it across turns so the
+    // KV cache (and, in paged mode, the radix prefix cache) persists between turns.
+    // Chat front-ends resend the growing conversation every turn, so most of the
+    // prompt is a shared prefix that paged KV can reuse via the radix PrefixCache.
+    std::unique_ptr<InferenceContext> ctx = std::make_unique<InferenceContext>(model);
+
+    {
+        auto engine = EngineRegistry::instance().create(cfg.arch_type, model, *ctx);
+        if (!engine) {
+            std::cerr << "Error: No matching engine for architecture: " << cfg.arch_type << "\n";
+            return;
+        }
+
+        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
+        if (tfm_eng) {
+            KVCacheDType kv_dtype = KVCacheDType::F16;
+            if (args.kv_cache_dtype == "fp32")
+                kv_dtype = KVCacheDType::FP32;
+            else if (args.kv_cache_dtype == "f16")
+                kv_dtype = KVCacheDType::F16;
+            else if (args.kv_cache_dtype == "q8_0")
+                kv_dtype = KVCacheDType::Q8_0;
+            else if (args.kv_cache_dtype == "q4_0")
+                kv_dtype = KVCacheDType::Q4_0;
+            else if (args.kv_cache_dtype == "fp8_e4m3")
+                kv_dtype = KVCacheDType::FP8_E4M3;
+            else if (args.kv_cache_dtype == "fp8_e5m2")
+                kv_dtype = KVCacheDType::FP8_E5M2;
+            tfm_eng->set_kv_cache_dtype(kv_dtype);
+            tfm_eng->set_gpu_layers(args.n_gpu_layers);
+            if (args.cuda_graph) {
+                tfm_eng->set_use_graph(true);
+                tfm_eng->set_cuda_graph_enabled(true);
+            }
+        }
+        ctx->set_engine(std::move(engine));
+        ctx->init_kv_cache();
+
+        if (model.device() == DeviceType::CUDA) {
+            std::cout << "CUDA warmup...\n";
+            try {
+                ctx->warmup();
+                std::cout << "CUDA warmup done\n";
+            } catch (const std::runtime_error& e) {
+                std::cout << "Warmup skipped (" << e.what() << ")\n";
+            }
+        }
+    }
+
+    // Persisted across turns; holds cached prefixes in dedicated cache seq_ids.
+    PrefixCache prefix_cache;
 
     while (!g_interrupted) {
         std::cout << "> ";
@@ -155,39 +206,11 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
             prompt_ids = apply_chat_template(tokenizer, conversation, tmpl_type, true);
         }
 
-        ctx = std::make_unique<InferenceContext>(model);
-
-        auto engine = EngineRegistry::instance().create(cfg.arch_type, model, *ctx);
-        if (!engine) {
-            std::cerr << "Error: No matching engine for architecture: " << cfg.arch_type << "\n";
-            conversation.pop_back();
-            continue;
+        // Contiguous mode keeps the old per-turn behavior (fresh KV each turn);
+        // paged mode leaves seq 0 to the radix PrefixCache (lookup + register).
+        if (ctx->params().kv_storage_mode != KVStorageMode::Paged) {
+            ctx->reset_kv_cache();
         }
-
-        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
-        if (tfm_eng) {
-            KVCacheDType kv_dtype = KVCacheDType::F16;
-            if (args.kv_cache_dtype == "fp32")
-                kv_dtype = KVCacheDType::FP32;
-            else if (args.kv_cache_dtype == "f16")
-                kv_dtype = KVCacheDType::F16;
-            else if (args.kv_cache_dtype == "q8_0")
-                kv_dtype = KVCacheDType::Q8_0;
-            else if (args.kv_cache_dtype == "q4_0")
-                kv_dtype = KVCacheDType::Q4_0;
-            else if (args.kv_cache_dtype == "fp8_e4m3")
-                kv_dtype = KVCacheDType::FP8_E4M3;
-            else if (args.kv_cache_dtype == "fp8_e5m2")
-                kv_dtype = KVCacheDType::FP8_E5M2;
-            tfm_eng->set_kv_cache_dtype(kv_dtype);
-            tfm_eng->set_gpu_layers(args.n_gpu_layers);
-            if (args.cuda_graph) {
-                tfm_eng->set_use_graph(true);
-                tfm_eng->set_cuda_graph_enabled(true);
-            }
-        }
-
-        ctx->set_engine(std::move(engine));
 
         std::cout << "\n";
         std::cout.flush();
@@ -197,12 +220,14 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
         if (args.no_stream) {
             stats = generate_batch(*ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                   !args.no_sample, args.seed, tokenizer.eos_token_id());
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id(),
+                                   args.spec, &prefix_cache);
         } else {
             stats =
                 generate_streaming(*ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                   !args.no_sample, args.seed, tokenizer.eos_token_id());
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id(),
+                                   args.spec, &prefix_cache);
         }
 
         std::cout << "\n";
