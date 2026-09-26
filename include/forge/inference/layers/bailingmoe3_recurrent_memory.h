@@ -54,10 +54,21 @@ public:
     float* conv_state_v_cpu(int seq_id, int layer_idx);
     float* ssm_state_cpu(int seq_id, int layer_idx);
 
+    // ---- per-sequence device state accessors (CUDA 模式) ----
+    float* conv_state_q_dev(int seq_id, int layer_idx);
+    float* conv_state_k_dev(int seq_id, int layer_idx);
+    float* conv_state_v_dev(int seq_id, int layer_idx);
+    float* ssm_state_dev(int seq_id, int layer_idx);
+
     // ---- speculative rollback (per sequence) ----
     void snapshot(int seq_id);
     void rollback(int seq_id);
     void reset_seq(int seq_id);
+
+    // 切换 CPU/GPU 状态后端。在 set_gpu_layers 中于首次 forward 之前调用;
+    // 切换后 ensure_seq 会按对应后端惰性分配缓冲。
+    void set_cuda_mode(bool on) { cuda_mode_ = on; }
+    bool cuda_mode() const { return cuda_mode_; }
 
 private:
     struct CpuState {
@@ -66,19 +77,35 @@ private:
         std::vector<float> conv_v;  // [(d_conv-1) * d_inner]
         std::vector<float> ssm_state;  // [num_v_heads * vd * kd]
     };
+    // GPU 后端: 所有缓冲都是设备指针 (cudaMalloc), 不含可分页内存。
+    struct DevState {
+        float* conv_q = nullptr;
+        float* conv_k = nullptr;
+        float* conv_v = nullptr;
+        float* ssm_state = nullptr;
+        float* snap_conv_q = nullptr;
+        float* snap_conv_k = nullptr;
+        float* snap_conv_v = nullptr;
+        float* snap_ssm_state = nullptr;
+    };
+
     struct PerSeq {
-        std::vector<CpuState> cur;   // 按层
-        std::vector<CpuState> snap;  // 快照
+        std::vector<CpuState> cur;   // 按层 (CPU 后端)
+        std::vector<CpuState> snap;  // 快照 (CPU 后端)
+        std::vector<DevState> dev;   // 按层 (CUDA 后端)
         bool snap_valid = false;
     };
 
     PerSeq& ensure_seq(int seq_id);
     void alloc_state(CpuState& s);
+    void alloc_device(DevState& s);
+    void free_device(DevState& s);
 
     Bailingmoe3SsmDims dims_;
     int num_layers_ = 0;
     std::unordered_map<int, PerSeq> seqs_;
     bool initialized_ = false;
+    bool cuda_mode_ = false;
 };
 
 }  // namespace forge

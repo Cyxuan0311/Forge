@@ -1,7 +1,10 @@
 #include "cpu/common/thread_pool.h"
 #include "forge/inference/layers/qwen35_linear_attention.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -10,6 +13,7 @@
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
+#include "forge/perf_profiler.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -59,10 +63,11 @@ void Qwen35LinearAttention::gated_delta_net_step(const float* q, const float* k,
                                                  float* output, int head_k_dim, int head_v_dim,
                                                  int num_k_heads, int num_v_heads) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
-    int head_repeat = num_v_heads / num_k_heads;
 
     cpu::parallel_for(num_v_heads, [&](int hv) {
-        int hk = hv / head_repeat;
+        // K 头到 V 头的映射: llama.cpp 用 ggml_repeat/broadcast 把 [.., H_k] 平铺到
+        // [.., H_v], 平铺是取模的 (hv % H_k), 不是按组切块 (hv / head_repeat)。
+        int hk = hv % num_k_heads;
 
         float* S = state + hv * head_v_dim * head_v_dim;
         const float* q_h = q + hk * head_k_dim;
@@ -172,14 +177,25 @@ TensorPtr Qwen35LinearAttention::apply_cpu(const TensorPtr& normed,
     const int value_dim = dims.value_dim();
 
     // 输入投影后统一拉回 CPU: 递推部分是标量循环。
-    // 四个投影共享同一输入 (normed): 若 qkv 为 Q4_K/Q6_K 且 z/alpha/beta 为 Q4_K
-    // 则走融合内核, 一次 Q8_K 量化 + 单个 OpenMP 区完成 qkv/z/alpha/beta。
+    // 四个投影共享同一输入 (normed): qkv/z 为 K-quant (Q4_K/Q5_K/Q6_K) 且
+    // z/alpha/beta 为 K-quant 或 Q8_0 时走融合内核, 一次 Q8_K 量化 +
+    // 单个并行区完成 qkv/z/alpha/beta (省 3 次区域进入 + 3 次 x 量化)。
     TensorPtr qkv_mixed, z, alpha, beta;
     auto qkv_dt = lw.attn_qkv()->dtype();
-    bool qkv_z_ab_fused = (qkv_dt == DataType::Q4_K || qkv_dt == DataType::Q6_K) &&
-                          lw.attn_gate()->dtype() == DataType::Q4_K &&
-                          lw.ssm_alpha()->dtype() == DataType::Q4_K &&
-                          lw.ssm_beta()->dtype() == DataType::Q4_K;
+    auto z_dt = lw.attn_gate()->dtype();
+    auto alpha_dt = lw.ssm_alpha()->dtype();
+    auto beta_dt = lw.ssm_beta()->dtype();
+    auto is_k_quant = [](DataType dt) {
+        return dt == DataType::Q4_K || dt == DataType::Q5_K || dt == DataType::Q6_K;
+    };
+    auto is_bundle_dt = [](DataType dt) {
+        return dt == DataType::Q4_K || dt == DataType::Q5_K || dt == DataType::Q6_K ||
+               dt == DataType::Q8_0;
+    };
+    // 融合内核按行流式处理, 仅在 decode (M==1) 时启用; prefill 走
+    // 各自的 M>1 批量 GEMM 路径 (逐 m 开并行区反而慢)。
+    bool qkv_z_ab_fused = seq_len == 1 && is_k_quant(qkv_dt) && is_k_quant(z_dt) &&
+                          is_bundle_dt(alpha_dt) && is_bundle_dt(beta_dt);
     if (qkv_z_ab_fused) {
         auto normed_cpu = ensure_cpu(normed);
         auto fused = ops::matmul_transB_fused_qkv_z_ab(normed_cpu, lw.attn_qkv(), lw.attn_gate(),
@@ -315,7 +331,8 @@ TensorPtr Qwen35LinearAttention::apply_cpu(const TensorPtr& normed,
             }
         });
 
-    return ops::matmul_transB(restore_device(delta_net_out, lctx.device), lw.ssm_out());
+    auto attn_out = ops::matmul_transB(restore_device(delta_net_out, lctx.device), lw.ssm_out());
+    return attn_out;
 }
 
 #ifdef USE_CUDA
@@ -373,11 +390,13 @@ TensorPtr Qwen35LinearAttention::apply_cuda(const TensorPtr& normed,
 
     float* gate_out_data = static_cast<float*>(gate_out->data());
     float* beta_out_data = static_cast<float*>(beta_out->data());
+    PERF_SCOPE("ssm/preprocess");
     forge::cuda::launch_ssm_preprocess(static_cast<const float*>(alpha->data()),
                                        static_cast<const float*>(beta->data()), dt_bias, ssm_a_ptr,
                                        gate_out_data, beta_out_data, seq_len, num_v_heads, stream);
 
     float* conv_out_data = static_cast<float*>(conv_out->data());
+    PERF_SCOPE("ssm/conv1d");
     forge::cuda::launch_ssm_conv1d(static_cast<const float*>(qkv_mixed->data()), conv_weight,
                                    memory_.conv_state_gpu(seq_id, layer_idx), conv_out_data,
                                    seq_len, conv_channels, d_conv, stream);
@@ -385,25 +404,30 @@ TensorPtr Qwen35LinearAttention::apply_cuda(const TensorPtr& normed,
     float* q_conv_data = static_cast<float*>(q_conv->data());
     float* k_conv_data = static_cast<float*>(k_conv->data());
     float* v_conv_data = static_cast<float*>(v_conv->data());
+    PERF_SCOPE("ssm/silu_split");
     forge::cuda::launch_ssm_silu_split(conv_out_data, q_conv_data, k_conv_data, v_conv_data,
                                        seq_len, key_dim, value_dim, stream);
 
+    PERF_SCOPE("ssm/l2norm");
     forge::cuda::launch_ssm_per_head_l2norm(q_conv_data, seq_len, num_k_heads, head_k_dim,
                                             cfg.rms_norm_eps, stream);
     forge::cuda::launch_ssm_per_head_l2norm(k_conv_data, seq_len, num_k_heads, head_k_dim,
                                             cfg.rms_norm_eps, stream);
 
     float* dn_out_data = static_cast<float*>(delta_net_out->data());
+    PERF_SCOPE("ssm/gdn");
     forge::cuda::launch_ssm_gated_delta_net(q_conv_data, k_conv_data, v_conv_data, gate_out_data,
                                             beta_out_data, memory_.ssm_state_gpu(seq_id, layer_idx),
                                             dn_out_data, seq_len, head_k_dim, head_v_dim,
                                             num_k_heads, num_v_heads, stream);
 
+    PERF_SCOPE("ssm/gated_norm");
     forge::cuda::launch_ssm_gated_norm(dn_out_data, static_cast<const float*>(z->data()),
                                        ssm_norm_w, seq_len, head_v_dim, num_v_heads,
                                        cfg.rms_norm_eps, stream);
 
-    return ops::matmul_transB(delta_net_out, lw.ssm_out());
+    auto attn_out = ops::matmul_transB(delta_net_out, lw.ssm_out());
+    return attn_out;
 }
 #endif
 

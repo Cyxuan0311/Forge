@@ -21,11 +21,13 @@ Qwen35RecurrentMemory::~Qwen35RecurrentMemory() {
             if (ds.ssm_state)
                 cudaFree(ds.ssm_state);
         }
-        for (auto& ds : seq.dev_snap) {
-            if (ds.conv_state)
-                cudaFree(ds.conv_state);
-            if (ds.ssm_state)
-                cudaFree(ds.ssm_state);
+        for (int s = 0; s < kSnapshotSlots; ++s) {
+            for (auto& ds : seq.dev_snap[s]) {
+                if (ds.conv_state)
+                    cudaFree(ds.conv_state);
+                if (ds.ssm_state)
+                    cudaFree(ds.ssm_state);
+            }
         }
     }
 #endif
@@ -109,10 +111,12 @@ Qwen35RecurrentMemory::PerSeqState& Qwen35RecurrentMemory::ensure_seq(int seq_id
 
     PerSeqState seq;
     seq.cpu.assign(num_layers_, CpuState{});
-    seq.cpu_snap.assign(num_layers_, CpuState{});
+    for (int s = 0; s < kSnapshotSlots; ++s)
+        seq.cpu_snap[s].assign(num_layers_, CpuState{});
 #ifdef USE_CUDA
     seq.dev.assign(num_layers_, DeviceState{});
-    seq.dev_snap.assign(num_layers_, DeviceState{});
+    for (int s = 0; s < kSnapshotSlots; ++s)
+        seq.dev_snap[s].assign(num_layers_, DeviceState{});
 #endif
     const int conv_state_size = dims_.conv_state_size();
     const int state_size = dims_.state_size();
@@ -120,8 +124,10 @@ Qwen35RecurrentMemory::PerSeqState& Qwen35RecurrentMemory::ensure_seq(int seq_id
         seq.cpu[layer_idx].conv_state.assign(conv_state_size, 0.0f);
         seq.cpu[layer_idx].ssm_state.assign(state_size, 0.0f);
         // 快照 CPU 缓冲与活跃缓冲同大小, 内容在 snapshot() 时写入。
-        seq.cpu_snap[layer_idx].conv_state.assign(conv_state_size, 0.0f);
-        seq.cpu_snap[layer_idx].ssm_state.assign(state_size, 0.0f);
+        for (int s = 0; s < kSnapshotSlots; ++s) {
+            seq.cpu_snap[s][layer_idx].conv_state.assign(conv_state_size, 0.0f);
+            seq.cpu_snap[s][layer_idx].ssm_state.assign(state_size, 0.0f);
+        }
 #ifdef USE_CUDA
         cudaMalloc(&seq.dev[layer_idx].conv_state, conv_state_size * sizeof(float));
         cudaMalloc(&seq.dev[layer_idx].ssm_state, state_size * sizeof(float));
@@ -158,18 +164,20 @@ float* Qwen35RecurrentMemory::ssm_state_gpu(int seq_id, int layer_idx) {
     return seq.dev[layer_idx].ssm_state;
 }
 
-void Qwen35RecurrentMemory::snapshot(int seq_id) {
+void Qwen35RecurrentMemory::snapshot(int seq_id, int slot) {
+    if (slot < 0 || slot >= kSnapshotSlots)
+        return;
     auto& seq = ensure_seq(seq_id);
     for (int layer_idx : linear_layer_idx_) {
-        seq.cpu_snap[layer_idx].conv_state = seq.cpu[layer_idx].conv_state;
-        seq.cpu_snap[layer_idx].ssm_state = seq.cpu[layer_idx].ssm_state;
+        seq.cpu_snap[slot][layer_idx].conv_state = seq.cpu[layer_idx].conv_state;
+        seq.cpu_snap[slot][layer_idx].ssm_state = seq.cpu[layer_idx].ssm_state;
     }
-    seq.snap_valid = true;
+    seq.snap_valid[slot] = true;
 #ifdef USE_CUDA
     const int conv_state_size = dims_.conv_state_size();
     const int state_size = dims_.state_size();
     for (int layer_idx : linear_layer_idx_) {
-        auto& snap = seq.dev_snap[layer_idx];
+        auto& snap = seq.dev_snap[slot][layer_idx];
         if (!snap.conv_state) {
             cudaMalloc(&snap.conv_state, conv_state_size * sizeof(float));
             cudaMalloc(&snap.ssm_state, state_size * sizeof(float));
@@ -182,22 +190,24 @@ void Qwen35RecurrentMemory::snapshot(int seq_id) {
 #endif
 }
 
-void Qwen35RecurrentMemory::rollback(int seq_id) {
+void Qwen35RecurrentMemory::rollback(int seq_id, int slot) {
+    if (slot < 0 || slot >= kSnapshotSlots)
+        return;
     auto it = seqs_.find(seq_id);
     if (it == seqs_.end())
         return;  // 该序列尚无状态, 无需回滚
     auto& seq = it->second;
-    if (!seq.snap_valid)
-        return;  // 从未 snapshot 过 -> no-op
+    if (!seq.snap_valid[slot])
+        return;  // 该槽从未 snapshot 过 -> no-op
     for (int layer_idx : linear_layer_idx_) {
-        seq.cpu[layer_idx].conv_state = seq.cpu_snap[layer_idx].conv_state;
-        seq.cpu[layer_idx].ssm_state = seq.cpu_snap[layer_idx].ssm_state;
+        seq.cpu[layer_idx].conv_state = seq.cpu_snap[slot][layer_idx].conv_state;
+        seq.cpu[layer_idx].ssm_state = seq.cpu_snap[slot][layer_idx].ssm_state;
     }
 #ifdef USE_CUDA
     const int conv_state_size = dims_.conv_state_size();
     const int state_size = dims_.state_size();
     for (int layer_idx : linear_layer_idx_) {
-        auto& snap = seq.dev_snap[layer_idx];
+        auto& snap = seq.dev_snap[slot][layer_idx];
         if (!snap.conv_state)
             continue;  // 从未 snapshot 过
         cudaMemcpy(seq.dev[layer_idx].conv_state, snap.conv_state, conv_state_size * sizeof(float),
@@ -228,7 +238,8 @@ void Qwen35RecurrentMemory::reset_seq(int seq_id) {
             cudaMemset(ds.ssm_state, 0, state_size * sizeof(float));
     }
 #endif
-    seq.snap_valid = false;  // 状态已清空, 之前的快照失效
+    for (int s = 0; s < kSnapshotSlots; ++s)
+        seq.snap_valid[s] = false;  // 状态已清空, 所有槽快照失效
 }
 
 void Qwen35RecurrentMemory::reset() {

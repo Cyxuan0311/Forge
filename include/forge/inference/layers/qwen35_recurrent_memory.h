@@ -12,6 +12,13 @@
 // 2.3: 状态改为按 seq_id 隔离（每序列一份 conv/ssm 状态, 惰性分配）。speculative
 // decoding 部分拒绝 draft 时, 通过 snapshot(seq_id)/rollback(seq_id) 把状态回滚到
 // 接受点, 与 KVCache::rollback 的语义对齐。
+//
+// 快照槽位 (slot): 两个独立使用方需要各自的快照, 互不覆盖——
+//   slot 0: speculative executor。verify 前快照 "接受点" 状态, 部分拒绝时回滚。
+//   slot 1: DFlash 引擎的 "上下文前沿" 快照（状态 as-of anchor 前）。引擎在为
+//           drafter 重放 target delta 前回滚到该点, forward 结束后刷新, 使 live
+//           状态恰好停在下一次 verify 所需的位置。两个 slot 的缓冲独立, rollback
+//           一个 slot 不影响另一个。
 
 #include <unordered_map>
 #include <vector>
@@ -62,11 +69,12 @@ public:
     float* ssm_state_gpu(int seq_id, int layer_idx);
 
     // ---- speculative rollback (per sequence) ----
-    // snapshot: 保存当前状态到快照缓冲（CPU 深拷贝 + GPU D2D 拷贝）。
-    // rollback: 从快照恢复; 若该序列从未 snapshot 过则为 no-op。
-    // reset_seq: 仅清零该序列的状态内容。
-    void snapshot(int seq_id);
-    void rollback(int seq_id);
+    // snapshot: 保存当前状态到指定快照槽（CPU 深拷贝 + GPU D2D 拷贝）。
+    // rollback: 从指定快照槽恢复; 若该序列/槽从未 snapshot 过则为 no-op。
+    // reset_seq: 仅清零该序列的状态内容（所有槽的快照同时失效）。
+    static constexpr int kSnapshotSlots = 2;
+    void snapshot(int seq_id, int slot = 0);
+    void rollback(int seq_id, int slot = 0);
     void reset_seq(int seq_id);
 
 private:
@@ -78,16 +86,16 @@ private:
         float* conv_state = nullptr;
         float* ssm_state = nullptr;
     };
-    // 每序列: 活跃状态(CPU+GPU) + 快照(CPU+GPU)。快照 GPU 缓冲在首次
-    // snapshot() 时惰性分配。snap_valid 标记该序列是否 snapshot 过:
-    // 从未 snapshot 的序列 rollback() 必须是 no-op（否则会错误地把尚未
-    // 初始化的零快照写回活跃状态）。
+    // 每序列: 活跃状态(CPU+GPU) + 每槽快照(CPU+GPU)。快照 GPU 缓冲在首次
+    // snapshot() 时惰性分配。snap_valid[slot] 标记该槽是否 snapshot 过: 从未
+    // snapshot 的槽 rollback() 必须是 no-op（否则会错误地把尚未初始化的零快照
+    // 写回活跃状态）。
     struct PerSeqState {
         std::vector<CpuState> cpu;
         std::vector<DeviceState> dev;
-        std::vector<CpuState> cpu_snap;
-        std::vector<DeviceState> dev_snap;
-        bool snap_valid = false;
+        std::vector<CpuState> cpu_snap[kSnapshotSlots];
+        std::vector<DeviceState> dev_snap[kSnapshotSlots];
+        bool snap_valid[kSnapshotSlots] = {};
     };
 
     PerSeqState& ensure_seq(int seq_id);

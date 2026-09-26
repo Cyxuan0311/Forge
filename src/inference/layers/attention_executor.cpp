@@ -490,19 +490,18 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                     ", seq_len=" + std::to_string(seq_len) + ")");
             }
         } else {
+            // Quantized KV (Q4_0 / Q8_0 / Q4_K) is materialized to FP32 lazily.
+            // update() invalidates dequantized_filled from the write position
+            // onward, so the newest row(s) are stale in the FP32 tensor. If we
+            // handed out the slice view without refreshing them, attention would
+            // read uninitialized heap memory (nondeterministic under
+            // multithreaded malloc). dequantize_layer() re-materializes only
+            // rows [dequantized_filled, filled) and is a no-op when up to date;
+            // it also allocates the FP32 tensor for engines that don't
+            // pre-dequantize, so get_key_filled always returns a valid view.
+            kv_cache_.dequantize_layer(layer_idx);
             k_out = kv_cache_.get_key_filled(layer_idx);
             v_out = kv_cache_.get_value_filled(layer_idx);
-            // Quantized KV (Q4_0 / Q8_0 / Q4_K) is materialized to FP32 only on
-            // demand. If the dequantized buffer is missing (some engines don't
-            // pre-dequantize), populate it now so the attention kernels (which
-            // read float*) have a valid tensor. Engines that dequantize ahead of
-            // time make this a no-op. Without it, get_key_filled returns nullptr
-            // and the attention call dereferences a null tensor.
-            if (!k_out || !v_out) {
-                kv_cache_.dequantize_layer(layer_idx);
-                k_out = kv_cache_.get_key_filled(layer_idx);
-                v_out = kv_cache_.get_value_filled(layer_idx);
-            }
         }
         if (dev == DeviceType::CUDA && k_out && k_out->device() == DeviceType::CPU) {
             auto k_cuda =

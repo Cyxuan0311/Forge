@@ -25,6 +25,12 @@ public:
     // Multi-GPU overload: gpu_layers_per_dev[i] = layers on GPU i
     void set_gpu_layers(int gpu_layers, const std::vector<int>& gpu_layers_per_dev);
     int gpu_layers() const override { return gpu_layers_; }
+    // Whether this engine will actually execute on CUDA. Base: any non-zero
+    // n_gpu_layers (explicit >0 or auto -1) means "on GPU". Engines that cannot
+    // offload (e.g. bailingmoe3, until its GDN/MLA CUDA path lands) override to
+    // report the real backend, so the CLI still auto-tunes CPU threads instead
+    // of silently leaving them at the default when GPU is unavailable.
+    virtual bool uses_gpu() const { return gpu_layers_ != 0; }
     void set_kv_cache_dtype(KVCacheDType dtype) { kv_cache_dtype_ = dtype; }
     // User-requested KV cache context size (0 = auto: min(model max_seq_len,
     // KV_MAX_SEQ_CAP)). Larger values let long agent sessions (e.g. opencode)

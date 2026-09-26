@@ -2,15 +2,65 @@
 
 #include "forge/logger.h"
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace forge {
 
-Bailingmoe3RecurrentMemory::~Bailingmoe3RecurrentMemory() = default;
+Bailingmoe3RecurrentMemory::~Bailingmoe3RecurrentMemory() {
+    for (auto& [seq_id, st] : seqs_) {
+        (void)seq_id;
+        for (auto& s : st.dev) free_device(s);
+    }
+}
 
 void Bailingmoe3RecurrentMemory::alloc_state(CpuState& s) {
     s.conv_q.assign(static_cast<size_t>(dims_.conv_state_size_q()), 0.0f);
     s.conv_k.assign(static_cast<size_t>(dims_.conv_state_size_k()), 0.0f);
     s.conv_v.assign(static_cast<size_t>(dims_.conv_state_size_v()), 0.0f);
     s.ssm_state.assign(static_cast<size_t>(dims_.state_size()), 0.0f);
+}
+
+void Bailingmoe3RecurrentMemory::alloc_device(DevState& s) {
+#ifdef USE_CUDA
+    auto malloc_zero = [](size_t n) -> float* {
+        if (n == 0) return nullptr;
+        float* p = nullptr;
+        if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return nullptr;
+        cudaMemset(p, 0, n * sizeof(float));
+        return p;
+    };
+    s.conv_q = malloc_zero(static_cast<size_t>(dims_.conv_state_size_q()));
+    s.conv_k = malloc_zero(static_cast<size_t>(dims_.conv_state_size_k()));
+    s.conv_v = malloc_zero(static_cast<size_t>(dims_.conv_state_size_v()));
+    s.ssm_state = malloc_zero(static_cast<size_t>(dims_.state_size()));
+    s.snap_conv_q = malloc_zero(static_cast<size_t>(dims_.conv_state_size_q()));
+    s.snap_conv_k = malloc_zero(static_cast<size_t>(dims_.conv_state_size_k()));
+    s.snap_conv_v = malloc_zero(static_cast<size_t>(dims_.conv_state_size_v()));
+    s.snap_ssm_state = malloc_zero(static_cast<size_t>(dims_.state_size()));
+#else
+    (void)s;
+#endif
+}
+
+void Bailingmoe3RecurrentMemory::free_device(DevState& s) {
+#ifdef USE_CUDA
+    auto free = [](float*& p) {
+        if (p) cudaFree(p);
+        p = nullptr;
+    };
+    free(s.conv_q);
+    free(s.conv_k);
+    free(s.conv_v);
+    free(s.ssm_state);
+    free(s.snap_conv_q);
+    free(s.snap_conv_k);
+    free(s.snap_conv_v);
+    free(s.snap_ssm_state);
+#else
+    (void)s;
+#endif
 }
 
 void Bailingmoe3RecurrentMemory::init(const ModelConfig& cfg, const ModelWeights& /*weights*/) {
@@ -44,8 +94,25 @@ void Bailingmoe3RecurrentMemory::init(const ModelConfig& cfg, const ModelWeights
 void Bailingmoe3RecurrentMemory::reset() {
     for (auto& [seq_id, st] : seqs_) {
         (void)seq_id;
-        for (auto& s : st.cur) alloc_state(s);
-        for (auto& s : st.snap) alloc_state(s);
+        if (cuda_mode_) {
+            for (auto& s : st.dev) {
+                auto zero = [](float* p, size_t n) {
+#ifdef USE_CUDA
+                    if (p && n) cudaMemset(p, 0, n * sizeof(float));
+#else
+                    (void)p;
+                    (void)n;
+#endif
+                };
+                zero(s.conv_q, static_cast<size_t>(dims_.conv_state_size_q()));
+                zero(s.conv_k, static_cast<size_t>(dims_.conv_state_size_k()));
+                zero(s.conv_v, static_cast<size_t>(dims_.conv_state_size_v()));
+                zero(s.ssm_state, static_cast<size_t>(dims_.state_size()));
+            }
+        } else {
+            for (auto& s : st.cur) alloc_state(s);
+            for (auto& s : st.snap) alloc_state(s);
+        }
         st.snap_valid = false;
     }
 }
@@ -55,10 +122,15 @@ Bailingmoe3RecurrentMemory::PerSeq& Bailingmoe3RecurrentMemory::ensure_seq(int s
     if (it != seqs_.end())
         return it->second;
     PerSeq st;
-    st.cur.resize(num_layers_);
-    st.snap.resize(num_layers_);
-    for (auto& s : st.cur) alloc_state(s);
-    for (auto& s : st.snap) alloc_state(s);
+    if (cuda_mode_) {
+        st.dev.resize(num_layers_);
+        for (auto& s : st.dev) alloc_device(s);
+    } else {
+        st.cur.resize(num_layers_);
+        st.snap.resize(num_layers_);
+        for (auto& s : st.cur) alloc_state(s);
+        for (auto& s : st.snap) alloc_state(s);
+    }
     auto res = seqs_.emplace(seq_id, std::move(st));
     return res.first->second;
 }
@@ -77,8 +149,42 @@ BM3_STATE_ACCESSOR(ssm_state, ssm_state_cpu)
 
 #undef BM3_STATE_ACCESSOR
 
+#define BM3_DEV_ACCESSOR(field, getter)                                               \
+    float* Bailingmoe3RecurrentMemory::getter(int seq_id, int layer_idx) {             \
+        if (layer_idx < 0 || layer_idx >= num_layers_) return nullptr;                 \
+        auto& st = ensure_seq(seq_id);                                                 \
+        return st.dev[layer_idx].field;                                                \
+    }
+
+BM3_DEV_ACCESSOR(conv_q, conv_state_q_dev)
+BM3_DEV_ACCESSOR(conv_k, conv_state_k_dev)
+BM3_DEV_ACCESSOR(conv_v, conv_state_v_dev)
+BM3_DEV_ACCESSOR(ssm_state, ssm_state_dev)
+
+#undef BM3_DEV_ACCESSOR
+
 void Bailingmoe3RecurrentMemory::snapshot(int seq_id) {
     auto& st = ensure_seq(seq_id);
+#ifdef USE_CUDA
+    if (cuda_mode_) {
+        auto copy = [](float* dst, const float* src, size_t n) {
+            if (dst && src && n)
+                cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToDevice);
+        };
+        for (int i = 0; i < num_layers_; ++i) {
+            copy(st.dev[i].snap_conv_q, st.dev[i].conv_q,
+                  static_cast<size_t>(dims_.conv_state_size_q()));
+            copy(st.dev[i].snap_conv_k, st.dev[i].conv_k,
+                  static_cast<size_t>(dims_.conv_state_size_k()));
+            copy(st.dev[i].snap_conv_v, st.dev[i].conv_v,
+                  static_cast<size_t>(dims_.conv_state_size_v()));
+            copy(st.dev[i].snap_ssm_state, st.dev[i].ssm_state,
+                  static_cast<size_t>(dims_.state_size()));
+        }
+        st.snap_valid = true;
+        return;
+    }
+#endif
     for (int i = 0; i < num_layers_; ++i) {
         st.snap[i].conv_q = st.cur[i].conv_q;
         st.snap[i].conv_k = st.cur[i].conv_k;
@@ -95,6 +201,25 @@ void Bailingmoe3RecurrentMemory::rollback(int seq_id) {
     auto& st = it->second;
     if (!st.snap_valid)
         return;  // 从未 snapshot 的序列: 必须是 no-op
+#ifdef USE_CUDA
+    if (cuda_mode_) {
+        auto copy = [](float* dst, const float* src, size_t n) {
+            if (dst && src && n)
+                cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToDevice);
+        };
+        for (int i = 0; i < num_layers_; ++i) {
+            copy(st.dev[i].conv_q, st.dev[i].snap_conv_q,
+                  static_cast<size_t>(dims_.conv_state_size_q()));
+            copy(st.dev[i].conv_k, st.dev[i].snap_conv_k,
+                  static_cast<size_t>(dims_.conv_state_size_k()));
+            copy(st.dev[i].conv_v, st.dev[i].snap_conv_v,
+                  static_cast<size_t>(dims_.conv_state_size_v()));
+            copy(st.dev[i].ssm_state, st.dev[i].snap_ssm_state,
+                  static_cast<size_t>(dims_.state_size()));
+        }
+        return;
+    }
+#endif
     for (int i = 0; i < num_layers_; ++i) {
         st.cur[i].conv_q = st.snap[i].conv_q;
         st.cur[i].conv_k = st.snap[i].conv_k;
@@ -107,6 +232,21 @@ void Bailingmoe3RecurrentMemory::reset_seq(int seq_id) {
     auto it = seqs_.find(seq_id);
     if (it == seqs_.end())
         return;
+#ifdef USE_CUDA
+    if (cuda_mode_) {
+        auto zero = [](float* p, size_t n) {
+            if (p && n) cudaMemset(p, 0, n * sizeof(float));
+        };
+        for (auto& s : it->second.dev) {
+            zero(s.conv_q, static_cast<size_t>(dims_.conv_state_size_q()));
+            zero(s.conv_k, static_cast<size_t>(dims_.conv_state_size_k()));
+            zero(s.conv_v, static_cast<size_t>(dims_.conv_state_size_v()));
+            zero(s.ssm_state, static_cast<size_t>(dims_.state_size()));
+        }
+        it->second.snap_valid = false;
+        return;
+    }
+#endif
     for (auto& s : it->second.cur) alloc_state(s);
     it->second.snap_valid = false;
 }
