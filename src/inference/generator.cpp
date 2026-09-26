@@ -1,14 +1,18 @@
 #include "forge/generator.h"
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+
+#include <vector>
 
 #include "forge/engine.h"
 #include "forge/engines/llama_engine.h"
 #include "forge/inference/forward_request.h"
 #include "forge/inference_batch.h"
+#include "forge/kv_working_set.h"
 #include "forge/logger.h"
 #include "forge/perf_profiler.h"
 #include "forge/speculative_executor.h"
@@ -36,57 +40,14 @@ static bool aborted(const GenerationConfig& config) {
 // deferred CUDA events and dumping the summary here yields a clean prefill-only
 // breakdown, isolated from the decode phase that would otherwise dominate the
 // per-request --perf-detail totals for long generations.
+// dump_phase_profile lives in perf_profiler.cpp (shared with --bench's decode
+// dump); see perf_profiler.h for the contract.
 static void dump_prefill_profile(double prefill_ms, int n_tokens) {
     auto& prof = forge::PerfProfiler::instance();
 #ifdef USE_CUDA
     prof.flush_deferred();
 #endif
-    auto rows = prof.summary();
-    if (rows.empty()) {
-        fprintf(stderr,
-                "[prefill-profile] no operator data. Build with -DFORGE_PROFILING=ON and "
-                "run with --perf-detail (or just FORGE_PERF_PREFILL=1) to capture it.\n");
-        return;
-    }
-
-    // Split layer-scoped records (forward/layer_*) from everything else so we can
-    // print layers in index order and the rest sorted by cost.
-    std::vector<std::pair<std::string, forge::PerfRecord>> layers, others;
-    for (auto& r : rows) {
-        if (r.first.rfind("forward/layer_", 0) == 0)
-            layers.push_back(r);
-        else
-            others.push_back(r);
-    }
-    std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) {
-        int la = 0, lb = 0;
-        sscanf(a.first.c_str(), "forward/layer_%d", &la);
-        sscanf(b.first.c_str(), "forward/layer_%d", &lb);
-        return la < lb;
-    });
-    std::sort(others.begin(), others.end(),
-              [](const auto& a, const auto& b) { return a.second.total_ms > b.second.total_ms; });
-
-    double layer_total = 0.0;
-    for (auto& l : layers)
-        layer_total += l.second.total_ms;
-
-    fprintf(stderr, "\n===== PREFILL-ONLY PROFILE (snapshot before decode) =====\n");
-    fprintf(stderr, "[prefill-profile] wall prefill = %.1f ms (%d tokens)\n", prefill_ms, n_tokens);
-    fprintf(stderr, "[prefill-profile] layers total = %.1f ms across %zu layer(s)\n", layer_total,
-            layers.size());
-    fprintf(stderr, "[prefill-profile] per-layer (ms):\n");
-    for (auto& l : layers)
-        fprintf(stderr, "  %-22s %9.2f ms\n", l.first.c_str(), l.second.total_ms);
-    fprintf(stderr, "[prefill-profile] top other operators (by total ms):\n");
-    for (size_t i = 0; i < others.size() && i < 16; ++i) {
-        const auto& [name, rec] = others[i];
-        double avg = rec.count > 0 ? rec.total_ms / rec.count : 0.0;
-        fprintf(stderr, "  %-38s n=%-6lld total=%9.2f ms avg=%8.3f ms\n", name.c_str(),
-                (long long)rec.count, rec.total_ms, avg);
-    }
-    fprintf(stderr, "==========================================================\n\n");
-    fflush(stderr);
+    dump_phase_profile("PREFILL-ONLY", prefill_ms, n_tokens, prof.summary());
 }
 
 Generator::Generator(InferenceContext& ctx, const SamplerConfig& sampler_cfg)
@@ -151,24 +112,75 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
 
     int prompt_len = static_cast<int>(prompt_tokens.size());
 
+    // ---- KVMem tiered working set ----
+    // When tiered KV is attached, the *logical* context (-c) is what the caller
+    // reasons about, but the engine only ever sees the bounded window. The
+    // working set decides, once per turn, which prefix of the logical history is
+    // still resident (kept_window_len slots) and where the window starts in
+    // logical space (rope_pos_offset). Everything downstream -- the prefill
+    // cursor, the attention mask, KV writes -- then uses window slots, while
+    // RoPE uses logical positions, so a 256K conversation can run in a 32K GPU
+    // window (arXiv:2609.04852).
+    //
+    // With no working set attached this whole block is skipped and every value
+    // below keeps its legacy meaning, so the untiered path is unchanged.
+    KVemTurnPlan ws_plan;
+    bool tiered = false;
+    int64_t rope_pos_offset = 0;
+    if (auto* kv_mem = engine->kv_memory()) {
+        if (auto* ws = kv_mem->working_set()) {
+            tiered = true;
+            // Per-request generation reserve: the window reserves decode headroom
+            // for exactly this request's max_new_tokens (clamped inside the plan).
+            ws_plan = ws->on_prompt(prompt_tokens, config.max_new_tokens);
+            if (ws_plan.window_overflow) {
+                throw std::runtime_error(
+                    "Generator: KVMem window overflow -- the prompt does not fit the "
+                    "working-set budget; raise --kvmem-budget or lower --ctx-size");
+            }
+            // Only the non-resident tail needs a forward; the resident prefix is
+            // already in window slots [0, kept_window_len).
+            prompt_len = static_cast<int>(ws_plan.new_to_compute.size());
+            rope_pos_offset = ws_plan.new_rope_off - ws_plan.kept_window_len;
+        }
+    }
+
     // ---- Session prefix reuse ----
     // The caller guarantees that KV positions [0, prefix_len) already hold
     // prompt_tokens[0, prefix_len), so only the tail needs a forward. Clamped
     // to leave at least one token: we need a logits row to sample from.
+    // In tiered mode prefix_len is expressed in *window* slots instead: the
+    // resident prefix is kept_window_len slots, and the tail to forward is
+    // exactly the window slots [kept_window_len, new_window_len).
     int prefix_len = 0;
-    if (config.prefix_len > 0 && prompt_len > 1) {
+    if (tiered) {
+        prefix_len = static_cast<int>(ws_plan.kept_window_len);
+    } else if (config.prefix_len > 0 && prompt_len > 1) {
         prefix_len = std::min(config.prefix_len, prompt_len - 1);
     }
-    const int fwd_len = prompt_len - prefix_len;
+    // Tiered: the resident prefix is already in window slots [0, kept_window_len)
+    // and must NOT be re-forwarded, so the tail to compute is the whole
+    // new_to_compute vector (length = kept_window_len + new_window_len tail),
+    // not prompt_tokens[prefix_len:] which would drop kept_window_len tokens of
+    // the assistant's turn and desync the output.
+    const int fwd_len = tiered ? static_cast<int>(ws_plan.new_to_compute.size())
+                               : prompt_len - prefix_len;
 
     // The KV write cursor is monotonic, so a previous request can leave rows
     // beyond prefix_len. Prefill masks them out (causal: j > q_pos), but decode
     // attends to everything below total_len, so rewind to the reuse point.
+    // In tiered mode the window slot count after the previous turn is already
+    // tracked by the working set, so recomputing the window is the caller's
+    // side of the contract: the stale slots beyond kept_window_len are masked
+    // by the causal prefill, and the window length the next turn reports comes
+    // from the plan, not from the KV cursor.
     if (prefix_len > 0) {
-        if (auto* kv = engine->kv_cache()) {
-            kv->rollback(prefix_len);
+        if (!tiered) {
+            if (auto* kv = engine->kv_cache()) {
+                kv->rollback(prefix_len);
+            }
         }
-    } else if (config.reset_kv_cache) {
+    } else if (!tiered && config.reset_kv_cache) {
         ctx_.reset_kv_cache();
     }
 
@@ -195,14 +207,24 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         };
         auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{fwd_len},
                                                   DeviceType::CPU);
-        std::memcpy(input_ids->data(), prompt_tokens.data() + prefix_len,
-                    fwd_len * sizeof(int32_t));
+        // Tiered: forward ws_plan.new_to_compute (the non-resident tail), not
+        // prompt_tokens[prefix_len:].
+        const int32_t* fwd_src = tiered ? ws_plan.new_to_compute.data()
+                                        : prompt_tokens.data() + prefix_len;
+        std::memcpy(input_ids->data(), fwd_src, fwd_len * sizeof(int32_t));
 
         if (dev == DeviceType::CUDA) {
             input_ids->to_device(DeviceType::CUDA);
         }
 
-        auto logits = engine->forward_request(ForwardRequest::from_ids(input_ids, prefix_len));
+        // In tiered mode the mask/KV cursors use window slots (prefix_len) while
+        // RoPE must use logical positions: the window's first slot carries
+        // logical position rope_pos_offset, which keeps archived KV at its true
+        // relative distance. Untiered, rope_pos_offset stays 0 and this is a
+        // no-op.
+        auto prefill_req = ForwardRequest::from_ids(input_ids, prefix_len);
+        prefill_req.rope_pos_offset = rope_pos_offset;
+        auto logits = engine->forward_request(prefill_req);
 
         // The engine may return sparse logits ([1, vocab]: prefill projects only
         // the final row) or the legacy full [fwd_len, vocab] buffer; the row we
@@ -249,15 +271,35 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         dump_prefill_if_enabled();
     }
 
-    int64_t pos = prompt_len;
+    // Tiered: the decode cursor starts right after the prefilled tail, i.e. the
+    // full new window length (kept_window_len + new_to_compute.size()).
+    int64_t pos = tiered ? static_cast<int64_t>(ws_plan.new_window_len) : prompt_len;
+
+    // Tiered: cap generation at the remaining window slots so the pool never
+    // overflows mid-reply. Non-tiered: unbounded.
+    const int64_t gen_cap_steps = tiered
+        ? std::max<int64_t>(0, ws_plan.max_generate)
+        : (std::numeric_limits<int64_t>::max)();
     const auto decode_start = std::chrono::steady_clock::now();
+
+    // ---- Decode-only profiler snapshot (FORGE_PERF_DECODE=1) ----
+    // Enables the profiler with CUDA-event timing for the decode loop and
+    // resets the accumulator so the decode_done dump holds only decode work.
+    // Host-wall profiles mis-attribute async queue drains; CUDA events give
+    // per-op device-stream time.
+    const bool perf_decode = std::getenv("FORGE_PERF_DECODE") != nullptr;
+    if (perf_decode) {
+        forge::PerfProfiler::instance().reset();
+        forge::PerfProfiler::instance().enable();
+        forge::PerfProfiler::instance().set_use_cuda_events(true);
+    }
 
     // ---- Decode phase (speculative decoding via SpeculativeExecutor) ----
     if (spec_executor_) {
         spec_executor_->begin_generation(prompt_tokens);
     }
 
-    for (int step = 1; step < config.max_new_tokens;) {
+    for (int step = 1; step < config.max_new_tokens && step <= gen_cap_steps;) {
         if (aborted(config)) {
             goto decode_done;
         }
@@ -271,6 +313,12 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
                 bool stop_gen = false;
 
                 for (int32_t tok : out.tokens) {
+                    // Tiered: a speculative draft can exceed the remaining window
+                    // slots; stop before writing past the pool.
+                    if (tiered && step > gen_cap_steps) {
+                        stop_gen = true;
+                        break;
+                    }
                     result.token_ids.push_back(tok);
                     pos += 1;
                     step += 1;
@@ -336,7 +384,11 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         {
             PERF_SCOPE("decode/forward");
             SET_PERF_CONTEXT(0, "decode", -1, dev == DeviceType::CUDA ? "cuda" : "cpu", 1);
-            logits = engine->forward_request(ForwardRequest::from_ids(input_ids, pos));
+            // Tiered mode: `pos` is the window cursor, so RoPE needs the
+            // logical offset added back in (see the prefill forward above).
+            auto decode_req = ForwardRequest::from_ids(input_ids, pos);
+            decode_req.rope_pos_offset = rope_pos_offset;
+            logits = engine->forward_request(decode_req);
         }
 
         {
@@ -393,6 +445,15 @@ decode_done:
                           std::chrono::steady_clock::now() - decode_start)
                           .count();
     result.spec_stats = spec_executor_ ? &spec_executor_->stats() : nullptr;
+
+    if (perf_decode) {
+        auto& prof = forge::PerfProfiler::instance();
+#ifdef USE_CUDA
+        prof.flush_deferred();
+#endif
+        dump_phase_profile("DECODE-ONLY", result.decode_ms,
+                           result.num_generated_tokens, prof.summary());
+    }
     return result;
 }
 

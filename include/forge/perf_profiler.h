@@ -551,6 +551,12 @@ public:
 #endif
 };
 
+// Shared phase-scoped profile printer (prefill / decode dumps). `rows` come
+// from a flushed PerfProfiler; layer-scoped records (forward/layer_*) are
+// split from the rest so layers print in index order and the rest by cost.
+void dump_phase_profile(const char* title, double wall_ms, int n_tokens,
+                        const std::vector<std::pair<std::string, PerfRecord>>& rows);
+
 // ---- RAII timer ----
 // Phase 3: 增加 stream 参数，显式记录到指定 CUDA stream。
 // Phase 4: 析构时同时写入 trace ring buffer（如果开启）。
@@ -660,32 +666,42 @@ private:
 // PERF_SCOPE_FMT 对动态层名使用 intern_name_fast() 做 thread-local 缓存。
 
 #if defined(FORGE_PROFILING) && FORGE_PROFILING == 1
-#    define PERF_SCOPE(name)                                                  \
-        static ::forge::PerfEventId _eid_##__LINE__ =                         \
-            ::forge::PerfProfiler::instance().intern_name(name);              \
-        ::forge::PerfScopeTimer _perf_timer_##__LINE__(_eid_##__LINE__)
+// 二级拼接宏：让 __LINE__ 先展开成行号再与前缀拼接。
+// 直接写 _eid_##__LINE__ 时，__LINE__ 是 ## 的操作数不会先展开，
+// 所有调用点都会生成同一个 "_eid___LINE__"，导致重复声明。
+#    define FORGE_PERF_CONCAT_(a, b) a##b
+#    define FORGE_PERF_CONCAT(a, b) FORGE_PERF_CONCAT_(a, b)
 
-#    define PERF_RECORD(name, ms)                                             \
-        do {                                                                  \
-            static ::forge::PerfEventId _eid_##__LINE__ =                     \
-                ::forge::PerfProfiler::instance().intern_name(name);          \
-            ::forge::PerfProfiler::instance().record(_eid_##__LINE__, ms);    \
+#    define PERF_SCOPE(name)                                                       \
+        static ::forge::PerfEventId FORGE_PERF_CONCAT(_eid_, __LINE__) =           \
+            ::forge::PerfProfiler::instance().intern_name(name);                   \
+        ::forge::PerfScopeTimer FORGE_PERF_CONCAT(_perf_timer_, __LINE__)(         \
+            FORGE_PERF_CONCAT(_eid_, __LINE__))
+
+#    define PERF_RECORD(name, ms)                                                  \
+        do {                                                                       \
+            static ::forge::PerfEventId FORGE_PERF_CONCAT(_eid_, __LINE__) =       \
+                ::forge::PerfProfiler::instance().intern_name(name);               \
+            ::forge::PerfProfiler::instance().record(                              \
+                FORGE_PERF_CONCAT(_eid_, __LINE__), ms);                           \
         } while (0)
 
-#    define PERF_SCOPE_FMT(fmt, ...)                                          \
-            char _perf_name_buf_##__LINE__[256];                              \
-            std::snprintf(_perf_name_buf_##__LINE__, sizeof(_perf_name_buf_##__LINE__), \
-                          fmt, __VA_ARGS__);                                  \
-            /* NOT static: the formatted name changes per call (e.g. the      \
-               layer index), so the id must be re-resolved against the        \
-               current name. intern_name_fast() keeps a thread-local          \
-               name->id cache, so this stays cheap on the hot path and each   \
-               distinct name lands in its own bucket instead of all sharing   \
-               the first call-site's id (the old static behaviour). */        \
-            ::forge::PerfEventId _eid_##__LINE__ =                            \
-                ::forge::PerfProfiler::instance().intern_name_fast(           \
-                    _perf_name_buf_##__LINE__);                               \
-            ::forge::PerfScopeTimer _perf_timer_##__LINE__(_eid_##__LINE__)
+#    define PERF_SCOPE_FMT(fmt, ...)                                               \
+            char FORGE_PERF_CONCAT(_perf_name_buf_, __LINE__)[256];                \
+            std::snprintf(FORGE_PERF_CONCAT(_perf_name_buf_, __LINE__),            \
+                          sizeof(FORGE_PERF_CONCAT(_perf_name_buf_, __LINE__)),    \
+                          fmt, __VA_ARGS__);                                       \
+            /* NOT static: the formatted name changes per call (e.g. the           \
+               layer index), so the id must be re-resolved against the             \
+               current name. intern_name_fast() keeps a thread-local               \
+               name->id cache, so this stays cheap on the hot path and each        \
+               distinct name lands in its own bucket instead of all sharing        \
+               the first call-site's id (the old static behaviour). */             \
+            ::forge::PerfEventId FORGE_PERF_CONCAT(_eid_, __LINE__) =              \
+                ::forge::PerfProfiler::instance().intern_name_fast(                \
+                    FORGE_PERF_CONCAT(_perf_name_buf_, __LINE__));                 \
+            ::forge::PerfScopeTimer FORGE_PERF_CONCAT(_perf_timer_, __LINE__)(     \
+                FORGE_PERF_CONCAT(_eid_, __LINE__))
 
 #    define SET_PERF_CONTEXT(...) ::forge::set_perf_context({__VA_ARGS__})
 #    define CLEAR_PERF_CONTEXT() ::forge::clear_perf_context()
