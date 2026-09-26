@@ -64,6 +64,11 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         dflash_markov_bias = store.get("markov_bias.weight");
     dflash_draft_id_to_target_id = store.get("draft_id_to_target_id");
 
+    // DFlash2 selector weights (present only for DFlash2 GGUFs).
+    dflash_selector_prev = store.get("dflash_selector_prev");
+    dflash_selector_next = store.get("dflash_selector_next");
+    dflash_selector_hidden = store.get("dflash_selector_hidden");
+
     if (output_weight && output_weight->device() == DeviceType::CPU) {
         bool has_fused_kernel =
             (output_weight->dtype() == DataType::Q4_0 || output_weight->dtype() == DataType::Q8_0 ||

@@ -104,6 +104,18 @@ struct ModelConfig {
     int n_embd_inp_enc = 0;               // encoder input width = |target_layers| * hidden_dim
     int parallel_drafting_token_id = -1;  // MASK/noise token of the parallel query block
 
+    // ---- DFlash2 (speculative.cpp PR #27342): conv + selector ----
+    // Presence of dflash_selector_top_k > 0 marks a DFlash2 model: the decoder
+    // applies a block-causal dynamic depthwise conv before/after each
+    // attn/ffn, and the selector packs a top-k lattice (candidate ids + pairwise
+    // transition scores) into the nextn output slot for the CPU-side greedy walk.
+    int dflash_block_size = 0;        // tokens per noise block
+    int dflash_conv_kernel_size = 0;  // conv kernel width
+    int dflash_conv_group_size = 0;   // channels per conv group (n_embd % group == 0)
+    int dflash_selector_rank = 0;     // selector embed rank
+    int dflash_selector_top_k = 0;    // top-k candidates per block position
+    float f_logit_scale = 0.0f;       // target logit scale fed to the selector (0 = disabled)
+
     // ---- BailingMoE3 (Ling 3.0) hybrid MoE + MLA + SSM/KDA ----
     int kda_head_dim = 0;               // attention.key_length (576) for the SSM/linear branch
     int kda_value_dim = 0;              // attention.value_length (128)
@@ -279,6 +291,12 @@ struct LayerWeights {
 
     // Gemma4 proportional RoPE frequency factors (per-layer, full-attention layers only)
     TensorPtr rope_freqs() const { return get("rope_freqs"); }
+
+    // DFlash2 block-causal dynamic conv (per-layer, present only for DFlash2)
+    TensorPtr dflash_attn_conv_base() const { return get("dflash_attn_conv_base"); }
+    TensorPtr dflash_attn_conv_proj() const { return get("dflash_attn_conv_proj"); }
+    TensorPtr dflash_ffn_conv_base() const { return get("dflash_ffn_conv_base"); }
+    TensorPtr dflash_ffn_conv_proj() const { return get("dflash_ffn_conv_proj"); }
 };
 
 // Unified model-level weight container
@@ -306,6 +324,16 @@ struct ModelWeights {
     // Optional reduced draft vocab: draft logits are over a smaller vocabulary and
     // each draft id is mapped back to the target id via this int32 table.
     TensorPtr dflash_draft_id_to_target_id;  // [draft_vocab] int32
+
+    // ---- DFlash2 selector (present only for DFlash2) ----
+    // selector_prev/next embed the predecessor/successor candidate ids into a
+    // rank-dim vector; selector_hidden projects t_embd into the same rank. The
+    // pairwise transition score is <selector_prev[prev] * gate, selector_next[succ]>.
+    // Forge shapes are row-major (GGUF dims reversed): prev/next are
+    // [n_vocab, rank] (one rank-row per token), hidden is [rank, n_embd].
+    TensorPtr dflash_selector_prev;    // [n_vocab, rank] float
+    TensorPtr dflash_selector_next;    // [n_vocab, rank] float
+    TensorPtr dflash_selector_hidden;  // [rank, n_embd] float
 
     // Gemma4 per-layer embedding weights
     TensorPtr per_layer_tok_embd;
@@ -620,6 +648,12 @@ public:
     bool offload_embedding() const { return offload_embedding_; }
 
     TensorPtr get_weight(const std::string& name) const;
+
+    // Forward GGUF/ninf metadata queries to the backing loader (kept alive by
+    // this Model). Used e.g. by the DFlash drafter to resolve its MASK token id
+    // from "tokenizer.ggml.mask_token_id" when no explicit config key exists.
+    int64_t metadata_int(const std::string& key, int64_t default_val = 0) const;
+    std::string metadata_str(const std::string& key, const std::string& default_val = "") const;
 
     static std::string detect_format(const std::string& path);
 

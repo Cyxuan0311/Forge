@@ -497,6 +497,27 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 LOG_WARN(
                     "model load: dflash encoder weight "
                     "'output_norm_enc.weight'/'enc.output_norm.weight' missing");
+
+            // DFlash2 selector weights (present only for DFlash2 GGUFs). The
+            // GGUF carries selector_*.weight as model-level (non-layer) tensors
+            // even though llama.cpp assigns them LLM_TENSOR_LAYER_OUTPUT; load
+            // them once into the model-level weight store.
+            if (config_.dflash_selector_top_k > 0) {
+                auto sel_prev = load_tensor("selector_predecessor.weight", last_layer_dev);
+                auto sel_next = load_tensor("selector_successor.weight", last_layer_dev);
+                auto sel_hidden = load_tensor("selector_hidden.weight", last_layer_dev);
+                if (sel_prev && sel_next && sel_hidden) {
+                    weight_store_.set("dflash_selector_prev", sel_prev);
+                    weight_store_.set("dflash_selector_next", sel_next);
+                    weight_store_.set("dflash_selector_hidden", sel_hidden);
+                    LOG_INFO("model load: DFlash2 selector loaded (rank=" +
+                             std::to_string(config_.dflash_selector_rank) + ", top_k=" +
+                             std::to_string(config_.dflash_selector_top_k) + ")");
+                } else {
+                    LOG_WARN("model load: DFlash2 metadata present but selector "
+                             "tensors missing; selector disabled");
+                }
+            }
         } else {
             auto te = load_tensor("token_embd.weight", emb_dev);
             if (!te) {
@@ -612,6 +633,57 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 set_if(base + ".ssm_alpha", blk + ".ssm_alpha.weight");
                 set_if(base + ".ssm_beta", blk + ".ssm_beta.weight");
                 set_if(base + ".ssm_out", blk + ".ssm_out.weight");
+            } else if (config_.arch_type == "spark2_5") {
+                // Spark-X2.5: fused attn_qkv [n_embd_q+2*n_embd_kv, n_embd] splits into
+                // wq/wk/wv along dim0 (row ranges stay block-aligned for GGUF quants,
+                // which quantize along dim1/K). attn_gate is the per-head sigmoid
+                // output gate [n_head, n_embd]; wo ← attn_output [n_embd, n_embd_q].
+                auto qkv = load_tensor(blk + ".attn_qkv.weight", layer_dev);
+                if (qkv && qkv->shape().size() == 2) {
+                    auto split_rows = [&](int64_t row_begin, int64_t row_end) -> TensorPtr {
+                        const int64_t K = qkv->shape()[1];
+                        DataType dt = qkv->dtype();
+                        size_t row_bytes;
+                        if (is_quantized_type(dt)) {
+                            if (K % dtype_block_elements(dt) != 0) {
+                                LOG_ERROR("spark2_5: attn_qkv K=" + std::to_string(K) +
+                                          " not aligned to quant block");
+                                return nullptr;
+                            }
+                            row_bytes =
+                                (size_t)(K / dtype_block_elements(dt)) * dtype_block_size(dt);
+                        } else {
+                            row_bytes = (size_t)K * dtype_size(dt);
+                        }
+                        auto out = std::make_shared<Tensor>(
+                            dt, std::vector<int64_t>{row_end - row_begin, K}, qkv->device());
+                        const uint8_t* src = static_cast<const uint8_t*>(qkv->data()) +
+                                             static_cast<size_t>(row_begin) * row_bytes;
+                        uint8_t* dst = static_cast<uint8_t*>(out->data());
+                        size_t bytes = static_cast<size_t>(row_end - row_begin) * row_bytes;
+                        if (qkv->device() == DeviceType::CUDA) {
+                            cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+                        } else {
+                            std::memcpy(dst, src, bytes);
+                        }
+                        return out;
+                    };
+                    const int64_t n_q =
+                        static_cast<int64_t>(config_.num_heads) * config_.head_dim;
+                    const int64_t n_kv =
+                        static_cast<int64_t>(config_.num_kv_heads) * config_.head_dim;
+                    if (qkv->shape()[0] == n_q + 2 * n_kv) {
+                        weight_store_.set(base + ".wq", split_rows(0, n_q));
+                        weight_store_.set(base + ".wk", split_rows(n_q, n_q + n_kv));
+                        weight_store_.set(base + ".wv", split_rows(n_q + n_kv, qkv->shape()[0]));
+                    } else {
+                        LOG_ERROR("spark2_5: unexpected attn_qkv shape " +
+                                  std::to_string(qkv->shape()[0]) + "x" +
+                                  std::to_string(qkv->shape()[1]));
+                    }
+                }
+                set_if(base + ".attn_gate", blk + ".attn_gate.weight");
+                set_if(base + ".wo", blk + ".attn_output.weight");
             } else if (config_.arch_type == "qwen3vl") {
                 // Qwen3-VL: standard GQA with QK-norm and MRoPE
                 set_if(base + ".wq", blk + ".attn_q.weight");
@@ -691,6 +763,20 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 set_if(base + ".wk", blk + ".attn_k.weight");
                 set_if(base + ".wv", blk + ".attn_v.weight");
                 set_if(base + ".wo", blk + ".attn_output.weight");
+                // QK-Norm 架构 (Qwen3 DFlash/DSPark 等) 的逐 head q/k norm:
+                // 仅当 GGUF 存在对应 key 时加载 (set_if 幂等, 对普通 GQA 模型无副作用)。
+                set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
+                set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
+
+                // DFlash2: block-causal dynamic depthwise conv. GGUF tensor
+                // names: conv_base carries no ".weight" suffix while conv_proj
+                // does (upstream tn(..., "weight", i) / tn(..., i)).
+                if (config_.dflash_selector_top_k > 0) {
+                    set_if(base + ".dflash_attn_conv_base", blk + ".attn_conv_base");
+                    set_if(base + ".dflash_attn_conv_proj", blk + ".attn_conv_proj.weight");
+                    set_if(base + ".dflash_ffn_conv_base", blk + ".ffn_conv_base");
+                    set_if(base + ".dflash_ffn_conv_proj", blk + ".ffn_conv_proj.weight");
+                }
             }
 
             // Biases (may not exist for all architectures)
@@ -941,6 +1027,14 @@ void Model::set_quant_policy(const QuantPolicy& policy) {
 
 TensorPtr Model::get_weight(const std::string& name) const {
     return weight_store_.get(name);
+}
+
+int64_t Model::metadata_int(const std::string& key, int64_t default_val) const {
+    return loader_ ? loader_->get_metadata_int(key, default_val) : default_val;
+}
+
+std::string Model::metadata_str(const std::string& key, const std::string& default_val) const {
+    return loader_ ? loader_->get_metadata_str(key, default_val) : default_val;
 }
 
 bool Model::load_vision_weights(const std::string& mmproj_path, DeviceType device) {

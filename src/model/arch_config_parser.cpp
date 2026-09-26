@@ -127,6 +127,46 @@ ModelConfig parse_dflash_config(ModelLoader& loader, const std::string& arch) {
     for (size_t i = 0; i < swa_pattern.size() && i < (size_t)cfg.num_layers; ++i) {
         cfg.swa_layers[i] = static_cast<int>(swa_pattern[i]);
     }
+
+    // ---- DFlash2 metadata (llama.cpp PR #27342) ----
+    // All five keys are optional; the model is treated as DFlash2 only when the
+    // GGUF actually carries the selector weights (dflash_selector_top_k > 0).
+    cfg.dflash_block_size =
+        static_cast<int>(loader.get_metadata_int(arch + ".block_size", 0));
+    cfg.dflash_conv_kernel_size =
+        static_cast<int>(loader.get_metadata_int(arch + ".conv_kernel_size", 0));
+    cfg.dflash_conv_group_size =
+        static_cast<int>(loader.get_metadata_int(arch + ".conv_group_size", 0));
+    cfg.dflash_selector_rank =
+        static_cast<int>(loader.get_metadata_int(arch + ".selector_rank", 0));
+    cfg.dflash_selector_top_k =
+        static_cast<int>(loader.get_metadata_int(arch + ".selector_top_k", 0));
+
+    // 部分 RoPE (partial rope): Qwen3 系 DFlash 转换器把旋转维度写成
+    // rope.dimension_sections (mrope 四段布局, [64,0,0,0] = 仅旋转前 64 维,
+    // 第 4 段为不旋转的透传维)。漏解析时 rot_dim 回退 head_dim=128, 位置编码
+    // 与训练不符, 直接摧毁 drafter 接受率。
+    auto rope_sections =
+        loader.get_metadata_int_array(arch + ".rope.dimension_sections", {});
+    if (!rope_sections.empty()) {
+        for (size_t i = 0; i < rope_sections.size() && i < 4; ++i) {
+            cfg.rope_dimension_sections[i] = rope_sections[i];
+        }
+        if (cfg.rope_dimension_count <= 0)
+            cfg.rope_dimension_count = rope_sections[0] + rope_sections[1] + rope_sections[2];
+    }
+    if (cfg.rope_dimension_count <= 0) {
+        cfg.rope_dimension_count =
+            static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+    }
+
+    // Target logits fed to the DFlash2 selector go through the target's output
+    // transforms: logit_scale scaling + final_logit_softcapping tanh cap.
+    cfg.f_logit_scale =
+        static_cast<float>(loader.get_metadata_float(arch + ".logit_scale", 0.0));
+    cfg.f_final_logit_softcapping =
+        static_cast<float>(loader.get_metadata_float(arch + ".final_logit_softcapping", 0.0));
+
     return cfg;
 }
 
@@ -505,6 +545,53 @@ ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch) {
         // degenerate repetition loops in generated output
         cfg.suppress_tokens = {258882, 258883};
     }
+
+    return cfg;
+}
+
+// ============================================================================
+// Spark-X2.5 (iFlytek SparkLLM, arch spark2_5)
+// ============================================================================
+// Mixed attention (3 SWA + 1 full), dual RoPE (SWA: full 256-dim @ 10k;
+// full-attention: partial 64-dim @ 5M), per-head sigmoid output gate,
+// GELU-gated FFN, tied embeddings.
+
+ModelConfig parse_spark25_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    // GGUF 权重已是半拆 (split-half) 布局, 不可再做 neox 权重重排,
+    // 否则会把半拆权重翻成交错布局, 与引擎的半拆 RoPE 配对冲突 → Q/K 错乱。
+    // (同 Gemma4: "GGUF already stores weights in half-split format")
+    cfg.use_neox_rope = false;
+    cfg.rope_type = RopeType::NeoX;
+    cfg.tie_embeddings = true;
+    cfg.ffn_activation = ActivationType::GeGLU;
+    cfg.ffn_type = FFNType::GeGLU;       // gelu(gate)*up (exact GELU, not tanh)
+
+    // Sliding window attention
+    cfg.n_swa = static_cast<int>(loader.get_metadata_int(arch + ".attention.sliding_window", 0));
+
+    // SWA layer pattern (bool array: 1=SWA, 0=full attention)
+    auto swa_pattern =
+        loader.get_metadata_int_array(arch + ".attention.sliding_window_pattern", {});
+    cfg.swa_layers.resize(cfg.num_layers, 0);
+    for (size_t i = 0; i < swa_pattern.size() && i < (size_t)cfg.num_layers; ++i) {
+        cfg.swa_layers[i] = static_cast<int>(swa_pattern[i]);
+    }
+    cfg.n_layer_kv_from_start = cfg.num_layers;  // every layer has its own KV
+
+    // Dual RoPE: full-attention layers use rope.freq_base + rope.dimension_count
+    // (partial rotary, 64 of 256 dims); SWA layers use the *_swa variants.
+    cfg.rope_theta_swa =
+        static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base_swa", cfg.rope_theta));
+    cfg.rope_dim_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+    cfg.rope_dim_count_swa =
+        static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count_swa", 0));
+
+    // All layers share the same head geometry (attention.key_length = 256)
+    cfg.head_dim_swa = cfg.head_dim;
+    cfg.num_heads_swa = cfg.num_heads;
+    cfg.num_kv_heads_swa = cfg.num_kv_heads;
 
     return cfg;
 }

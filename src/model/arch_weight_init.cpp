@@ -63,6 +63,13 @@ void init_gqa_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "bv", base + ".bv");
     load_if_present(store, lw, "attn_q_norm", base + ".attn_q_norm");
     load_if_present(store, lw, "attn_k_norm", base + ".attn_k_norm");
+
+    // DFlash2 block-causal dynamic conv (only dflash arch carries these keys;
+    // load_if_present is a no-op for every other GQA arch).
+    load_if_present(store, lw, "dflash_attn_conv_base", base + ".dflash_attn_conv_base");
+    load_if_present(store, lw, "dflash_attn_conv_proj", base + ".dflash_attn_conv_proj");
+    load_if_present(store, lw, "dflash_ffn_conv_base", base + ".dflash_ffn_conv_base");
+    load_if_present(store, lw, "dflash_ffn_conv_proj", base + ".dflash_ffn_conv_proj");
 }
 
 void init_mla_layer_weights(LayerWeightInitContext& ctx) {
@@ -110,6 +117,16 @@ void init_qwen35_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "ssm_beta", base + ".ssm_beta");
     load_if_present(store, lw, "ssm_norm", base + ".ssm_norm");
     load_if_present(store, lw, "ssm_out", base + ".ssm_out");
+}
+
+// Spark-X2.5: standard GQA slots (fused attn_qkv already split into wq/wk/wv by
+// the model loader) plus the per-head sigmoid attention output gate.
+void init_spark25_layer_weights(LayerWeightInitContext& ctx) {
+    init_gqa_layer_weights(ctx);
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+    load_if_present(store, lw, "attn_gate", base + ".attn_gate");
 }
 
 void init_falcon_layer_weights(LayerWeightInitContext& ctx) {
