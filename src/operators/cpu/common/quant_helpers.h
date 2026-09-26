@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include "forge/host_mem_pool.h"
 
@@ -75,34 +76,57 @@ struct block_q6_K {
     uint16_t d;
 };
 
-// Quantize one FP32 row to Q8_K format
+// llama.cpp nearest_int (round-to-nearest via magic number, ties to even).
+static inline int nearest_int_f(float fval) {
+    float val = fval + 12582912.0f;
+    int i;
+    std::memcpy(&i, &val, sizeof(int));
+    return (int)(val - 12582912.0f);
+}
+
+// Quantize one FP32 row to Q8_K format.
+// Mirrors llama.cpp quantize_row_q8_K_ref exactly: iscale = -127/max_signed
+// (so d carries the sign of the max-magnitude element), integer range
+// [-127, 127], magic-number rounding. Parity with llama.cpp matters because
+// the fused dot kernels feed these same integers into identical AVX2 paths —
+// with the old Forge convention (d = amax/127, round-half-away) element
+// products differed by ±1 on rounding boundaries, which flips near-tie logits
+// on low-bpw IQ models.
 static void quantize_row_q8_K(const float* src, block_q8_K* dst, int k) {
     constexpr int QK_K = 256;
     const int nb = (k + QK_K - 1) / QK_K;
     for (int bi = 0; bi < nb; ++bi) {
         int base = bi * QK_K;
         int n_el = std::min(QK_K, k - base);
+        float max = 0.0f;
         float amax = 0.0f;
         for (int j = 0; j < n_el; ++j) {
-            float v = std::abs(src[base + j]);
-            if (v > amax)
-                amax = v;
+            const float ax = std::fabs(src[base + j]);
+            if (ax > amax) {
+                amax = ax;
+                max = src[base + j];
+            }
         }
-        float d = amax / 127.0f;
-        float id = d > 0.0f ? 1.0f / d : 0.0f;
-        dst[bi].d = d;
         int sum[16] = {0};
-        for (int j = 0; j < n_el; ++j) {
-            int q = (int)(src[base + j] * id + (src[base + j] >= 0 ? 0.5f : -0.5f));
-            if (q < -128)
-                q = -128;
-            if (q > 127)
-                q = 127;
-            dst[bi].qs[j] = (int8_t)q;
-            sum[j / 16] += q;
+        if (amax == 0.0f) {
+            dst[bi].d = 0.0f;
+            for (int j = 0; j < QK_K; ++j)
+                dst[bi].qs[j] = 0;
+        } else {
+            const float iscale = -127.0f / max;
+            for (int j = 0; j < n_el; ++j) {
+                int v = nearest_int_f(iscale * src[base + j]);
+                if (v > 127)
+                    v = 127;
+                dst[bi].qs[j] = (int8_t)v;
+                sum[j / 16] += v;
+            }
+            // Tail (K not a multiple of 256): zeros contribute nothing to the
+            // dot products; llama.cpp asserts full blocks.
+            for (int j = n_el; j < QK_K; ++j)
+                dst[bi].qs[j] = 0;
+            dst[bi].d = 1.0f / iscale;
         }
-        for (int j = n_el; j < QK_K; ++j)
-            dst[bi].qs[j] = 0;
         for (int j = 0; j < 16; ++j)
             dst[bi].bsums[j] = (int16_t)sum[j];
     }

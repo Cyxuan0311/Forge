@@ -5,6 +5,7 @@
 // Originally moved out of src/operators/cpu/matmul.cpp (commit 1: pure move).
 
 #include "matmul_cuda.h"
+#include "forge/perf_profiler.h"
 
 #ifdef USE_CUDA
 
@@ -16,6 +17,7 @@
 #    include <cstring>
 #    include <functional>
 #    include <stdexcept>
+#    include <vector>
 
 #    include <cuda_runtime.h>
 
@@ -161,6 +163,8 @@ void gemv_dispatch_row(const TensorPtr& a, const TensorPtr& b, float* o_row, int
                        const char* op_name) {
     const float* a_data = static_cast<const float*>(a->data());
     const DataType dt = b->dtype();
+
+    PERF_SCOPE_FMT("cuda/gemv_%s", dtype_name(dt));
 
     KernelProblem problem;
     problem.domain = KernelDomain::MatMul;

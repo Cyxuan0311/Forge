@@ -36,6 +36,7 @@ if(CUDAToolkit_FOUND)
             cuda/cuda_activation.cu
             cuda/cuda_elementwise.cu
             cuda/cuda_rope.cu
+            cuda/cuda_spark25.cu
             cuda/cuda_flash_attn.cu
             cuda/cuda_embedding.cu
             cuda/cuda_gemv.cu
@@ -50,6 +51,8 @@ if(CUDAToolkit_FOUND)
             cuda/cuda_moe.cu
             cuda/cuda_sampler.cu
             cuda/cuda_ssm.cu
+            cuda/cuda_gdn.cu
+            cuda/cuda_mla.cu
             cuda/cuda_mmq.cu
             cuda/kernel_selector.cpp)
   target_compile_definitions(forge_ops PUBLIC USE_CUDA)

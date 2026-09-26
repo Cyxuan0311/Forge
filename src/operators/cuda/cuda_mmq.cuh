@@ -60,8 +60,9 @@ namespace cuda {
 #define MMQ_QI8_0  8   // ints per Q8_0 scale group (32 int8 elements / 4 per int = 8)
 
 // tile_y stride: padded to avoid bank conflicts
-// Each tile_y row = MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32 + 4 = 36 ints
-#define MMQ_TILE_Y_K   (MMQ_TILE_NE_K + MMQ_TILE_NE_K / GEMV_QI8_1)
+// Each tile_y row = 32-byte scales area + 128 int8 = 160 B = 40 ints
+// (scales area grew to 32 B with the fp32 DS4/Q8_K alignment fix)
+#define MMQ_TILE_Y_K   (MMQ_TILE_NE_K + MMQ_TILE_NE_K / (GEMV_QI8_1 / 2))
 
 // ============================================================================
 // block_q8_1_mmq layout
@@ -70,19 +71,27 @@ namespace cuda {
 // DS layout: determines how scales/sums are stored in block_q8_1_mmq
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,    // 4 float32 scales (one per 32 int8 values)
-    MMQ_Q8_1_DS_LAYOUT_DS4,   // 4 half2 (d, s) pairs (one per 32 int8 values)
+    MMQ_Q8_1_DS_LAYOUT_DS4,   // 4 float2 (d, s) pairs (one per 32 int8 values)
     MMQ_Q8_1_DS_LAYOUT_D2S6,  // 2 half (d) + 6 half (partial sums) — for Q2_K
 };
 
+// Scales area is 32 B so the union stays fp32 for D4/DS4. d (and s = d * bsum)
+// use the CPU quantize_row_q8_K semantics: ONE fp32 scale per 256-element
+// group shared by all 8 sub-blocks (the quantize kernel is organized as one
+// thread block per 256 values). The previous per-32 fp16 scales desynced the
+// MMQ matmul from the CPU path by ~0.05% per layer — the exact drift the GEMV
+// path's Q8_K alignment fix already eliminated.
 struct block_q8_1_mmq {
     union {
-        float  d4[4];    // D4 layout: d0, d1, d2, d3
-        half2  ds4[4];   // DS4 layout: (d0,s0), (d1,s1), (d2,s2), (d3,s3)
-        half   d2s6[8];  // D2S6 layout: d0, d1, s0, s1, s2, s3, s4, s5
+        float   d4[4];    // D4 layout: d0, d1, d2, d3 (all equal per-256 d)
+        float2  ds4[4];   // DS4 layout: (d,s0), (d,s1), (d,s2), (d,s3); s = d * bsum
+        // D2S6 layout: d0, d1, then EIGHT 16-value partial sums s0..s7
+        // (the Q2_K dot consumes them as half2 pairs at slots 2..9).
+        half    d2s6[16];
     };
     int8_t qs[MMQ_QK8_1_MMQ];  // 128 quantized int8 values
 };
-static_assert(sizeof(block_q8_1_mmq) == 144, "Unexpected block_q8_1_mmq size");
+static_assert(sizeof(block_q8_1_mmq) == 160, "Unexpected block_q8_1_mmq size");
 
 // ============================================================================
 // tile_x_sizes: shared memory layout per weight type

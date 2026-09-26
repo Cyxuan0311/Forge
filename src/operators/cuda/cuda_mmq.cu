@@ -20,20 +20,29 @@ namespace cuda {
 // ============================================================================
 
 // Each thread quantizes 4 consecutive FP32 values into 4 int8 values.
-// A group of vals_per_scale/4 threads cooperates to compute the scale
-// for one block of 32 int8 values (standard Q8_1).
-// For D4 layout: 4 float scales (one per 32 values).
-// For DS4 layout: 4 half2 (d, s) pairs (one per 32 values).
+// One thread block covers 64*4 = 256 values — exactly one CPU block_q8_K
+// group — so the per-256 amax/signed-max is reduced in-block and the group
+// scale d is shared by all 8 sub-blocks, replicating CPU quantize_row_q8_K
+// semantics: iscale = -127/max (signed), fp32 d = 1/iscale, values clamped
+// and rounded-to-nearest, and the DS4 sum stored as s = d * (integer sum of
+// the quantized values). This is the MMQ counterpart of the GEMV path's
+// Q8_K alignment fix: per-32 fp16 scales desynced the matmul from the CPU
+// drafter by ~0.05% per layer, amplified by the GDN recurrence.
+// For D4 layout: 4 float32 scales (all equal to the group d).
+// For DS4 layout: 4 float2 (d, s) pairs.
+// For D2S6 layout: fp16 d pair + fp16 partial sums (Q2_K only, unchanged).
 
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_q8_1_mmq_kernel(
     const float* __restrict__ x, void* __restrict__ vy,
     int K, int M, int K_padded)
 {
-    // Each thread processes 4 consecutive values
+    // Each thread processes 4 consecutive values. Threads beyond K_padded (the
+    // tail block when K_padded % 256 == 128) participate in the group reduce
+    // with zero values but never write — an early return here would leave the
+    // second warp's shared-memory partials unwritten.
     const int i0 = ((int64_t)blockDim.x * blockIdx.y + threadIdx.x) * 4;
-
-    if (i0 >= K_padded) return;
+    const bool valid = i0 < K_padded;
 
     const int m = blockIdx.x;  // Row index
 
@@ -44,78 +53,129 @@ static __global__ void quantize_q8_1_mmq_kernel(
     const int64_t iqs     = i0 % MMQ_QK8_1_MMQ;  // Offset within MMQ block
 
     // Load 4 floats
-    float4 xi;
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (i0 < K) {
         xi = x4[(int64_t)m * K / 4 + i0 / 4];
-    } else {
-        xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    // Compute max abs value across 32 values (8 threads cooperate)
-    float amax = fabsf(xi.x);
-    amax = fmaxf(amax, fabsf(xi.y));
-    amax = fmaxf(amax, fabsf(xi.z));
-    amax = fmaxf(amax, fabsf(xi.w));
-
+    // Compute the per-256 amax/signed-max (CPU first-wins tie semantics via
+    // the element index), deterministically across all participating threads.
+    const float ax[4] = {fabsf(xi.x), fabsf(xi.y), fabsf(xi.z), fabsf(xi.w)};
+    const float xv[4] = {xi.x, xi.y, xi.z, xi.w};
+    float amax = 0.0f;
+    float max = 0.0f;
+    int max_idx = i0;
 #pragma unroll
-    for (int offset = 4; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, 32));
-    }
-
-    // Compute sum for DS4 layout
-    float sum = 0.0f;
-    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4 || ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
-        sum = xi.x + xi.y + xi.z + xi.w;
-#pragma unroll
-        for (int offset = 4; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, 32);
+    for (int j = 0; j < 4; ++j) {
+        if (ax[j] > amax) {
+            amax = ax[j];
+            max = xv[j];
+            max_idx = i0 + j;
         }
     }
+    // 8 threads (32 values) -> 4 groups per warp -> 2 warps = 256 values
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        const float o_amax = __shfl_xor_sync(0xFFFFFFFF, amax, offset, 32);
+        const float o_max = __shfl_xor_sync(0xFFFFFFFF, max, offset, 32);
+        const int o_idx = __shfl_xor_sync(0xFFFFFFFF, max_idx, offset, 32);
+        if (o_amax > amax || (o_amax == amax && o_idx < max_idx)) {
+            amax = o_amax;
+            max = o_max;
+            max_idx = o_idx;
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset >= 8; offset >>= 1) {
+        const float o_amax = __shfl_xor_sync(0xFFFFFFFF, amax, offset, 32);
+        const float o_max = __shfl_xor_sync(0xFFFFFFFF, max, offset, 32);
+        const int o_idx = __shfl_xor_sync(0xFFFFFFFF, max_idx, offset, 32);
+        if (o_amax > amax || (o_amax == amax && o_idx < max_idx)) {
+            amax = o_amax;
+            max = o_max;
+            max_idx = o_idx;
+        }
+    }
+    __shared__ float s_amax[2];
+    __shared__ float s_max[2];
+    __shared__ int s_idx[2];
+    const int wi = threadIdx.x / 32;
+    if (threadIdx.x % 32 == 0) {
+        s_amax[wi] = amax;
+        s_max[wi] = max;
+        s_idx[wi] = max_idx;
+    }
+    __syncthreads();
+    // Both warps evaluate the same deterministic winner (smaller index on ties).
+    if (s_amax[1] > s_amax[0] || (s_amax[1] == s_amax[0] && s_idx[1] < s_idx[0])) {
+        amax = s_amax[1];
+        max = s_max[1];
+    } else {
+        amax = s_amax[0];
+        max = s_max[0];
+    }
+
+    // CPU quantize_row_q8_K scale semantics (shared by all 8 sub-blocks)
+    const bool nonzero = amax > 0.0f;
+    const float iscale = nonzero ? -127.0f / max : 0.0f;
+    const float d = nonzero ? 1.0f / iscale : 0.0f;
 
     // Quantize
-    const float d_inv = 127.0f / fmaxf(amax, 1e-8f);
-    char4 q;
-    q.x = roundf(xi.x * d_inv);
-    q.y = roundf(xi.y * d_inv);
-    q.z = roundf(xi.z * d_inv);
-    q.w = roundf(xi.w * d_inv);
-    const float d = 1.0f / d_inv;
+    int8_t q[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float v = iscale * xv[j];
+        v = fminf(fmaxf(v, -127.0f), 127.0f);
+        q[j] = static_cast<int8_t>(__float2int_rn(v));
+    }
 
     // Write int8 values
     const int64_t ib = (int64_t)m * (K_padded / MMQ_QK8_1_MMQ) + k_block;
-    char4* yqs4 = (char4*)y[ib].qs;
-    yqs4[iqs / 4] = q;
+    if (valid) {
+        char4* yqs4 = (char4*)y[ib].qs;
+        yqs4[iqs / 4] = make_char4(q[0], q[1], q[2], q[3]);
+    }
+
+    // Integer sub-block sums of the quantized values (CPU bsum semantics).
+    // 16-value groups for D2S6 partial sums; 32-value groups for DS4 sums.
+    int qsum = (int)q[0] + q[1] + q[2] + q[3];
+    int qsum16 = qsum;
+#pragma unroll
+    for (int offset = 2; offset > 0; offset >>= 1) {
+        qsum16 += __shfl_xor_sync(0xFFFFFFFF, qsum16, offset, 32);
+    }
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        qsum += __shfl_xor_sync(0xFFFFFFFF, qsum, offset, 32);
+    }
 
     // Write scale/sum
-    if (iqs % 32 == 0) {
+    if (valid) {
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
-            // D2S6 layout: vals_per_scale=64 (two sub-blocks share one d)
-            // d2s6[0] = d for first 64 values (iqs 0..63)
-            // d2s6[1] = d for second 64 values (iqs 64..127)
-            // d2s6[2..7] = partial sums for 16-value groups covering first 96 values
+            // D2S6 layout: d2s6[0] = d for first 64 values (iqs 0..63),
+            // d2s6[1] = d for second 64 values (iqs 64..127) — both equal the
+            // shared per-256 group d now; d2s6[2..9] = partial sums of the
+            // quantized values (scaled by d) for the eight 16-value groups.
+            //
+            // All EIGHT slots must be written: the Q2_K dot reads them as
+            // half2 pairs at slot (1 + k01/QI8_1)*2, i.e. d2s6[2..9] for
+            // k01 = 0, 8, 16, 24 — the last pair covers iqs 96..127. The old
+            // `iqs < 96` bound left that pair unwritten, so every 128-value
+            // activation block fed garbage into the Q2_K sum term.
             if (iqs == 0) {
                 y[ib].d2s6[0] = __float2half(d);
             } else if (iqs == 64) {
                 y[ib].d2s6[1] = __float2half(d);
             }
-            // Partial sums: 6 groups of 16 values covering first 96 values
-            // Each 16-value group spans threads iqs 0-15, 16-31, 32-47, 48-63, 64-79, 80-95
-            if (iqs < 96) {
-                // Compute sum for this group of 16 values (4 threads cooperate)
-                float group_sum = 0.0f;
-                group_sum = xi.x + xi.y + xi.z + xi.w;
-#pragma unroll
-                for (int offset = 1; offset > 0; offset >>= 1) {
-                    group_sum += __shfl_xor_sync(0xFFFFFFFF, group_sum, offset, 4);
-                }
-                if ((iqs % 16) == 0) {
-                    y[ib].d2s6[2 + iqs / 16] = __float2half(group_sum);
-                }
+            if (iqs % 16 == 0) {
+                y[ib].d2s6[2 + iqs / 16] = __float2half(d * (float)qsum16);
             }
-        } else if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
-            y[ib].ds4[iqs / 32] = make_half2(__float2half(d), __float2half(sum));
-        } else {
-            y[ib].d4[iqs / 32] = d;
+        } else if (iqs % 32 == 0) {
+            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+                y[ib].ds4[iqs / 32] = make_float2(d, d * (float)qsum);
+            } else {
+                y[ib].d4[iqs / 32] = d;
+            }
         }
     }
 }
@@ -131,9 +191,11 @@ static void launch_quantize_q8_1_mmq(
     // Pad K to multiple of MMQ_QK8_1_MMQ (128)
     int K_padded = (K + MMQ_QK8_1_MMQ - 1) / MMQ_QK8_1_MMQ * MMQ_QK8_1_MMQ;
 
-    const int block_size = 32;  // 32 threads per warp, each processes 4 values
-    const int blocks_per_row = K_padded / 4;  // number of 4-value groups
-    const int block_num_y = (blocks_per_row + block_size - 1) / block_size;
+    // 64 threads x 4 values = 256 values per block = one CPU Q8_K group, so
+    // the per-256 amax/max is reduced in-block by the quantize kernel.
+    const int block_size = 64;
+    const int blocks_per_row = (K_padded + 255) / 256;
+    const int block_num_y = blocks_per_row;
     const dim3 num_blocks(M, block_num_y);
 
     if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
@@ -177,11 +239,11 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_mmq(
 
 // ---- Q4_K × Q8_1_mmq (DS4 layout) ----
 // Q4_K: 4-bit values, extracted via shift+mask
-// Q8_1_mmq DS4: 4 half2 (d, s) pairs
+// Q8_1_mmq DS4: 4 float2 (d, s) pairs
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_mmq(
     const int* __restrict__ v, const int* __restrict__ u,
     const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
-    const half2& dm4, const half2* __restrict__ ds8)
+    const half2& dm4, const float2* __restrict__ ds8)
 {
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -193,7 +255,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_mmq(
         for (int j = 0; j < GEMV_QI8_1; ++j) {
             sumi_d = forge_dp4a((v[j] >> (4 * i)) & 0x0F0F0F0F, u[i * GEMV_QI8_1 + j], sumi_d);
         }
-        const float2 ds8f = __half22float2(ds8[i]);
+        const float2 ds8f = ds8[i];
         sumf_d += ds8f.x * (sc[i] * sumi_d);
         sumf_m += ds8f.y * m[i];
     }
@@ -204,11 +266,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_mmq(
 
 // ---- Q5_K × Q8_1_mmq (DS4 layout) ----
 // Q5_K: 5-bit values stored as separate high/low nibbles
-// Q8_1_mmq DS4: 4 half2 (d, s) pairs
+// Q8_1_mmq DS4: 4 float2 (d, s) pairs
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1_mmq(
     const int* __restrict__ v, const int* __restrict__ u,
     const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
-    const half2& dm5, const half2* __restrict__ ds8)
+    const half2& dm5, const float2* __restrict__ ds8)
 {
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -220,7 +282,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_mmq(
         for (int j = 0; j < GEMV_QI8_1; ++j) {
             sumi_d = forge_dp4a(v[i * GEMV_QI8_1 + j], u[i * GEMV_QI8_1 + j], sumi_d);
         }
-        const float2 ds8f = __half22float2(ds8[i]);
+        const float2 ds8f = ds8[i];
         sumf_d += ds8f.x * (sc[i] * sumi_d);
         sumf_m += ds8f.y * m[i];
     }
@@ -231,10 +293,10 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_mmq(
 
 // ---- Q4_0 × Q8_1_mmq (DS4 layout) ----
 // Q4_0: raw packed 4-bit values (NOT split into lo/hi — vec_dot extracts inline)
-// Q8_1_mmq DS4: 4 half2 (d, s) pairs
+// Q8_1_mmq DS4: 4 float2 (d, s) pairs
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mmq(
     const int* __restrict__ v, const int* __restrict__ u,
-    const float& d4, const half2* __restrict__ ds8)
+    const float& d4, const float2* __restrict__ ds8)
 {
     int sumi = 0;
 #pragma unroll
@@ -244,25 +306,25 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mmq(
         sumi = forge_dp4a(vi0, u[2 * i + 0], sumi);
         sumi = forge_dp4a(vi1, u[2 * i + 1], sumi);
     }
-    const float2 ds8f = __half22float2(*ds8);
+    const float2 ds8f = *ds8;
     return d4 * (sumi * ds8f.x - (8 * VDR_Q4_0_Q8_1_MMQ / MMQ_QI4_0) * ds8f.y);
 }
 
 // ---- Q8_0 × Q8_1_mmq (DS4 layout) ----
 // Q8_0: raw signed int8 values (32 per block) stored as 8 plain ints.
-// Q8_1_mmq DS4: 4 half2 (d, s) pairs. Unlike Q4_0 there is no value bias, so
+// Q8_1_mmq DS4: 4 float2 (d, s) pairs. Unlike Q4_0 there is no value bias, so
 // the dot is a straight 8-way dp4a and ds.y (the activation sum) is unused —
 // the same arithmetic as the decode-path vec_dot_q8_0_q8_1.
 static __device__ __forceinline__ float vec_dot_q8_0_q8_1_mmq(
     const int* __restrict__ v, const int* __restrict__ u,
-    const float& d, const half2* __restrict__ ds8)
+    const float& d, const float2* __restrict__ ds8)
 {
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < MMQ_QI8_0; ++i) {
         sumi = forge_dp4a(v[i], u[i], sumi);
     }
-    const float2 ds8f = __half22float2(*ds8);
+    const float2 ds8f = *ds8;
     return d * (sumi * ds8f.x);
 }
 
@@ -954,18 +1016,19 @@ __global__ void mul_mat_q_kernel(
         }
 
         // Load activation tile into shared memory
-        // block_q8_1_mmq is 144 bytes = 36 ints per block
+        // block_q8_1_mmq is 160 bytes = 40 ints per block (32-byte fp32
+        // scales area + 128 int8 values, Q8_K-aligned)
         // Each MMQ block covers 128 K-elements
         // For kb, the activation data starts at q_act_mmq + m*M_blocks + kb
         // But the layout is: for row m, block k, the data is at
         //   q_act_mmq[m * (K_padded/MMQ_QK8_1_MMQ) + kb] as block_q8_1_mmq
-        constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);  // 36
+        constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);  // 40
         const int num_mmq_blocks_per_row = K_padded / MMQ_QK8_1_MMQ;
 
         // Each block_q8_1_mmq contains 4 sub-blocks of 32 int8 values
         // We load 2 sub-blocks per syncthreads (matching llama.cpp's approach)
-        // Sub-block 0: first 32 int8 values + scale (offset 0..36 in ints)
-        // Sub-block 1: next 32 int8 values + scale (offset 36..72 in ints)
+        // Sub-block 0: first 32 int8 values + scale (offset 0..40 in ints)
+        // Sub-block 1: next 32 int8 values + scale (offset 40..80 in ints)
 
 #pragma unroll
         for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
@@ -1003,7 +1066,7 @@ __global__ void mul_mat_q_kernel(
 
             // tile_y access: y_df = first 4 floats, y_qs = next 32 ints
             const float* y_df = (const float*)tile_y;
-            const int*   y_qs = (const int*)(y_df + 4);
+            const int*   y_qs = (const int*)(y_df + 8);
 
             // Process VDR sub-tiles within the 32 K-elements
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR3_K * VDR_Q3_K_Q8_1_MMQ) {
@@ -1040,7 +1103,7 @@ __global__ void mul_mat_q_kernel(
             const half2* x_dm = (const half2*)(x_qs + txs_q4k.qs);
             const int*   x_sc = (const int*)(x_dm + txs_q4k.dm);
 
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR4_K * VDR_Q4_K_Q8_1_MMQ) {
@@ -1064,7 +1127,7 @@ __global__ void mul_mat_q_kernel(
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 sc, sc + 8,
                                 x_dm[i],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1076,7 +1139,7 @@ __global__ void mul_mat_q_kernel(
             const half2* x_dm = (const half2*)(x_qs + txs_q5k.qs);
             const int*   x_sc = (const int*)(x_dm + txs_q5k.dm);
 
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR5_K * VDR_Q5_K_Q8_1_MMQ) {
@@ -1100,7 +1163,7 @@ __global__ void mul_mat_q_kernel(
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 sc, sc + 8,
                                 x_dm[i],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1111,7 +1174,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_qs = tile_x;
             const float* x_df = (const float*)(x_qs + txs_q40.qs);
 
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QR4_0 * VDR_Q4_0_Q8_1_MMQ) {
@@ -1145,7 +1208,7 @@ __global__ void mul_mat_q_kernel(
                                 u,
                                 x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 +
                                      k0 / (MMQ_QR4_0 * MMQ_QI4_0)],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1158,7 +1221,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_qs = tile_x;
             const float* x_df = (const float*)(x_qs + txs_q80.qs);
 
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QI8_0) {
@@ -1184,7 +1247,7 @@ __global__ void mul_mat_q_kernel(
                                 &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0],
                                 u,
                                 x_df[i * 8 + i / MMQ_QI8_0 + k0 / MMQ_QI8_0],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1197,7 +1260,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_sc = (const int*)(x_df + txs_q6k.dm);
 
             const float* y_df = (const float*)tile_y;
-            const int*   y_qs = (const int*)(y_df + 4);
+            const int*   y_qs = (const int*)(y_df + 8);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR6_K * VDR_Q6_K_Q8_1_MMQ) {
 #pragma unroll
@@ -1231,7 +1294,7 @@ __global__ void mul_mat_q_kernel(
 
             // tile_y: D2S6 layout
             const half*  y_d2s6 = (const half*)tile_y;
-            const int*   y_qs = (const int*)(y_d2s6 + 8);
+            const int*   y_qs = (const int*)(y_d2s6 + 16);
 
             // First loop: k01 = 0..MMQ_TILE_NE_K/2-1, step QR2_K*VDR, ns=2
             for (int k01 = 0; k01 < MMQ_TILE_NE_K / 2; k01 += GEMV_QR2_K * VDR_Q2_K_Q8_1_MMQ) {
@@ -1316,7 +1379,7 @@ __global__ void mul_mat_q_kernel(
             const float* x_df = (const float*)(x_qs + txs_q3k.qs);
             const int*   x_sc = (const int*)(x_df + txs_q3k.dm);
             const float* y_df = (const float*)tile_y;
-            const int*   y_qs = (const int*)(y_df + 4);
+            const int*   y_qs = (const int*)(y_df + 8);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR3_K * VDR_Q3_K_Q8_1_MMQ) {
                 int k0 = MMQ_TILE_NE_K + k01;
@@ -1348,7 +1411,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_qs = tile_x;
             const half2* x_dm = (const half2*)(x_qs + txs_q4k.qs);
             const int*   x_sc = (const int*)(x_dm + txs_q4k.dm);
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR4_K * VDR_Q4_K_Q8_1_MMQ) {
@@ -1372,7 +1435,7 @@ __global__ void mul_mat_q_kernel(
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 sc, sc + 8,
                                 x_dm[i],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1381,7 +1444,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_qs = tile_x;
             const half2* x_dm = (const half2*)(x_qs + txs_q5k.qs);
             const int*   x_sc = (const int*)(x_dm + txs_q5k.dm);
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR5_K * VDR_Q5_K_Q8_1_MMQ) {
@@ -1405,7 +1468,7 @@ __global__ void mul_mat_q_kernel(
                                 &y_qs[j * MMQ_TILE_Y_K + k01],
                                 sc, sc + 8,
                                 x_dm[i],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1414,7 +1477,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_qs = tile_x;
             const float* x_df = (const float*)(x_qs + txs_q40.qs);
 
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QR4_0 * VDR_Q4_0_Q8_1_MMQ) {
@@ -1444,7 +1507,7 @@ __global__ void mul_mat_q_kernel(
                                 u,
                                 x_df[i * (MMQ_TILE_NE_K / MMQ_QI4_0) + i / MMQ_QI4_0 +
                                      k0 / (MMQ_QR4_0 * MMQ_QI4_0)],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1455,7 +1518,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_qs = tile_x;
             const float* x_df = (const float*)(x_qs + txs_q80.qs);
 
-            const half2* y_ds = (const half2*)tile_y;
+            const float2* y_ds = (const float2*)tile_y;
             const int*   y_qs = (const int*)(y_ds + 4);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += MMQ_QI8_0) {
@@ -1481,7 +1544,7 @@ __global__ void mul_mat_q_kernel(
                                 &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0],
                                 u,
                                 x_df[i * 8 + i / MMQ_QI8_0 + k0 / MMQ_QI8_0],
-                                &y_ds[j * MMQ_TILE_Y_K + k01 / GEMV_QI8_1]);
+                                &y_ds[j * (MMQ_TILE_Y_K / 2) + k01 / GEMV_QI8_1]);
                     }
                 }
             }
@@ -1492,7 +1555,7 @@ __global__ void mul_mat_q_kernel(
             const int*   x_sc = (const int*)(x_df + txs_q6k.dm);
 
             const float* y_df = (const float*)tile_y;
-            const int*   y_qs = (const int*)(y_df + 4);
+            const int*   y_qs = (const int*)(y_df + 8);
 
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += GEMV_QR6_K * VDR_Q6_K_Q8_1_MMQ) {
                 const int k0 = MMQ_TILE_NE_K + k01;
@@ -1524,7 +1587,7 @@ __global__ void mul_mat_q_kernel(
             const half2* x_dm = (const half2*)(x_qs + txs_q2k.qs);
 
             const half*  y_d2s6 = (const half*)tile_y;
-            const int*   y_qs = (const int*)(y_d2s6 + 8);
+            const int*   y_qs = (const int*)(y_d2s6 + 16);
 
             // Second sub-block: k01 = 0..MMQ_TILE_NE_K/2-1, step QR2_K*VDR, ns=2
             for (int k01 = 0; k01 < MMQ_TILE_NE_K / 2; k01 += GEMV_QR2_K * VDR_Q2_K_Q8_1_MMQ) {

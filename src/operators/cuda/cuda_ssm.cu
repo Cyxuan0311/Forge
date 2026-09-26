@@ -157,13 +157,20 @@ __global__ void ssm_per_head_l2norm_kernel(
         sum_sq += head[i] * head[i];
     }
 
-    __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = 0.0f;
+    // 确定性块内归约: 原来的 atomicAdd 累加顺序随 warp 调度变化, 同一输入
+    // 逐次运行会得到不同的 RMS, 经 32 层放大后足以翻转 argmax。改用树形折半,
+    // 累加顺序固定。
+    extern __shared__ float red[];
+    red[threadIdx.x] = sum_sq;
     __syncthreads();
-    atomicAdd(&s_sum, sum_sq);
-    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
 
-    float inv_rms = rsqrtf(s_sum + eps);
+    float inv_rms = rsqrtf(red[0] + eps);
 
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         head[i] *= inv_rms;
@@ -176,7 +183,7 @@ void launch_ssm_per_head_l2norm(
     cudaStream_t stream) {
     int total_heads = seq_len * num_heads;
     int threads = std::min(head_dim, 1024);
-    ssm_per_head_l2norm_kernel<<<total_heads, threads, 0, stream>>>(
+    ssm_per_head_l2norm_kernel<<<total_heads, threads, threads * sizeof(float), stream>>>(
         data, seq_len, num_heads, head_dim, eps);
 }
 
@@ -207,8 +214,8 @@ __global__ void ssm_gated_delta_net_kernel(
     float* smem_q_h = smem;
     float* smem_k_h = smem + head_k_dim;
 
-    int head_repeat = num_v_heads / num_k_heads;
-    int hk = hv / head_repeat;
+    // K 头到 V 头的映射: 与 llama.cpp 的 ggml_repeat 平铺一致 (取模), 不是按组切块。
+    int hk = hv % num_k_heads;
 
     float* S = ssm_state + hv * head_v_dim * head_v_dim;
     float scale = rsqrtf(static_cast<float>(head_k_dim));
@@ -249,6 +256,11 @@ __global__ void ssm_gated_delta_net_kernel(
             sum2 += S[j * head_v_dim + tid] * smem_q_h[j];
         }
         out_h[tid] = sum2 * scale;
+
+        // 尾屏障: 下一次迭代会覆写 smem_k_h / smem_q_h。没有它, 先跑完的线程
+        // 会在其他线程仍读取第 s 步的 q/k 时写入第 s+1 步的值 —— seq_len > 1
+        // (prefill) 时是读写竞争, 使 GDN 输出逐次运行不一致。
+        __syncthreads();
     }
 }
 
@@ -290,13 +302,20 @@ __global__ void ssm_gated_norm_kernel(
         sum_sq += out_head[i] * out_head[i];
     }
 
-    __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = 0.0f;
+    // 确定性块内归约: 原来的 atomicAdd 累加顺序随 warp 调度变化, 同一输入
+    // 逐次运行会得到不同的 RMS, 与 per_head_l2norm 同源问题。改用树形折半,
+    // 累加顺序固定, 运行间完全可复现。
+    extern __shared__ float red[];
+    red[threadIdx.x] = sum_sq;
     __syncthreads();
-    atomicAdd(&s_sum, sum_sq);
-    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
 
-    float inv_rms = rsqrtf(s_sum / head_v_dim + eps);
+    float inv_rms = rsqrtf(red[0] / head_v_dim + eps);
 
     for (int i = threadIdx.x; i < head_v_dim; i += blockDim.x) {
         float gz = z_head[i] / (1.0f + expf(-z_head[i]));
@@ -311,7 +330,7 @@ void launch_ssm_gated_norm(
     cudaStream_t stream) {
     int total_heads = seq_len * num_v_heads;
     int threads = std::min(head_v_dim, 1024);
-    ssm_gated_norm_kernel<<<total_heads, threads, 0, stream>>>(
+    ssm_gated_norm_kernel<<<total_heads, threads, threads * sizeof(float), stream>>>(
         delta_out, z, norm_w, seq_len, head_v_dim, num_v_heads, eps);
 }
 

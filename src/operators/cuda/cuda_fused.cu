@@ -776,38 +776,53 @@ void launch_ffn_up_fused_q4_k(const float* x, const void* q_w1, const void* q_w3
 #define FUSED_QI8_1 8
 
 struct block_q8_1_fused {
-    half2 ds;
+    float2 ds;       // ds.x = d (fp32 scale, CPU block_q8_K semantics), ds.y unused
     int8_t qs[32];
 };
 
-// Quantize FP32 x to Q8_1 format (same as cuda_gemv.cu)
+// Quantize FP32 x to Q8 activation format, mirroring the CPU
+// quantize_row_q8_K exactly (see quantize_q8_1_kernel in cuda_gemv.cu):
+// one fp32 scale per 256-element group, iscale = -127/max, RNE rounding.
 __global__ void quantize_q8_1_fused_kernel(const float* __restrict__ x,
                                            block_q8_1_fused* __restrict__ y, int k) {
-    int bi = blockIdx.x * blockDim.x + threadIdx.x;
-    int num_blocks = (k + 31) / 32;
-    if (bi >= num_blocks)
+    int groups_per_row = (k + 255) / 256;
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groups_per_row)
         return;
 
-    int base = bi * 32;
-    int end = min(base + 32, k);
+    int base = g * 256;
+    int n_el = min(256, k - base);
 
     float amax = 0.0f;
-    for (int j = base; j < end; ++j) {
-        float ax = fabsf(x[j]);
-        if (ax > amax)
+    float max = 0.0f;
+    for (int j = 0; j < n_el; ++j) {
+        float ax = fabsf(x[base + j]);
+        if (ax > amax) {
             amax = ax;
+            max = x[base + j];
+        }
     }
 
-    float d_val = (amax > 1e-10f) ? (amax / 127.0f) : (1.0f / 127.0f);
-    float inv_d = 1.0f / d_val;
+    int gbase = g * 8;  // 8 sub-blocks per 256-element group
+    if (amax == 0.0f) {
+        y[gbase].ds = make_float2(0.0f, 0.0f);
+        return;
+    }
 
-    y[bi].ds = __halves2half2(__float2half(d_val), __float2half(0.0f));
+    const float iscale = -127.0f / max;
+    const float d = 1.0f / iscale;
 
-    int8_t* qs = y[bi].qs;
-    for (int j = 0; j < end - base; ++j) {
-        float v = x[base + j] * inv_d;
-        v = fminf(fmaxf(v, -128.0f), 127.0f);
-        qs[j] = static_cast<int8_t>(__float2int_rn(v));
+    for (int s = 0; s * 32 < n_el; ++s) {
+        int send = min(32, n_el - s * 32);
+        block_q8_1_fused& blk = y[gbase + s];
+        blk.ds = make_float2(d, 0.0f);
+        int8_t* qs = blk.qs;
+        int ebase = base + s * 32;
+        for (int j = 0; j < send; ++j) {
+            float v = iscale * x[ebase + j];
+            v = fminf(fmaxf(v, -127.0f), 127.0f);
+            qs[j] = static_cast<int8_t>(__float2int_rn(v));
+        }
     }
 }
 
@@ -830,12 +845,19 @@ static __device__ __forceinline__ float vec_dot_q4_k_q8_1_fused(
     const uint16_t* scales = (const uint16_t*)(bq4_K + 4);
     uint16_t aux[2];
     const int j = bq8_offset / 2;
-    if (j < 2) {
-        aux[0] = scales[j + 0] & 0x3f3f;
-        aux[1] = scales[j + 2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+    // Canonical ggml scale decode (llama.cpp ggml-cuda/vecdotq.cuh
+    // vec_dot_q4_K_q8_1). The index wraps mod 2 (jm = j&1) because each pair of
+    // Q8_1 sub-blocks with the same jm shares one 6-bit scale/min byte pair,
+    // and the j>=2 half selects the nibble-packed excess bits via the hi mask.
+    // Same fix as vec_dot_q4_K_q8_1 in cuda_gemv_common.cuh.
+    {
+        const int  jm = j & 1;
+        const uint32_t s0 = scales[jm + 0];
+        const uint32_t s2 = scales[jm + 2];
+        const uint32_t s4 = scales[jm + 4];
+        const uint32_t hi = (uint32_t) - (int32_t)(j >= 2);
+        aux[0] = (uint16_t)(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        aux[1] = (uint16_t)(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
     }
     const uint8_t* sc = (const uint8_t*)aux;
     const uint8_t* m = sc + 2;
@@ -843,7 +865,7 @@ static __device__ __forceinline__ float vec_dot_q4_k_q8_1_fused(
 #pragma unroll
     for (int i = 0; i < FUSED_QR4_K; ++i) {
         const block_q8_1_fused* bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
+        d8[i] = bq8i->ds.x;
         const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
         u[2 * i + 0] = q8[0];
         u[2 * i + 1] = q8[4];
@@ -966,7 +988,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_fused(
 
     float acc = 0.0f;
     for (int g = 0; g < 8; ++g) {
-        int hidx = 2 * g - (g & 1);
+        int hidx = 2 * g;  // scales_h >> 2*ib, matches llama.cpp (shifts 0,2,4,...,14)
         int hbits = (h >> hidx) & 0x3;
         uint8_t ls_byte = scales_l[g / 2];
         int ls_low = (g & 1) ? (ls_byte >> 4) : (ls_byte & 0xf);
@@ -976,7 +998,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1_fused(
         const int* qs_g = (const int*)(qs + (size_t)g * 16);
         const block_q8_1_fused* q8b = q8_base + g;
         const int* q8i = (const int*)q8b->qs;
-        float d8 = __low2float(q8b->ds);
+        float d8 = q8b->ds.x;
 
         int dot = 0;
 #pragma unroll

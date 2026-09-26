@@ -4,6 +4,7 @@
 
 #include "forge/cuda_kernels.h"
 #include "forge/dtype_contract.h"
+#include "forge/inference/tensor_device_utils.h"
 #include "forge/op_dispatch.h"
 #include "forge/operator_norm.h"
 #include "forge/perf_profiler.h"
@@ -119,8 +120,15 @@ TensorPtr rms_norm(const TensorPtr& x, const TensorPtr& weight, float eps) {
                 std::string("ops::rms_norm (CPU): FP32 only; got dtype '") + dtype_name(dt) +
                 "'. Use the CUDA device for native FP16 RMSNorm (Phase 6-A-2).");
         }
-        const float* x_data = static_cast<const float*>(x->data());
-        const float* w_data = weight ? static_cast<const float*>(weight->data()) : nullptr;
+        // Hybrid CPU+GPU offload (G1): activations stay on the host while layer
+        // weights may live on the device. ensure_cpu keeps the CPU-only RMSNorm
+        // kernel correct regardless of where the weight is allocated. The CUDA
+        // RMSNorm branch above only triggers when x is already on the device, so
+        // this never affects the pure-CUDA path.
+        const auto xc = ensure_cpu(x);
+        const auto wc = weight ? ensure_cpu(weight) : nullptr;
+        const float* x_data = static_cast<const float*>(xc->data());
+        const float* w_data = wc ? static_cast<const float*>(wc->data()) : nullptr;
         float* o_data = static_cast<float*>(out->data());
 
         forge::cpu::parallel_for_chunks(rows, 1, [&](int r0, int r1) {

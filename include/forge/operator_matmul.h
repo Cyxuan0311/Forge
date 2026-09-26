@@ -38,7 +38,8 @@ TensorPtr matmul_transB_fused_qkv_q4_k(const TensorPtr& input, const TensorPtr& 
 
 // Fused QKV + z + alpha + beta projection for qwen35 linear attention: all four
 // projections share the same input and are computed in a single OpenMP region.
-// qkv may be Q4_K or Q6_K; z/alpha/beta must be Q4_K. Returns the four outputs.
+// qkv/z must be a K-quant (Q4_K/Q5_K/Q6_K); alpha/beta may additionally be Q8_0.
+// Returns the four outputs.
 struct FusedQkvZAlphaBeta {
     TensorPtr qkv;
     TensorPtr z;

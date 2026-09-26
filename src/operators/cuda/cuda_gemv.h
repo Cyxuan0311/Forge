@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "forge/types.h"
+
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
@@ -81,6 +83,37 @@ void launch_moe_expert_iq2_s_down(const float* x, const void* q_down, float* out
                                   int K, int N, int n_expert, int n_expert_used,
                                   int n_tokens, cudaStream_t stream);
 
+// ---- Grouped IQ MoE, DT-generic (IQ2_XXS / IQ2_S / IQ3_XXS / IQ1_M) ----
+// Same slot-strided semantics as the IQ2_S kernels above: expert_indices lives
+// on device ([n_tokens*k]); one launch covers every (token, slot) pair. For
+// unsupported dtypes these are no-ops — the caller falls back to per-expert
+// matmul_transB. x is [n_tokens, K] fp32 on device; out_* are caller-owned
+// device buffers ([n_tokens*k, N]; down's `out` is [n_tokens, N] and must be
+// pre-zeroed — the kernel overwrites rows deterministically in slot order).
+void launch_moe_expert_iq_gateup_dt(
+    DataType dt, const float* x, const void* q_gate, const void* q_up,
+    float* out_gate, float* out_up, const int* expert_indices,
+    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+    cudaStream_t stream);
+void launch_moe_expert_iq_down_dt(
+    DataType dt, const float* x, const void* q_down, float* out,
+    const int* expert_indices, const float* expert_weights,
+    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+    cudaStream_t stream);
+
+// ---- GDN fused projections, DT-generic (IQ2_XXS / IQ2_S / IQ3_XXS / IQ1_M) ----
+// Decode (M==1) multi-weight GEMV: the shared activation is q8-quantized ONCE,
+// then one kernel computes up to 4 quantized [N_s, K] weight segments against
+// it, writing each segment to its own output buffer. Bit-identical to calling
+// launch_gemv_<dt>_q8_1 per weight (same vec_dot, same reduction order), but
+// 2*S launches collapse to 2. w/outs/Ns are host arrays of length >= 4
+// (unused segments: nullptr / 0). Unsupported dtypes are a no-op — caller
+// falls back to per-weight matmul_transB.
+void launch_gdn_proj_fused_dt(
+    DataType dt, const float* x,
+    const void* const* w, float* const* outs, const int* Ns,
+    int n_seg, int K, cudaStream_t stream = 0);
+
 // ---- IQ2_XS GEMV (Q8_1 + dp4a) ----
 void launch_gemv_iq2_xs_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
                               cudaStream_t stream = 0);
@@ -92,6 +125,18 @@ void launch_gemv_iq3_s_q8_1(const float* x, const void* q_weight, float* out, in
                              cudaStream_t stream = 0);
 void launch_gemv_iq3_s_q8_1_batch(const float* x, const void* q_weight, float* out,
                                    int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- IQ3_XXS GEMV (Q8_1 + dp4a, 98B/256elem) ----
+void launch_gemv_iq3_xxs_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                                cudaStream_t stream = 0);
+void launch_gemv_iq3_xxs_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                     int M, int K, int N, cudaStream_t stream = 0);
+
+// ---- IQ1_M GEMV (Q8_1 + dp4a, 56B/256elem) ----
+void launch_gemv_iq1_m_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
+                              cudaStream_t stream = 0);
+void launch_gemv_iq1_m_q8_1_batch(const float* x, const void* q_weight, float* out,
+                                    int M, int K, int N, cudaStream_t stream = 0);
 
 // ---- Q4_1 GEMV (Q8_1 + dp4a, Phase 5) ----
 void launch_gemv_q4_1_q8_1(const float* x, const void* q_weight, float* out, int K, int N,
@@ -144,8 +189,8 @@ void launch_ffn_up_fused_q2k_q2k(const float* x, const void* q_gate, const void*
 using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
 using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const GemvFn gemv_dispatch[21];
-extern const GemvBatchFn gemv_batch_dispatch[21];
+extern const GemvFn gemv_dispatch[25];
+extern const GemvBatchFn gemv_batch_dispatch[25];
 
 }  // namespace cuda
 }  // namespace forge

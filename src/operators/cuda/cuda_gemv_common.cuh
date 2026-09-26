@@ -37,11 +37,15 @@
 #define GEMV_QI6_K (GEMV_QK_K / (4 * GEMV_QR6_K))  // 32
 
 // ============================================================================
-// Q8_1 block layout: half2 ds (d + s) + int8_t qs[32] = 36 bytes
-// Compatible with llama.cpp's block_q8_1
+// Q8_1 block layout: float2 ds (d + unused s) + int8_t qs[32] = 40 bytes
+// ds.x is an fp32 scale shared by all 8 sub-blocks of a 256-element group and
+// computed with the exact CPU quantize_row_q8_K semantics (see
+// quantize_q8_1_kernel) so CUDA matmul outputs stay numerically aligned with
+// the CPU path — critical for speculative decoding, where the drafter replays
+// the same weights on CPU and per-layer drift is amplified by GDN recurrence.
 // ============================================================================
 struct block_q8_1_gemv {
-    half2 ds;         // ds.x = d (scale), ds.y = s (sum, unused in GEMV)
+    float2 ds;        // ds.x = d (fp32 scale, CPU block_q8_K d), ds.y unused
     int8_t qs[32];   // quantized values
 };
 
@@ -78,10 +82,12 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, cons
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
 }
 
-// Unpack 7-bit sign information into 4 byte-wide sign bits (0x80 per byte).
-static __device__ __forceinline__ uint32_t unpack_ksigns(const uint32_t packed) {
-    return ((packed << 24) & 0x80000000) | ((packed << 15) & 0x00800000) |
-           ((packed <<  6) & 0x00008000) | ((packed >>  3) & 0x00000080);
+// Unpack the seven explicit sign bits plus the parity-encoded eighth bit.
+// This is the llama.cpp representation used by IQ2_XXS/IQ2_XS/IQ3_XXS.
+static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+    const uint32_t parity = __popc(v) & 1;
+    const uint32_t signs = v ^ (parity << 7);
+    return signs * 0x01010101;
 }
 
 // ============================================================================
@@ -106,7 +112,7 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     uint16_t scale_bits;
     memcpy(&scale_bits, block_ptr, sizeof(uint16_t));
     float scale = __half2float(reinterpret_cast<const __half&>(scale_bits));
-    float d8 = __low2float(q8_blk->ds);
+    float d8 = q8_blk->ds.x;
 
     const uint8_t* qs = block_ptr + 2;
     const int* q8_int = (const int*)q8_blk->qs;
@@ -141,7 +147,7 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     uint16_t d_bits;
     memcpy(&d_bits, block_ptr, sizeof(uint16_t));
     float d = __half2float(reinterpret_cast<const __half&>(d_bits));
-    float d8 = __low2float(q8_blk->ds);
+    float d8 = q8_blk->ds.x;
 
     const int8_t* qs = reinterpret_cast<const int8_t*>(block_ptr + 2);
     const int* q8_int = (const int*)q8_blk->qs;
@@ -177,13 +183,22 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     const uint16_t* scales = (const uint16_t*)(bq4_K + 4);
     uint16_t aux[2];
-    const int j = bq8_offset / 2;
-    if (j < 2) {
-        aux[0] = scales[j + 0] & 0x3f3f;
-        aux[1] = scales[j + 2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+    int j = bq8_offset / 2;
+    // Canonical ggml scale decode (llama.cpp ggml-cuda/vecdotq.cuh
+    // vec_dot_q4_K_q8_1). The index wraps mod 2 (jm = j&1) because each pair of
+    // Q8_1 sub-blocks with the same jm shares one 6-bit scale/min byte pair,
+    // and the j>=2 half selects the nibble-packed excess bits via the hi mask.
+    // Verified byte-for-byte against the CPU gemv utmp decode. The previous
+    // linear-index version desynced sc/m across the two halves (j=0,1 m wrong;
+    // j=2,3 sc wrong) -> CUDA garbage.
+    {
+        int  jm = j & 1;
+        uint32_t s0 = scales[jm + 0];
+        uint32_t s2 = scales[jm + 2];
+        uint32_t s4 = scales[jm + 4];
+        uint32_t hi = (uint32_t) - (int32_t)(j >= 2);
+        aux[0] = (uint16_t)(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        aux[1] = (uint16_t)(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
     }
     const uint8_t* sc = (const uint8_t*)aux;
     const uint8_t* m  = sc + 2;
@@ -191,7 +206,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 #pragma unroll
     for (int i = 0; i < GEMV_QR4_K; ++i) {
         const block_q8_1_gemv* bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
+        d8[i] = bq8i->ds.x;
         const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
         u[2 * i + 0] = q8[0];
         u[2 * i + 1] = q8[4];
@@ -243,7 +258,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 #pragma unroll
     for (int i = 0; i < GEMV_QR6_K; ++i) {
         u[i] = get_int_b4(bq8_1[bq8_offset + 2 * i].qs, iqs % GEMV_QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + 2 * i].ds);
+        d8[i] = bq8_1[bq8_offset + 2 * i].ds.x;
     }
 
     float sumf = 0.0f;

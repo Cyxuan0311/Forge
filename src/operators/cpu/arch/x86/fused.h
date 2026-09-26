@@ -9,6 +9,7 @@
 #include "cpu/common/thread_pool.h"
 #include "vec.h"
 #include "../../common/quant_helpers.h"
+#include "forge/types.h"
 #ifdef USE_AVX2
 #    include <immintrin.h>
 #endif
@@ -535,22 +536,53 @@ static void gemv_q4_K_fused_qkv_avx2(const float* a, const uint8_t* wq, const ui
 // All four projections share the same input vector. Computed in a single OpenMP
 // region so the Q8_K activation quantization and region setup are amortized
 // once instead of four separate gemm calls.
-// qkv may be Q4_K or Q6_K; z/alpha/beta are always Q4_K.
+// qkv/z may be Q4_K, Q5_K or Q6_K; alpha/beta may additionally be Q8_0
+// (activation-quantized to Q8_0_act alongside the shared Q8_K).
 
 #ifdef USE_AVX2
+static inline size_t kquant_block_bytes(DataType dt) {
+    switch (dt) {
+    case DataType::Q4_K: return 144;
+    case DataType::Q5_K: return 176;
+    case DataType::Q6_K: return 210;
+    default: return 0;
+    }
+}
+
+static inline float dot_kquant_row_q8_K_avx2(DataType dt, const uint8_t* row,
+                                             const block_q8_K* q8, int nb) {
+    switch (dt) {
+    case DataType::Q4_K: return dot_q4_K_q8_K_avx2(row, q8, nb);
+    case DataType::Q5_K: return dot_q5_K_q8_K_avx2(row, q8, nb);
+    case DataType::Q6_K: return dot_q6_K_q8_K_avx2(row, q8, nb);
+    default: return 0.0f;
+    }
+}
+
 static void gemv_fused_qkv_z_ab_avx2(
-    const float* a, const uint8_t* w_qkv, bool qkv_q6, const uint8_t* w_z,
-    const uint8_t* w_alpha, const uint8_t* w_beta, float* out_qkv, float* out_z,
-    float* out_alpha, float* out_beta, int K, int N_qkv, int N_z, int N_alpha, int N_beta) {
+    const float* a, const uint8_t* w_qkv, DataType qkv_dt, const uint8_t* w_z, DataType z_dt,
+    const uint8_t* w_alpha, DataType alpha_dt, const uint8_t* w_beta, DataType beta_dt,
+    float* out_qkv, float* out_z, float* out_alpha, float* out_beta, int K, int N_qkv, int N_z,
+    int N_alpha, int N_beta) {
     constexpr int QK_K = 256;
-    constexpr int Q4_K_BLOCK_BYTES = 144;
-    constexpr int Q6_K_BLOCK_BYTES = 210;
     const int nb = (K + QK_K - 1) / QK_K;
-    const size_t qkv_stride = (size_t)nb * (qkv_q6 ? Q6_K_BLOCK_BYTES : Q4_K_BLOCK_BYTES);
-    const size_t q4_stride = (size_t)nb * Q4_K_BLOCK_BYTES;
+    const size_t qkv_stride = (size_t)nb * kquant_block_bytes(qkv_dt);
+    const size_t z_stride = (size_t)nb * kquant_block_bytes(z_dt);
+    const size_t alpha_stride = (size_t)nb * kquant_block_bytes(alpha_dt);
+    const size_t beta_stride = (size_t)nb * kquant_block_bytes(beta_dt);
+
+    // alpha/beta may be Q8_0 (per-32-block activation) instead of a K-quant.
+    constexpr int Q8_0_BLOCK_BYTES = 34;
+    const bool alpha_q8_0 = (alpha_dt == DataType::Q8_0);
+    const bool beta_q8_0 = (beta_dt == DataType::Q8_0);
+    const int nb32 = (K + 31) / 32;
+    const size_t q8_0_stride = (size_t)nb32 * Q8_0_BLOCK_BYTES;
 
     scratch_vec<block_q8_K> q8_buf(nb);
     quantize_row_q8_K(a, q8_buf.data(), K);
+    scratch_vec<block_q8_0_act> q8_act_buf(alpha_q8_0 || beta_q8_0 ? nb32 : 0);
+    if (alpha_q8_0 || beta_q8_0)
+        quantize_row_q8_0_act(a, q8_act_buf.data(), K);
 
     const int n_qkv_z = N_qkv + N_z;
     const int n_qkv_z_ab = n_qkv_z + N_alpha;
@@ -561,18 +593,22 @@ static void gemv_fused_qkv_z_ab_avx2(
         float v;
         if (n < N_qkv) {
             const uint8_t* row = w_qkv + (size_t)n * qkv_stride;
-            v = qkv_q6 ? dot_q6_K_q8_K_avx2(row, q8_buf.data(), nb)
-                       : dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
-            out_qkv[n] = v;
+            out_qkv[n] = dot_kquant_row_q8_K_avx2(qkv_dt, row, q8_buf.data(), nb);
         } else if (n < n_qkv_z) {
-            const uint8_t* row = w_z + (size_t)(n - N_qkv) * q4_stride;
-            out_z[n - N_qkv] = dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
+            const uint8_t* row = w_z + (size_t)(n - N_qkv) * z_stride;
+            out_z[n - N_qkv] = dot_kquant_row_q8_K_avx2(z_dt, row, q8_buf.data(), nb);
         } else if (n < n_qkv_z_ab) {
-            const uint8_t* row = w_alpha + (size_t)(n - n_qkv_z) * q4_stride;
-            out_alpha[n - n_qkv_z] = dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
+            const int r = n - n_qkv_z;
+            const uint8_t* row = w_alpha + (size_t)r * (alpha_q8_0 ? q8_0_stride : alpha_stride);
+            v = alpha_q8_0 ? vec_dot_q8_0_q8_0_avx2(row, q8_act_buf.data(), nb32)
+                           : dot_kquant_row_q8_K_avx2(alpha_dt, row, q8_buf.data(), nb);
+            out_alpha[r] = v;
         } else {
-            const uint8_t* row = w_beta + (size_t)(n - n_qkv_z_ab) * q4_stride;
-            out_beta[n - n_qkv_z_ab] = dot_q4_K_q8_K_avx2(row, q8_buf.data(), nb);
+            const int r = n - n_qkv_z_ab;
+            const uint8_t* row = w_beta + (size_t)r * (beta_q8_0 ? q8_0_stride : beta_stride);
+            v = beta_q8_0 ? vec_dot_q8_0_q8_0_avx2(row, q8_act_buf.data(), nb32)
+                          : dot_kquant_row_q8_K_avx2(beta_dt, row, q8_buf.data(), nb);
+            out_beta[r] = v;
         }
         }
     });

@@ -103,6 +103,110 @@ void launch_moe_router(
 }
 
 // ============================================================================
+// bailingmoe3 Router Kernel — sigmoid gate + biased group selection + renorm
+// ============================================================================
+// 逐位镜像 Bailingmoe3Engine::apply_moe_ffn 的 host 路由:
+//   probs[e] = sigmoid(logits[e])                 (无偏专家权重)
+//   sel[e]   = bias ? probs[e] + bias[e] : probs[e]
+//   分组 mask: 组分 = 组内 sel 的 top1+top2, 保留 top n_group_used 组,
+//              其余专家 sel = -FLT_MAX
+//   top-k: sel 降序 (平局取小 index, 顺序扫描严格 > 即保持); 
+//   w[k]   = norm_w ? probs[idx[k]] / max(topk_sum, 6.103515625e-5) : probs[idx[k]],
+//          再乘 w_scale (仅当 w_scale 不为 0/1)。
+// 每 token 一个 block; n_expert <= 256。消掉每层 ensure_cpu(router_logits)
+// 的同步 D2H 管线排空 (decode 每步 23 次)。
+__global__ void moe_router_sigmoid_kernel(
+    const float* __restrict__ logits,       // [seq_len, n_expert]
+    const float* __restrict__ bias,         // [n_expert] 或 nullptr
+    int* __restrict__ expert_indices,       // [seq_len, n_expert_used]
+    float* __restrict__ expert_weights,     // [seq_len, n_expert_used]
+    int n_expert, int n_expert_used, int n_group, int n_group_used,
+    int norm_w, float w_scale)
+{
+    __shared__ float s_probs[256];
+    __shared__ float s_sel[256];
+    __shared__ float s_group[256];
+    __shared__ char s_keep[256];
+    __shared__ char s_used[256];
+
+    const int s = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int n = n_expert;
+    const int n_per_group = (n_group > 1) ? n / n_group : 0;
+
+    if (tid < n) {
+        const float lg = logits[(size_t)s * n + tid];
+        const float p = 1.0f / (1.0f + expf(-lg));
+        s_probs[tid] = p;
+        s_sel[tid] = bias ? p + bias[tid] : p;
+        s_used[tid] = 0;
+    }
+    __syncthreads();
+
+    // 分组 mask (分支条件对整 block 一致, __syncthreads 合法)
+    if (n_group > 1 && n_group_used > 0 && n_group_used < n_group) {
+        if (tid < n_group) {
+            float top1 = -FLT_MAX, top2 = -FLT_MAX;
+            for (int j = 0; j < n_per_group; ++j) {
+                const float v = s_sel[tid * n_per_group + j];
+                if (v > top1) { top2 = top1; top1 = v; }
+                else if (v > top2) { top2 = v; }
+            }
+            s_group[tid] = top1 + top2;
+            s_keep[tid] = 0;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            for (int gi = 0; gi < n_group_used; ++gi) {
+                int best = -1;
+                float bv = -FLT_MAX;
+                for (int g = 0; g < n_group; ++g)
+                    if (!s_keep[g] && s_group[g] > bv) { bv = s_group[g]; best = g; }
+                s_keep[best] = 1;
+            }
+            for (int e = 0; e < n; ++e)
+                if (!s_keep[e / n_per_group]) s_sel[e] = -FLT_MAX;
+        }
+        __syncthreads();
+    }
+
+    // top-k + renorm (单线程顺序, 与 host 逐位同序)
+    if (tid == 0) {
+        float topk_sum = 0.0f;
+        int* s_idx = expert_indices + (size_t)s * n_expert_used;
+        float* s_w = expert_weights + (size_t)s * n_expert_used;
+        for (int k = 0; k < n_expert_used; ++k) {
+            int best = -1;
+            float bv = -FLT_MAX;
+            for (int e = 0; e < n; ++e)
+                if (!s_used[e] && s_sel[e] > bv) { bv = s_sel[e]; best = e; }
+            s_used[best] = 1;
+            s_idx[k] = best;
+            s_w[k] = s_probs[best];
+            topk_sum += s_probs[best];
+        }
+        const float denom = norm_w ? fmaxf(topk_sum, 6.103515625e-5f) : 1.0f;
+        for (int k = 0; k < n_expert_used; ++k) {
+            float w = norm_w ? s_w[k] / denom : s_w[k];
+            if (w_scale != 0.0f && w_scale != 1.0f) w *= w_scale;
+            s_w[k] = w;
+        }
+    }
+}
+
+void launch_moe_router_sigmoid(
+    const float* logits, const float* bias, int* expert_indices, float* expert_weights,
+    int n_expert, int n_expert_used, int n_group, int n_group_used,
+    int norm_w, float w_scale, int seq_len, cudaStream_t stream)
+{
+    const int threads = min(n_expert, 256);
+    moe_router_sigmoid_kernel<<<seq_len, threads, 0, stream>>>(
+        logits, bias, expert_indices, expert_weights,
+        n_expert, n_expert_used, n_group, n_group_used, norm_w, w_scale);
+}
+
+
+// ============================================================================
 // MoE Router Scaling Kernel — pre-norm + inv_sqrt + element-wise scale
 // ============================================================================
 // Applies: x = rms_norm(x, ones, eps) * (1/sqrt(hidden_dim)) * scale_per_dim
@@ -163,40 +267,56 @@ void launch_moe_router_scale(
 // ============================================================================
 // Q8_1 activation quantization (batched) — Phase 1-A
 // ============================================================================
-// Quantize [n_tokens, K] FP32 activations to Q8_1 (one block_q8_1_gemv per 32
-// elements, contiguous across tokens). Mirrors quantize_q8_1_kernel but handles
-// the leading n_tokens dimension so the MoE path can quantize the whole batch
-// once and reuse it across every routed expert (they share the activation).
+// Quantize [n_tokens, K] FP32 activations to the GEMV Q8 format (one
+// block_q8_1_gemv per 32 elements, contiguous across tokens). Mirrors the CPU
+// quantize_row_q8_K exactly (see quantize_q8_1_kernel in cuda_gemv.cu): one
+// fp32 scale per 256-element group shared by its 8 sub-blocks, iscale =
+// -127/max, RNE rounding. Handles the leading n_tokens dimension so the MoE
+// path can quantize the whole batch once and reuse it across every routed
+// expert (they share the activation).
 __global__ void quantize_q8_1_batch_kernel(
     const float* __restrict__ x, block_q8_1_gemv* __restrict__ q8, int K, int n_tokens)
 {
-    int num_blocks = (K + 31) / 32;
-    int total = n_tokens * num_blocks;
+    int groups_per_row = (K + 255) / 256;
     int bi = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bi >= total) return;
+    if (bi >= n_tokens * groups_per_row) return;
 
-    int tok = bi / num_blocks;
-    int b = bi % num_blocks;
-    const float* x_row = x + (size_t)tok * K;
-    int base = b * 32;
-    int end = min(base + 32, K);
+    int tok = bi / groups_per_row;
+    int g = bi - tok * groups_per_row;
+    const float* xr = x + (size_t)tok * K;
+    int base = g * 256;
+    int n_el = min(256, K - base);
 
     float amax = 0.0f;
-    for (int j = base; j < end; ++j) {
-        float ax = fabsf(x_row[j]);
-        if (ax > amax) amax = ax;
+    float max = 0.0f;
+    for (int j = 0; j < n_el; ++j) {
+        float ax = fabsf(xr[base + j]);
+        if (ax > amax) {
+            amax = ax;
+            max = xr[base + j];
+        }
     }
 
-    float d_val = (amax > 1e-10f) ? (amax / 127.0f) : (1.0f / 127.0f);
-    float inv_d = 1.0f / d_val;
+    int gbase = bi * 8;  // blocks are contiguous across tokens: bi == row-local group id
+    if (amax == 0.0f) {
+        q8[gbase].ds = make_float2(0.0f, 0.0f);
+        return;
+    }
 
-    block_q8_1_gemv& blk = q8[bi];
-    blk.ds = __halves2half2(__float2half(d_val), __float2half(0.0f));
+    const float iscale = -127.0f / max;
+    const float d = 1.0f / iscale;
 
-    for (int j = 0; j < end - base; ++j) {
-        float v = x_row[base + j] * inv_d;
-        v = fminf(fmaxf(v, -128.0f), 127.0f);
-        blk.qs[j] = static_cast<int8_t>(__float2int_rn(v));
+    for (int s = 0; s * 32 < n_el; ++s) {
+        int send = min(32, n_el - s * 32);
+        block_q8_1_gemv& blk = q8[gbase + s];
+        blk.ds = make_float2(d, 0.0f);
+        int8_t* qs = blk.qs;
+        int ebase = base + s * 32;
+        for (int j = 0; j < send; ++j) {
+            float v = iscale * xr[ebase + j];
+            v = fminf(fmaxf(v, -127.0f), 127.0f);
+            qs[j] = static_cast<int8_t>(__float2int_rn(v));
+        }
     }
 }
 

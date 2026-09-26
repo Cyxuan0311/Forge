@@ -2416,6 +2416,87 @@ void launch_dequant_iq3_s_matrix(const void* q_data, float* out, int N, int K,
         static_cast<const uint8_t*>(q_data), out, N, K);
 }
 
+// Embedding row gather: same per-element IQ3_S block math as the matrix kernel
+// above, but the row index comes from `indices` instead of idx/K. Runs fully on
+// device — no blocking D2H of the indices, no host dequant, no H2D copy-back.
+__global__ void embedding_iq3_s_kernel(const uint8_t* __restrict__ q_weight,
+                                       const int32_t* __restrict__ indices,
+                                       float* __restrict__ out, int num_indices,
+                                       int embed_dim, int vocab_size, int row_len,
+                                       bool transposed) {
+    const int QK_K = 256;
+    const int IQ3_S_BLOCK_SIZE = 110;
+
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)num_indices * embed_dim)
+        return;
+    int token_idx = static_cast<int>(idx / embed_dim);
+    int dim_idx = static_cast<int>(idx % embed_dim);
+
+    int vocab_idx = indices[token_idx];
+    if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+        out[idx] = 0.0f;
+        return;
+    }
+    // transposed table ([embed_dim, vocab] row-major): row = dim, col = vocab.
+    // normal table ([vocab, embed_dim]): row = vocab, col = dim.
+    const int row = transposed ? dim_idx : vocab_idx;
+    const int col = transposed ? vocab_idx : dim_idx;
+
+    int blocks_per_row = (row_len + QK_K - 1) / QK_K;
+    int bi = col / QK_K;
+    int col_in_block = col % QK_K;
+
+    const uint8_t* row_ptr = q_weight + (int64_t)row * blocks_per_row * IQ3_S_BLOCK_SIZE;
+    const uint8_t* block_ptr = row_ptr + bi * IQ3_S_BLOCK_SIZE;
+
+    float d = __half2float(
+        reinterpret_cast<const __half&>(*reinterpret_cast<const uint16_t*>(block_ptr)));
+    const uint8_t* qs = block_ptr + 2;                    // 64 bytes
+    const uint8_t* qh = block_ptr + 2 + 64;               // 8 bytes
+    const uint8_t* signs = block_ptr + 2 + 64 + 8;        // 32 bytes
+    const uint8_t* scales = block_ptr + 2 + 64 + 8 + 32;  // 4 bytes
+
+    int iter = col_in_block / 64;    // 0..3  (ib32 = 2*iter)
+    int within = col_in_block % 64;  // 0..63
+    int sub = within / 32;           // 0 (even, db1) or 1 (odd, db2)
+    int within_sub = within % 32;    // 0..31
+    int l = within_sub / 8;          // 0..3
+    int j = within_sub % 8;          // 0..7
+
+    int qs_base = iter * 16 + sub * 8;
+    int signs_idx = iter * 8 + sub * 4 + l;
+    int qh_idx = iter * 2 + sub;
+
+    float db = (sub == 0) ? d * (1 + 2 * (scales[iter] & 0xF)) : d * (1 + 2 * (scales[iter] >> 4));
+
+    uint8_t qh_byte = qh[qh_idx];
+    int grid1_idx = qs[qs_base + 2 * l + 0] | ((qh_byte << (8 - 2 * l)) & 256);
+    int grid2_idx = qs[qs_base + 2 * l + 1] | ((qh_byte << (7 - 2 * l)) & 256);
+
+    int grid_idx = (j < 4) ? grid1_idx : grid2_idx;
+    int grid_elem = j & 3;  // j % 4
+
+    const uint8_t* grid = reinterpret_cast<const uint8_t*>(&c_iq3s_grid[grid_idx]);
+    uint8_t sign_byte = signs[signs_idx];
+
+    out[idx] =
+        db * static_cast<float>(grid[grid_elem]) * (sign_byte & c_kmask_iq2xs[j] ? -1.f : 1.f);
+}
+
+void launch_embedding_iq3_s(const void* q_weight, const int32_t* indices, float* out,
+                            int num_indices, int embed_dim, int vocab_size,
+                            bool transposed, cudaStream_t stream) {
+    ensure_iq3_s_tables();
+    const int row_len = transposed ? vocab_size : embed_dim;
+    int64_t total = (int64_t)num_indices * embed_dim;
+    int threads = 256;
+    int64_t blocks = (total + threads - 1) / threads;
+    embedding_iq3_s_kernel<<<(int)blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(q_weight), indices, out, num_indices, embed_dim,
+        vocab_size, row_len, transposed);
+}
+
 // =========================================================================
 // IQ4_NL CUDA Dequantization
 // block_iq4_nl: fp16 d (2B) + 16*qs nibble-packed (16B) = 18B per 32 elements

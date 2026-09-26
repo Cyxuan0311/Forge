@@ -495,6 +495,17 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
             cuda::launch_embedding_q3_k(
                 weight->data(), static_cast<const int32_t*>(indices->data()),
                 static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+        } else if (weight->dtype() == DataType::IQ3_S) {
+            // Device-side row gather straight from the quantized table: keeps
+            // the indices on device (the generic fallback below does a blocking
+            // indices-D2H that drains the whole default-stream pipeline every
+            // decode step — measured 35ms/step on RTX 4050).
+            bool transposed =
+                (weight->shape().size() >= 2 && weight->shape()[0] < weight->shape()[1]);
+            cuda::launch_embedding_iq3_s(
+                weight->data(), static_cast<const int32_t*>(indices->data()),
+                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size,
+                transposed);
         } else if (is_quantized_type(weight->dtype())) {
             auto dequant_fn = get_dequant_emb_fn(weight->dtype());
             if (dequant_fn) {

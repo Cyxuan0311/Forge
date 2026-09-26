@@ -772,6 +772,18 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                 PERF_SCOPE("matmul_transB/iq2_s_q8k_fused_gemv");
                 gemv_iq2_s_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()),
                                             o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ2_XXS) {
+                PERF_SCOPE("matmul_transB/iq2_xxs_q8k_fused_gemv");
+                gemv_iq2_xxs_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()),
+                                             o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ3_XXS) {
+                PERF_SCOPE("matmul_transB/iq3_xxs_q8k_fused_gemv");
+                gemv_iq3_xxs_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()),
+                                             o_data, M, K, N);
+            } else if (b->dtype() == DataType::IQ1_M) {
+                PERF_SCOPE("matmul_transB/iq1_m_q8k_fused_gemv");
+                gemv_iq1_m_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()),
+                                           o_data, M, K, N);
             } else if (b->dtype() == DataType::IQ2_XS) {
                 PERF_SCOPE("matmul_transB/iq2_xs_q8k_fused_gemv");
                 gemv_iq2_xs_q8k_transB_avx2(a_data, static_cast<const uint8_t*>(b->data()),
@@ -1782,13 +1794,21 @@ FusedQkvZAlphaBeta matmul_transB_fused_qkv_z_ab(const TensorPtr& input,
     if (input->ndim() != 2 || wqkv->ndim() != 2 || wz->ndim() != 2 || walpha->ndim() != 2 ||
         wbeta->ndim() != 2)
         throw std::runtime_error("matmul_transB_fused_qkv_z_ab expects 2D tensors");
-    if ((wqkv->dtype() != DataType::Q4_K && wqkv->dtype() != DataType::Q6_K) ||
-        wz->dtype() != DataType::Q4_K || walpha->dtype() != DataType::Q4_K ||
-        wbeta->dtype() != DataType::Q4_K)
-        throw std::runtime_error(
-            "matmul_transB_fused_qkv_z_ab requires Q4_K/Q6_K qkv and Q4_K z/alpha/beta");
     if (input->device() != DeviceType::CPU)
         throw std::runtime_error("matmul_transB_fused_qkv_z_ab is CPU-only");
+
+    auto is_k_quant = [](DataType dt) {
+        return dt == DataType::Q4_K || dt == DataType::Q5_K || dt == DataType::Q6_K;
+    };
+    auto is_bundle_dt = [](DataType dt) {
+        return dt == DataType::Q4_K || dt == DataType::Q5_K || dt == DataType::Q6_K ||
+               dt == DataType::Q8_0;
+    };
+    // qkv/z must be K-quants; alpha/beta may additionally be Q8_0.
+    if (!is_k_quant(wqkv->dtype()) || !is_k_quant(wz->dtype()) || !is_bundle_dt(walpha->dtype()) ||
+        !is_bundle_dt(wbeta->dtype()))
+        throw std::runtime_error(
+            "matmul_transB_fused_qkv_z_ab requires K-quant qkv/z and K-quant/Q8_0 alpha/beta");
 
     int M = static_cast<int>(input->shape()[0]);
     int K = static_cast<int>(input->shape()[1]);
@@ -1808,13 +1828,13 @@ FusedQkvZAlphaBeta matmul_transB_fused_qkv_z_ab(const TensorPtr& input,
 
 #if defined(USE_AVX2)
     PERF_SCOPE("matmul_transB/fused_qkv_z_ab");
-    const bool qkv_q6 = (wqkv->dtype() == DataType::Q6_K);
     const float* a_data = static_cast<const float*>(input->data());
     for (int m = 0; m < M; ++m) {
         cpu::gemv_fused_qkv_z_ab_avx2(
-            a_data + m * K, static_cast<const uint8_t*>(wqkv->data()), qkv_q6,
-            static_cast<const uint8_t*>(wz->data()), static_cast<const uint8_t*>(walpha->data()),
-            static_cast<const uint8_t*>(wbeta->data()),
+            a_data + m * K, static_cast<const uint8_t*>(wqkv->data()), wqkv->dtype(),
+            static_cast<const uint8_t*>(wz->data()), wz->dtype(),
+            static_cast<const uint8_t*>(walpha->data()), walpha->dtype(),
+            static_cast<const uint8_t*>(wbeta->data()), wbeta->dtype(),
             static_cast<float*>(r.qkv->data()) + m * N_qkv,
             static_cast<float*>(r.z->data()) + m * N_z,
             static_cast<float*>(r.alpha->data()) + m * N_alpha,

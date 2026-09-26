@@ -72,6 +72,17 @@ static inline void fmadd_f32(float* acc, const float* src, int n, float weight) 
         acc[i] += weight * src[i];
 }
 
+// ---- mul_vec_f32: dst[i] *= v[i] for i in [0, n) ----
+static inline void mul_vec_f32(float* dst, const float* v, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 a = _mm256_loadu_ps(dst + i);
+        __m256 b = _mm256_loadu_ps(v + i);
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(a, b));
+    }
+    for (; i < n; ++i) dst[i] *= v[i];
+}
+
 // ---- simd_gemm: C[M x N] += A[M x K] * B[K x N] (row-major, N contiguous) ----
 // Accumulating GEMM used by tiled prefill attention. Adapted from llama.cpp
 // ggml-cpu/simd-gemm.h (AVX2, RM=6 x RN=2 micro-kernel). No internal memset and
@@ -151,6 +162,20 @@ static inline void simd_gemm(float* C, const float* A, const float* B, int M, in
 
 #ifndef USE_AVX2
 // Scalar fallback (only compiled if this header is ever included without AVX2).
+static inline float dot_f32(const float* a, const float* b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+static inline void scale_f32(float* data, int n, float scale) {
+    for (int i = 0; i < n; ++i) data[i] *= scale;
+}
+static inline void fmadd_f32(float* acc, const float* src, int n, float weight) {
+    for (int i = 0; i < n; ++i) acc[i] += weight * src[i];
+}
+static inline void mul_vec_f32(float* dst, const float* v, int n) {
+    for (int i = 0; i < n; ++i) dst[i] *= v[i];
+}
 static inline void simd_gemm(float* C, const float* A, const float* B, int M, int K, int N) {
     for (int m = 0; m < M; ++m) {
         const float* a_row = A + (size_t)m * K;

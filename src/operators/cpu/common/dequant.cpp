@@ -445,8 +445,7 @@ void dequantize_iq2_xxs_row(const uint8_t* q_data, float* out, int K, int row) {
             uint32_t aux32[2];
             memcpy(aux32, q2, 2 * sizeof(uint32_t));
             const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(aux32);
-            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
-            const float db = d * ls * 0.25f;
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
 
             for (int l = 0; l < 4; ++l) {
                 const uint8_t* grid = reinterpret_cast<const uint8_t*>(&iq2xxs_grid[aux8[l]]);
@@ -680,8 +679,8 @@ void dequantize_iq1_m_row(const uint8_t* q_data, float* out, int K, int row) {
         for (int sib = 0; sib < 8; ++sib) {
             const float dl1 = d * (2 * ((sc[sib / 2] >> (6 * (sib % 2) + 0)) & 0x7) + 1);
             const float dl2 = d * (2 * ((sc[sib / 2] >> (6 * (sib % 2) + 3)) & 0x7) + 1);
-            const uint8_t b1 = qh[2 * sib + 0];
-            const uint8_t b2 = qh[2 * sib + 1];
+            const uint8_t b1 = qh[0];
+            const uint8_t b2 = qh[1];
             int idx[4];
             idx[0] = qs[0] | ((b1 << 8) & 0x700);
             idx[1] = qs[1] | ((b1 << 4) & 0x700);

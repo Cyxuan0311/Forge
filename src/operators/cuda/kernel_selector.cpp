@@ -52,14 +52,14 @@ namespace internal {
 
 cuda::GemvFn lookup_gemv(DataType dt) {
     int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 21)
+    if (idx < 0 || idx >= static_cast<int>(sizeof(cuda::gemv_dispatch) / sizeof(cuda::gemv_dispatch[0])))
         return nullptr;
     return cuda::gemv_dispatch[idx];
 }
 
 cuda::GemvBatchFn lookup_gemv_batch(DataType dt) {
     int idx = static_cast<int>(dt);
-    if (idx < 0 || idx >= 21)
+    if (idx < 0 || idx >= static_cast<int>(sizeof(cuda::gemv_batch_dispatch) / sizeof(cuda::gemv_batch_dispatch[0])))
         return nullptr;
     return cuda::gemv_batch_dispatch[idx];
 }

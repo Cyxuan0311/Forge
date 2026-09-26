@@ -23,7 +23,7 @@
 #   6. 提交生成结果与本文件
 #
 # 注意: dispatch 数组大小必须等于 DataType 枚举的最大值 + 1。
-# 当前为 21 (IQ4_XS = 20)。新增类型时必须同步扩大。
+# 当前为 25 (IQ1_M = 24)。新增类型时必须同步扩大。
 # ============================================================================
 
 # ---------------------------------------------------------------------------
@@ -82,3 +82,7 @@ dispatch:
   - {i: 18, name: IQ2_XS,   gemv: launch_gemv_iq2_xs_q8_1,  batch: launch_gemv_iq2_xs_q8_1_batch,  note: "Q8_1+dp4a (M=1, direct quantized GEMV)" }
   - {i: 19, name: IQ3_S,    gemv: launch_gemv_iq3_s_q8_1,   batch: launch_gemv_iq3_s_q8_1_batch,   note: "Q8_1+dp4a (M=1, direct quantized GEMV)" }
   - {i: 20, name: IQ4_XS,   gemv: launch_gemv_iq4_xs_q8_1,  batch: launch_gemv_iq4_xs_q8_1_batch,  note: "Q8_1+dp4a (136B/256elem block)" }
+  - {i: 21, name: FP8_E4M3, gemv: null, batch: null, note: "" }
+  - {i: 22, name: IQ1_S, gemv: null, batch: null, note: "暂未实现 CUDA GEMV" }
+  - {i: 23, name: IQ3_XXS, gemv: launch_gemv_iq3_xxs_q8_1, batch: launch_gemv_iq3_xxs_q8_1_batch, note: "Q8_1+dp4a (98B/256elem block)" }
+  - {i: 24, name: IQ1_M, gemv: launch_gemv_iq1_m_q8_1, batch: launch_gemv_iq1_m_q8_1_batch, note: "Q8_1+dp4a (56B/256elem block)" }

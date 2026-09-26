@@ -59,7 +59,7 @@ INST_GEMV(DataType::Q6_K)
 // ============================================================================
 
 
-const GemvFn gemv_dispatch[21] = {
+const GemvFn gemv_dispatch[25] = {
     /* FP32=0 */ nullptr,
     /* FP16=1 */ nullptr,
     /* Q4_0=2 */ launch_gemv_q4_0_q8_1,         // Q8_1+dp4a
@@ -81,9 +81,13 @@ const GemvFn gemv_dispatch[21] = {
     /* IQ2_XS=18 */ launch_gemv_iq2_xs_q8_1,    // Q8_1+dp4a (M=1, direct quantized GEMV)
     /* IQ3_S=19 */ launch_gemv_iq3_s_q8_1,      // Q8_1+dp4a (M=1, direct quantized GEMV)
     /* IQ4_XS=20 */ launch_gemv_iq4_xs_q8_1,    // Q8_1+dp4a (136B/256elem block)
+    /* FP8_E4M3=21 */ nullptr,
+    /* IQ1_S=22 */ nullptr,                     // 暂未实现 CUDA GEMV
+    /* IQ3_XXS=23 */ launch_gemv_iq3_xxs_q8_1,  // Q8_1+dp4a (98B/256elem block)
+    /* IQ1_M=24 */ launch_gemv_iq1_m_q8_1,      // Q8_1+dp4a (56B/256elem block)
 };
 
-const GemvBatchFn gemv_batch_dispatch[21] = {
+const GemvBatchFn gemv_batch_dispatch[25] = {
     /* FP32=0 */ nullptr,
     /* FP16=1 */ nullptr,
     /* Q4_0=2 */ launch_gemv_q4_0_q8_1_batch,         // Q8_1+dp4a
@@ -105,6 +109,10 @@ const GemvBatchFn gemv_batch_dispatch[21] = {
     /* IQ2_XS=18 */ launch_gemv_iq2_xs_q8_1_batch,    // Q8_1+dp4a (M=1, direct quantized GEMV)
     /* IQ3_S=19 */ launch_gemv_iq3_s_q8_1_batch,      // Q8_1+dp4a (M=1, direct quantized GEMV)
     /* IQ4_XS=20 */ launch_gemv_iq4_xs_q8_1_batch,    // Q8_1+dp4a (136B/256elem block)
+    /* FP8_E4M3=21 */ nullptr,
+    /* IQ1_S=22 */ nullptr,                           // 暂未实现 CUDA GEMV
+    /* IQ3_XXS=23 */ launch_gemv_iq3_xxs_q8_1_batch,  // Q8_1+dp4a (98B/256elem block)
+    /* IQ1_M=24 */ launch_gemv_iq1_m_q8_1_batch,      // Q8_1+dp4a (56B/256elem block)
 };
 
 

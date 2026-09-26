@@ -27,6 +27,13 @@ TensorPtr flatten_rows(const TensorPtr& t);
 // Extract expert e (of n_expert) from a [n_expert, rows, cols] weight tensor.
 TensorPtr extract_expert(const TensorPtr& t, int e, int n_expert);
 
+// Borrowed view of expert e's packed rows as a [rows, cols] tensor sharing the
+// base storage — no dequant, no copy. Works for quantized dtypes (row stride =
+// ceil(cols/block_el) * block_sz) and FP32. The returned tensor must not
+// outlive `t`. Lets matmul_transB dispatch quantized experts straight to the
+// fused dot kernels (llama.cpp runs MoE mul_mat on packed weights directly).
+TensorPtr expert_quant_view(const TensorPtr& t, int e, int n_expert);
+
 // In-place interleaved RoPE on a single vector (dim must be even).
 void apply_rope_interleaved(float* vec, int dim, int64_t pos, float theta);
 
@@ -69,6 +76,30 @@ TensorPtr gdn_recurrence(const TensorPtr& q, const TensorPtr& k, const TensorPtr
 TensorPtr gdn_output_gate(const TensorPtr& core_out, const TensorPtr& out_gate_logits,
                           const TensorPtr& ssm_norm, int seq_len, int num_heads,
                           int head_dim, float eps);
+
+// Absorbed MLA attention (bailingmoe3). The caller precomputes the two history
+// quantities that are fixed once a position is stored, so this op does no RoPE
+// or value-contraction of its own (that work lives in the engine's incremental
+// MLA cache):
+//   q_abs[h]  = attn_k_b[h] @ q_nope[h]        (contracted, per head — query side)
+//   v_all[j][h*v_dim+d] = attn_v_b[h*v_dim+d] @ c_nope_norm[j]  (precomputed)
+//   k_pe_rot[j] = rope(c_rope[j], pos=j)                       (precomputed)
+// Per (query token, head): score(j) = ((q_abs·c_nope_norm[j]) + (rope(q_rope,
+// qi)·k_pe_rot[j])) * scale, causal over j<=qi, softmax, then
+//   out = Σ_j w_j * v_all[j] , finally multiplied by sigmoid(attn_gate) per head.
+// `q_flat`  is [seq, n_head*(qk_nope_dim + rope_dim)];
+// `c_nope_norm` [total, kv_lora]; `k_pe_rot` [total, rope_dim] (already rotated);
+// `kb` is the (dequantized) FP32 attn_k_b [n_head*kv_lora, qk_nope_dim];
+// `v_all` [total, n_head*v_dim] (precomputed); `gate` is [seq, n_head] with the
+// sigmoid already applied. Returns [seq, n_head*v_dim].
+TensorPtr bailingmoe3_mla_attention(const TensorPtr& q_flat,
+                                    const TensorPtr& c_nope_norm,
+                                    const TensorPtr& k_pe_rot,
+                                    const TensorPtr& kb, const TensorPtr& v_all,
+                                    const TensorPtr& gate, int start_pos,
+                                    int seq_len, int total, int n_head,
+                                    int kv_lora, int qk_nope_dim, int rope_dim,
+                                    int v_dim, float theta, float scale);
 
 }  // namespace ops
 }  // namespace forge

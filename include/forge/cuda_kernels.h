@@ -177,6 +177,17 @@ void launch_rope_gemma4_q_only(const float* q, float* q_out, int num_heads, int 
                                int seq_len, int64_t pos, float theta, const float* freq_factors,
                                cudaStream_t stream = 0);
 
+// Partial split-half RoPE (Spark-X2.5): rotate dims [0, n_rot) as pairs
+// (x[d], x[d + n_rot/2]), pass through dims [n_rot, head_dim).
+void launch_rope_partial_gqa(const float* q, const float* k, float* q_out, float* k_out,
+                             int num_q_heads, int num_kv_heads, int head_dim, int n_rot,
+                             int seq_len, int64_t pos, float theta, cudaStream_t stream = 0);
+
+// Per-head sigmoid gate multiply: x[s, h*head_dim+d] *= sigmoid(gate[s, h])
+// (Spark-X2.5 attn output gate).
+void launch_headwise_sigmoid_gate_mul(float* x, const float* gate, int seq_len, int num_heads,
+                                      int head_dim, cudaStream_t stream = 0);
+
 void launch_expand_kv(const float* kv, float* out, int seq_len, int num_heads, int num_kv_heads,
                       int head_dim, cudaStream_t stream = 0);
 
@@ -199,8 +210,8 @@ void launch_gemv(const float* x, const float* W, float* out, int K, int N, cudaS
 using GemvFn = void (*)(const float*, const void*, float*, int, int, cudaStream_t);
 using GemvBatchFn = void (*)(const float*, const void*, float*, int, int, int, cudaStream_t);
 
-extern const GemvFn gemv_dispatch[21];
-extern const GemvBatchFn gemv_batch_dispatch[21];
+extern const GemvFn gemv_dispatch[25];
+extern const GemvBatchFn gemv_batch_dispatch[25];
 
 // ---- Phase 6: MMQ (Matrix-Matrix Quantized) ----
 // For large M (>32), replaces dequantize-to-FP32 + cuBLAS with dp4a.
@@ -787,6 +798,14 @@ void launch_moe_router(const float* logits, int* expert_indices, float* expert_w
                        float* softmax_buf, int n_expert, int n_expert_used, int seq_len,
                        cudaStream_t stream = 0);
 
+// bailingmoe3 语义路由 (sigmoid + bias + 分组 top-k + renorm), 全程设备端。
+// bias 为 nullptr 时不加偏置; norm_w 非 0 时权重除以 max(topk_sum, 6.1e-5)。
+void launch_moe_router_sigmoid(const float* logits, const float* bias,
+                               int* expert_indices, float* expert_weights,
+                               int n_expert, int n_expert_used, int n_group,
+                               int n_group_used, int norm_w, float w_scale,
+                               int seq_len, cudaStream_t stream = 0);
+
 void launch_moe_router_scale(const float* x, const float* scale, float* out, int hidden_dim,
                              float inv_sqrt, float eps, int seq_len, cudaStream_t stream = 0);
 
@@ -826,6 +845,16 @@ void launch_dequant_iq2_xs_matrix(const void* q_data, float* out, int N, int K,
 
 void launch_dequant_iq3_s_matrix(const void* q_data, float* out, int N, int K,
                                  cudaStream_t stream = 0);
+
+// Device-side embedding row gather for IQ3_S tables: dequantizes only the
+// selected rows straight from the quantized device buffer. Eliminates the
+// blocking indices-D2H + host dequant + H2D round trip of the generic IQ
+// fallback (that D2H drains the whole default-stream pipeline every decode
+// step). Layout must match launch_dequant_iq3_s_matrix: [N rows, K cols],
+// quant row-major; transposed tables pass row=dim, col=vocab (K=vocab_size).
+void launch_embedding_iq3_s(const void* q_weight, const int32_t* indices, float* out,
+                            int num_indices, int embed_dim, int vocab_size,
+                            bool transposed, cudaStream_t stream = 0);
 
 void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
                                   cudaStream_t stream = 0);
