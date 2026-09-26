@@ -65,6 +65,10 @@ public:
     /// text encoding. Defaults to false.
     bool add_eos_token() const { return add_eos_token_; }
 
+    /// GGUF `tokenizer.ggml.pre` value (e.g. "spark2_5", "llama3", "qwen2", ...).
+    /// Empty when the field is absent. Drives pre-tokenization regex selection.
+    const std::string& pre_type() const { return pre_type_; }
+
     /// Look up token ID by string.
     int32_t token_to_id(const std::string& token) const;
 
@@ -90,6 +94,10 @@ private:
 
     // Byte-level BPE pre-tokenization (GPT-2 style)
     std::vector<std::string> bpe_pre_tokenize(const std::string& text) const;
+
+    // spark2_5 pre-tokenization (CJK grouping, 1-3 digit numbers, etc.)
+    // Used when tokenizer.ggml.pre == "spark2_5".
+    std::vector<std::string> bpe_pre_tokenize_spark25(const std::string& text) const;
 
     // Apply BPE merges to a word
     std::vector<std::string> bpe_apply(const std::vector<std::string>& word) const;
@@ -122,6 +130,7 @@ private:
     bool add_eos_token_ = false;
 
     std::string chat_template_;
+    std::string pre_type_;  // from tokenizer.ggml.pre (empty = unspecified)
     bool loaded_ = false;
 
     // Byte-level BPE lookup tables

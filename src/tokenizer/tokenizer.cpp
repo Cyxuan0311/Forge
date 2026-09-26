@@ -326,6 +326,8 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
             add_eos_token_ = (reader.read_u8() != 0);
         } else if (key == "tokenizer.chat_template") {
             chat_template_ = reader.read_str();
+        } else if (key == "tokenizer.ggml.pre") {
+            pre_type_ = reader.read_str();
         } else {
             reader.skip_value(vtype);
         }
@@ -383,8 +385,8 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
             unk_id_ = it->second;
     }
 
-    LOG_INFO("Tokenizer loaded: model=" + tok_model + " vocab_size=" +
-             std::to_string(vocab_.tokens.size()) + " bos=" + std::to_string(bos_id_) +
+    LOG_INFO("Tokenizer loaded: model=" + tok_model + " pre=" + (pre_type_.empty() ? "<unspecified>" : pre_type_) +
+             " vocab_size=" + std::to_string(vocab_.tokens.size()) + " bos=" + std::to_string(bos_id_) +
              " eos=" + std::to_string(eos_id_) + " merges=" + std::to_string(tok_merges.size()));
 
     loaded_ = true;
@@ -840,7 +842,125 @@ std::string Tokenizer::byte_level_to_text(const std::string& text) const {
     return result;
 }
 
+namespace {
+
+// ---- spark2_5 pre-tokenization support ----
+// Mirrors llama.cpp's LLAMA_VOCAB_PRE_TYPE_SPARK2_5 regex set:
+//   \p{N}{1,3} | [CJK]+ | (punct+letters | word | punct/sym | newline | ws) | \p{N}
+// Implemented by hand over Unicode codepoints because std::regex does not
+// support \p{} property classes.
+
+enum class UC : int { WS, DIGIT, LETTER, PUNCT, SYMBOL, ACCENT, CJK, OTHER };
+
+static bool u_is_han(uint32_t c) {
+    return (c>=0x4E00&&c<=0x9FFF) || (c>=0x3400&&c<=0x4DBF) ||
+           (c>=0x20000&&c<=0x2A6DF) || (c>=0x2A700&&c<=0x2B73F) ||
+           (c>=0x2B740&&c<=0x2B81F) || (c>=0x2B820&&c<=0x2CEAF) ||
+           (c>=0x2CEB0&&c<=0x2EBEF) || (c>=0xF900&&c<=0xFAFF) ||
+           (c>=0x2F800&&c<=0x2FA1F);
+}
+static bool u_is_hira(uint32_t c) { return c>=0x3040 && c<=0x309F; }
+static bool u_is_kana(uint32_t c) { return c>=0x30A0 && c<=0x30FF; }
+static bool u_is_hangul(uint32_t c) {
+    return (c>=0xAC00&&c<=0xD7A3) || (c>=0x1100&&c<=0x11FF) || (c>=0x3130&&c<=0x318F);
+}
+static bool u_is_accent(uint32_t c) {
+    if (c>=0x0300&&c<=0x036F) return true;
+    if (c>=0x0483&&c<=0x0489) return true;
+    if (c>=0x0591&&c<=0x05BD) return true;
+    if (c>=0x0610&&c<=0x061A) return true;
+    if (c>=0x064B&&c<=0x065F) return true;
+    if (c>=0x1AB0&&c<=0x1AFF) return true;
+    if (c>=0x1DC0&&c<=0x1DFF) return true;
+    if (c>=0x20D0&&c<=0x20FF) return true;
+    if (c>=0xFE20&&c<=0xFE2F) return true;
+    return false;
+}
+static bool u_is_digit(uint32_t c) {
+    if (c>='0' && c<='9') return true;
+    static const std::pair<uint32_t,uint32_t> nd[] = {
+        {0x0660,0x0669},{0x06F0,0x06F9},{0x07C0,0x07C9},{0x0966,0x096F},
+        {0x09E6,0x09EF},{0x0A66,0x0A6F},{0x0AE6,0x0AEF},{0x0B66,0x0B6F},
+        {0x0BE6,0x0BEF},{0x0C66,0x0C6F},{0x0CE6,0x0CEF},{0x0D66,0x0D6F},
+        {0x0E50,0x0E59},{0x0ED0,0x0ED9},{0x0F20,0x0F29},{0x1040,0x1049},
+        {0x17E0,0x17E9},{0x1810,0x1819},{0x1946,0x194F},{0x19D0,0x19D9},
+        {0x1A80,0x1A89},{0x1A90,0x1A99},{0x1B50,0x1B59},{0x1BB0,0x1BB9},
+        {0xA620,0xA629},{0xA8D0,0xA8D9},{0xA900,0xA909},{0xA9D0,0xA9D9},
+        {0xAA50,0xAA59},{0xABF0,0xABF9},{0xFF10,0xFF19},
+    };
+    for (const auto& r : nd) if (c>=r.first && c<=r.second) return true;
+    return false;
+}
+static bool u_is_punct(uint32_t c) {
+    if (c>=0x200B && c<=0x200F) return true;
+    if (c>=0x2010 && c<=0x2027) return true;
+    if (c>=0x202A && c<=0x202E) return true;
+    if (c>=0x2030 && c<=0x205E) return true;
+    if (c>=0x205F && c<=0x206F) return true;
+    if (c>=0x2E00 && c<=0x2E7F) return true;
+    if (c>=0x3001 && c<=0x303F) return true;
+    if (c>=0xFE30 && c<=0xFE4F) return true;
+    if (c>=0xFE50 && c<=0xFE6B) return true;
+    return false;
+}
+static bool u_is_symbol(uint32_t c) {
+    if (c>=0x20A0 && c<=0x20B8) return true;
+    if (c>=0x2100 && c<=0x214F) return true;
+    if (c>=0x2150 && c<=0x218F) return true;
+    if (c>=0x2190 && c<=0x21FF) return true;
+    if (c>=0x2200 && c<=0x22FF) return true;
+    if (c>=0x2300 && c<=0x23FF) return true;
+    if (c>=0x2400 && c<=0x243F) return true;
+    if (c>=0x2460 && c<=0x24FF) return true;
+    if (c>=0x2500 && c<=0x25FF) return true;
+    if (c>=0x2600 && c<=0x26FF) return true;
+    if (c>=0x2700 && c<=0x27BF) return true;
+    if (c>=0x27C0 && c<=0x27EF) return true;
+    if (c>=0x2B00 && c<=0x2BFF) return true;
+    if (c>=0x1F100 && c<=0x1F1FF) return true;
+    return false;
+}
+
+static UC u_class(uint32_t c) {
+    if (c < 0x80) {
+        if (c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\f'||c=='\v') return UC::WS;
+        if (c>='0'&&c<='9') return UC::DIGIT;
+        if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')) return UC::LETTER;
+        static const char* ps = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+        if (strchr(ps, (char)c)) return UC::PUNCT;
+        return UC::OTHER;
+    }
+    if (c>=0xFF00 && c<=0xFFEF) {  // fullwidth / halfwidth forms
+        if (c>=0xFF10 && c<=0xFF19) return UC::DIGIT;
+        if ((c>=0xFF21&&c<=0xFF3A)||(c>=0xFF41&&c<=0xFF5A)) return UC::LETTER;
+        if (c>=0xFF01 && c<=0xFF60) return UC::PUNCT;  // fullwidth ASCII punctuation
+        return UC::OTHER;
+    }
+    if (c==0x0085||c==0x00A0||c==0x1680||(c>=0x2000&&c<=0x200A)||c==0x2028||c==0x2029||c==0x202F||c==0x205F||c==0x3000)
+        return UC::WS;
+    if (u_is_han(c)||u_is_hira(c)||u_is_kana(c)) return UC::CJK;
+    if (u_is_hangul(c)) return UC::LETTER;
+    if (u_is_accent(c)) return UC::ACCENT;
+    if (u_is_punct(c)) return UC::PUNCT;
+    if (u_is_symbol(c)) return UC::SYMBOL;
+    return UC::LETTER;  // unknown non-ASCII scripts treated as letters
+}
+
+static bool u_is_ascii_letter(uint32_t c) {
+    return (c>='A'&&c<='Z')||(c>='a'&&c<='z');
+}
+static const char* k_ascii_punctsym = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+static bool u_is_ascii_punctsym(uint32_t c) {
+    return c < 0x80 && strchr(k_ascii_punctsym, (char)c) != nullptr;
+}
+
+}  // namespace
+
 std::vector<std::string> Tokenizer::bpe_pre_tokenize(const std::string& text) const {
+    if (pre_type_ == "spark2_5") {
+        return bpe_pre_tokenize_spark25(text);
+    }
+
     // GPT-2 pre-tokenization regex
     // Pattern: '(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
     std::vector<std::string> chunks;
@@ -859,6 +979,110 @@ std::vector<std::string> Tokenizer::bpe_pre_tokenize(const std::string& text) co
         chunks.push_back(it->str());
     }
 
+    return chunks;
+}
+
+std::vector<std::string> Tokenizer::bpe_pre_tokenize_spark25(const std::string& text) const {
+    std::vector<std::string> chunks;
+
+    // Decode to codepoints with their byte offsets.
+    std::vector<uint32_t> cpts;
+    std::vector<size_t> boff;
+    size_t off = 0;
+    while (off < text.size()) {
+        size_t s = off;
+        uint32_t cp = utf8_to_unicode(text, off);
+        cpts.push_back(cp);
+        boff.push_back(s);
+    }
+    boff.push_back(text.size());
+    const size_t n = cpts.size();
+
+    auto emit = [&](size_t i, size_t len) {
+        size_t a = boff[i], b = boff[i + len];
+        chunks.push_back(text.substr(a, b - a));
+    };
+
+    size_t i = 0;
+    while (i < n) {
+        uint32_t cp = cpts[i];
+        UC cl = u_class(cp);
+        size_t consume = 1;
+
+        if (cl == UC::DIGIT) {
+            // alt1: \p{N}{1,3}
+            size_t j = i;
+            while (j < n && u_class(cpts[j]) == UC::DIGIT && (j - i) < 3) ++j;
+            consume = j - i;
+        } else if (cl == UC::CJK) {
+            // alt2: [CJK]+
+            size_t j = i;
+            while (j < n && u_class(cpts[j]) == UC::CJK) ++j;
+            consume = j - i;
+        } else {
+            bool matched = false;
+            // alt3a: [punct/sym ASCII][A-Za-z]+
+            if (!matched && u_is_ascii_punctsym(cp) && i + 1 < n &&
+                u_is_ascii_letter(cpts[i + 1])) {
+                size_t j = i + 1;
+                while (j < n && u_is_ascii_letter(cpts[j])) ++j;
+                consume = j - i; matched = true;
+            }
+            // alt3b: [^\r\n\L\P\S]? [\L\M]+
+            // NOTE: in llama.cpp CJK (Han/Hira/Kata) are Unicode *letters* (\p{L}),
+            // so the word rule also covers them. We treat CJK as word-like here
+            // (alt2 already grabbed any standalone CJK run at this position).
+            if (!matched) {
+                auto wordish = [](UC c) { return c == UC::LETTER || c == UC::ACCENT || c == UC::CJK; };
+                bool is_letterish = wordish(cl);
+                bool prefix_ok = (cp != '\r' && cp != '\n' && !wordish(cl) &&
+                                  cl != UC::PUNCT && cl != UC::SYMBOL);
+                bool letter_after = (i + 1 < n) && wordish(u_class(cpts[i + 1]));
+                if (is_letterish) {
+                    size_t j = i;
+                    while (j < n && wordish(u_class(cpts[j]))) ++j;
+                    consume = j - i; matched = true;
+                } else if (prefix_ok && letter_after) {
+                    size_t j = i + 1;
+                    while (j < n && wordish(u_class(cpts[j]))) ++j;
+                    consume = j - i; matched = true;
+                }
+            }
+            // alt3c:  ? [\P\S]+
+            if (!matched) {
+                bool ps = (cl == UC::PUNCT || cl == UC::SYMBOL);
+                if (ps) {
+                    size_t j = i;
+                    while (j < n && (u_class(cpts[j]) == UC::PUNCT || u_class(cpts[j]) == UC::SYMBOL)) ++j;
+                    consume = j - i; matched = true;
+                } else if (cp == ' ' && i + 1 < n &&
+                           (u_class(cpts[i + 1]) == UC::PUNCT || u_class(cpts[i + 1]) == UC::SYMBOL)) {
+                    size_t j = i + 1;
+                    while (j < n && (u_class(cpts[j]) == UC::PUNCT || u_class(cpts[j]) == UC::SYMBOL)) ++j;
+                    consume = j - i; matched = true;
+                }
+            }
+            // alt3d: [\r\n]
+            if (!matched && (cp == '\r' || cp == '\n')) { consume = 1; matched = true; }
+            // alt3e: \s+(?!\S)
+            if (!matched && cl == UC::WS) {
+                size_t j = i;
+                while (j < n && u_class(cpts[j]) == UC::WS) ++j;
+                if (j == n) { consume = j - i; matched = true; }       // trailing whitespace
+                else if ((j - i) >= 2) { consume = (j - i) - 1; matched = true; } // keep 1 for next token
+            }
+            // alt3f: \s+
+            if (!matched && cl == UC::WS) {
+                size_t j = i;
+                while (j < n && u_class(cpts[j]) == UC::WS) ++j;
+                consume = j - i; matched = true;
+            }
+            // fallback: a single codepoint
+            if (!matched) consume = 1;
+        }
+        emit(i, consume);
+        i += consume;
+    }
     return chunks;
 }
 
@@ -977,12 +1201,14 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special
             // Skip BOS, EOS, PAD tokens
             if (id == bos_id_ || id == eos_id_ || id == pad_id_)
                 continue;
-            // Skip control tokens (token_type == 3 in GGUF: <s>, </s>, etc.)
-            // But NOT byte tokens (token_type == 6: <0xHH>) — they represent actual text content
+            // Skip special tokens (GGUF types 3/4/5: CONTROL like <s>, and
+            // USER_DEFINED like <|im_end|> / <|im_start|>). Must stay in sync
+            // with ensure_special_tokens_cached(). NOT byte tokens (type 6:
+            // <0xHH>) — they represent actual text content.
             if (id < static_cast<int32_t>(vocab_.token_types.size())) {
                 int tt = vocab_.token_types[id];
-                if (tt == 3)
-                    continue;  // CONTROL token type
+                if (tt == 3 || tt == 4 || tt == 5)
+                    continue;  // CONTROL / USER_DEFINED / UNUSED
             }
         }
 
