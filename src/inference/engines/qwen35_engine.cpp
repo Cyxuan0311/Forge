@@ -1,9 +1,13 @@
 #include "forge/engines/qwen35_engine.h"
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
 #include "forge/inference/layers/ffn_executor.h"
+#include "forge/inference/tensor_device_utils.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
@@ -67,7 +71,8 @@ TensorPtr Qwen35Engine::forward_layer(const TensorPtr& hidden,
     }
 
     auto hidden_after_attn = ops::add(hidden, attn_out);
-    return apply_ffn(hidden_after_attn, lctx);
+    auto out = apply_ffn(hidden_after_attn, lctx);
+    return out;
 }
 
 TensorPtr Qwen35Engine::apply_ffn(const TensorPtr& hidden_after_attn,
@@ -155,6 +160,13 @@ TensorPtr Qwen35Engine::mtp_step(int32_t token, const TensorPtr& h_prev, int64_t
                                         DeviceType::CPU);
     *static_cast<int32_t*>(ids->data()) = token;
     auto emb_w = model_.weights().get("token_embedding");
+    // ops::embedding 的 CPU/CUDA 分支都假定 weight 与 indices 同设备:
+    // token_embedding 被 offload 到 GPU 时, 若把 CPU 上的 ids 指针直接喂给
+    // CUDA kernel, 会在设备侧索引主机内存 -> cudaMalloc 报 sticky
+    // illegal memory access (见 dflash_engine::embed_via_target 同款注释)。
+    if (emb_w && ids->device() != emb_w->device()) {
+        ids->to_device(emb_w->device());
+    }
     auto h = ops::embedding(emb_w, ids);
     if (!h) return nullptr;
     if (h->device() != dev) {

@@ -101,7 +101,7 @@ struct ModelDraftProvider::Impl {
           p_min(spec.p_min) {
         register_runtime();
 
-        if (model_path.empty() || !model.load(model_path, target.device)) {
+        if (model_path.empty() || !model.load(model_path, gpu_layers)) {
             LOG_WARN("ModelDraftProvider: failed to load draft model");
             return;
         }

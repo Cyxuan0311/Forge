@@ -66,7 +66,7 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
         if (cfg_.draft_model_path.empty()) {
             LOG_WARN(
                 "SpeculativeExecutor: --spec-draft-arch set but no drafter GGUF "
-                "(--spec-draft-model); skipping DFlash");
+                "(--spec-model); skipping DFlash");
         } else {
             auto dflash = std::make_unique<DFlashDraftProvider>(cfg_, ctx_, *ctx_.engine(),
                                                                 ctx_.model().config().vocab_size);
@@ -77,7 +77,8 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
             }
         }
     }
-    if (!cfg_.draft_model_path.empty()) {
+    if (!cfg_.draft_model_path.empty() &&
+        cfg_.draft_arch != "dflash" && cfg_.draft_arch != "dspark") {
         auto draft = std::make_unique<ModelDraftProvider>(cfg_, ctx_.params(),
                                                           ctx_.model().config().vocab_size);
         if (draft->valid()) {
@@ -141,6 +142,14 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     bool has_chain = !providers_.empty();
     bool has_legacy = provider_ != nullptr;
     if ((!has_chain && !has_legacy) || !engine || in.max_tokens <= 1) {
+        static bool warned_top = false;
+        if (!warned_top) {
+            warned_top = true;
+            LOG_WARN("SpecExecutor: top-guard fallback (chain=" + std::to_string(has_chain) +
+                     " legacy=" + std::to_string(has_legacy) + " engine=" +
+                     std::to_string(engine != nullptr) + " max_tokens=" +
+                     std::to_string(in.max_tokens) + ")");
+        }
         ++stats_.n_fallback_steps;
         return out;
     }
@@ -160,6 +169,9 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     }
     const int n_draft = std::min({adaptive_draft_, cfg_.n_draft, in.max_tokens - 1});
     if (n_draft <= 0) {
+        LOG_WARN("SpecExecutor: fallback n_draft<=0 (adaptive=" +
+                 std::to_string(adaptive_draft_) + " cfg=" + std::to_string(cfg_.n_draft) +
+                 " max_tokens=" + std::to_string(in.max_tokens) + ")");
         ++stats_.n_fallback_steps;
         return out;
     }
@@ -176,6 +188,8 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
             }
         }
         if (drafts.empty()) {
+            LOG_WARN(std::string("SpecExecutor: fallback no-draft (provider0=") +
+                     providers_[0]->name() + ")");
             ++stats_.n_fallback_steps;
             return out;
         }
@@ -238,6 +252,13 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         out.tokens.push_back(vr.bonus);
     }
     if (out.tokens.empty()) {
+        static bool warned_empty = false;
+        if (!warned_empty) {
+            warned_empty = true;
+            LOG_WARN("SpecExecutor: fallback tokens-empty (accepted=" +
+                     std::to_string(vr.accepted_tokens.size()) + " resampled=" +
+                     std::to_string(vr.resampled) + " bonus=" + std::to_string(vr.bonus) + ")");
+        }
         ++stats_.n_fallback_steps;
         return out;
     }

@@ -198,7 +198,11 @@ RopeExecutor::Result RopeExecutor::apply(const TensorPtr& q, const TensorPtr& k,
     auto q_rope = std::make_shared<Tensor>(DataType::FP32, q->shape(), dev);
     auto k_rope = std::make_shared<Tensor>(DataType::FP32, k->shape(), dev);
 
-    int n_rot = cfg.use_mrope ? cfg.rope_dimension_count : head_dim;
+    // 显式 rope_dimension_count 优先 (partial rope / mrope): Qwen3 系 DFlash
+    // 转换器把旋转维度放在 rope.dimension_sections ([64,0,0,0] → 64), 不解析时
+    // 回退 head_dim 会让位置编码错用全头维。qwen3vl 解析器保证该字段非零,
+    // 其余架构为 0 时回退 head_dim, 行为不变。
+    int n_rot = cfg.rope_dimension_count > 0 ? cfg.rope_dimension_count : head_dim;
     if (n_rot <= 0) n_rot = head_dim;
 
     if (dev == DeviceType::CUDA) {

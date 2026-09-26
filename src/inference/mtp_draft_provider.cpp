@@ -85,11 +85,15 @@ std::vector<int32_t> MtpDraftProvider::draft(int32_t /*last_token*/, int n_draft
 
     TensorPtr h = pending_h_;
     int32_t tok_in = last_committed_tok_;
+    chain_h_.clear();
+    chain_h_.reserve(static_cast<size_t>(n_draft));
     for (int i = 0; i < n_draft; ++i) {
         TensorPtr logits;
         auto h_next = eng_->mtp_step(tok_in, h, committed_len_ + i, /*seq_id=*/0,
                                      &logits);
         if (!h_next || !logits) break;
+
+        chain_h_.push_back(h_next);
 
         // Keep logits on the device. Sampler::sample() performs a GPU argmax
         // and transfers only the resulting int32 token, avoiding a full
@@ -122,11 +126,35 @@ void MtpDraftProvider::accept(const std::vector<int32_t>& tokens) {
     // is a no-op; on full acceptance it drops the un-confirmed draft rows.
     if (auto* kv = ctx_.engine()->kv_cache()) kv->rollback(new_len);
 
-    // Replay the confirmed tokens through the MTP module to rebuild the
-    // hidden chain exactly (speculative drafting may have been cut short).
-    TensorPtr h = pending_h_;
-    int32_t tok_in = last_committed_tok_;
-    for (size_t i = 0; i < tokens.size(); ++i) {
+    // ---- 链复用 (替代整段重放) ----
+    // 重放步骤 i 的输入是 (tokens[i-1], h_{i-1}, pos=base+i)。对已接受的
+    // draft 前缀, tokens[i-1] == d_{i-1}, 即重放步骤 0..n_accepted 与本轮
+    // 草稿链步骤 0..n_accepted 同输入、确定性同输出 —— 直接复用 chain_h_,
+    // 最多补算 1 步 (全接受时的 bonus 末位)。部分接受时 0 步补算。
+    // (draft_active_ == false 时无本轮链, 回退为从 pending_h_ 逐步重放,
+    //  与旧行为一致; 该路径通常每轮只喂 1 个 token。)
+    TensorPtr h;
+    int32_t tok_in = -1;
+    size_t i_start = 0;
+    if (draft_active_ && !chain_h_.empty()) {
+        const size_t len = tokens.size();
+        // 可复用的链步骤数: min(len, chain_h_.size())
+        //   - 部分接受: len = n_accepted+1 <= chain 步数 -> 全部复用, 0 补算
+        //   - 全部接受: len = k+1, chain 有 k 步 -> 复用 k 步, 补 1 步 (bonus)
+        const size_t reuse = std::min(len, chain_h_.size());
+        if (reuse > 0) {
+            h = chain_h_[reuse - 1];
+            i_start = reuse;
+            if (reuse >= 1)
+                tok_in = tokens[reuse - 1];
+        }
+    }
+    if (i_start == 0) {
+        h = pending_h_;
+        tok_in = last_committed_tok_;
+    }
+
+    for (size_t i = i_start; i < tokens.size(); ++i) {
         auto h_next = eng_->mtp_step(tok_in, h, base + static_cast<int64_t>(i),
                                      /*seq_id=*/0, nullptr);
         if (!h_next) {
@@ -141,6 +169,7 @@ void MtpDraftProvider::accept(const std::vector<int32_t>& tokens) {
     committed_len_ = new_len;
     draft_active_ = false;
     drafted_tail_ = 0;
+    chain_h_.clear();
 }
 
 void MtpDraftProvider::reset() {
@@ -149,6 +178,7 @@ void MtpDraftProvider::reset() {
     drafted_tail_ = 0;
     pending_h_ = nullptr;
     last_committed_tok_ = -1;
+    chain_h_.clear();
 }
 
 }  // namespace forge

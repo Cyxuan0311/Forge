@@ -35,6 +35,10 @@ private:
     size_t drafted_tail_ = 0;
     bool draft_active_ = false;
     TensorPtr pending_h_;
+    // 本轮草稿链各步的输出隐藏态 h_0..h_{k-1} (h_i = 第 i 步 mtp_step 的输出)。
+    // 部分接受时, 已接受前缀对应的链步骤与重放逐位一致 (确定性同输入),
+    // accept() 直接复用, 最多补 1 步 —— 省掉整段 O(k) 重放。
+    std::vector<TensorPtr> chain_h_;
 };
 
 }  // namespace forge

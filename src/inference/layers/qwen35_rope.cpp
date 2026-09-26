@@ -6,9 +6,10 @@
 namespace forge {
 
 int Qwen35Rope::rot_dim(const ModelConfig& cfg) {
-    int n_rot = cfg.use_mrope ? cfg.rope_dimension_count : cfg.head_dim;
-    if (n_rot <= 0) n_rot = cfg.head_dim;
-    return n_rot;
+    // 显式 rope_dimension_count 优先 (partial rope / mrope); 0 时回退全头维。
+    if (cfg.rope_dimension_count > 0)
+        return cfg.rope_dimension_count;
+    return cfg.head_dim;
 }
 
 void Qwen35Rope::apply_cpu(const float* q_data, const float* k_data, float* q_out, float* k_out,

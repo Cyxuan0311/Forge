@@ -5,13 +5,13 @@
 // (standalone lightweight transformer sharing the target's token_embd/lm_head)
 // to propose `n_spec` candidate tokens in a single parallel forward.
 //
-// A draft round:
-//   1. take multi-layer target hiddens for the committed prefix (target must
-//      have captures_layer_hiddens() enabled),
-//   2. encode -> context feature (cached in the engine),
-//   3. precompute_context_kv: inject target prefix K/V into the draft KV cache,
-//   4. decode([anchor, MASK*n_spec]) non-causally -> [n_spec+1, vocab] logits,
-//   5. greedy-sample n_spec tokens (anchor row -> first draft, MASK rows -> rest).
+// A draft round (incremental context KV, vLLM dflash style):
+//   1. append the newly confirmed tokens' K/V into the persistent drafter KV
+//      cache (O(delta) per round; no full-prefix rebuild, no target re-forward),
+//   2. decode([anchor, MASK*n_spec]) non-causally at the anchor's real position
+//      -> [n_spec+1, vocab] logits,
+//   3. greedy-sample the MASK rows only (row 0 predicts the anchor itself and is
+//      never part of the draft; DFlash2 replaces this with a selector-lattice walk).
 //
 // Verification (greedy argmax + resample-consistency) is reused unchanged from
 // the SpeculativeExecutor; DFlash is lossless regardless of any offset.
@@ -44,6 +44,10 @@ public:
     void accept(const std::vector<int32_t>& tokens) override;
     void reset() override;
     const char* name() const override { return is_dspark_ ? "dspark" : "dflash"; }
+    // DFlash 维护与 target 确认边界严格一致的 committed 账本 (增量上下文 KV 的
+    // 记账依据), 即使某轮未中选也必须接收确认流, 否则账本出现缺口, 下次
+    // 中选时 delta 注入会错位。
+    bool is_global() const override { return true; }
 
 private:
     struct Impl;
