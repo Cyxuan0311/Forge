@@ -239,6 +239,17 @@ target_include_directories(forge_tokenizer
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(forge_tokenizer PUBLIC forge_core)
 
+# ---- Agent module (static) ----
+# Pluggable tool-call dialects + <think> reasoning separation for the server.
+# Pure host logic (nlohmann/json + std); no engine or tokenizer dependency.
+add_library(
+  forge_agent STATIC
+  src/agent/tool_dialect.cpp src/agent/reasoning_filter.cpp
+  src/agent/agent_pipeline.cpp)
+target_include_directories(
+  forge_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                     ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
 # ---- Vision library (static) ----
 add_library(
   forge_vision STATIC
@@ -379,6 +390,7 @@ target_link_libraries(
           forge_ops
           forge_core
           forge_tokenizer
+          forge_agent
           forge_vision
           forge_httplib
           $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
