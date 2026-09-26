@@ -62,9 +62,14 @@ json build_tool_calls_array(const std::vector<fsrv::ToolCall>& calls) {
 }
 
 // Build the assistant message: tool_calls when present, else plain content.
+// Separated <think> reasoning travels in the DeepSeek-style
+// `reasoning_content` field, which OpenAI-compatible clients that do not use
+// it simply ignore.
 json build_assistant_message(const fsrv::ChatCompletionResult& r) {
     json msg = json::object();
     msg["role"] = "assistant";
+    if (!r.reasoning.empty())
+        msg["reasoning_content"] = r.reasoning;
     if (!r.tool_calls.empty()) {
         msg["tool_calls"] = build_tool_calls_array(r.tool_calls);
         msg["content"] = r.text.empty() ? json(nullptr) : json(r.text);
@@ -89,13 +94,43 @@ bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRe
         return false;
     }
     for (const auto& m : body["messages"]) {
-        if (!m.is_object() || !m.contains("role") || !m.contains("content")) {
-            err = "Each message must be an object with 'role' and 'content'";
+        if (!m.is_object() || !m.contains("role")) {
+            err = "Each message must be an object with 'role'";
             return false;
         }
         fsrv::ChatTemplateMessage msg;
         msg.role = m["role"].get<std::string>();
-        if (m["content"].is_string()) {
+        // OpenAI spec: an assistant message that only calls tools has
+        // content=null; tool_calls must still reach the template replay.
+        if (m.contains("reasoning_content") && m["reasoning_content"].is_string())
+            msg.reasoning_content = m["reasoning_content"].get<std::string>();
+        if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+            for (const auto& tc : m["tool_calls"]) {
+                if (!tc.is_object())
+                    continue;
+                const json& fn = (tc.contains("function") && tc["function"].is_object())
+                                     ? tc["function"]
+                                     : tc;
+                fsrv::ChatTemplateToolCall call;
+                call.id = tc.value("id", "");
+                call.name = fn.value("name", "");
+                if (fn.contains("arguments")) {
+                    if (fn["arguments"].is_string())
+                        call.arguments_json = fn["arguments"].get<std::string>();
+                    else if (fn["arguments"].is_object())
+                        call.arguments_json = fn["arguments"].dump();
+                }
+                if (!call.name.empty())
+                    msg.tool_calls.push_back(std::move(call));
+            }
+        }
+        if (!m.contains("content") || m["content"].is_null()) {
+            if (msg.role != "assistant" || msg.tool_calls.empty()) {
+                err = "'content' must be a string, an array of parts, or null "
+                      "for an assistant tool_calls message";
+                return false;
+            }
+        } else if (m["content"].is_string()) {
             msg.content = m["content"].get<std::string>();
         } else if (m["content"].is_array()) {
             // Multimodal-style content parts: Phase 1 concatenates text parts only.
@@ -299,6 +334,15 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
             std::string error_text;
             std::string error_type;  // non-empty => client-fixable (mapped verbatim)
             const bool tools_stream = !creq.tools.empty() && creq.tool_choice != "none";
+            // Reasoning deltas (separated <think> content) stream in the
+            // DeepSeek-style reasoning_content field; clients that do not
+            // render reasoning ignore the extra delta key.
+            auto on_reasoning = [&](const std::string& delta) -> bool {
+                if (!sink.is_writable())
+                    return false;
+                std::string payload = make_chunk(json{{"reasoning_content", delta}}, nullptr);
+                return sink.write(payload.data(), payload.size());
+            };
             auto on_token = [&](const std::string& delta) -> bool {
                 if (!sink.is_writable())
                     return false;
@@ -312,7 +356,7 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
                 return sink.write(payload.data(), payload.size());
             };
             try {
-                r = state.chat_completion(creq, on_token);
+                r = state.chat_completion(creq, on_token, on_reasoning);
             } catch (const fsrv::ContextLengthExceededError& e) {
                 error_text = e.what();
                 error_type = "invalid_request_error";
@@ -344,6 +388,388 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
                 const char* done = "data: [DONE]\n\n";
                 sink.write(done, std::strlen(done));
             }
+            sink.done();
+            return true;
+        });
+}
+
+// ---- OpenAI Responses API (used by opencode's chat models) ----
+// opencode drives chat through the Responses API (/responses) rather than
+// /chat/completions. We translate the request into the existing
+// ChatCompletionRequest, reuse the same generation pipeline, and emit the
+// Responses wire format (SSE) so no client-side change is needed.
+
+// Convert a Responses request body into a ChatCompletionRequest.
+bool parse_responses_request(const httplib::Request& http_req,
+                             fsrv::ChatCompletionRequest& out, std::string& err) {
+    json body = json::parse(http_req.body, nullptr, false);
+    if (body.is_discarded()) {
+        err = "Invalid JSON in request body";
+        return false;
+    }
+
+    // instructions -> system prompt
+    if (body.contains("instructions") && body["instructions"].is_string() &&
+        !body["instructions"].get<std::string>().empty()) {
+        fsrv::ChatTemplateMessage sys;
+        sys.role = "system";
+        sys.content = body["instructions"].get<std::string>();
+        out.messages.push_back(std::move(sys));
+    }
+
+    auto extract_text = [](const json& content) -> std::string {
+        if (content.is_string())
+            return content.get<std::string>();
+        if (content.is_array()) {
+            std::string s;
+            for (const auto& part : content) {
+                if (!part.is_object())
+                    continue;
+                std::string t = part.value("type", "");
+                if (t == "input_text" || t == "output_text" || t == "text") {
+                    if (part.contains("text") && part["text"].is_string())
+                        s += part["text"].get<std::string>();
+                }
+            }
+            return s;
+        }
+        return "";
+    };
+
+    auto add_item = [&](const json& item) {
+        if (!item.is_object())
+            return;
+        const std::string type = item.value("type", "");
+        fsrv::ChatTemplateMessage msg;
+        if (type == "function_call") {
+            // Assistant turn replay: name + JSON-string arguments (+ call id).
+            msg.role = "assistant";
+            fsrv::ChatTemplateToolCall call;
+            call.name = item.value("name", "");
+            call.id = item.value("call_id", "");
+            if (item.contains("arguments") && item["arguments"].is_string())
+                call.arguments_json = item["arguments"].get<std::string>();
+            if (!call.name.empty())
+                msg.tool_calls.push_back(std::move(call));
+            out.messages.push_back(std::move(msg));
+            return;
+        }
+        if (type == "function_call_output" || item.value("role", "") == "tool") {
+            msg.role = "tool";
+            if (item.contains("output") && item["output"].is_string())
+                msg.content = item["output"].get<std::string>();
+            else
+                msg.content = extract_text(item.value("content", json("")));
+            out.messages.push_back(std::move(msg));
+            return;
+        }
+        msg.role = item.value("role", "user");
+        msg.content = extract_text(item.value("content", json("")));
+        if (item.contains("reasoning_content") && item["reasoning_content"].is_string())
+            msg.reasoning_content = item["reasoning_content"].get<std::string>();
+        out.messages.push_back(std::move(msg));
+    };
+
+    if (body.contains("input")) {
+        const json& input = body["input"];
+        if (input.is_string()) {
+            fsrv::ChatTemplateMessage msg;
+            msg.role = "user";
+            msg.content = input.get<std::string>();
+            out.messages.push_back(std::move(msg));
+        } else if (input.is_array()) {
+            for (const auto& item : input)
+                add_item(item);
+        } else {
+            err = "'input' must be a string or an array of items";
+            return false;
+        }
+    }
+
+    if (out.messages.empty()) {
+        err = "'input' must contain at least one message";
+        return false;
+    }
+
+    if (body.contains("temperature") && body["temperature"].is_number())
+        out.temperature = body["temperature"].get<float>();
+    if (body.contains("top_p") && body["top_p"].is_number())
+        out.top_p = body["top_p"].get<float>();
+    if (body.contains("top_k") && body["top_k"].is_number_integer())
+        out.top_k = body["top_k"].get<int>();
+    if (body.contains("repeat_penalty") && body["repeat_penalty"].is_number())
+        out.repeat_penalty = body["repeat_penalty"].get<float>();
+    if (body.contains("repeat_last_n") && body["repeat_last_n"].is_number_integer())
+        out.repeat_last_n = body["repeat_last_n"].get<int>();
+    if (body.contains("seed") && body["seed"].is_number_unsigned())
+        out.seed = body["seed"].get<uint64_t>();
+    // Responses API uses max_output_tokens; fall back to max_tokens.
+    if (body.contains("max_output_tokens") && body["max_output_tokens"].is_number_integer())
+        out.max_tokens = body["max_output_tokens"].get<int>();
+    else if (body.contains("max_tokens") && body["max_tokens"].is_number_integer())
+        out.max_tokens = body["max_tokens"].get<int>();
+    if (body.contains("stream") && body["stream"].is_boolean())
+        out.stream = body["stream"].get<bool>();
+
+    if (body.contains("tools") && body["tools"].is_array()) {
+        for (const auto& t : body["tools"]) {
+            if (!t.is_object())
+                continue;
+            const json& fn = (t.contains("function") && t["function"].is_object())
+                                 ? t["function"]
+                                 : t;
+            fsrv::ToolSpec spec;
+            spec.name = fn.value("name", "");
+            spec.description = fn.value("description", "");
+            if (fn.contains("parameters") && fn["parameters"].is_object())
+                spec.parameters_json = fn["parameters"].dump();
+            if (!spec.name.empty())
+                out.tools.push_back(std::move(spec));
+        }
+    }
+    if (body.contains("tool_choice")) {
+        if (body["tool_choice"].is_string())
+            out.tool_choice = body["tool_choice"].get<std::string>();
+        else if (body["tool_choice"].is_object())
+            out.tool_choice = body["tool_choice"].dump();
+    }
+    return true;
+}
+
+// Build the Responses "output" array from a chat result. The message item
+// reuses the id that was announced via response.output_item.added so streaming
+// clients can correlate the final item with the deltas they already received.
+json build_responses_output(const fsrv::ChatCompletionResult& r,
+                            const std::string& message_item_id) {
+    json items = json::array();
+    // A response may carry both a prose message and function-call items.
+    if (!r.text.empty()) {
+        items.push_back(json{{"id", message_item_id},
+                             {"type", "message"},
+                             {"status", "completed"},
+                             {"role", "assistant"},
+                             {"content", json::array({json{{"type", "output_text"},
+                                                           {"text", r.text}}})}});
+    }
+    for (const auto& tc : r.tool_calls) {
+        items.push_back(json{{"type", "function_call"},
+                             {"status", "completed"},
+                             {"name", tc.name},
+                             {"arguments", tc.arguments},
+                             {"call_id", tc.id}});
+    }
+    return items;
+}
+
+json responses_usage(const fsrv::ChatCompletionResult& r) {
+    return json{{"input_tokens", r.prompt_tokens},
+                {"output_tokens", r.completion_tokens},
+                {"total_tokens", r.prompt_tokens + r.completion_tokens}};
+}
+
+void handle_responses(const httplib::Request& http_req, httplib::Response& res,
+                      fsrv::ServerState& state) {
+    if (const char* dump_path = std::getenv("FORGE_DUMP_REQ")) {
+        if (FILE* fp = fopen(dump_path, "w")) {
+            fwrite(http_req.body.data(), 1, http_req.body.size(), fp);
+            fclose(fp);
+        }
+    }
+
+    fsrv::ChatCompletionRequest creq;
+    std::string err;
+    // Debug: FORGE_DUMP_REQ=/path.json dumps the raw /responses body (same
+    // hook as handle_chat_completions) for client-side diagnosis.
+    if (const char* dump_path = std::getenv("FORGE_DUMP_REQ")) {
+        if (FILE* fp = fopen(dump_path, "w")) {
+            fwrite(http_req.body.data(), 1, http_req.body.size(), fp);
+            fclose(fp);
+        }
+    }
+    if (!parse_responses_request(http_req, creq, err)) {
+        send_error(res, 400, err, "invalid_request_error", "400");
+        return;
+    }
+
+    if (!state.try_acquire_slot()) {
+        send_error(res, 429, "Server is busy: inference queue is full, retry later.",
+                   "server_error", "429");
+        return;
+    }
+
+    // ---- non-streaming ----
+    if (!creq.stream) {
+        SlotGuard guard{state};
+        fsrv::ChatCompletionResult r;
+        try {
+            r = state.chat_completion(creq, nullptr);
+        } catch (const fsrv::ContextLengthExceededError& e) {
+            send_error(res, 400, e.what(), "invalid_request_error", "400");
+            return;
+        } catch (const std::exception& e) {
+            send_error(res, 500, std::string("Inference failed: ") + e.what(),
+                       "server_error", "500");
+            return;
+        }
+        json out;
+        out["id"] = gen_id("resp");
+        out["object"] = "response";
+        out["created_at"] = unix_now();
+        out["model"] = state.model_id();
+        out["status"] = "completed";
+        out["output"] = build_responses_output(r, "");
+        out["usage"] = responses_usage(r);
+        res.set_content(out.dump(), "application/json");
+        return;
+    }
+
+    // ---- streaming (Responses SSE) ----
+    const std::string id = gen_id("resp");
+    const std::string item_id = gen_id("msg");
+    auto slot = std::shared_ptr<SlotGuard>(new SlotGuard{state});
+
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [&state, creq, id, item_id, slot](size_t, httplib::DataSink& sink) -> bool {
+            auto sse = [&](const std::string& type, json data) -> bool {
+                if (!sink.is_writable())
+                    return false;
+                data["type"] = type;
+                std::string s = "event: " + type + "\ndata: " + data.dump() + "\n\n";
+                return sink.write(s.data(), s.size());
+            };
+
+            json base = json{{"id", id},
+                             {"object", "response"},
+                             {"status", "in_progress"},
+                             {"model", state.model_id()},
+                             {"output", json::array()}};
+            // Responses-API SSE wraps the response object under a "response"
+            // field for lifecycle events (created/in_progress/completed/failed);
+            // the item/delta events below are flat.
+            sse("response.created", json{{"response", base}});
+            sse("response.in_progress", json{{"response", base}});
+
+            // When tools are offered, visible deltas are held back until the
+            // full text has been parsed for tool calls: a tool call is only
+            // recognizable at finalize, so streaming it live would leak the
+            // raw call syntax (###TOOL###/<function>/<tool_call>) into the
+            // client as message text. Same policy as /chat/completions.
+            const bool tools_stream = !creq.tools.empty() && creq.tool_choice != "none";
+            std::string held;
+            fsrv::ChatCompletionResult r;
+            std::string error_text, error_type;
+
+            // The assistant message item must exist before any text deltas so
+            // streaming clients can attach deltas to it as they arrive. This
+            // holds even when tools are offered (opencode streams prose and
+            // only emits a function_call output item if the model actually
+            // calls a tool).
+            sse("response.output_item.added",
+                json{{"output_index", 0},
+                     {"item", json{{"id", item_id},
+                                   {"type", "message"},
+                                   {"status", "in_progress"},
+                                   {"role", "assistant"},
+                                   {"content", json::array()}}}});
+            sse("response.content_part.added",
+                json{{"output_index", 0},
+                     {"content_index", 0},
+                     {"part", json{{"type", "text"}, {"text", ""}}}});
+
+            auto on_token = [&](const std::string& delta) -> bool {
+                if (!sink.is_writable())
+                    return false;
+                if (tools_stream) {
+                    held += delta;  // replayed after finalize when it is prose
+                    return true;
+                }
+                // item_id is required by the OpenAI Responses SSE schema; the
+                // @ai-sdk/openai parser uses it to attach the delta to the
+                // message item (it ignores output_index for text deltas).
+                return sse("response.output_text.delta",
+                           json{{"item_id", item_id},
+                                {"output_index", 0},
+                                {"content_index", 0},
+                                {"delta", delta}});
+            };
+
+            try {
+                r = state.chat_completion(creq, on_token);
+            } catch (const fsrv::ContextLengthExceededError& e) {
+                error_text = e.what();
+                error_type = "invalid_request_error";
+            } catch (const std::exception& e) {
+                error_text = e.what();
+            }
+
+            if (!sink.is_writable())
+                return true;
+
+            if (!error_text.empty()) {
+                json f = base;
+                f["status"] = "failed";
+                json err = json{{"message", error_type.empty()
+                                                  ? ("Inference failed: " + error_text)
+                                                  : error_text},
+                                 {"type", error_type.empty() ? "server_error" : error_type}};
+                sse("response.failed", json{{"response", f}, {"error", err}});
+                sink.done();
+                return true;
+            }
+
+            // Text content: streamed above (or replayed here after the tool
+            // parse proved it is prose). Replay the FINALIZED text (r.text), not
+            // the raw `held` buffer: r.text has had its tool-call syntax stripped
+            // and <think> reasoning separated, so the delta a streaming client
+            // (opencode/@ai-sdk) renders can never contain raw <function>/###TOOL###
+            // markers. The /chat/completions path already uses r.text for the
+            // equivalent final chunk; this keeps both endpoints consistent.
+            if (tools_stream && r.tool_calls.empty() && !r.text.empty()) {
+                (void)sse("response.output_text.delta",
+                          json{{"item_id", item_id},
+                               {"output_index", 0},
+                               {"content_index", 0},
+                               {"delta", r.text}});
+            }
+            sse("response.output_text.done",
+                json{{"item_id", item_id},
+                     {"output_index", 0},
+                     {"content_index", 0},
+                     {"text", r.text}});
+            sse("response.output_item.done",
+                json{{"output_index", 0},
+                     {"item", json{{"id", item_id},
+                                   {"type", "message"},
+                                   {"status", "completed"},
+                                   {"role", "assistant"},
+                                   {"content", json::array({json{{"type", "output_text"},
+                                                                 {"text", r.text}}})}}}});
+
+            // Function-call output items (indexed after the message item).
+            int fidx = 1;
+            for (const auto& tc : r.tool_calls) {
+                json item = json{{"type", "function_call"},
+                                 {"name", tc.name},
+                                 {"arguments", tc.arguments},
+                                 {"call_id", tc.id},
+                                 {"status", "completed"}};
+                sse("response.output_item.added",
+                    json{{"output_index", fidx}, {"item", item}});
+                sse("response.output_item.done",
+                    json{{"output_index", fidx}, {"item", item}});
+                ++fidx;
+            }
+
+            json done_obj = json{{"id", id},
+                                 {"object", "response"},
+                                 {"status", "completed"},
+                                 {"model", state.model_id()},
+                                 {"output", build_responses_output(r, item_id)},
+                                 {"usage", responses_usage(r)}};
+            sse("response.completed", json{{"response", done_obj}});
             sink.done();
             return true;
         });
@@ -392,6 +818,16 @@ void register_routes(httplib::Server& svr, ServerState& state) {
     svr.Post("/v1/chat/completions", [&state](const httplib::Request& req,
                                               httplib::Response& res) {
         handle_chat_completions(req, res, state);
+    });
+
+    // OpenAI Responses API (opencode drives chat through this endpoint).
+    svr.Post("/responses", [&state](const httplib::Request& req,
+                                    httplib::Response& res) {
+        handle_responses(req, res, state);
+    });
+    svr.Post("/v1/responses", [&state](const httplib::Request& req,
+                                       httplib::Response& res) {
+        handle_responses(req, res, state);
     });
 }
 

@@ -64,6 +64,22 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             opt.cuda_graph = true;
         } else if (arg == "--paged-kv") {
             opt.paged_kv = true;
+        } else if (arg == "--kvmem") {
+            opt.kvmem = true;
+            opt.paged_kv = true;  // the tier needs the page pool it caps
+        } else if (arg == "--kvmem-budget") {
+            opt.kvmem_budget = std::stoi(value_of(i, "--kvmem-budget"));
+        } else if (arg == "--kvmem-sink") {
+            opt.kvmem_sink = std::stoi(value_of(i, "--kvmem-sink"));
+        } else if (arg == "--kvmem-gen-reserve") {
+            opt.kvmem_gen_reserve = std::stoi(value_of(i, "--kvmem-gen-reserve"));
+        } else if (arg == "--kvmem-retrieval") {
+            opt.kvmem_retrieval = value_of(i, "--kvmem-retrieval");
+            if (opt.kvmem_retrieval != "recent" && opt.kvmem_retrieval != "embed") {
+                std::cerr << "Error: Invalid --kvmem-retrieval: " << opt.kvmem_retrieval
+                          << ". Valid: recent, embed\n";
+                std::exit(1);
+            }
         } else if (arg == "--log-prefix") {
             opt.log_prompt_prefix = true;
         } else if (arg == "--dequant-cache-mb") {
@@ -97,6 +113,17 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "                          more context for the same VRAM)\n"
                 << "      --cuda-graph        Enable CUDA Graph for decode\n"
                 << "      --paged-kv          Use paged KV cache storage (default: off)\n"
+                << "      --kvmem             Enable the tiered KV working set (implies\n"
+                << "                          --paged-kv): a bounded GPU resident window over\n"
+                << "                          host-archived history, so the logical context\n"
+                << "                          (-c) can exceed the GPU pool\n"
+                << "      --kvmem-budget N    GPU resident budget in tokens (default: 0 = the\n"
+                << "                          paged pool size; the pool is capped to it)\n"
+                << "      --kvmem-sink N      Prefix tokens pinned resident forever (default 256)\n"
+                << "      --kvmem-gen-reserve N  Window slots held back for this turn's output\n"
+                << "                          (default: 0)\n"
+                << "      --kvmem-retrieval M Recall policy for archived history: recent\n"
+                << "                          (default) | embed (reserved)\n"
                 << "      --dequant-cache-mb MB  Per-weight FP16 dequant cache budget in MB\n"
                 << "                          (default 1024; 0 disables the cache; env\n"
                 << "                          FORGE_DEQUANT_CACHE_MB also honored)\n"
@@ -119,6 +146,19 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
     if (opt.model_path.empty()) {
         std::cerr << "Error: -m/--model is required\n";
         std::exit(1);
+    }
+    // KVMem tier validation: a sink larger than the budget would overflow the
+    // window before a single token is written.
+    if (opt.kvmem) {
+        if (opt.kvmem_sink < 0 || opt.kvmem_budget < 0 || opt.kvmem_gen_reserve < 0) {
+            std::cerr << "Error: --kvmem-sink / --kvmem-budget / --kvmem-gen-reserve must be >= 0\n";
+            std::exit(1);
+        }
+        if (opt.kvmem_budget > 0 && opt.kvmem_sink > opt.kvmem_budget) {
+            std::cerr << "Error: --kvmem-sink (" << opt.kvmem_sink
+                      << ") cannot exceed --kvmem-budget (" << opt.kvmem_budget << ")\n";
+            std::exit(1);
+        }
     }
     return opt;
 }

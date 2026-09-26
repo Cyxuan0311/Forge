@@ -21,8 +21,10 @@
 #include <string>
 #include <vector>
 
+#include "forge/agent/agent_pipeline.h"
 #include "forge/chat_template.h"
 #include "forge/generator.h"
+#include "forge/kv_working_set.h"
 #include "forge/model.h"
 #include "forge/prefix_cache.h"
 #include "forge/tokenizer.h"
@@ -66,23 +68,34 @@ struct ServerOptions {
     //                 summary line works in any build)
     bool perf = false;
     bool perf_detail = false;
+    // KVMem tiered KV working set (arXiv:2609.04852). --kvmem implies
+    // --paged-kv: the paged pool is capped to the working set and the logical
+    // context (-c) may exceed it, with cold history archived off-device and
+    // recalled per turn by KVWorkingSetManager.
+    bool kvmem = false;
+    int kvmem_budget = 0;       // GPU resident budget (tokens); 0 = the paged pool cap
+    int kvmem_sink = 256;       // prefix tokens pinned resident forever
+    int kvmem_gen_reserve = 0;  // window slots held back for this turn's output
+    std::string kvmem_retrieval = "recent";  // recent | embed (reserved)
+
+    KVemConfig kvem_config() const {
+        KVemConfig c;
+        c.enabled = kvmem;
+        c.budget_tokens = kvmem_budget;
+        c.sink_tokens = kvmem_sink;
+        // Same reasoning as the CLI: a window that fills before the reply is
+        // done makes the first decode step write past the pool. With no
+        // explicit --kvmem-gen-reserve, reserve the default generation budget
+        // (a request's max_tokens defaults to 512).
+        c.gen_reserve = kvmem_gen_reserve > 0 ? kvmem_gen_reserve : 512;
+        c.retrieval = kvmem_retrieval;
+        return c;
+    }
 };
 
 // ---- Tool calling (OpenAI function-calling contract) ----
-
-struct ToolCall {
-    std::string id;          // e.g. "call-<hex>-<n>"
-    std::string type = "function";
-    std::string name;        // function name
-    std::string arguments;   // JSON string (arguments object serialized)
-};
-
-// A tool the client exposes; parsed from the OpenAI `tools` array.
-struct ToolSpec {
-    std::string name;
-    std::string description;
-    std::string parameters_json;  // JSON schema, serialized
-};
+// ToolCall / ToolSpec now live in forge/agent/tool_call.h (included above);
+// dialect parsing and reasoning separation live in the forge_agent module.
 
 // ---- Parsed OpenAI chat-completion request ----
 
@@ -109,6 +122,7 @@ struct ChatCompletionRequest {
 
 struct ChatCompletionResult {
     std::string text;
+    std::string reasoning;      // <think> content separated from text (may be empty)
     int prompt_tokens = 0;
     int completion_tokens = 0;
     std::string finish_reason;  // normalized to "stop" | "length" | "tool_calls"
@@ -133,10 +147,12 @@ public:
     /// Run one chat completion. When `on_token` is provided it receives
     /// UTF-8-safe decoded deltas (streaming); returning false from the
     /// callback signals client disconnect (generation still completes in
-    /// Phase 1 - abort propagation is deferred).
+    /// Phase 1 - abort propagation is deferred). `on_reasoning`, when
+    /// provided, receives the <think> deltas separated from the content.
     ChatCompletionResult chat_completion(
         const ChatCompletionRequest& req,
-        const std::function<bool(const std::string& delta)>& on_token);
+        const std::function<bool(const std::string& delta)>& on_token,
+        const std::function<bool(const std::string& reasoning_delta)>& on_reasoning = {});
 
     const std::string& model_id() const { return model_id_; }
 
@@ -151,6 +167,7 @@ private:
     std::unique_ptr<Tokenizer> tokenizer_;
     std::unique_ptr<InferenceContext> ctx_;
     std::unique_ptr<ChatTemplateEngine> chat_template_;
+    AgentPipelineConfig agent_cfg_;  // resolved once in load() (FORGE_TOOL_DIALECT)
     std::mutex inference_mutex_;  // serializes all inference (single KV cache)
     std::string model_id_;
     std::atomic<int> active_requests_{0};

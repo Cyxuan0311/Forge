@@ -33,302 +33,9 @@
 
 namespace forge {
 
-namespace {
-
-// Unique id for a parsed tool call (call-<hex-time>-<counter>).
-std::string make_tool_call_id() {
-    static std::atomic<uint64_t> counter{0};
-    auto now = std::chrono::system_clock::now().time_since_epoch().count();
-    std::ostringstream oss;
-    oss << "call-" << std::hex << now << std::dec << "-" << ++counter;
-    return oss.str();
-}
-
-// Find a tool-call open marker. The catalogue instructs the model to emit
-// "###TOOL###", but quantized models routinely drop a '#' and emit
-// "###TOOL##" (or add extras). We therefore match "###TOOL" followed by one
-// or more '#'. Returns the position of the "###TOOL" prefix, or npos;
-// `inner_start` is set just past the trailing '#'s (where the JSON begins).
-size_t find_tool_open(const std::string& t, size_t from, size_t& inner_start) {
-    static const std::string prefix = "###TOOL";
-    size_t p = t.find(prefix, from);
-    if (p == std::string::npos)
-        return std::string::npos;
-    size_t i = p + prefix.size();
-    while (i < t.size() && t[i] == '#')
-        ++i;
-    inner_start = i;
-    return p;
-}
-
-// Normalize a tool name for fuzzy matching against the registered catalogue:
-// lowercase and strip everything but alphanumerics, so "get_weather",
-// "getWeather" and "getweather" all collapse to "getweather" and match.
-std::string normalize_tool_name(const std::string& s) {
-    std::string o;
-    o.reserve(s.size());
-    for (char c : s) {
-        if (std::isalnum(static_cast<unsigned char>(c)))
-            o += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return o;
-}
-
-// Render the tool catalogue into a system-prompt block the model can follow.
-std::string build_tools_prompt(const std::vector<forge::ToolSpec>& tools,
-                               const std::string& tool_choice) {
-    std::string p = "You have access to tools. To call one, respond with exactly one block of the form:\n"
-                    "###TOOL###{name: <tool_name>, arguments: <json_object>}###END###\n"
-                    "Only call a tool when it is genuinely needed to answer the user.";
-    if (!tool_choice.empty() && tool_choice != "auto")
-        p += " You MUST call the requested tool.";
-    p += "\n\n# Tools\n";
-    for (const auto& t : tools) {
-        p += "- name: " + t.name + "\n";
-        if (!t.description.empty())
-            p += "  description: " + t.description + "\n";
-        p += "  parameters: " + (t.parameters_json.empty() ? "{}" : t.parameters_json) + "\n";
-    }
-    return p;
-}
-
-// Prepend/append the tool catalogue to the system message.
-std::vector<forge::ChatTemplateMessage> inject_tools_into_messages(
-    const std::vector<forge::ChatTemplateMessage>& msgs,
-    const std::vector<forge::ToolSpec>& tools, const std::string& tool_choice) {
-    if (tools.empty())
-        return msgs;
-    std::vector<forge::ChatTemplateMessage> out = msgs;
-    std::string block = build_tools_prompt(tools, tool_choice);
-    if (!out.empty() && out[0].role == "system") {
-        out[0].content += "\n\n" + block;
-    } else {
-        forge::ChatTemplateMessage sys;
-        sys.role = "system";
-        sys.content = block;
-        out.insert(out.begin(), std::move(sys));
-    }
-    return out;
-}
-
-// Read a scalar field from a possibly-unquoted-key object body, so that a
-// model emitting {name: fn, arguments: {...}} still yields a usable call.
-std::string extract_tool_field(const std::string& body, const std::string& key) {
-    size_t k = body.find(key);
-    if (k == std::string::npos)
-        return "";
-    size_t c = body.find(':', k + key.size());
-    if (c == std::string::npos)
-        return "";
-    size_t s = c + 1;
-    while (s < body.size() && (body[s] == ' ' || body[s] == '\t'))
-        ++s;
-    if (s < body.size() && body[s] == '"') {
-        size_t end = body.find('"', s + 1);
-        if (end == std::string::npos)
-            return "";
-        return body.substr(s + 1, end - s - 1);
-    }
-    size_t end = body.find_first_of(",}", s);
-    if (end == std::string::npos)
-        end = body.size();
-    std::string v = body.substr(s, end - s);
-    size_t a = v.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos)
-        return "";
-    size_t b = v.find_last_not_of(" \t\r\n");
-    return v.substr(a, b - a + 1);
-}
-
-// Read a balanced JSON object field from a possibly-unquoted-key object body.
-std::string extract_tool_object(const std::string& body, const std::string& key) {
-    size_t k = body.find(key);
-    if (k == std::string::npos)
-        return "";
-    size_t s = body.find('{', k + key.size());
-    if (s == std::string::npos)
-        return "";
-    int depth = 0;
-    for (size_t i = s; i < body.size(); ++i) {
-        if (body[i] == '{')
-            ++depth;
-        else if (body[i] == '}') {
-            --depth;
-            if (depth == 0)
-                return body.substr(s, i - s + 1);
-        }
-    }
-    return "";
-}
-
-// Lenient JSON repair: some quantized models emit invalid string escapes
-// (e.g. \' or \. inside a JSON string) that strict parsers reject with
-// "Invalid escape character". We cannot re-train the model, so repair the
-// text: any backslash that does NOT begin a valid JSON escape is turned into
-// a literal backslash (\\), which is valid JSON and preserves the character
-// content. Only string literals are touched; structure outside quotes is left
-// untouched so balanced-brace recovery still works.
-std::string repair_json_invalid_escapes(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    bool in_str = false;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (in_str) {
-            if (c == '\\') {
-                bool valid = false;
-                if (i + 1 < s.size()) {
-                    char n = s[i + 1];
-                    valid = (n == '"' || n == '\\' || n == '/' || n == 'b' ||
-                             n == 'f' || n == 'n' || n == 'r' || n == 't');
-                    if (n == 'u' && i + 5 < s.size() &&
-                        std::isxdigit(static_cast<unsigned char>(s[i + 2])) &&
-                        std::isxdigit(static_cast<unsigned char>(s[i + 3])) &&
-                        std::isxdigit(static_cast<unsigned char>(s[i + 4])) &&
-                        std::isxdigit(static_cast<unsigned char>(s[i + 5]))) {
-                        valid = true;
-                    }
-                }
-                if (!valid) {
-                    // Escape the offending backslash so the following character
-                    // stays literal; the result is valid JSON and survives parse.
-                    out += '\\';
-                    out += '\\';
-                    if (i + 1 < s.size()) {
-                        out += s[i + 1];
-                        ++i;  // consume the escaped character
-                    }
-                    continue;
-                }
-            } else if (c == '"') {
-                in_str = false;
-            }
-            out += c;
-        } else {
-            if (c == '"')
-                in_str = true;
-            out += c;
-        }
-    }
-    return out;
-}
-
-// Extract tool calls (###TOOL[#]...###END### wrapper) from generated text.
-// `allowed`, when non-null and non-empty, is the set of tool names registered
-// by the client; a name the model emitted (often mangled, e.g. "getweather"
-// for "get_weather") is normalized and fuzzy-matched back to a registered
-// name so the upstream caller receives a valid tool id. Calls that cannot be
-// resolved to any registered tool are dropped.
-std::vector<forge::ToolCall> parse_tool_calls(
-    const std::string& text, const std::vector<std::string>* allowed = nullptr) {
-    std::vector<forge::ToolCall> calls;
-    static const std::string close = "###END###";
-    size_t pos = 0;
-    while (true) {
-        size_t s = 0, inner_start = 0;
-        s = find_tool_open(text, pos, inner_start);
-        if (s == std::string::npos)
-            break;
-        size_t e = text.find(close, inner_start);
-        if (e == std::string::npos)
-            break;
-        std::string inner = text.substr(inner_start, e - inner_start);
-        // Repair invalid escapes (e.g. \') that strict parsers reject, so a
-        // model-emitted tool call is not silently dropped (and so the client
-        // does not choke re-parsing the arguments JSON).
-        inner = repair_json_invalid_escapes(inner);
-        nlohmann::json j;
-        bool parsed = false;
-        try {
-            j = nlohmann::json::parse(inner);
-            parsed = true;
-        } catch (...) {
-            size_t b = inner.find('{');
-            size_t en = inner.rfind('}');
-            if (b != std::string::npos && en != std::string::npos && en > b) {
-                try {
-                    j = nlohmann::json::parse(inner.substr(b, en - b + 1));
-                    parsed = true;
-                } catch (...) {
-                }
-            }
-        }
-        forge::ToolCall tc;
-        tc.type = "function";
-        if (parsed && j.is_object()) {
-            if (j.contains("name") && j["name"].is_string())
-                tc.name = j["name"].get<std::string>();
-            if (j.contains("arguments")) {
-                const auto& a = j["arguments"];
-                tc.arguments = a.is_string() ? a.get<std::string>() : a.dump();
-            }
-        } else {
-            // Tolerant path: models often emit unquoted keys, e.g.
-            // {name: fn, arguments: {...}}. Recover name/arguments manually.
-            tc.name = extract_tool_field(inner, "name");
-            std::string args = extract_tool_object(inner, "arguments");
-            tc.arguments = args.empty() ? "{}" : args;
-        }
-        if (tc.name.empty())
-            break;
-        // Resolve the (possibly mangled) name against the registered catalogue.
-        if (allowed && !allowed->empty()) {
-            bool resolved = false;
-            const std::string norm = normalize_tool_name(tc.name);
-            if (!norm.empty()) {
-                for (const auto& a : *allowed) {
-                    if (a == tc.name) {
-                        tc.name = a;
-                        resolved = true;
-                        break;
-                    }
-                }
-                if (!resolved) {
-                    for (const auto& a : *allowed) {
-                        if (normalize_tool_name(a) == norm) {
-                            tc.name = a;
-                            resolved = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!resolved)
-                break;  // not a known tool: drop this block
-        }
-        tc.id = make_tool_call_id();
-        calls.push_back(std::move(tc));
-        pos = e + close.size();
-    }
-    return calls;
-}
-
-// Remove tool-call wrapper blocks from the assistant text.
-std::string strip_tool_call_blocks(const std::string& text) {
-    std::string out = text;
-    static const std::string close = "###END###";
-    size_t pos = 0;
-    while (true) {
-        size_t s = 0, inner_start = 0;
-        s = find_tool_open(out, pos, inner_start);
-        if (s == std::string::npos)
-            break;
-        size_t e = out.find(close, inner_start);
-        if (e == std::string::npos) {
-            out.erase(s);
-            break;
-        }
-        out.erase(s, e + close.size() - s);
-        pos = s;
-    }
-    size_t a = out.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos)
-        return "";
-    size_t b = out.find_last_not_of(" \t\r\n");
-    return out.substr(a, b - a + 1);
-}
-
-}  // namespace
+// Tool-call catalogue injection, dialect parsing and wrapper stripping moved
+// to the forge_agent module (src/agent/, include/forge/agent/); the request
+// pipeline is built per chat_completion() call from agent_cfg_.
 
 // ============================================================================
 // Engine & loader registration (same as forge-cli)
@@ -387,6 +94,9 @@ static size_t utf8_complete_len(const std::string& s) {
 
 bool ServerState::load(const ServerOptions& opt, std::string& error) {
     opt_ = opt;
+    // Tool-call dialect selection is a process-wide setting: resolve the env
+    // override once (FORGE_TOOL_DIALECT, default "auto").
+    agent_cfg_ = agent_pipeline_config_from_env();
     ensure_engines_registered();
     ensure_loaders_registered();
 
@@ -483,6 +193,33 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
             tfm_eng->set_cuda_graph_enabled(true);
         }
     }
+
+    // ---- KVMem tiered KV: cap the GPU page pool BEFORE init_kv_cache ----
+    // Same ordering constraint as forge-cli: the manager is pure policy, but
+    // the pool cap is read by PagedKVStorage::init() while sizing the page
+    // pools, so it must be set before ctx_->init_kv_cache(). The manager is
+    // attached right after, once the pool geometry is known.
+    bool kvmem_active = false;
+    if (opt.kvmem) {
+        auto* kv_mem = tfm_eng ? tfm_eng->kv_memory() : nullptr;
+        if (!tfm_eng || !kv_mem) {
+            std::cerr << "Warning: --kvmem needs a transformer engine with KV memory; "
+                         "tiered KV disabled\n";
+        } else if (!kv_mem->is_paged()) {
+            std::cerr << "Warning: --kvmem needs paged KV storage; tiered KV disabled\n";
+        } else if (cfg.n_swa > 0) {
+            // PagedKVStorage::kvmem_supported() rejects mixed policies: pages can
+            // only be archived uniformly when every layer is Full-attention.
+            std::cerr << "Warning: --kvmem needs all-Full attention layers; model has "
+                      << cfg.n_swa << " sliding-window layer(s); tiered KV disabled\n";
+        } else {
+            // 0 = keep the device-sized pool; the budget then falls back to it.
+            if (opt.kvmem_budget > 0)
+                kv_mem->storage().set_pool_token_cap(opt.kvmem_budget);
+            kvmem_active = true;
+        }
+    }
+
     ctx_->set_engine(std::move(engine));
 
     ctx_->params_mut().offload_kqv = true;
@@ -490,6 +227,33 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     if (!ctx_->init_kv_cache()) {
         error = "Failed to initialize KV cache";
         return false;
+    }
+
+    // ---- Attach the KVMem working-set manager ----
+    // After init_kv_cache: kvmem_supported() needs the page pools to exist and
+    // the manager needs the real page_size / pool_tokens. From here the
+    // generator reads window + rope metadata off it, and the request path
+    // (below) hands history management over to the tier instead of doing its
+    // own context shift.
+    if (kvmem_active && tfm_eng) {
+        auto* kv_mem = tfm_eng->kv_memory();
+        if (!kv_mem->storage().kvmem_supported()) {
+            std::cerr << "Warning: --kvmem unsupported by this KV storage "
+                         "(mixed layer policies); tiered KV disabled\n";
+        } else {
+            const int page_size = kv_mem->storage().page_size();
+            const int pool_tokens = kv_mem->max_pool_tokens();
+            auto ws = std::make_unique<KVWorkingSetManager>(opt.kvem_config(), page_size,
+                                                           pool_tokens);
+            std::cout << "KVMem tiered KV enabled: budget=" << ws->budget()
+                      << ", sink=" << ws->sink_tokens()
+                      << ", gen_reserve=" << ws->gen_reserve()
+                      << ", retrieval=" << opt.kvmem_retrieval << "\n"
+                      << "  logical ctx=" << kv_mem->max_seq_len()
+                      << " tokens, gpu pool=" << pool_tokens
+                      << " tokens, page=" << page_size << "\n";
+            kv_mem->set_working_set(std::move(ws));
+        }
     }
 
     if (model_->device() == DeviceType::CUDA) {
@@ -510,6 +274,10 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     // ---- Chat template (jinja + fallback) ----
     chat_template_ =
         std::make_unique<ChatTemplateEngine>(ChatTemplateEngine::from_tokenizer(*tokenizer_));
+    // Native tool templates (MiniCPM/Qwen/GLM jinja chat templates with a
+    // tools branch) render the catalogue and replay tool calls themselves;
+    // the forge_text catalogue injection would teach a competing format.
+    agent_cfg_.native_template_tools = chat_template_->supports_tools();
 
     // Model id = file name without directory / extension.
     auto slash = opt.model_path.find_last_of("/\\");
@@ -521,9 +289,15 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
 
 ChatCompletionResult ServerState::chat_completion(
     const ChatCompletionRequest& req,
-    const std::function<bool(const std::string& delta)>& on_token) {
+    const std::function<bool(const std::string& delta)>& on_token,
+    const std::function<bool(const std::string& reasoning_delta)>& on_reasoning) {
     // Single model / KV cache instance: serialize inference across HTTP workers.
     std::lock_guard<std::mutex> lock(inference_mutex_);
+
+    // Per-request agent pipeline: tool catalogue injection (dialect-rendered),
+    // streaming think-separation, and the final reasoning/tool-call split.
+    // Cheap to construct and stateless across requests.
+    AgentPipeline pipeline(agent_cfg_);
 
     // ---- Context-capacity-aware history truncation ----
     // The KV cache is capped for memory (e.g. 4096 for large-ctx models, see
@@ -534,18 +308,31 @@ ChatCompletionResult ServerState::chat_completion(
     // dropping oldest non-system messages until the rendered prompt plus the
     // requested generation budget fits.
     int kv_capacity = 0;
+    // KVMem: with the tier attached, the working set — not the server — owns
+    // history management for this request. The server steps back from the three
+    // places it would otherwise fight the tier: the capacity bound below, the
+    // structural context shift, and the paged radix-prefix turn hooks.
+    bool tiered = false;
     if (auto* eng = ctx_->engine()) {
+        if (auto* mem = eng->kv_memory())
+            tiered = mem->tiered();
         // Paged mode: the pool is the real token capacity (it is fully
         // allocated up front) while the contiguous cache is never allocated —
         // reading kv_cache() here returned an uninitialized 0 and fell through
         // to the model's native max_seq_len (e.g. 262144), disabling the
         // truncation below entirely. Combine the pool bound with max_seq_len
         // like vLLM's min(max_model_len, num_gpu_blocks * block_size) check.
+        // Tiered (KVMem): the pool is deliberately only the *working set*, so
+        // binding capacity to it would reject every prompt longer than the
+        // window — exactly the case the tier exists to serve. The logical bound
+        // is max_seq_len; the working set drops/recalls history inside it.
         if (auto* mem = eng->kv_memory(); mem && mem->is_paged()) {
-            kv_capacity = std::min(mem->max_seq_len(), mem->max_pool_tokens());
+            kv_capacity = tiered ? mem->max_seq_len()
+                                 : std::min(mem->max_seq_len(), mem->max_pool_tokens());
             LOG_WARN("[capacity-check] paged storage: max_seq=" +
                      std::to_string(mem->max_seq_len()) + " pool_tokens=" +
-                     std::to_string(mem->max_pool_tokens()) + " -> capacity=" +
+                     std::to_string(mem->max_pool_tokens()) + " tiered=" +
+                     std::to_string(tiered ? 1 : 0) + " -> capacity=" +
                      std::to_string(kv_capacity));
         } else if (auto* kvc = eng->kv_cache()) {
             kv_capacity = kvc->max_seq_len();
@@ -561,16 +348,34 @@ ChatCompletionResult ServerState::chat_completion(
     const int gen_budget = req.max_tokens > 0 ? req.max_tokens : 512;
 
     // ---- Tool injection (OpenAI function calling) ----
-    // When the client offers tools (and does not forbid calling them), splice a
-    // tool catalogue into the prompt so the model knows what it can invoke.
-    const bool tools_active = !req.tools.empty() && req.tool_choice != "none";
-    std::vector<ChatTemplateMessage> tooled_messages =
-        tools_active ? inject_tools_into_messages(req.messages, req.tools, req.tool_choice)
-                     : req.messages;
+    // When the client offers tools (and does not forbid calling them), the
+    // model must learn what it can invoke: either the jinja template renders
+    // the catalogue natively (native_template_tools: tools_json feeds the
+    // template's `tools` variable), or the configured dialect splices a
+    // text protocol block into the system message.
+    bool tools_active = false;
+    std::string tools_json;
+    if (agent_cfg_.native_template_tools && !req.tools.empty() && req.tool_choice != "none") {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& t : req.tools) {
+            nlohmann::json params = nlohmann::json::parse(t.parameters_json, nullptr, false);
+            if (params.is_discarded())
+                params = nlohmann::json::object();
+            arr.push_back({{"name", t.name},
+                           {"description", t.description},
+                           {"parameters", std::move(params)}});
+        }
+        tools_json = arr.dump();
+        tools_active = true;
+    }
+    std::vector<ChatTemplateMessage> tooled_messages = tools_json.empty()
+        ? pipeline.inject_tools(req.messages, req.tools, req.tool_choice, &tools_active)
+        : req.messages;
 
     ChatTemplateInput input;
     input.messages = tooled_messages;
     input.add_generation_prompt = true;
+    input.tools_json = tools_json;
     std::vector<int32_t> prompt_ids = chat_template_->apply(input);
 
     // ---- DEBUG (set FORGE_DEBUG_TEMPLATE=1 to enable) ----
@@ -599,7 +404,14 @@ ChatCompletionResult ServerState::chat_completion(
                   << "\n";
     }
 
-    if (kv_capacity > 0 &&
+    // Tiered (KVMem): skip the structural context shift. The working set
+    // already decides, per turn, which prefix stays resident (its sink) and
+    // which stale history is archived/recalled, and it does so in *logical*
+    // space with the rope remap to match. Shifting the message list here would
+    // rewrite the prompt under the manager's feet — its common-prefix match
+    // would diverge every turn and the resident window would be recomputed
+    // from scratch, which is the opposite of what the tier is for.
+    if (!tiered && kv_capacity > 0 &&
         static_cast<int>(prompt_ids.size()) + gen_budget > kv_capacity &&
         tooled_messages.size() > 2) {
         // ---- Context shift (llama.cpp `n_keep` semantics) ----
@@ -637,6 +449,7 @@ ChatCompletionResult ServerState::chat_completion(
             ChatTemplateInput inp;
             inp.messages = msgs;
             inp.add_generation_prompt = true;
+            inp.tools_json = tools_json;  // keep the native catalogue on re-render
             return chat_template_->apply(inp);
         };
         // Token-granular trim: keep the most-recent `keep` tokens of a boundary
@@ -716,7 +529,11 @@ ChatCompletionResult ServerState::chat_completion(
     // shift above — e.g. opencode pasting one large file) run the whole
     // prefill and die mid-write on page-pool exhaustion (a 500 after burning
     // the full prefill compute) instead of an immediate 400.
-    if (kv_capacity > 0 &&
+    // Tiered (KVMem): the working set owns history truncation and generation
+    // capping, so the server must NOT reject on the raw prompt length here —
+    // doing so would block every long prompt the tier exists to serve. The
+    // generator caps decode at plan.max_generate, so the pool can never overflow.
+    if (!tiered && kv_capacity > 0 &&
         static_cast<int>(prompt_ids.size()) + gen_budget > kv_capacity) {
         LOG_WARN("[capacity-check] REJECTING: prompt=" + std::to_string(prompt_ids.size()) +
                  " budget=" + std::to_string(gen_budget) + " capacity=" +
@@ -745,6 +562,15 @@ ChatCompletionResult ServerState::chat_completion(
     gen_cfg.do_sample = req.temperature > 0.0f;
     gen_cfg.seed = req.seed;
     gen_cfg.eos_token_id = tokenizer_->eos_token_id();
+    // Chat turn terminator: MiniCPM/Qwen-style templates end an assistant turn
+    // with <|im_end|> while the vocab eos is a different id (here eos=1).
+    // Stop at the first turn terminator (llama.cpp/vLLM derive this from the
+    // chat template), so trailing control tokens never leak into the reply.
+    if (int32_t turn_end = tokenizer_->token_to_id("<|im_end|>");
+        turn_end >= 0 && turn_end != tokenizer_->unk_token_id() &&
+        turn_end != gen_cfg.eos_token_id) {
+        gen_cfg.stop_token_ids.push_back(turn_end);
+    }
 
     std::atomic<bool> abort_flag{false};
     gen_cfg.abort_flag = &abort_flag;
@@ -783,6 +609,13 @@ ChatCompletionResult ServerState::chat_completion(
             // path already filters via decode(skip_special=true)).
             return;
         }
+        // Stop tokens reach this callback before generate() acts on them
+        // (generator.cpp pushes the token and fires the callback first), so
+        // their pieces would otherwise be streamed verbatim.
+        for (int32_t sid : gen_cfg.stop_token_ids) {
+            if (tok == sid)
+                return;
+        }
         pending += tokenizer_->decode_token(tok);
         size_t ok = utf8_complete_len(pending);
         if (ok == 0)
@@ -808,7 +641,16 @@ ChatCompletionResult ServerState::chat_completion(
         }
         if (emit > 0) {
             std::string delta = pending.substr(0, emit);
-            if (on_token && !on_token(delta)) {
+            // Agent pipeline: split the delta into visible content and
+            // <think> reasoning before it reaches the client callbacks.
+            std::string reasoning_delta;
+            std::string visible =
+                pipeline.process_delta(delta, on_reasoning ? &reasoning_delta : nullptr);
+            if (on_reasoning && !reasoning_delta.empty() && !on_reasoning(reasoning_delta)) {
+                // Client disconnected: stop burning compute on this request.
+                abort_flag.store(true, std::memory_order_relaxed);
+            }
+            if (!visible.empty() && on_token && !on_token(visible)) {
                 // Client disconnected: stop burning compute on this request.
                 abort_flag.store(true, std::memory_order_relaxed);
             }
@@ -834,7 +676,20 @@ ChatCompletionResult ServerState::chat_completion(
     //    This mirrors vLLM's free(request) + per-block ref_count eviction.
     int prefix_len = 0;
     const bool paged_mode = (ctx_->params().kv_storage_mode == KVStorageMode::Paged);
-    if (paged_mode) {
+    if (paged_mode && tiered) {
+        // ---- KVMem turn boundary ----
+        // seq 0's resident window IS the conversation state, tracked by the
+        // working-set manager across turns. Releasing it, or sharing its pages
+        // into radix cache seq_ids, would invalidate the window layout that
+        // on_prompt() plans against — so nothing is released or looked up here.
+        // The manager computes the common prefix in logical space and the
+        // generator forwards only the non-resident tail. The free-page
+        // admission check below is skipped for the same reason: it measures the
+        // whole prompt against the *pool*, while the tier only ever needs the
+        // working set's worth of pages.
+        gen_cfg.prefix_len = 0;
+        gen_cfg.reset_kv_cache = false;
+    } else if (paged_mode) {
         if (auto* km = ctx_->engine()->kv_memory()) {
             // Drop the previous request's radix-node reference and working set
             // so seq 0 starts empty (register_prefix() may have left a trailing
@@ -938,7 +793,9 @@ ChatCompletionResult ServerState::chat_completion(
         // and let the next request start from a clean cache. In paged mode also
         // release seq 0's working set (its prefix pages are shared with the radix
         // cache, which survives) so the next request does not append onto stale KV.
-        if (paged_mode) {
+        // Tiered: seq 0 holds the tier's window, which must survive the failed
+        // request for the next turn's plan to match against.
+        if (paged_mode && !tiered) {
             if (auto* km = ctx_->engine()->kv_memory()) {
                 km->storage().release(0);
             }
@@ -954,9 +811,13 @@ ChatCompletionResult ServerState::chat_completion(
         // register_prefix() transfers seq 0's prefix pages into per-node cache
         // seq_ids (ref-counted, no copy) and releases seq 0's own reference; the
         // cached copy survives. Short prompts are handled internally (no-op).
-        if (auto* km = ctx_->engine()->kv_memory()) {
-            prefix_cache_.register_prefix(prompt_ids, 0, km->storage());
-            prefix_cache_.evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
+        // Tiered: skipped — the pages must stay in seq 0's window, which is the
+        // tier's resident state for the next turn.
+        if (!tiered) {
+            if (auto* km = ctx_->engine()->kv_memory()) {
+                prefix_cache_.register_prefix(prompt_ids, 0, km->storage());
+                prefix_cache_.evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
+            }
         }
     } else {
         // Contiguous single-entry mirror.
@@ -968,12 +829,39 @@ ChatCompletionResult ServerState::chat_completion(
         }
     }
 
-    if (on_token && !stop_hit && !pending.empty()) {
-        on_token(pending);  // flush any trailing partial sequence
+    if (!stop_hit && !pending.empty()) {
+        // Flush any trailing partial sequence through the same agent-pipeline
+        // split as the regular streaming deltas.
+        std::string reasoning_delta;
+        std::string visible =
+            pipeline.process_delta(pending, on_reasoning ? &reasoning_delta : nullptr);
+        if (on_reasoning && !reasoning_delta.empty())
+            (void)on_reasoning(reasoning_delta);
+        if (on_token && !visible.empty())
+            (void)on_token(visible);  // client-disconnect return is moot here
     }
 
     ChatCompletionResult out;
-    out.text = tokenizer_->decode(result.token_ids, true, false);
+    // skip_special=false: MiniCPM5-style vocabularies encode the tool-call
+    // syntax itself as CONTROL-type special tokens (function-open/param-open/
+    // close tags). Decoding with skip_special=true strips those tags and
+    // leaves mangled attribute/CDATA fragments that no tool-call dialect can
+    // parse, which then leak into the visible text. Keep the literals, then
+    // cut the turn at the first turn-terminator or EOS literal.
+    out.text = tokenizer_->decode(result.token_ids, false, false);
+    {
+        const char* const kTurnEnds[] = {"<|" "im_end" "|>", "<|" "im_start" "|>",
+                                         "</" "s" ">", "<|" "end" "|>",
+                                         "<|" "eot_id" "|>"};
+        size_t cut = std::string::npos;
+        for (const char* s : kTurnEnds) {
+            const size_t p = out.text.find(s);
+            if (p != std::string::npos && p < cut)
+                cut = p;
+        }
+        if (cut != std::string::npos)
+            out.text.resize(cut);
+    }
 
     // Truncate at the earliest stop string (also a safety net for the
     // non-streaming path, where stop detection only drives the abort flag).
@@ -991,19 +879,22 @@ ChatCompletionResult ServerState::chat_completion(
         }
     }
 
-    // ---- Tool-call extraction (OpenAI function calling) ----
-    // Parse any ###TOOL###...###END### blocks the model emitted into
-    // OpenAI-shaped tool_calls and strip them from the assistant text.
-    if (tools_active) {
+    // ---- Agent post-processing: reasoning separation + tool-call extraction ----
+    // Split <think>...</think> into out.reasoning and, when tools were
+    // offered, parse the dialect's call blocks into OpenAI-shaped tool_calls
+    // (stripped from the assistant text).
+    {
         std::vector<std::string> tool_names;
-        tool_names.reserve(req.tools.size());
-        for (const auto& t : req.tools)
-            tool_names.push_back(t.name);
-        auto calls = parse_tool_calls(out.text, &tool_names);
-        if (!calls.empty()) {
-            out.text = strip_tool_call_blocks(out.text);
-            out.tool_calls = std::move(calls);
+        if (tools_active) {
+            tool_names.reserve(req.tools.size());
+            for (const auto& t : req.tools)
+                tool_names.push_back(t.name);
         }
+        auto fin = pipeline.finalize(out.text, tools_active ? &tool_names : nullptr);
+        out.text = std::move(fin.text);
+        out.reasoning = std::move(fin.reasoning);
+        if (tools_active)
+            out.tool_calls = std::move(fin.tool_calls);
     }
 
     out.prompt_tokens = result.num_prompt_tokens;

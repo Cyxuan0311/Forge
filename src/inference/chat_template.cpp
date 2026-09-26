@@ -6,6 +6,8 @@
 #include "forge/chat_template.h"
 #include "forge/tokenizer.h"
 
+#include <nlohmann/json.hpp>
+
 #include <stdexcept>
 
 namespace forge {
@@ -37,33 +39,16 @@ ChatTemplateEngine ChatTemplateEngine::from_tokenizer(const Tokenizer& tok) {
             auto lex_res = lex.tokenize(engine.tmpl_source_);
             auto prog = jinja::parse_from_tokens(lex_res);
 
-            // Detect capabilities
-            jinja::caps caps;
-
             auto jp = std::make_unique<JinjaProgram>();
             jp->prog = std::move(prog);
-            jp->caps = caps;
+            // Trial-execute the template with probe messages/tools to learn
+            // which OpenAI features it actually renders (tools branch, tool
+            // call replay, object vs string arguments, system role).
+            jp->caps = jinja::caps_get(jp->prog);
             engine.jinja_prog_ = std::move(jp);
 
-            // Detect system role support
-            try {
-                jinja::context ctx(engine.tmpl_source_);
-                auto messages_arr = jinja::mk_val<jinja::value_array>();
-                auto msg = jinja::mk_val<jinja::value_object>();
-                msg->insert("role", jinja::mk_val<jinja::value_string>("system"));
-                msg->insert("content", jinja::mk_val<jinja::value_string>("test"));
-                messages_arr->push_back(msg);
-                ctx.set_val("messages", messages_arr);
-                ctx.set_val("bos_token", jinja::mk_val<jinja::value_string>(""));
-                ctx.set_val("eos_token", jinja::mk_val<jinja::value_string>(""));
-                ctx.set_val("add_generation_prompt", jinja::mk_val<jinja::value_bool>(false));
-
-                jinja::runtime runtime(ctx);
-                runtime.execute(engine.jinja_prog_->prog);
-                engine.jinja_supports_system_ = true;
-            } catch (...) {
-                // Template doesn't handle system role — that's fine
-            }
+            engine.jinja_supports_system_ = engine.jinja_prog_->caps.supports_system_role;
+            engine.jinja_supports_tools_ = engine.jinja_prog_->caps.supports_tools;
         } catch (const std::exception& e) {
             // Jinja compilation failed — fall back to hardcoded templates
             engine.jinja_prog_.reset();
@@ -103,6 +88,10 @@ bool ChatTemplateEngine::supports_system_role() const {
     return fallback_type_ == FallbackType::ChatML;
 }
 
+bool ChatTemplateEngine::supports_tools() const {
+    return jinja_prog_ && jinja_supports_tools_;
+}
+
 // ========================================================================
 // render
 // ========================================================================
@@ -132,37 +121,69 @@ std::vector<int32_t> ChatTemplateEngine::apply(const ChatTemplateInput& input) c
 // ========================================================================
 
 std::string ChatTemplateEngine::render_jinja(const ChatTemplateInput& input) const {
-    jinja::context ctx(tmpl_source_);
+    using json = nlohmann::ordered_json;
 
-    // Build messages array
-    auto messages_arr = jinja::mk_val<jinja::value_array>();
-
-    // Add system prompt if provided (prepend as system message)
+    // ---- Build the template context as JSON, then inject via global_from_json.
+    // OpenAI-shaped messages/tools: templates that render a native tool
+    // catalogue read `tools` and replay `tool_calls` from assistant turns.
+    json msgs = json::array();
     if (!input.system_prompt.empty()) {
-        auto msg = jinja::mk_val<jinja::value_object>();
-        msg->insert("role", jinja::mk_val<jinja::value_string>("system"));
-        msg->insert("content", jinja::mk_val<jinja::value_string>(input.system_prompt));
-        messages_arr->push_back(msg);
+        msgs.push_back(json{{"role", "system"}, {"content", input.system_prompt}});
     }
-
+    bool any_tool_calls = false;
+    int call_seq = 0;
     for (const auto& msg : input.messages) {
-        auto msg_obj = jinja::mk_val<jinja::value_object>();
-        msg_obj->insert("role", jinja::mk_val<jinja::value_string>(msg.role));
-        msg_obj->insert("content", jinja::mk_val<jinja::value_string>(msg.content));
-        messages_arr->push_back(msg_obj);
+        json jm = json{{"role", msg.role}, {"content", msg.content}};
+        if (!msg.reasoning_content.empty())
+            jm["reasoning_content"] = msg.reasoning_content;
+        if (!msg.tool_calls.empty()) {
+            any_tool_calls = true;
+            json tcs = json::array();
+            for (const auto& tc : msg.tool_calls) {
+                json args = json::parse(tc.arguments_json, nullptr, false);
+                if (args.is_discarded())
+                    args = json::object();
+                // Dict-iterating templates (e.g. MiniCPM's XML dialect) need
+                // object arguments; string-argument ones get the JSON text.
+                if (!jinja_prog_->caps.supports_object_arguments && args.is_object())
+                    args = args.dump();
+                std::string id = tc.id.empty() ? ("call" + std::to_string(++call_seq)) : tc.id;
+                tcs.push_back(json{{"id", id},
+                                   {"type", "function"},
+                                   {"function", {{"name", tc.name}, {"arguments", args}}}});
+            }
+            jm["tool_calls"] = std::move(tcs);
+        }
+        msgs.push_back(std::move(jm));
     }
 
-    ctx.set_val("messages", messages_arr);
+    json ctx_json = json{{"messages", std::move(msgs)},
+                         {"bos_token", tok_->decode_token(tok_->bos_token_id())},
+                         {"eos_token", tok_->decode_token(tok_->eos_token_id())},
+                         {"add_generation_prompt", input.add_generation_prompt}};
 
-    // Set bos/eos tokens
-    std::string bos_str = tok_->decode_token(tok_->bos_token_id());
-    std::string eos_str = tok_->decode_token(tok_->eos_token_id());
-    ctx.set_val("bos_token", jinja::mk_val<jinja::value_string>(bos_str));
-    ctx.set_val("eos_token", jinja::mk_val<jinja::value_string>(eos_str));
+    if (!input.tools_json.empty()) {
+        json tools = json::parse(input.tools_json, nullptr, false);
+        if (!tools.is_discarded() && tools.is_array() && !tools.empty()) {
+            json wrapped = json::array();
+            for (auto& t : tools) {
+                if (t.is_object() && t.contains("function"))
+                    wrapped.push_back(std::move(t));
+                else
+                    wrapped.push_back(json{{"type", "function"}, {"function", std::move(t)}});
+            }
+            ctx_json["tools"] = std::move(wrapped);
+        }
+    }
+    // Templates that interleave replayed calls into assistant content at
+    // <tool_sep> markers also render a fallback copy unless told the calls
+    // were already handled (undefined == false). We always replay via the
+    // template's own tool_calls path, so mark it done.
+    if (any_tool_calls)
+        ctx_json["has_tool_sep"] = true;
 
-    // Add generation prompt flag
-    ctx.set_val("add_generation_prompt",
-                jinja::mk_val<jinja::value_bool>(input.add_generation_prompt));
+    jinja::context ctx(tmpl_source_);
+    jinja::global_from_json(ctx, ctx_json, false);
 
     // Execute
     jinja::runtime runtime(ctx);

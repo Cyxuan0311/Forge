@@ -23,9 +23,20 @@ class Tokenizer;
 
 // ---- Chat message ----
 
+// A tool call emitted by a previous assistant turn, replayed into the prompt
+// so native tool templates (MiniCPM/Qwen XML dialects) can re-render it.
+struct ChatTemplateToolCall {
+    std::string id;              // OpenAI call id (synthesized when empty)
+    std::string name;
+    std::string arguments_json;  // JSON object text; "{}" when absent
+};
+
 struct ChatTemplateMessage {
     std::string role;     // "system", "user", "assistant", "tool"
     std::string content;  // text content
+    // Assistant-only replay fields (empty/unused on other roles):
+    std::string reasoning_content;
+    std::vector<ChatTemplateToolCall> tool_calls;
 };
 
 // ---- Input to ChatTemplateEngine ----
@@ -34,6 +45,10 @@ struct ChatTemplateInput {
     std::vector<ChatTemplateMessage> messages;
     bool add_generation_prompt = true;
     std::string system_prompt;  // if non-empty, prepended as a system message
+    // JSON array of {"name","description","parameters"} objects passed to the
+    // template as the `tools` variable (native tool-calling templates render
+    // their own catalogue from it). Empty = no tools in context.
+    std::string tools_json;
 };
 
 // ---- ChatTemplateEngine ----
@@ -55,6 +70,10 @@ public:
 
     /// Whether the template supports a system role.
     bool supports_system_role() const;
+
+    /// Whether the compiled jinja template has a tools branch (renders the
+    /// `tools` context variable into a native tool catalogue).
+    bool supports_tools() const;
 
     /// Render messages into a prompt string.
     /// @throws std::runtime_error on rendering failure.
