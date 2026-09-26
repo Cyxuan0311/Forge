@@ -266,6 +266,7 @@ add_library(
   src/inference/dflash_draft_provider.cpp
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/gemma4_engine.cpp
+  src/inference/engines/spark25_engine.cpp
   src/inference/engines/phimoe_engine.cpp
   src/inference/engines/bailingmoe3_engine.cpp
   src/inference/engines/generic_engine.cpp

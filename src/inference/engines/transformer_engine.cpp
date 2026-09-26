@@ -1,8 +1,10 @@
 #include "forge/engines/transformer_engine.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <numeric>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -22,6 +24,7 @@
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 #include "forge/quant_traits.h"
+#include "forge/inference/tensor_device_utils.h"
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
@@ -55,6 +58,16 @@ size_t available_system_memory_bytes() {
 #else
     return 0;
 #endif
+}
+
+// 调试开关 (FORGE_DEBUG_SPARK=1)
+static bool txe_dbg_on() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("FORGE_DEBUG_SPARK");
+        v = (e && std::atoi(e) != 0) ? 1 : 0;
+    }
+    return v == 1;
 }
 
 }  // namespace
@@ -538,6 +551,20 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         if (total_tokens == 0)
             continue;
 
+        // 调试：打印实际喂入模型的 token id 序列 (仅首帧)
+        if (txe_dbg_on()) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                for (const auto& item : ubatch.items) {
+                    fprintf(stderr, "[SPARK-DBG] tokens(%zu):", item.tokens.size());
+                    for (int tid : item.tokens)
+                        fprintf(stderr, " %d", tid);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+
         // ==== Step 1: Fused embedding for all tokens ====
         DeviceTarget first_dev = layer_device_target(0);
 #ifdef USE_CUDA
@@ -658,6 +685,8 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         {
             PERF_SCOPE("forward_batch/output_norm");
             auto output_norm = weights_.output_norm;
+            if (output_norm && hidden->device() != output_norm->device())
+                hidden = transfer_hidden(hidden, DeviceTarget(output_norm->device()));
             hidden = ops::rms_norm(hidden, output_norm, cfg.rms_norm_eps);
         }
         last_hidden_ = hidden;  // forward_batch (prefill) hidden exposure
@@ -710,6 +739,25 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         if (logits->device() == DeviceType::CUDA) {
             logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(), DeviceType::CPU);
             logits_cpu->copy_from(*logits);
+        }
+
+        // 调试：打印最终 logits 的 top-5 候选 (token id:logit)
+        if (txe_dbg_on()) {
+            int64_t vs = logits_cpu->shape().back();
+            int64_t rows = logits_cpu->shape()[0];
+            const float* ld = static_cast<const float*>(logits_cpu->data());
+            for (int r = 0; r < rows; ++r) {
+                const float* row = ld + (int64_t)r * vs;
+                std::vector<int> idx(vs);
+                std::iota(idx.begin(), idx.end(), 0);
+                int k = std::min(5, (int)vs);
+                std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                                 [&](int a, int b) { return row[a] > row[b]; });
+                fprintf(stderr, "[SPARK-DBG] logits row%d top5:", r);
+                for (int i = 0; i < k; ++i)
+                    fprintf(stderr, " %d:%.3f", idx[i], row[idx[i]]);
+                fprintf(stderr, "\n");
+            }
         }
 
         // all_logits 模式：直接返回完整 [total_tokens, vocab] 张量
@@ -1113,6 +1161,20 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     const int seq_len = req.n_tokens;
     const int64_t start_pos = req.start_pos;
 
+    // 调试：打印实际喂入的 token id 序列 (仅首帧)
+    if (txe_dbg_on()) {
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            fprintf(stderr, "[SPARK-DBG] input_ids(%d):", (int)req.n_tokens);
+            auto ids = ensure_cpu(req.input_ids);
+            const int32_t* p = static_cast<const int32_t*>(ids->data());
+            for (int i = 0; i < (int)req.n_tokens; ++i)
+                fprintf(stderr, " %d", p[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+
     // DFlash/DSPark: when capturing per-layer hiddens, drop the graph path (it
     // packs the whole forward into one kernel) and reset the cache so only this
     // forward's layers are retained.
@@ -1137,13 +1199,6 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     // Imperative execution (original path)
     const auto& cfg = model_.config();
     auto t0 = std::chrono::steady_clock::now();
-#ifdef USE_CUDA
-    if (std::getenv("FORGE_DEBUG_LAYERS")) {
-        fprintf(stderr, "[DBG] forward_layers begin seq_len=%d n_layers=%d\n",
-                req.n_tokens, cfg.num_layers);
-        fflush(stderr);
-    }
-#endif
 
     auto cur_hidden = hidden;
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
@@ -1153,59 +1208,31 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             cudaSetDevice(layer_dev.device_id);
 #endif
         cur_hidden = transfer_hidden(cur_hidden, layer_dev);
+        if (captures_layer_hiddens()) {
+            // 捕获"层输入" (HF hidden_states 约定, 与 llama.cpp 的 t_layer_inp
+            // 一致): 层 i 的输入 = 层 i-1 的输出, DFlash 转换器的 target_layers
+            // 特征即取自该点。此前捕获的是层输出, 特征整体偏一层。
+            layer_hiddens_.push_back(cur_hidden);
+        }
         {
             PERF_SCOPE_FMT("forward/layer_%d", layer);
             SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu",
                              req.n_tokens);
             cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
         }
-        if (captures_layer_hiddens()) {
-            layer_hiddens_.push_back(cur_hidden);
-        }
         if (!cur_hidden) {
             fprintf(stderr, "[FATAL] Layer %d returned NULL!\n", layer);
             fflush(stderr);
             return nullptr;
         }
-#ifdef USE_CUDA
-        // Two independent diagnostics, split so the expensive device sync is not
-        // forced onto every debug run:
-        //   FORGE_DEBUG_LAYERS=1     -> per-layer begin/end markers only (cheap)
-        //   FORGE_DEBUG_CUDA_SYNC=1  -> cudaGetLastError + cudaDeviceSynchronize
-        //                               to surface which layer's kernels fail/hang
-        //                               under a given matmul path (e.g. dp4a MMQ)
-        if (std::getenv("FORGE_DEBUG_LAYERS")) {
-            fprintf(stderr, "[DBG] layer %d done (seq_len=%d)\n", layer, seq_len);
-            fflush(stderr);
-        }
-        if (std::getenv("FORGE_DEBUG_CUDA_SYNC")) {
-            cudaError_t e = cudaGetLastError();
-            if (e != cudaSuccess) {
-                fprintf(stderr, "[DBG] layer %d CUDA error after forward_layer: %s\n",
-                        layer, cudaGetErrorString(e));
-                fflush(stderr);
-            }
-            cudaError_t s = cudaDeviceSynchronize();
-            if (s != cudaSuccess) {
-                fprintf(stderr, "[DBG] layer %d cudaDeviceSynchronize FAILED: %s\n",
-                        layer, cudaGetErrorString(s));
-                fflush(stderr);
-                return nullptr;
-            }
-        }
-#endif
     }
 
-#ifdef USE_CUDA
-    if (std::getenv("FORGE_DEBUG_LAYERS")) {
-        fprintf(stderr, "[DBG] forward_layers loop done; entering output_norm+logits\n");
-        fflush(stderr);
-    }
-#endif
     // Use unified weights for output norm and projection
     auto output_norm = weights_.output_norm;
     {
         PERF_SCOPE("forward/output_norm");
+        if (output_norm && cur_hidden->device() != output_norm->device())
+            cur_hidden = transfer_hidden(cur_hidden, DeviceTarget(output_norm->device()));
         cur_hidden = ops::rms_norm(cur_hidden, output_norm, cfg.rms_norm_eps);
     }
     // Post-final-norm hidden (LM-head input feature), stashed for the MTP
@@ -1264,6 +1291,26 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             logits = ops::matmul_transB(last_row, output_weight);
         } else {
             logits = ops::matmul_transB(cur_hidden, output_weight);
+        }
+    }
+
+    // 调试：打印最终 logits 的 top-5 候选 (token id:logit)
+    if (txe_dbg_on()) {
+        auto lc = ensure_cpu(logits);
+        int64_t vs = lc->shape().back();
+        int64_t rows = lc->shape()[0];
+        const float* ld = static_cast<const float*>(lc->data());
+        for (int r = 0; r < rows; ++r) {
+            const float* row = ld + (int64_t)r * vs;
+            std::vector<int> idx(vs);
+            std::iota(idx.begin(), idx.end(), 0);
+            int k = std::min(5, (int)vs);
+            std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                             [&](int a, int b) { return row[a] > row[b]; });
+            fprintf(stderr, "[SPARK-DBG] logits row%d top5:", r);
+            for (int i = 0; i < k; ++i)
+                fprintf(stderr, " %d:%.3f", idx[i], row[idx[i]]);
+            fprintf(stderr, "\n");
         }
     }
 

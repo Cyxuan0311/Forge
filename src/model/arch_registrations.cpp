@@ -24,6 +24,7 @@
 #include "forge/engines/generic_engine.h"
 #include "forge/engines/phimoe_engine.h"
 #include "forge/engines/qwen35_engine.h"
+#include "forge/engines/spark25_engine.h"
 #include "forge/logger.h"
 #include "forge/model.h"
 
@@ -209,6 +210,22 @@ static ConfigParserAutoRegister _cfg_qwen35("qwen35", parse_qwen35_config);
 static WeightInitAutoRegister _winit_qwen35("qwen35", init_qwen35_layer_weights);
 static ArchCapabilityAutoRegister _cap_qwen35("qwen35",
                                               ArchCapability{.use_ssm = true, .use_mrope = true});
+
+// ============================================================================
+// Spark-X2.5 (iFlytek SparkLLM: mixed SWA/full attention, dual RoPE,
+// per-head sigmoid output gate, GeGLU, tied embeddings)
+// ============================================================================
+
+static EngineAutoRegister _eng_spark25(
+    "spark2_5", [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        return std::make_unique<Spark25Engine>(m, c);
+    });
+static ConfigParserAutoRegister _cfg_spark25("spark2_5", parse_spark25_config);
+static WeightInitAutoRegister _winit_spark25("spark2_5", init_spark25_layer_weights);
+static ArchCapabilityAutoRegister _cap_spark25("spark2_5",
+                                               ArchCapability{.use_gqa = true,
+                                                              .use_neox_rope = true,
+                                                              .ffn_activation = ActivationType::GeGLU});
 
 // ============================================================================
 // BailingMoE3 (Ling 3.0: hybrid MoE + MLA + SSM/KDA recurrent attention)
