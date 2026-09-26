@@ -124,6 +124,66 @@ public:
     virtual KVCache* cache() = 0;
     virtual const KVCache* cache() const = 0;
 
+    // ---- KVMem tiered window (no-ops on storages without window support) ----
+    // All layers Full-policy => windowing can archive pages uniformly.
+    virtual bool kvmem_supported() const { return false; }
+    // Cap the GPU page pool at `tokens` per sequence (0 = uncapped). Must be
+    // called before init()/resize_to_budget() to take effect.
+    virtual void set_pool_token_cap(int tokens) { (void)tokens; }
+    // Tokens visible to attention for (seq, layer). Equals logical_len when the
+    // window is inactive (kvmem disabled / not yet activated).
+    virtual int64_t seq_window_len(int seq_id, int layer) const {
+        (void)seq_id;
+        (void)layer;
+        return -1;
+    }
+    // Per-sequence window ops used by KVWorkingSetManager. Token counts are
+    // the page's filled rows; -1 signals an invalid op.
+    virtual int64_t seq_window_archive_page(int seq_id, int layer, int idx) {
+        (void)seq_id;
+        (void)layer;
+        (void)idx;
+        return -1;
+    }
+    virtual int64_t seq_window_drop_page(int seq_id, int layer, int idx) {
+        (void)seq_id;
+        (void)layer;
+        (void)idx;
+        return -1;
+    }
+    virtual int64_t seq_window_restore_page(int seq_id, int layer, int archive_idx,
+                                            int insert_idx) {
+        (void)seq_id;
+        (void)layer;
+        (void)archive_idx;
+        (void)insert_idx;
+        return -1;
+    }
+    virtual int64_t seq_window_tokens(int seq_id, int layer) const {
+        (void)seq_id;
+        (void)layer;
+        return -1;
+    }
+    virtual int64_t seq_archived_tokens(int seq_id, int layer) const {
+        (void)seq_id;
+        (void)layer;
+        return -1;
+    }
+    virtual int seq_archived_count(int seq_id, int layer) const {
+        (void)seq_id;
+        (void)layer;
+        return -1;
+    }
+    // Accessor for the archived page ids (chronological) — used by the manager
+    // to drive retrieval. Returns false when windowing is inactive.
+    virtual bool seq_archived_page_ids(int seq_id, int layer,
+                                       std::vector<int32_t>* out) const {
+        (void)seq_id;
+        (void)layer;
+        (void)out;
+        return false;
+    }
+
     // ---- Reset (clear all sequences, return pages to free list) ----
     virtual void reset() = 0;
 
@@ -222,6 +282,19 @@ struct SequencePageTable {
     int64_t logical_len = 0;        // total logical length
     int filled_in_last = 0;         // filled slots in the last page
 
+    // ---- KVMem tiered window ----
+    // When window_active is true, page_ids holds ONLY the resident window pages
+    // (compact, chronological) and logical_len counts window tokens. Pages
+    // evicted to the host swap pool (or dropped) are recorded in archived_pages
+    // (chronological). Attention/write/table-upload paths need no changes: they
+    // already index page_ids from position 0.
+    struct ArchivedPage {
+        int32_t page_id;
+        int32_t tokens;  // filled rows at archive time
+    };
+    bool window_active = false;
+    std::vector<ArchivedPage> archived_pages;
+
     // Phase 2-D: persistent per-(seq, layer) device mirror of page_ids.
     // upload_seq_page_table syncs only the appended pages on the hot path
     // (decode grows the table one page at a time), so per-token H2D traffic
@@ -295,6 +368,19 @@ public:
     size_t host_pool_bytes() const;
     // Total page capacity across all per-layer pools.
     int total_page_capacity() const;
+
+    // ---- KVMem tiered window ----
+    bool kvmem_supported() const override;
+    void set_pool_token_cap(int tokens) override { pool_cap_tokens_ = tokens; }
+    int64_t seq_window_len(int seq_id, int layer) const override;
+    int64_t seq_window_archive_page(int seq_id, int layer, int idx) override;
+    int64_t seq_window_drop_page(int seq_id, int layer, int idx) override;
+    int64_t seq_window_restore_page(int seq_id, int layer, int archive_idx,
+                                    int insert_idx) override;
+    int64_t seq_window_tokens(int seq_id, int layer) const override;
+    int64_t seq_archived_tokens(int seq_id, int layer) const override;
+    int seq_archived_count(int seq_id, int layer) const override;
+    bool seq_archived_page_ids(int seq_id, int layer, std::vector<int32_t>* out) const override;
 
     // Tokens the page pool can hold at most. The pool is fully allocated at
     // init time (NOT lazily), so max_pages_ * page_size_ is real reserved
@@ -370,6 +456,9 @@ private:
     int page_size_ = 16;  // tokens per page
     int max_num_seqs_ = 32;
     int max_pages_ = 0;  // max across layers (for log/CUDA sizing)
+    // KVMem: cap on GPU-resident tokens per sequence (0 = uncapped). Applied in
+    // init()/resize_to_budget() on top of the device-budget-derived page_cap.
+    int pool_cap_tokens_ = 0;
     DeviceType device_ = DeviceType::CPU;
     KVCacheTypeConfig kv_config_;
 

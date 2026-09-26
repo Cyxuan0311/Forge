@@ -120,6 +120,10 @@ void KVMemory::defrag() {
     storage_->defrag();
 }
 
+void KVMemory::set_working_set(std::unique_ptr<KVWorkingSetManager> ws) {
+    working_set_ = std::move(ws);
+}
+
 // FNV-1a 64-bit hash (same as RequestScheduler's hash_prompt)
 size_t KVMemory::hash_tokens(const std::vector<int32_t>& tokens) {
     size_t h = 14695981039346656037ULL;

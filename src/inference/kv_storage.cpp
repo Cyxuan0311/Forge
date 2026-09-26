@@ -281,6 +281,13 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     } else {
         page_cap = std::max(auto_max_pages, kMinPagedPages);
     }
+    // KVMem pool cap: the GPU pool only has to hold the working set
+    // (sink + budget + generation reserve), never the logical max_seq_len.
+    if (pool_cap_tokens_ > 0) {
+        int cap_pages = (pool_cap_tokens_ + page_size_ - 1) / page_size_;
+        if (cap_pages < page_cap)
+            page_cap = cap_pages;
+    }
     // Re-init: never shrink below the existing pool (see comment at function top).
     if (reinit_same_geometry) {
         max_num_seqs_ = std::max(max_num_seqs_, old_max_seqs);
@@ -451,6 +458,11 @@ bool PagedKVStorage::resize_to_budget() {
     }
 
     int new_cap = sizing.max_pages_per_layer;
+    // KVMem pool cap (see init()).
+    if (pool_cap_tokens_ > 0) {
+        int cap_pages = (pool_cap_tokens_ + page_size_ - 1) / page_size_;
+        new_cap = std::min(new_cap, cap_pages);
+    }
     // Never shrink: the pool may already back live traffic, and growing is the
     // only post-init adjustment this path makes (vLLM sizes once, we grow once).
     int cur_cap = 0;
@@ -1053,6 +1065,19 @@ void PagedKVStorage::release(int seq_id) {
                 }
             }
         }
+        // KVMem: archived pages are still reserved (device data evicted, host
+        // copy alive). free_page drops the host copy via swapper_.drop().
+        for (const auto& ap : table.archived_pages) {
+            auto& page = layer_pages_[l][ap.page_id];
+            if (page.ref_count > 0) {
+                page.ref_count--;
+                if (page.ref_count == 0) {
+                    free_page(l, ap.page_id);
+                }
+            }
+        }
+        table.archived_pages.clear();
+        table.window_active = false;
     }
 
     // Release the persistent device mirrors, then drop the host tables.
@@ -1464,6 +1489,161 @@ const int32_t* PagedKVStorage::upload_seq_page_table_unlocked(int layer, int seq
 #else
     return nullptr;
 #endif
+}
+
+// =========================================================================
+// KVMem tiered window (Phase K)
+// =========================================================================
+
+bool PagedKVStorage::kvmem_supported() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& pool : layer_pools_)
+        if (pool.policy != KVLayerPolicy::Full)
+            return false;
+    return !layer_pools_.empty();
+}
+
+int64_t PagedKVStorage::seq_window_len(int seq_id, int layer) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return -1;
+    const auto& table = it->second[layer];
+    if (!table.window_active)
+        return -1;
+    return table.logical_len;
+}
+
+int64_t PagedKVStorage::seq_window_tokens(int seq_id, int layer) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return -1;
+    return it->second[layer].logical_len;
+}
+
+int64_t PagedKVStorage::seq_archived_tokens(int seq_id, int layer) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return -1;
+    int64_t total = 0;
+    for (const auto& ap : it->second[layer].archived_pages)
+        total += ap.tokens;
+    return total;
+}
+
+int PagedKVStorage::seq_archived_count(int seq_id, int layer) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return -1;
+    return (int)it->second[layer].archived_pages.size();
+}
+
+bool PagedKVStorage::seq_archived_page_ids(int seq_id, int layer,
+                                           std::vector<int32_t>* out) const {
+    if (!out)
+        return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return false;
+    out->clear();
+    for (const auto& ap : it->second[layer].archived_pages)
+        out->push_back(ap.page_id);
+    return true;
+}
+
+int64_t PagedKVStorage::seq_window_archive_page(int seq_id, int layer, int idx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return -1;
+    auto& table = it->second[layer];
+    if (!table.window_active || idx < 0 || idx >= (int)table.page_ids.size())
+        return -1;
+
+    int page_id = table.page_ids[idx];
+    auto& page = layer_pages_[layer][page_id];
+    int64_t tokens = page.filled;
+
+    // Copy the page's data to the host swap pool before dropping it from the
+    // window table. offload_to_host_unlocked is idempotent for already-evicted
+    // pages and releases the device buffers.
+    if (!offload_to_host_unlocked(layer, page_id))
+        return -1;
+
+    table.page_ids.erase(table.page_ids.begin() + idx);
+    table.archived_pages.push_back({page_id, (int32_t)tokens});
+    table.d_dirty = true;  // window table shifted — full re-upload
+
+    // The archived page stays reserved (ref_count > 0, not in the free list);
+    // only the window token accounting shrinks.
+    table.logical_len -= tokens;
+    if (table.logical_len < 0)
+        table.logical_len = 0;
+    // filled_in_last describes the last window page; the archived page was not
+    // the last one (the manager never archives the final partial page), so the
+    // value survives the erase unchanged.
+    return tokens;
+}
+
+int64_t PagedKVStorage::seq_window_drop_page(int seq_id, int layer, int idx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return -1;
+    auto& table = it->second[layer];
+    if (!table.window_active || idx < 0 || idx >= (int)table.page_ids.size())
+        return -1;
+
+    int page_id = table.page_ids[idx];
+    auto& page = layer_pages_[layer][page_id];
+    int64_t tokens = page.filled;
+
+    // Stale data: discard entirely (frees any host copy too, see free_page).
+    if (page.ref_count > 0) {
+        page.ref_count--;
+        if (page.ref_count == 0)
+            free_page(layer, page_id);
+    }
+
+    table.page_ids.erase(table.page_ids.begin() + idx);
+    table.d_dirty = true;
+    table.logical_len -= tokens;
+    if (table.logical_len < 0)
+        table.logical_len = 0;
+    return tokens;
+}
+
+int64_t PagedKVStorage::seq_window_restore_page(int seq_id, int layer, int archive_idx,
+                                                int insert_idx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return -1;
+    auto& table = it->second[layer];
+    if (!table.window_active || archive_idx < 0 ||
+        archive_idx >= (int)table.archived_pages.size())
+        return -1;
+    if (insert_idx < 0 || insert_idx > (int)table.page_ids.size())
+        return -1;
+
+    auto ap = table.archived_pages[archive_idx];
+    // Restore the device copy from the host swap pool.
+    if (!bring_back_unlocked(layer, ap.page_id))
+        return -1;
+
+    table.archived_pages.erase(table.archived_pages.begin() + archive_idx);
+    table.page_ids.insert(table.page_ids.begin() + insert_idx, ap.page_id);
+    table.d_dirty = true;
+
+    // The restored page is a full page (the manager only archives completed
+    // pages), so window tokens grow by its fill; the last window page stays
+    // last, keeping filled_in_last valid.
+    table.logical_len += ap.tokens;
+    return ap.tokens;
 }
 
 }  // namespace forge

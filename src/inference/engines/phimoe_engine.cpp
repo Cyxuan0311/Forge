@@ -539,7 +539,7 @@ TensorPtr PhimoeEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     TensorPtr q_rope, k_rope;
     {
         PERF_SCOPE("layer/rope");
-        auto rope_result = rope_executor_.apply(q, k, cfg, start_pos, seq_len, dev);
+        auto rope_result = rope_executor_.apply(q, k, cfg, lctx.rope_pos(), seq_len, dev);
         q_rope = rope_result.q_rope;
         k_rope = rope_result.k_rope;
     }

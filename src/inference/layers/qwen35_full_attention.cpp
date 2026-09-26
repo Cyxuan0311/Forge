@@ -144,7 +144,7 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
     Qwen35Rope::apply_cpu(static_cast<const float*>(q->data()),
                           static_cast<const float*>(k->data()), static_cast<float*>(q_rope->data()),
                           static_cast<float*>(k_rope->data()), seq_len, num_heads, num_kv_heads,
-                          head_dim, n_rot, lctx.start_pos(), cfg.rope_theta);
+                          head_dim, n_rot, lctx.rope_pos(), cfg.rope_theta);
 
     // ---- KV write (storage-aware: paged PagedKVStorage or contiguous KVCache) ----
     if (kv_memory_) {
@@ -176,7 +176,8 @@ TensorPtr Qwen35FullAttention::attend_cpu(const TensorPtr& normed,
         attn_data[i] *= 1.0f / (1.0f + std::exp(-gate_data[i]));
     }
 
-    return ops::matmul_transB(attn_out, lw.attn_output());
+    auto proj_out = ops::matmul_transB(attn_out, lw.attn_output());
+    return proj_out;
 }
 
 #ifdef USE_CUDA
@@ -226,7 +227,7 @@ TensorPtr Qwen35FullAttention::attend_cuda(const TensorPtr& normed,
     forge::cuda::launch_rope_gqa(
         static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
         static_cast<float*>(q_rope->data()), static_cast<float*>(k_rope->data()), num_heads,
-        num_kv_heads, head_dim, seq_len, lctx.start_pos(), cfg.rope_theta, stream);
+        num_kv_heads, head_dim, seq_len, lctx.rope_pos(), cfg.rope_theta, stream);
 
     // ---- KV write (storage-aware: paged PagedKVStorage or contiguous KVCache) ----
     if (kv_memory_) {

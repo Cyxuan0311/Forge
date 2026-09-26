@@ -38,6 +38,8 @@ struct LayerExecutionContext {
     // ---- 便捷访问 ----
     int seq_len() const { return request.n_tokens; }
     int64_t start_pos() const { return request.start_pos; }
+    // RoPE 专用位置: 窗口槽位 + 逻辑偏移(KVMem; 非 KVMem 时等于 start_pos)。
+    int64_t rope_pos() const { return request.start_pos + request.rope_pos_offset; }
     int seq_id() const { return request.seq_id; }
     bool is_prefill() const { return request.is_prefill; }
 };

@@ -15,6 +15,7 @@
 
 #include "kv_cache.h"
 #include "kv_storage.h"
+#include "kv_working_set.h"
 #include "tensor.h"
 
 namespace forge {
@@ -133,6 +134,17 @@ public:
     // The caller (RequestScheduler) uses this to manage its own prefix cache.
     static size_t hash_tokens(const std::vector<int32_t>& tokens);
 
+    // ---- KVMem tiered working set ----
+    // Tiered KV (bounded GPU working set + host-archived history + query-based
+    // recall, arXiv:2609.04852). The manager owns the per-sequence turn policy
+    // and drives the window/archive primitives exposed by KVStorage; it is
+    // attached by the engine only when tiered KV is enabled, so `nullptr` means
+    // "logical context == GPU context" and every legacy path is unaffected.
+    void set_working_set(std::unique_ptr<KVWorkingSetManager> ws);
+    KVWorkingSetManager* working_set() { return working_set_.get(); }
+    const KVWorkingSetManager* working_set() const { return working_set_.get(); }
+    bool tiered() const { return working_set_ != nullptr; }
+
     // ---- Statistics ----
     int max_seq_len() const;
     int num_layers() const;
@@ -151,6 +163,7 @@ public:
 private:
     KVCache& cache_;
     std::unique_ptr<KVStorage> storage_;
+    std::unique_ptr<KVWorkingSetManager> working_set_;
     int prefix_hits_ = 0;
     int prefix_tokens_ = 0;
 };

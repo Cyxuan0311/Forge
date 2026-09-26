@@ -22,7 +22,7 @@ TensorPtr DeepSeekLayerExecutor::attend_gqa(const TensorPtr& normed,
     auto v = ops::matmul_transB(normed, lw.wv(), lw.bv());
 
     auto rope = RopeExecutor::apply_standard(q, k, num_heads, num_kv_heads, head_dim, seq_len,
-                                             lctx.start_pos(), cfg.rope_theta, dev);
+                                             lctx.rope_pos(), cfg.rope_theta, dev);
 
     if (kv_cache_.update(layer_idx, lctx.seq_id(), lctx.start_pos(), rope.k_rope, v, seq_len) < 0) {
         throw std::runtime_error(

@@ -129,6 +129,7 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
     const int64_t start_pos = lctx.start_pos();
+    const int64_t rope_pos = lctx.rope_pos();
     const DeviceType dev = lctx.device.type;
     int num_heads = cfg.num_heads;
     int num_kv_heads = cfg.num_kv_heads;
@@ -179,7 +180,7 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
     TensorPtr q_rope, k_rope;
     {
         PERF_SCOPE("layer/rope");
-        auto rope_result = rope_executor_.apply(q, k, cfg, start_pos, seq_len, dev);
+        auto rope_result = rope_executor_.apply(q, k, cfg, rope_pos, seq_len, dev);
         q_rope = rope_result.q_rope;
         k_rope = rope_result.k_rope;
     }

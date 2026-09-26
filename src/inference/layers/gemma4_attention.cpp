@@ -81,6 +81,7 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
     const int64_t start_pos = lctx.start_pos();
+    const int64_t rope_pos = lctx.rope_pos();
     const DeviceType dev = lctx.device.type;
 
     bool is_swa_layer = (layer_idx < (int)cfg.swa_layers.size() && cfg.swa_layers[layer_idx] == 1);
@@ -192,7 +193,7 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
             cuda::launch_rope_gemma4_gqa(
                 static_cast<const float*>(q->data()), static_cast<const float*>(k->data()),
                 static_cast<float*>(q_rope_out->data()), static_cast<float*>(k_rope->data()),
-                num_heads, num_kv_heads, head_dim, seq_len, start_pos, theta, d_freq_factors);
+                num_heads, num_kv_heads, head_dim, seq_len, rope_pos, theta, d_freq_factors);
         } else
 #endif
         {
@@ -204,7 +205,7 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
                             static_cast<const float*>(k->data()),
                             static_cast<float*>(q_rope->data()),
                             static_cast<float*>(k_rope->data()), seq_len, num_heads, num_kv_heads,
-                            head_dim, start_pos, theta, d_freq_factors);
+                            head_dim, rope_pos, theta, d_freq_factors);
         }
 
         {
@@ -228,7 +229,7 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
             q_rope_out = std::make_shared<Tensor>(DataType::FP32, q->shape(), DeviceType::CUDA);
             cuda::launch_rope_gemma4_q_only(static_cast<const float*>(q->data()),
                                             static_cast<float*>(q_rope_out->data()), num_heads,
-                                            head_dim, seq_len, start_pos, theta, d_freq_factors);
+                                            head_dim, seq_len, rope_pos, theta, d_freq_factors);
         } else
 #endif
         {
@@ -236,7 +237,7 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
             q = ensure_cpu(q);
             rope_gemma4_cpu(static_cast<const float*>(q->data()), nullptr,
                             static_cast<float*>(q_rope->data()), nullptr, seq_len, num_heads,
-                            num_kv_heads, head_dim, start_pos, theta, d_freq_factors);
+                            num_kv_heads, head_dim, rope_pos, theta, d_freq_factors);
         }
     }
 

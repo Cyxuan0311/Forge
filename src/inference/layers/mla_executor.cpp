@@ -11,6 +11,7 @@ TensorPtr MlaExecutor::attend(const TensorPtr& normed, const LayerExecutionConte
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
     const int64_t start_pos = lctx.start_pos();
+    const int64_t rope_pos = lctx.rope_pos();
     const DeviceType dev = lctx.device.type;
     const int num_heads = cfg.num_heads;
     const int head_dim = cfg.head_dim;
@@ -32,7 +33,7 @@ TensorPtr MlaExecutor::attend(const TensorPtr& normed, const LayerExecutionConte
 
     // MLA 的 K 只有一个 latent head。
     auto rope = RopeExecutor::apply_standard(q, k_latent, num_heads, /*num_kv_heads=*/1, head_dim,
-                                             seq_len, start_pos, cfg.rope_theta, dev);
+                                             seq_len, rope_pos, cfg.rope_theta, dev);
 
     kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, rope.k_rope, v_latent, seq_len);
 

@@ -41,7 +41,13 @@ struct ForwardRequest {
     int n_tokens = 0;
 
     // KV cache 中的起始位置。
+    // KVMem 窗口模式: 这是*窗口内*的槽位游标(mask 宽度 / KV 写入都以它为准)。
     int64_t start_pos = 0;
+
+    // KVMem 分层窗口: 逻辑位置 = start_pos + rope_pos_offset。
+    // 仅 RoPE 使用该偏移(保持新 token 与归档 KV 的原始相对距离);
+    // mask 构建与 KV 写入仍用 start_pos。默认 0 = 现行为。
+    int64_t rope_pos_offset = 0;
 
     // 序列 ID, 用于 KV cache 隔离。
     int seq_id = 0;

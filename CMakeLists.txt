@@ -193,6 +193,7 @@ add_library(
   src/inference/kv_memory.cpp
   src/inference/kv_sizing.cpp
   src/inference/kv_storage.cpp
+  src/inference/kv_working_set.cpp
   src/inference/prefix_cache.cpp)
 target_include_directories(
   forge_core
