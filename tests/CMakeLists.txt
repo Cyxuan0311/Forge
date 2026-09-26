@@ -27,7 +27,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src/operators)
 
 # Libraries shared by the native (host-compiled) test executables.
 set(FORGE_TEST_LIBS forge_infer forge_model forge_ops forge_core
-                    forge_tokenizer)
+                    forge_tokenizer forge_agent)
 
 # -----------------------------------------------------------------------------
 # Helper: link a native test like a regular executable (libs + optional
@@ -131,6 +131,16 @@ target_include_directories(
   PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME conv1d-reference COMMAND forge-conv1d-reference-test)
 
+# IQ-family dequant row functions vs llama.cpp scalar reference: pins the
+# IQ1_M qh pointer advance (must NOT double-step) and the IQ2_XXS group-scale
+# formula d*(0.5+s)*0.25, plus the IQ4_NL 32-element block path.
+add_executable(forge-dequant-reference-test test_dequant_reference.cpp)
+forge_link_native(forge-dequant-reference-test)
+target_include_directories(
+  forge-dequant-reference-test
+  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME dequant-reference COMMAND forge-dequant-reference-test)
+
 # Roadmap 2.5: prefill whole-segment quantized write (requires CUDA).
 add_executable(forge-kv-quant-segment-test test_kv_quant_segment.cpp)
 forge_link_native(forge-kv-quant-segment-test)
@@ -180,6 +190,21 @@ add_executable(
 target_include_directories(forge-dtype-contract-test
                            PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME dtype-contract COMMAND forge-dtype-contract-test)
+
+# Agent module: tool-call dialect parsing (forge_text / xml_function /
+# qwen_json + auto-detect) and <think> reasoning separation. Pure host logic —
+# compiles the forge_agent sources directly so the executable stays fast to
+# build (same pattern as dtype-contract above).
+add_executable(
+  forge-tool-dialects-test
+  test_tool_dialects.cpp
+  ${PROJECT_SOURCE_DIR}/src/agent/tool_dialect.cpp
+  ${PROJECT_SOURCE_DIR}/src/agent/reasoning_filter.cpp
+  ${PROJECT_SOURCE_DIR}/src/agent/agent_pipeline.cpp)
+target_include_directories(
+  forge-tool-dialects-test
+  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
+add_test(NAME tool-dialects COMMAND forge-tool-dialects-test)
 
 # Q3_K MMQ decode bisect -- a host-only mechanical debugging tool (not a
 # normal ctest assertion suite). Built on demand, not registered with CTest.
@@ -446,7 +471,7 @@ endif()
 # Quantized dot-kernel comparisons (x86 AVX2 hosts only).
 # -----------------------------------------------------------------------------
 if(FORGE_CPU_HAS_AVX2)
-  foreach(iq_test IN ITEMS iq2xs iq23s)
+  foreach(iq_test IN ITEMS iq2xs iq23s iq13xxs)
     add_executable(
       forge-${iq_test}-compare-test
       test_${iq_test}_compare.cpp

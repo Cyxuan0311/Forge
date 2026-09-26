@@ -20,6 +20,15 @@
 #include "forge/tensor.h"
 #include "operators/cpu/gdn.h"
 
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#    include <stdexcept>
+#    include <string>
+
+#    include "forge/inference/layers/bailingmoe3_recurrent_memory.h"
+#    include "operators/cuda/cuda_gdn.h"
+#endif
+
 namespace {
 
 using namespace forge;
@@ -31,7 +40,9 @@ void check(bool ok, const char* what) {
     if (!ok) ++g_failures;
 }
 
-bool near(float a, float b, float tol = 1e-5f) { return std::fabs(a - b) <= tol; }
+bool near(float a, float b, float tol = 1e-5f) {
+    return std::isfinite(a) && std::isfinite(b) && std::fabs(a - b) <= tol;
+}
 
 TensorPtr make_tensor(const std::vector<float>& data, const std::vector<int64_t>& shape) {
     auto t = std::make_shared<Tensor>(DataType::FP32, shape, DeviceType::CPU);

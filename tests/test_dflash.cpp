@@ -30,7 +30,9 @@
 #include "forge/engine.h"
 #include "forge/engines/dflash_engine.h"
 #include "forge/engines/transformer_engine.h"
+#include "forge/fp16_compat.h"
 #include "forge/gguf_model.h"
+#include "forge/inference/layers/norm_executor.h"
 #include "forge/inference/layers/rope_executor.h"
 #include "forge/kv_cache.h"
 #include "forge/model.h"
@@ -122,9 +124,15 @@ static void run_config_parse_test() {
     ModelConfig cfg = parse_dflash_config(loader, "dflash");
     // Probe C (2026-08-30): Qwen3.6-35B-A3B-DFlash has window=4096 and
     // sliding_window_pattern=[1,1,1,1,1,0] (5 SWA + 1 full layer).
-    CHECK(cfg.n_swa == 4096, "config parse: n_swa == 4096 (iSWA window)");
-    std::vector<int> want{1, 1, 1, 1, 1, 0};
-    CHECK(cfg.swa_layers == want, "config parse: swa_layers == [1,1,1,1,1,0] (5 SWA + 1 full)");
+    // Qwen3.8-27B-DFlash2 (current fixture): window=2048, 5 draft layers all SWA.
+    // Key the expectation off the fixture actually in use so the test tracks
+    // whichever drafter the env points at.
+    const bool want_legacy = (cfg.num_layers == 6);
+    const int want_swa = want_legacy ? 4096 : 2048;
+    CHECK(cfg.n_swa == want_swa, "config parse: n_swa matches the drafter fixture");
+    std::vector<int> want = want_legacy ? std::vector<int>{1, 1, 1, 1, 1, 0}
+                                        : std::vector<int>{1, 1, 1, 1, 1};
+    CHECK(cfg.swa_layers == want, "config parse: swa_layers matches the drafter fixture");
     CHECK(static_cast<int>(cfg.swa_layers.size()) == cfg.num_layers,
           "config parse: swa_layers covers every draft layer");
     std::printf("     parsed: n_swa=%d num_layers=%d swa_layers=[", cfg.n_swa, cfg.num_layers);
@@ -386,11 +394,21 @@ static void run_context_kv_injection_test() {
         CHECK(eng->kv_cache()->filled(ly) == L, "context-kv: layer wrote L prefix positions");
 
     // (b)/(c) exact K (rotated) and V (unrotated) match the projection.
+    // write_context_kv 现在统一先应用 encoder 输出 norm (hidden_norm), 再逐层
+    // 投影; DFlash 层带 QK-Norm 时 K 还要过逐层 k_norm。镜像引擎语义构造期望值。
     RopeExecutor rope;
+    TensorPtr proj_in = prefix;
+    if (eng->weights().dflash_output_norm_enc) {
+        proj_in = ops::rms_norm(prefix, eng->weights().dflash_output_norm_enc, cfg.rms_norm_eps);
+    }
     for (int ly = 0; ly < cfg.num_layers; ++ly) {
         const auto& lw = eng->weights().layers[ly];
-        TensorPtr K = ops::matmul_transB(prefix, lw.wk());
-        TensorPtr V = ops::matmul_transB(prefix, lw.wv());
+        TensorPtr K = ops::matmul_transB(proj_in, lw.wk());
+        TensorPtr V = ops::matmul_transB(proj_in, lw.wv());
+        if (cfg.use_qk_norm && lw.attn_k_norm()) {
+            K = NormExecutor::apply_qk_norm(K, lw.attn_k_norm(), cfg.num_kv_heads, cfg.head_dim,
+                                            cfg.rms_norm_eps, DeviceType::CPU);
+        }
         const int64_t kvdim = K->shape()[1];
         auto q_dummy = std::make_shared<Tensor>(
             DataType::FP32,
@@ -405,8 +423,9 @@ static void run_context_kv_injection_test() {
               "context-kv: K shape [L, kvdim]");
         CHECK(Vgot && Vgot->shape()[0] == L && Vgot->shape()[1] == kvdim,
               "context-kv: V shape [L, kvdim]");
-        CHECK(max_abs_diff(Kexp, Kgot) < 1e-2f, "context-kv: K == RoPE(wk(prefix))");
-        CHECK(max_abs_diff(V, Vgot) < 1e-2f, "context-kv: V == wv(prefix)");
+        CHECK(max_abs_diff(Kexp, Kgot) < 1e-2f,
+              "context-kv: K == RoPE(k_norm(wk(hidden_norm(prefix))))");
+        CHECK(max_abs_diff(V, Vgot) < 1e-2f, "context-kv: V == wv(hidden_norm(prefix))");
     }
 
     // (d) zero prefix -> all-zero K/V (verbatim use of the supplied prefix).
@@ -500,6 +519,135 @@ static void run_draft_end2end(const std::string& dflash_path, const std::string&
     CHECK(d1 == d2, "e2e: greedy draft is deterministic");
 }
 
+// =========================================================================
+// Part 7 -- DFlash2 conv / selector / lattice walk (pure functions, no model)
+// =========================================================================
+//
+// Synthetic tensors verify the row-major ports of llama.cpp's
+// build_dflash2_conv and build_dflash2_selector plus the provider's greedy
+// lattice walk. All expectations are hand-computed; small integers keep every
+// intermediate exact in FP32 and FP16.
+
+static TensorPtr make_f32_tensor(std::vector<int64_t> shape, const std::vector<float>& vals) {
+    auto t = std::make_shared<Tensor>(DataType::FP32, shape, DeviceType::CPU);
+    std::memcpy(t->data(), vals.data(), vals.size() * sizeof(float));
+    return t;
+}
+
+static bool rows_match(const TensorPtr& t, const std::vector<std::vector<float>>& want) {
+    if (!t || t->shape()[0] < static_cast<int64_t>(want.size()))
+        return false;
+    const float* p = static_cast<const float*>(t->data());
+    const int64_t w = t->shape()[1];
+    for (size_t r = 0; r < want.size(); ++r)
+        for (size_t c = 0; c < want[r].size(); ++c)
+            if (std::fabs(p[r * w + c] - want[r][c]) > 1e-4f)
+                return false;
+    return true;
+}
+
+static void run_dflash2_unit_test() {
+    std::printf("\n--- DFlash2 conv / selector / lattice walk ---\n");
+
+    // ---- conv: kernel=2, group_size=2, n_embd=4 (n_groups=2), 3 tokens ----
+    ModelConfig cfg{};
+    cfg.dflash_conv_kernel_size = 2;
+    cfg.dflash_conv_group_size = 2;
+
+    auto hidden = make_f32_tensor({3, 4}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    // dynamic[t][side*4 + k*2 + g] = t*10 + idx (side block = kernel*n_groups = 4)
+    std::vector<float> dynv(24);
+    for (int t = 0; t < 3; ++t)
+        for (int i = 0; i < 8; ++i)
+            dynv[t * 8 + i] = static_cast<float>(t * 10 + i);
+    auto dynamic = make_f32_tensor({3, 8}, dynv);
+    std::vector<float> basev(16);
+    for (int i = 0; i < 16; ++i)
+        basev[i] = static_cast<float>(i);  // base[side][k][c] flat
+    auto base = make_f32_tensor({16}, basev);
+
+    // out[t][c] = sum_k (dynamic[t][side*4+k*2+c/2] + base[side][k][c]) * h[t-k][c],
+    // taps with t-k < 0 skipped. E.g. side 0, t=1, c=0:
+    //   k=0: (10+0)*5  plus  k=1: (12+4)*1 = 66.
+    CHECK(rows_match(build_dflash2_conv(hidden, dynamic, base, 0, cfg),
+                     {{0, 2, 9, 16}, {66, 100, 148, 192}, {310, 372, 456, 528}}),
+          "dflash2 conv: side 0 matches hand-computed taps");
+    CHECK(rows_match(build_dflash2_conv(hidden, dynamic, base, 1, cfg),
+                     {{12, 26, 45, 64}, {138, 196, 268, 336}, {478, 564, 672, 768}}),
+          "dflash2 conv: side 1 matches hand-computed taps");
+
+    // FP16 hidden round-trips through the conv (values exact in FP16) and the
+    // result stays FP16 on the input's device.
+    auto h16 = std::make_shared<Tensor>(DataType::FP16, hidden->shape(), DeviceType::CPU);
+    {
+        const float* src = static_cast<const float*>(hidden->data());
+        auto* dst = static_cast<uint16_t*>(h16->data());
+        for (int64_t i = 0; i < hidden->numel(); ++i)
+            dst[i] = fp16_detail::float_to_half_bits(fp16_detail::float_bits(src[i]));
+    }
+    auto out16 = build_dflash2_conv(h16, dynamic, base, 0, cfg);
+    bool fp16_ok = out16 && out16->dtype() == DataType::FP16 && out16->numel() == 12;
+    if (fp16_ok) {
+        static const float want[3][4] = {{0, 2, 9, 16}, {66, 100, 148, 192}, {310, 372, 456, 528}};
+        const auto* p = static_cast<const uint16_t*>(out16->data());
+        for (int r = 0; r < 3 && fp16_ok; ++r)
+            for (int c = 0; c < 4 && fp16_ok; ++c)
+                if (std::fabs(fp16_detail::float_from_bits(fp16_detail::half_to_float_bits(
+                        p[r * 4 + c])) -
+                              want[r][c]) > 1e-2f)
+                    fp16_ok = false;
+    }
+    CHECK(fp16_ok, "dflash2 conv: FP16 in -> FP16 out, values preserved");
+
+    // ---- selector: top_k=2, vocab=5, 3 positions, rank=2, n_embd=4 ----
+    ModelConfig cfg2{};
+    cfg2.dflash_selector_top_k = 2;
+    // top-k rows: pos1 -> ids {2,1} (scores 9,8), pos2 -> ids {3,4} (scores 4,3).
+    auto logits = make_f32_tensor({3, 5}, {10, 40, 30, 20, 50, 5, 8, 9, 2, 1, 0, 1, 2, 4, 3});
+    // gate[pos] = <sel_hidden[r], t_embd[pos]>: pos0 {1,0}, pos1 {0,1}, pos2 {0,1}.
+    auto t_embd = make_f32_tensor({3, 4}, {1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
+    auto sel_hidden = make_f32_tensor({2, 4}, {1, 1, 0, 0, 0, 0, 1, 1});
+    auto sel_prev = make_f32_tensor({5, 2}, {1, 0, 0, 1, 1, 1, 0, 0, 2, -1});
+    auto sel_next = make_f32_tensor({5, 2}, {1, 1, 0.5f, 1, 1, 0.5f, -1, 2, 0, 0});
+
+    // pos1: pred=anchor 0 -> cond = prev[0]*{0,1} = {0,0} -> scores = unary {9,8}.
+    // pos2: cands {3,4}; preds {2,1} -> cond = {0,1} for both ->
+    //   score[p][s] = <next[cand_s], {0,1}> + unary[s] = {6,3} per pred.
+    auto lattice =
+        build_dflash2_selector(logits, t_embd, cfg2, sel_prev, sel_next, sel_hidden, 0);
+    CHECK(lattice && lattice->shape()[0] == 3 && lattice->shape()[1] == 6,
+          "dflash2 selector: lattice shape [n_tokens, top_k + top_k^2]");
+    CHECK(rows_match(lattice, {{0, 0, 0, 0, 0, 0}, {2, 1, 9, 8, 0, 0}, {3, 4, 6, 3, 6, 3}}),
+          "dflash2 selector: hand-computed candidates + transition scores");
+
+    // ---- walk: handcrafted lattice, padded row width catches index bugs ----
+    const int64_t row_w = 8;
+    std::vector<float> lat(4 * row_w, 0.0f);
+    auto set_row = [&](int64_t r, std::initializer_list<float> v) {
+        int64_t i = 0;
+        for (float x : v)
+            lat[r * row_w + i++] = x;
+    };
+    set_row(0, {0, 0, 0, 0, 0, 0, 99, 99});        // anchor (garbage pad)
+    set_row(1, {10, 11, 5, 7, 0, 0, 99, 99});      // pred0 scores {5,7} -> succ 1
+    set_row(2, {12, 13, 6, 4, 1, 1.05f, 99, 99});  // pred1 scores {1,1.05} -> succ 1
+    set_row(3, {14, 15, 9, 1, 3, 2, 99, 99});      // pred1 scores {3,2} -> succ 0
+
+    auto w0 = dflash2_lattice_walk(lat.data(), row_w, 2, 4, 0.0f);
+    CHECK((w0 == std::vector<int32_t>{11, 13, 14}), "dflash2 walk: greedy path 11 -> 13 -> 14");
+    // Position 2 (pred1 scores {1,1.05}): confidence 1/(1+exp(-0.05)) ~= 0.5125
+    // fails p_min=0.55 -> stop after position 1. Position 1 ({5,7}) confidence
+    // ~= 0.8808 already fails p_min=0.9 -> empty.
+    auto w55 = dflash2_lattice_walk(lat.data(), row_w, 2, 4, 0.55f);
+    CHECK((w55 == std::vector<int32_t>{11}), "dflash2 walk: p_min gate stops after position 1");
+    auto w90 = dflash2_lattice_walk(lat.data(), row_w, 2, 4, 0.9f);
+    CHECK(w90.empty(), "dflash2 walk: p_min gate rejects the first position");
+    CHECK(dflash2_lattice_walk(nullptr, row_w, 2, 4, 0.0f).empty(),
+          "dflash2 walk: null lattice -> empty");
+    CHECK(dflash2_lattice_walk(lat.data(), row_w, 2, 1, 0.0f).empty(),
+          "dflash2 walk: single anchor token -> empty");
+}
+
 int main() {
     std::printf("=== forge-dflash-test ===\n");
     register_forge_runtime();
@@ -507,6 +655,7 @@ int main() {
     run_config_parse_test();
     run_kvcache_swa_test();
     run_dspark_sample_test();
+    run_dflash2_unit_test();
     run_context_kv_injection_test();
 
     const char* dflash_env = std::getenv("FORGE_TEST_DFLASH_MODEL");
