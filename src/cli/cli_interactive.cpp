@@ -20,8 +20,8 @@
 
 using namespace forge;
 
-void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
-                      const CliArgs& args) {
+void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
+                      VisionEncoder* vision, const CliArgs& args) {
     const auto& cfg = model.config();
 
     // Build ChatTemplateEngine — jinja path is the default;
@@ -52,66 +52,29 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
     print_logo();
 
     std::cout << "\n";
-    std::cout << "  Model: " << cfg.arch_type << " (" << cfg.num_layers << " layers)\n";
-    std::cout << "  Device: " << (args.n_gpu_layers == 0 ? "CPU" : "CUDA") << "\n";
-    std::cout << "  GPU layers: " << args.n_gpu_layers << "\n";
-    std::cout << "  Commands: /quit, /clear, /system, /image, /save, /help\n";
+    std::cout << "  " << cli_color::green("Model:") << " " << cli_color::bold(cfg.arch_type)
+              << " (" << cli_color::cyan(std::to_string(cfg.num_layers)) << " layers)\n";
+    std::cout << "  " << cli_color::green("Device:") << " "
+              << cli_color::bold(args.n_gpu_layers == 0 ? "CPU" : "CUDA") << "\n";
+    std::cout << "  " << cli_color::green("GPU layers:") << " "
+              << cli_color::cyan(std::to_string(args.n_gpu_layers)) << "\n";
+    std::cout << "  " << cli_color::green("Commands:") << " "
+              << cli_color::dim("/quit, /clear, /system, /image, /save, /help") << "\n";
     std::cout << "\n";
 
-    // Create the inference context + engine ONCE and reuse it across turns so the
-    // KV cache (and, in paged mode, the radix prefix cache) persists between turns.
-    // Chat front-ends resend the growing conversation every turn, so most of the
-    // prompt is a shared prefix that paged KV can reuse via the radix PrefixCache.
-    std::unique_ptr<InferenceContext> ctx = std::make_unique<InferenceContext>(model);
-
-    {
-        auto engine = EngineRegistry::instance().create(cfg.arch_type, model, *ctx);
-        if (!engine) {
-            std::cerr << "Error: No matching engine for architecture: " << cfg.arch_type << "\n";
-            return;
-        }
-
-        auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
-        if (tfm_eng) {
-            KVCacheDType kv_dtype = KVCacheDType::F16;
-            if (args.kv_cache_dtype == "fp32")
-                kv_dtype = KVCacheDType::FP32;
-            else if (args.kv_cache_dtype == "f16")
-                kv_dtype = KVCacheDType::F16;
-            else if (args.kv_cache_dtype == "q8_0")
-                kv_dtype = KVCacheDType::Q8_0;
-            else if (args.kv_cache_dtype == "q4_0")
-                kv_dtype = KVCacheDType::Q4_0;
-            else if (args.kv_cache_dtype == "fp8_e4m3")
-                kv_dtype = KVCacheDType::FP8_E4M3;
-            else if (args.kv_cache_dtype == "fp8_e5m2")
-                kv_dtype = KVCacheDType::FP8_E5M2;
-            tfm_eng->set_kv_cache_dtype(kv_dtype);
-            tfm_eng->set_gpu_layers(args.n_gpu_layers);
-            if (args.cuda_graph) {
-                tfm_eng->set_use_graph(true);
-                tfm_eng->set_cuda_graph_enabled(true);
-            }
-        }
-        ctx->set_engine(std::move(engine));
-        ctx->init_kv_cache();
-
-        if (model.device() == DeviceType::CUDA) {
-            std::cout << "CUDA warmup...\n";
-            try {
-                ctx->warmup();
-                std::cout << "CUDA warmup done\n";
-            } catch (const std::runtime_error& e) {
-                std::cout << "Warmup skipped (" << e.what() << ")\n";
-            }
-        }
-    }
+    // Reuse the InferenceContext (and its engine + KV cache) created and
+    // initialized by the CLI main flow. A fresh context here would re-probe
+    // device memory after the weights + the main context already occupied VRAM
+    // and get its KV cache clamped to a tiny max_seq (observed: 15872 -> 256,
+    // KVCache::update cache overflow at token 256). The main context was sized
+    // with the full memory budget and is kept between turns; reset_kv_cache()
+    // below only clears contents, never the resident KV buffers.
 
     // Persisted across turns; holds cached prefixes in dedicated cache seq_ids.
     PrefixCache prefix_cache;
 
     while (!g_interrupted) {
-        std::cout << "> ";
+        std::cout << cli_color::blue("> ");
         std::string user_input;
         if (!std::getline(std::cin, user_input)) {
             std::cout << "\n";
@@ -132,7 +95,7 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
             }
             current_image_embeddings.clear();
             current_num_img_tokens = 0;
-            std::cout << "  [Conversation cleared]\n\n";
+            std::cout << "  " << cli_color::green("[Conversation cleared]") << "\n\n";
             continue;
         } else if (user_input == "/help") {
             std::cout << "  /quit, /exit      Exit\n";
@@ -149,11 +112,12 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
             } else if (!current_system.empty()) {
                 conversation.insert(conversation.begin(), {"system", current_system});
             }
-            std::cout << "  [System prompt set: " << current_system << "]\n\n";
+            std::cout << "  " << cli_color::green("[System prompt set: ") << current_system
+                      << cli_color::green("]") << "\n\n";
             continue;
         } else if (user_input.rfind("/image ", 0) == 0) {
             if (!vision) {
-                std::cout << "  [Error: Vision encoder not loaded, use --mmproj]\n\n";
+                std::cout << "  " << cli_color::red("[Error: Vision encoder not loaded, use --mmproj]") << "\n\n";
                 continue;
             }
             std::string img_path = user_input.substr(7);
@@ -167,20 +131,23 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
             current_image_embeddings = std::move(emb);
             current_num_img_tokens = n_tokens;
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            std::cout << "  [Image loaded: " << n_tokens << " tokens, " << ms << "ms]\n\n";
+            std::cout << "  " << cli_color::cyan("[Image loaded: ") << n_tokens << " tokens, " << ms
+                      << "ms" << cli_color::cyan("]") << "\n\n";
             continue;
         } else if (user_input.rfind("/save ", 0) == 0) {
             std::string save_path = user_input.substr(6);
             std::ofstream out(save_path);
             if (!out.is_open()) {
-                std::cout << "  [Error: Cannot create file: " << save_path << "]\n\n";
+                std::cout << "  " << cli_color::red("[Error: Cannot create file: ") << save_path
+                          << cli_color::red("]") << "\n\n";
                 continue;
             }
             for (const auto& msg : conversation) {
                 out << "[" << msg.role << "]\n" << msg.content << "\n\n";
             }
             out.close();
-            std::cout << "  [Conversation saved to: " << save_path << "]\n\n";
+            std::cout << "  " << cli_color::green("[Conversation saved to: ") << save_path
+                      << cli_color::green("]") << "\n\n";
             continue;
         }
 
@@ -208,8 +175,8 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
 
         // Contiguous mode keeps the old per-turn behavior (fresh KV each turn);
         // paged mode leaves seq 0 to the radix PrefixCache (lookup + register).
-        if (ctx->params().kv_storage_mode != KVStorageMode::Paged) {
-            ctx->reset_kv_cache();
+        if (ctx.params().kv_storage_mode != KVStorageMode::Paged) {
+            ctx.reset_kv_cache();
         }
 
         std::cout << "\n";
@@ -218,13 +185,13 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
         GenerationStats stats;
 
         if (args.no_stream) {
-            stats = generate_batch(*ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
+            stats = generate_batch(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
                                    !args.no_sample, args.seed, tokenizer.eos_token_id(),
                                    args.spec, &prefix_cache);
         } else {
             stats =
-                generate_streaming(*ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
+                generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
                                    !args.no_sample, args.seed, tokenizer.eos_token_id(),
                                    args.spec, &prefix_cache);
@@ -232,14 +199,7 @@ void interactive_chat(Model& model, Tokenizer& tokenizer, VisionEncoder* vision,
 
         std::cout << "\n";
 
-        if (stats.num_generated_tokens > 0) {
-            double prompt_tok_s = stats.num_prompt_tokens / (stats.prompt_eval_ms / 1000.0);
-            double gen_tok_s = stats.num_generated_tokens / (stats.elapsed_ms / 1000.0);
-            printf(
-                "  [%d prompt tokens, %.1f ms, %.1f tok/s | %d generated, %.1f ms, %.1f tok/s]\n",
-                stats.num_prompt_tokens, stats.prompt_eval_ms, prompt_tok_s,
-                stats.num_generated_tokens, stats.elapsed_ms, gen_tok_s);
-        }
+        forge_print_stats_line(stats);
 
         conversation.push_back({"assistant", ""});
 

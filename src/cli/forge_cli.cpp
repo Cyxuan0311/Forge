@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 
@@ -31,6 +32,8 @@
 #include "forge/engine.h"
 #include "forge/inference/forward_request.h"
 #include "forge/kv_cache.h"
+#include "forge/kv_memory.h"
+#include "forge/kv_storage.h"
 #include "forge/logger.h"
 
 #include "forge/model.h"
@@ -305,8 +308,29 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
     int num_decode_steps = 128;
     forge::PerfProfiler::instance().enable();
     forge::PerfProfiler::instance().reset();
+    // FORGE_PERF_DECODE=1: switch the profiler to CUDA-event timing so the
+    // dump below reflects per-op device-stream time (host wall mis-attributes
+    // async queue drains to whichever op happens to block the pipeline).
+    const bool perf_decode = std::getenv("FORGE_PERF_DECODE") != nullptr;
+    if (perf_decode)
+        forge::PerfProfiler::instance().set_use_cuda_events(true);
+    // FORGE_BENCH_PIPELINE=1: feed every step from a pre-staged device tensor
+    // (same token id, no writes) so no per-step sync H2D drains the pipeline.
+    // Wall/step then approaches pure device time and CUDA-event scopes lose
+    // the idle-gap inflation, isolating real kernel execution from queue
+    // drain artifacts.
+    const bool pipeline = std::getenv("FORGE_BENCH_PIPELINE") != nullptr;
+    std::shared_ptr<Tensor> pipe_ids;
+    if (pipeline && ctx.device() == DeviceType::CUDA) {
+        pipe_ids =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CUDA);
+    }
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_decode_steps; ++i) {
+        if (pipe_ids) {
+            ctx.engine()->forward_request(ForwardRequest::from_ids(pipe_ids, i + 1));
+            continue;
+        }
         auto input_ids =
             std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{1}, DeviceType::CPU);
         *static_cast<int32_t*>(input_ids->data()) = 0;
@@ -325,7 +349,19 @@ void run_benchmark(InferenceContext& ctx, const Tokenizer& tokenizer, int n_gpu_
     double tok_per_s = num_decode_steps / (ms / 1000.0);
     printf("  Decode  %4d tokens: %7.2f ms  (%8.1f tok/s)\n", num_decode_steps, ms, tok_per_s);
 
-    forge::PerfProfiler::instance().print_summary();
+    // Skip print_summary under perf_decode: the dump below supersedes it, and
+    // print_summary's merge is not idempotent (calling both would double-count
+    // every record).
+    if (!perf_decode)
+        forge::PerfProfiler::instance().print_summary();
+
+    if (perf_decode) {
+        auto& prof = forge::PerfProfiler::instance();
+#ifdef USE_CUDA
+        prof.flush_deferred();
+#endif
+        forge::dump_phase_profile("DECODE-ONLY", ms, num_decode_steps, prof.summary());
+    }
 
     std::cout << "\n  Benchmark complete\n";
 }
@@ -447,7 +483,11 @@ int main(int argc, char** argv) {
     model.set_offload_embedding(args.offload_embedding);
     model.set_prefetch(args.prefetch);
 
-    bool load_ok = model.load(args.model_path, args.n_gpu_layers);
+    // --info only prints metadata, so it must never offload weights. With the
+    // default -ngl -1 (all layers on GPU) a model larger than VRAM died here
+    // ("CUDA malloc failed" -> uncaught -> core dump) before printing anything.
+    const int load_gpu_layers = args.info_only ? 0 : args.n_gpu_layers;
+    bool load_ok = model.load(args.model_path, load_gpu_layers);
     if (!load_ok) {
         std::cerr << "Error: Failed to load model: " << args.model_path << "\n";
         return 1;
@@ -506,18 +546,9 @@ int main(int argc, char** argv) {
     auto t4 = std::chrono::high_resolution_clock::now();
 
     InferenceContext ctx(model);
-    // CPU threads: -t/--threads wins; default "auto" probes the fused GEMV.
-    if (args.threads > 0) {
-        ctx.params_mut().n_threads = args.threads;
-        ctx.params_mut().n_threads_batch = args.threads;
-        std::cout << "CPU threads set to: " << args.threads << "\n";
-    } else if (model.device() != DeviceType::CUDA) {
-        int t = forge::detect_best_cpu_threads(cfg.hidden_dim,
-                                               cfg.intermediate_dim);
-        ctx.params_mut().n_threads = t;
-        ctx.params_mut().n_threads_batch = t;
-        std::cout << "CPU threads auto-detected: " << t << "\n";
-    }
+    // CPU threads are tuned later (after the engine reports its real backend),
+    // because some engines (bailingmoe3) cannot offload to GPU and must still
+    // get properly auto-detected threads even when -ngl -1 was requested.
     if (args.paged_kv) {
         ctx.params_mut().kv_storage_mode = KVStorageMode::Paged;
         std::cout << "Paged KV cache storage enabled\n";
@@ -549,12 +580,32 @@ int main(int argc, char** argv) {
         else if (args.kv_cache_dtype == "fp8_e5m2")
             kv_dtype = KVCacheDType::FP8_E5M2;
         tfm_eng->set_kv_cache_dtype(kv_dtype);
+        // -c/--ctx-size caps the KV cache instead of trusting the model's native
+        // length. Without it a 256K-native model sizes KV from raw free memory
+        // (observed: 23808 tokens -> multi-GB host KV -> swap thrash on a 15GB box).
+        if (args.n_ctx > 0) {
+            tfm_eng->set_kv_cache_max_seq_len(args.n_ctx);
+        }
         if (!args.gpu_layers_per_dev.empty()) {
             tfm_eng->set_gpu_layers(args.n_gpu_layers, args.gpu_layers_per_dev);
         } else {
             tfm_eng->set_gpu_layers(args.n_gpu_layers);
         }
-        if (args.cuda_graph && model.device() == DeviceType::CUDA) {
+        // CPU thread auto-tune: only when the engine will actually run on CPU.
+        // This fixes the bailingmoe3 -ngl -1 case, where model.device() reports
+        // CUDA (so the old gate skipped tuning) even though the engine runs CPU.
+        if (args.threads > 0) {
+            ctx.params_mut().n_threads = args.threads;
+            ctx.params_mut().n_threads_batch = args.threads;
+            std::cout << "CPU threads set to: " << args.threads << "\n";
+        } else if (!tfm_eng->uses_gpu()) {
+            int t = forge::detect_best_cpu_threads(cfg.hidden_dim,
+                                                   cfg.intermediate_dim);
+            ctx.params_mut().n_threads = t;
+            ctx.params_mut().n_threads_batch = t;
+            std::cout << "CPU threads auto-detected: " << t << "\n";
+        }
+        if (args.cuda_graph && tfm_eng->uses_gpu()) {
             tfm_eng->set_use_graph(true);
             tfm_eng->set_cuda_graph_enabled(true);
         }
@@ -578,6 +629,34 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    // ---- KVMem tiered KV: cap the GPU page pool BEFORE init_kv_cache ----
+    // The working-set manager itself is pure policy, but the pool cap is what
+    // turns the paged arena into a bounded working set: PagedKVStorage::init()
+    // reads it while sizing the page pools, so it has to be set before
+    // ctx.init_kv_cache() runs. The manager is attached afterwards, once the
+    // pool geometry is known.
+    bool kvmem_active = false;
+    if (args.kvmem) {
+        auto* kv_mem = tfm_eng ? tfm_eng->kv_memory() : nullptr;
+        if (!tfm_eng || !kv_mem) {
+            std::cerr << "Warning: --kvmem needs a transformer engine with KV memory; "
+                         "tiered KV disabled\n";
+        } else if (!kv_mem->is_paged()) {
+            std::cerr << "Warning: --kvmem needs paged KV storage; tiered KV disabled\n";
+        } else if (cfg.n_swa > 0) {
+            // PagedKVStorage::kvmem_supported() rejects mixed policies: pages can
+            // only be archived uniformly when every layer is Full-attention.
+            std::cerr << "Warning: --kvmem needs all-Full attention layers; model has "
+                      << cfg.n_swa << " sliding-window layer(s); tiered KV disabled\n";
+        } else {
+            // 0 = keep the device-sized pool; the budget then falls back to it.
+            if (args.kvmem_budget > 0)
+                kv_mem->storage().set_pool_token_cap(args.kvmem_budget);
+            kvmem_active = true;
+        }
+    }
+
     ctx.set_engine(std::move(engine));
 
     ctx.params_mut().offload_kqv = args.offload_kqv;
@@ -611,6 +690,33 @@ int main(int argc, char** argv) {
             std::cout << "KV Cache: dtype=" << kv_dtype_to_name(cache->kv_dtype())
                       << ", size=" << format_bytes(cache->nbytes())
                       << ", max_seq=" << cache->max_seq_len() << "\n";
+        }
+    }
+
+    // ---- Attach the KVMem working-set manager ----
+    // Built after init_kv_cache so it sees the pool geometry the storage
+    // actually settled on (page_size + pool_tokens) — kvmem_supported() also
+    // needs the page pools to exist, so this is the earliest point the gate
+    // can run. From here the generator reads window/rope metadata off it and
+    // the logical context (-c) may exceed the GPU pool.
+    if (kvmem_active && tfm_eng) {
+        auto* kv_mem = tfm_eng->kv_memory();
+        if (!kv_mem->storage().kvmem_supported()) {
+            std::cerr << "Warning: --kvmem unsupported by this KV storage "
+                         "(mixed layer policies); tiered KV disabled\n";
+        } else {
+            const int page_size = kv_mem->storage().page_size();
+            const int pool_tokens = kv_mem->max_pool_tokens();
+            auto ws = std::make_unique<KVWorkingSetManager>(args.kvem_config(), page_size,
+                                                           pool_tokens);
+            std::cout << "KVMem tiered KV enabled: budget=" << ws->budget()
+                      << ", sink=" << ws->sink_tokens()
+                      << ", gen_reserve=" << ws->gen_reserve()
+                      << ", retrieval=" << args.kvmem_retrieval << "\n"
+                      << "  logical ctx=" << kv_mem->max_seq_len()
+                      << " tokens, gpu pool=" << pool_tokens
+                      << " tokens, page=" << page_size << "\n";
+            kv_mem->set_working_set(std::move(ws));
         }
     }
 
@@ -658,13 +764,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "\n\n";
-        if (stats.num_generated_tokens > 0) {
-            double prompt_tok_s = stats.num_prompt_tokens / (stats.prompt_eval_ms / 1000.0);
-            double gen_tok_s = stats.num_generated_tokens / (stats.elapsed_ms / 1000.0);
-            printf("  [%d prompt, %.1f ms, %.1f tok/s | %d generated, %.1f ms, %.1f tok/s]\n",
-                   stats.num_prompt_tokens, stats.prompt_eval_ms, prompt_tok_s,
-                   stats.num_generated_tokens, stats.elapsed_ms, gen_tok_s);
-        }
+        forge_print_stats_line(stats);
 
         // Print speculative decoding stats if requested
         if (args.spec.print_stats && args.spec.enabled && stats.spec.n_spec_steps > 0) {
@@ -688,7 +788,11 @@ int main(int argc, char** argv) {
     }
 
     // ---- Interactive chat mode ----
-    interactive_chat(model, tokenizer, vision.get(), args);
+    // Reuse the fully initialized ctx (engine + KV cache sized with the full
+    // VRAM budget) instead of letting interactive_chat build a second context,
+    // which would get its KV max_seq clamped to a tiny value (256) and crash
+    // with "KVCache::update: cache overflow" once generation exceeds it.
+    interactive_chat(ctx, model, tokenizer, vision.get(), args);
 
     return 0;
 }

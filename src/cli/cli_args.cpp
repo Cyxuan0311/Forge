@@ -31,9 +31,24 @@ static void print_usage(const char* prog) {
            "  -nkvo,--no-kv-offload        Keep KV cache on CPU (for long context + small VRAM)\n"
            "  -t,  --threads N           CPU threads (default: auto)\n"
            "  -b,  --batch-size N        Prompt processing batch size (default: 512)\n"
+           "  -c,  --ctx-size N          Context window / KV cache size in tokens (default: 0 = model\n"
+           "                           native length, clamped to fit memory; use it to cap KV RAM)\n"
            "       --kv-cache-dtype TYPE KV cache dtype: fp32, f16, q8_0, q4_0 (default: fp32)\n"
            "       --cuda-graph          Enable CUDA Graph for decode (default: off)\n"
            "       --paged-kv            Use paged KV cache storage (default: off, contiguous)\n"
+           "\n"
+           "Tiered KV (KVMem, arXiv:2609.04852):\n"
+           "       --kvmem               Enable the tiered KV working set: a bounded GPU\n"
+           "                           resident window over host-archived history, so the\n"
+           "                           logical context (-c) can exceed the GPU pool. Implies\n"
+           "                           --paged-kv.\n"
+           "       --kvmem-budget N      GPU resident budget in tokens (default: 0 = the\n"
+           "                           paged pool size; the pool is capped to it)\n"
+           "       --kvmem-sink N        Prefix tokens pinned resident forever (default: 256)\n"
+           "       --kvmem-gen-reserve N Window slots held back for this turn's output\n"
+           "                           (default: 0)\n"
+           "       --kvmem-retrieval M   Recall policy for archived history: recent (default)\n"
+           "                           | embed (reserved)\n"
            "\n"
            "Memory:\n"
             "       --load-mode MODE      Memory mapping mode: mmap (default), mlock, mmap_mlock\n"
@@ -196,6 +211,16 @@ CliArgs parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             args.batch_size = std::stoi(argv[i]);
+        } else if (arg == "-c" || arg == "--ctx-size" || arg == "--n-ctx") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.n_ctx = std::stoi(argv[i]);
+            if (args.n_ctx < 0) {
+                std::cerr << "Error: --ctx-size must be >= 0 (0 = auto = model native length)\n";
+                std::exit(1);
+            }
         } else if (arg == "--kv-cache-dtype") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
@@ -270,6 +295,38 @@ CliArgs parse_args(int argc, char** argv) {
             args.cuda_graph = true;
         } else if (arg == "--paged-kv") {
             args.paged_kv = true;
+        } else if (arg == "--kvmem") {
+            args.kvmem = true;
+            args.paged_kv = true;  // the tier needs the page pool it caps
+        } else if (arg == "--kvmem-budget") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.kvmem_budget = std::stoi(argv[i]);
+        } else if (arg == "--kvmem-sink") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.kvmem_sink = std::stoi(argv[i]);
+        } else if (arg == "--kvmem-gen-reserve") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.kvmem_gen_reserve = std::stoi(argv[i]);
+        } else if (arg == "--kvmem-retrieval") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.kvmem_retrieval = argv[i];
+            if (args.kvmem_retrieval != "recent" && args.kvmem_retrieval != "embed") {
+                std::cerr << "Error: Invalid --kvmem-retrieval: " << args.kvmem_retrieval
+                          << ". Valid: recent, embed\n";
+                std::exit(1);
+            }
         } else if (arg == "--load-mode") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
@@ -465,6 +522,20 @@ CliArgs parse_args(int argc, char** argv) {
 
     if (args.temperature == 0.0f) {
         args.no_sample = true;
+    }
+
+    // KVMem tier validation: the working set needs the page pool to cap, and a
+    // sink larger than the budget would force an overflow on every prompt.
+    if (args.kvmem) {
+        if (args.kvmem_sink < 0 || args.kvmem_budget < 0 || args.kvmem_gen_reserve < 0) {
+            std::cerr << "Error: --kvmem-sink / --kvmem-budget / --kvmem-gen-reserve must be >= 0\n";
+            std::exit(1);
+        }
+        if (args.kvmem_budget > 0 && args.kvmem_sink > args.kvmem_budget) {
+            std::cerr << "Error: --kvmem-sink (" << args.kvmem_sink
+                      << ") cannot exceed --kvmem-budget (" << args.kvmem_budget << ")\n";
+            std::exit(1);
+        }
     }
 
     if (args.prompt.empty() && !args.info_only && !args.bench) {
