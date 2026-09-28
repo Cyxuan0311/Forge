@@ -598,12 +598,17 @@ int main(int argc, char** argv) {
             ctx.params_mut().n_threads = args.threads;
             ctx.params_mut().n_threads_batch = args.threads;
             std::cout << "CPU threads set to: " << args.threads << "\n";
-        } else if (!tfm_eng->uses_gpu()) {
+        } else if (args.n_gpu_layers < cfg.num_layers) {
+            // Hybrid offload: some layers still run on CPU, so we must tune CPU
+            // threads even though uses_gpu() is true. The old gate
+            // (!uses_gpu()) skipped tuning here and left the CPU-resident layers
+            // running at the default n_threads=4, making CPU the decode
+            // bottleneck while the GPU sat idle.
             int t = forge::detect_best_cpu_threads(cfg.hidden_dim,
                                                    cfg.intermediate_dim);
             ctx.params_mut().n_threads = t;
             ctx.params_mut().n_threads_batch = t;
-            std::cout << "CPU threads auto-detected: " << t << "\n";
+            std::cout << "CPU threads auto-detected (hybrid offload): " << t << "\n";
         }
         if (args.cuda_graph && tfm_eng->uses_gpu()) {
             tfm_eng->set_use_graph(true);
