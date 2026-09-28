@@ -131,11 +131,46 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
 
 SpeculativeExecutor::~SpeculativeExecutor() = default;
 
+int adaptive_draft_target(double accept_len_ewma, int cur, int max_draft, double gain,
+                          double accepted, double proposed) {
+    if (max_draft < 1) return max_draft;
+    if (cur < 1) return std::min(max_draft, std::max(1, max_draft));
+    // Negative means "no measurement yet" -> hold the current value rather than
+    // reacting to an uninitialised signal.
+    if (accept_len_ewma < 0.0) return cur;
+
+    int target;
+    if (accept_len_ewma < 1.0) {
+        // Under 1 token accepted per round, a round cannot break even: the drafter
+        // forward and the verify pass both scale with n_draft, so proposing 2 rows
+        // to yield 0.2 is strictly worse than proposing 1. --spec-min-acc is the
+        // lever for abandoning speculation altogether; this just stops paying for
+        // rows that cannot pay for themselves.
+        target = 1;
+    } else {
+        // Aim above the recent accepted length: a good run can reach past the mean,
+        // and an unused draft costs nothing extra because the drafter always runs
+        // the full trained block width regardless of n_draft. The payoff of a row
+        // that goes unused is zero; the payoff of one that lands is ~1 token.
+        target = static_cast<int>(std::ceil(accept_len_ewma * gain)) + 1;
+    }
+    target = std::max(1, std::min(target, max_draft));
+
+    // Slew limit of one row per round. Two reasons: a single noisy round cannot
+    // swing the draft across its whole range, and the response is gradual enough
+    // that a transient dip (one hard token) does not collapse a drafter that is
+    // otherwise performing -- which is exactly what the old rate-based rule did.
+    if (target > cur) return std::min(target, cur + 1);
+    if (target < cur) return std::max(target, cur - 1);
+    return cur;
+}
+
 void SpeculativeExecutor::begin_generation(const std::vector<int32_t>& prompt) {
     stats_.reset();
     last_drafter_idx_ = -1;
     adaptive_draft_ = 0;
     accept_ewma_ = -1.0;
+    accept_len_ewma_ = -1.0;
     spec_off_streak_ = 0;
     spec_off_ = false;
     invalidate_verify_hiddens();
@@ -165,21 +200,43 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
                      std::to_string(in.max_tokens) + ")");
         }
         ++stats_.n_fallback_steps;
+        ++stats_.n_fb_guard;
         return out;
     }
 
-    // Adaptive draft: scale effective n_draft by recent acceptance rate.
-    // When acceptance is low, a large draft wastes a full multi-row forward
-    // for little gain (net negative). Shrink toward 1; grow back when the
-    // provider is reliably accepted. Starts at the user-requested ceiling.
-    if (adaptive_draft_ <= 0) {
-        adaptive_draft_ = cfg_.n_draft;  // initialize to configured ceiling
-    }
-    if (accept_ewma_ >= 0.0) {
-        // target draft proportional to acceptance, clamped to [1, cfg_.n_draft]
-        int target = static_cast<int>(
-            std::max(1.0, std::min<double>(cfg_.n_draft, adaptive_draft_ * (0.5 + accept_ewma_))));
-        adaptive_draft_ = target;
+    // Adaptive draft sizing.
+    //
+    // This used to scale n_draft by (0.5 + acceptance_rate), which is a one-way
+    // ratchet: any rate below 0.5 gives a multiplier < 1, so the draft shrank
+    // every round and could never grow back. At the measured 41.7% acceptance it
+    // walked 7 -> 1 within six rounds and then stayed at 1 for the rest of the
+    // generation, which is why "draft tokens" came out ~= "spec steps" no matter
+    // what --spec-draft or --spec-draft-n were set to. It was also
+    // self-reinforcing: once n_draft reached 1 a round could only accept 0 or 1,
+    // so the measured rate kept decaying and pinned it there for good.
+    //
+    // Acceptance *rate* is the wrong signal on two counts:
+    //   - it is confounded with the draft length. Shrinking the draft raises the
+    //     rate at constant drafter quality, so the controller rewards its own
+    //     mistake and converges to 1.
+    //   - the saving from a shorter draft is tiny. The drafter forward always
+    //     runs the full trained block width; n_draft only truncates how many of
+    //     the tokens it hands back. A discarded draft token is already paid for,
+    //     so dropping it wastes work that was done.
+    //
+    // Size on accepted LENGTH instead -- that is the actual payoff -- and let it
+    // move in both directions under a slew limit so it tracks without
+    // oscillating. --no-adaptive-draft pins n_draft to the configured value.
+    if (!cfg_.adaptive_draft) {
+        adaptive_draft_ = cfg_.n_draft;
+    } else {
+        if (adaptive_draft_ <= 0) {
+            adaptive_draft_ = cfg_.n_draft;  // start at the ceiling to gather signal fast
+        } else {
+            adaptive_draft_ =
+                adaptive_draft_target(accept_len_ewma_, adaptive_draft_, cfg_.n_draft,
+                                      kDraftLenGain, kEwmaAccepted, kEwmaProposed);
+        }
     }
     const int n_draft = std::min({adaptive_draft_, cfg_.n_draft, in.max_tokens - 1});
     if (n_draft <= 0) {
@@ -187,6 +244,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
                  std::to_string(adaptive_draft_) + " cfg=" + std::to_string(cfg_.n_draft) +
                  " max_tokens=" + std::to_string(in.max_tokens) + ")");
         ++stats_.n_fallback_steps;
+        ++stats_.n_fb_guard;
         return out;
     }
 
@@ -200,6 +258,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     if (spec_min_acc_ > 0.0) {
         if (spec_off_) {
             ++stats_.n_fallback_steps;
+            ++stats_.n_fb_min_acc;
             return out;
         }
         if (accept_ewma_ >= 0.0 && accept_ewma_ < spec_min_acc_) {
@@ -211,6 +270,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
                          "% -> drafter net-negative, disabling speculation for this "
                          "generation (falling back to plain decode)");
                 ++stats_.n_fallback_steps;
+                ++stats_.n_fb_min_acc;
                 return out;
             }
         } else {
@@ -237,6 +297,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
             LOG_WARN(std::string("SpecExecutor: fallback no-draft (provider0=") +
                      providers_[0]->name() + ")");
             ++stats_.n_fallback_steps;
+            ++stats_.n_fb_no_draft;
             return out;
         }
     } else {
@@ -246,6 +307,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         }
         if (static_cast<int>(drafts.size()) < std::max(cfg_.n_min, 1)) {
             ++stats_.n_fallback_steps;
+            ++stats_.n_fb_no_draft;
             return out;
         }
     }
@@ -309,6 +371,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     if (!logits_all || logits_all->ndim() < 2 || logits_all->shape()[0] < n_rows) {
         LOG_WARN("SpeculativeExecutor: verify forward failed, falling back to plain decode");
         ++stats_.n_fallback_steps;
+        ++stats_.n_fb_verify_fail;
         if (rmem)
             rmem->rollback(0);
         return out;
@@ -333,6 +396,7 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         static bool warned_empty = false;
         if (!warned_empty) {
             warned_empty = true;
+            ++stats_.n_fb_empty;
             LOG_WARN("SpecExecutor: fallback tokens-empty (accepted=" +
                      std::to_string(vr.accepted_tokens.size()) + " resampled=" +
                      std::to_string(vr.resampled) + " bonus=" + std::to_string(vr.bonus) + ")");
@@ -359,14 +423,24 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     out.speculated = true;
     last_drafter_idx_ = drafter_idx;
 
-    // Update acceptance EWMA (used by adaptive draft sizing next round).
+    // Update the acceptance EWMAs. Kept separate on purpose: the rate drives the
+    // --spec-min-acc early exit (a quality measure) while the length drives
+    // adaptive sizing (a payoff measure). They can disagree -- a round that
+    // accepts 1 of 1 is 100% but yields nothing.
     {
         const double round_acc =
             drafts.empty() ? 0.0 : static_cast<double>(vr.n_accepted) / drafts.size();
         if (accept_ewma_ < 0.0) {
             accept_ewma_ = round_acc;
         } else {
-            accept_ewma_ = 0.7 * accept_ewma_ + 0.3 * round_acc;
+            accept_ewma_ = kEwmaAccepted * accept_ewma_ + kEwmaProposed * round_acc;
+        }
+        const double round_len = static_cast<double>(vr.n_accepted);
+        if (accept_len_ewma_ < 0.0) {
+            accept_len_ewma_ = round_len;
+        } else {
+            accept_len_ewma_ =
+                kEwmaAccepted * accept_len_ewma_ + kEwmaProposed * round_len;
         }
     }
 
@@ -374,6 +448,26 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     stats_.n_draft_tokens += static_cast<int64_t>(drafts.size());
     stats_.n_accepted_tokens += vr.n_accepted;
     stats_.n_output_tokens += static_cast<int64_t>(out.tokens.size());
+    // Per-position acceptance and the per-round proposed length. See the struct
+    // comment: position 0 vs the tail is the diagnostic that separates "the
+    // drafter is inaccurate" from "the tail was never worth proposing".
+    {
+        const int nd = static_cast<int>(drafts.size());
+        for (int j = 0; j < nd && j < SpeculativeStats::kMaxTrackedPos; ++j)
+            ++stats_.n_proposed[j];
+        for (int j = 0; j < vr.n_accepted && j < SpeculativeStats::kMaxTrackedPos; ++j)
+            ++stats_.n_accepted_at[j];
+        // buckets: 0, 1, 2, 3, 4-5, 6-7, 8+  ->  idx 0..6
+        int bucket = 6;
+        if (nd <= 3) {
+            bucket = nd;
+        } else if (nd <= 5) {
+            bucket = 4;
+        } else if (nd <= 7) {
+            bucket = 5;
+        }
+        ++stats_.n_rounds_by_len[bucket];
+    }
     if (has_chain) {
         for (size_t i = 0; i < providers_.size(); ++i) {
             if (static_cast<int>(i) == drafter_idx || providers_[i]->is_global()) {

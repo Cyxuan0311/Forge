@@ -79,6 +79,8 @@ static void print_usage(const char* prog) {
             "       --spec-dspark-topk N  DSpark: apply markov bias only to top-N base-logit candidates (0 = full vocab)\n"
             "       --spec-dspark-conf F   DSpark: drop drafted positions whose confidence < F (default: 0.5)\n"
             "       --spec-min-acc F       Disable drafting (fall back to plain decode) while acceptance EWMA < F\n"
+            "       --no-adaptive-draft     Always draft the full --spec-draft budget instead of sizing it to the\n"
+            "                             recent accepted length (adaptive sizing is on by default)\n"
             "                           (default: 0 = always speculate; useful when the drafter is larger\n"
             "                           than the target, e.g. MiniCPM5-2.6B-DSpark over a 2B target)\n"
             "       --perf                Print per-phase performance breakdown after generation\n"
@@ -524,6 +526,9 @@ CliArgs parse_args(int argc, char** argv) {
             args.spec.enabled = true;
             args.spec.no_ngram = true;
             args.spec.use_ngram = false;
+        } else if (arg == "--no-adaptive-draft") {
+            args.spec.enabled = true;
+            args.spec.adaptive_draft = false;
         } else if (arg == "--spec-ngram-mod-n") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";

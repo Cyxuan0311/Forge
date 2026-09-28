@@ -39,9 +39,38 @@ struct SpeculativeStats {
     int64_t n_accepted_tokens = 0;  // accepted candidates (excludes resampled/bonus)
     int64_t n_output_tokens = 0;    // tokens produced via spec path (accepted + resampled/bonus)
 
+    // Fallback rounds broken down by cause. A single n_fallback_steps counter hid
+    // the two failures that actually cost the most here: rounds where the
+    // provider returned nothing (n_fb_no_draft, typically confidence truncation
+    // emptying the batch) and rounds abandoned by the --spec-min-acc floor. A
+    // large no-draft count with a healthy acceptance rate means the drafter is
+    // working but is being asked for nothing, not that it is inaccurate.
+    int64_t n_fb_no_draft = 0;      // provider returned fewer than n_min candidates
+    int64_t n_fb_min_acc = 0;       // --spec-min-acc floor tripped, speculation disabled
+    int64_t n_fb_verify_fail = 0;   // verify forward returned no usable logits
+    int64_t n_fb_empty = 0;         // verification produced no tokens at all
+    int64_t n_fb_guard = 0;         // no provider / no engine / max_tokens<=1
+
+    // Acceptance by draft position: the first proposed token is by far the most
+    // likely to be accepted and the last the least, so a flat curve means the
+    // tail is dead weight while a cliff at position 0 means the drafter's very
+    // first guess is wrong (a prompt-encoding or conditioning problem, not a
+    // depth problem). Indexed by position; entries at or beyond the largest
+    // round size requested stay 0.
+    static constexpr int kMaxTrackedPos = 16;
+    int64_t n_proposed[kMaxTrackedPos] = {0};
+    int64_t n_accepted_at[kMaxTrackedPos] = {0};
+
+    // How many tokens each round actually proposed, bucketed 0 / 1 / 2 / 3 /
+    // 4-5 / 6-7 / 8+. Reveals a draft that has collapsed to a constant width
+    // (adaptive sizing pinned by its own control signal) as opposed to one that
+    // is genuinely varying with confidence.
+    int64_t n_rounds_by_len[7] = {0};
+
     void reset();
     double acceptance_rate() const;   // candidate acceptance rate [0,1]
     double tokens_per_step() const;   // avg tokens produced per speculation round (>1 means speedup)
+    double acceptance_at(int pos) const;  // -1.0 when that position was never proposed
 };
 
 // ---- Configuration ----
@@ -51,6 +80,11 @@ struct SpeculativeConfig {
     int n_min = 0;              // drop the whole round if fewer candidates than this (--spec-n-min)
     float p_min = 0.0f;         // draft confidence early-stop threshold (Phase 3 model draft)
     bool print_stats = false;   // CLI: print SpeculativeStats after generation (--spec-stats)
+
+    // Size n_draft per round to track the recent accepted length (on by default).
+    // --no-adaptive-draft pins it to n_draft instead. See SpeculativeExecutor::step
+    // for why the acceptance rate is the wrong control signal.
+    bool adaptive_draft = true;
 
     // Standalone small draft model (Phase 3); takes priority over n-gram when set
     std::string draft_model_path;
@@ -63,8 +97,12 @@ struct SpeculativeConfig {
     int draft_n_spec = 5;                  // speculative tokens proposed per round
 
     // DSpark (MiniCPM5-2.6B-DSpark) tuning knobs, override the GGUF-derived defaults.
-    int dspark_top_k = 0;                  // truncated candidate re-ranking top-k (0 = full vocab)
-    float dspark_conf_threshold = 0.5f;    // confidence-head adaptive draft truncation threshold
+    // <0 means "not set on the command line", so the GGUF default is used; 0 is a
+    // real value meaning "off" and is distinguishable from unset. Using 0 as the
+    // unset marker made `--spec-dspark-conf 0` silently fall back to 0.5, i.e.
+    // the opposite of what it reads as.
+    int dspark_top_k = -1;              // truncated candidate re-ranking top-k (0 = full vocab)
+    float dspark_conf_threshold = -1.0f;  // confidence truncation threshold (<0 = from GGUF, 0 = off)
 
     // Acceptance floor below which the drafter is judged net-negative and
     // speculation is disabled for the rest of the generation (<=0 = never).
