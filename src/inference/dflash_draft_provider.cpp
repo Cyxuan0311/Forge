@@ -165,12 +165,13 @@ struct DFlashDraftProvider::Impl {
         }
 
         // DSpark tuning: the CLI flags (SpeculativeConfig) override the GGUF-derived
-        // defaults parsed into ModelConfig.
-        dspark_top_k_ = spec.dspark_top_k > 0 ? spec.dspark_top_k
+        // defaults parsed into ModelConfig. "<0 = not set" is what makes an
+        // explicit 0 meaningful (0 top-k = full vocab, 0 conf = truncation off).
+        dspark_top_k_ = spec.dspark_top_k >= 0 ? spec.dspark_top_k
                                               : model.config().dspark_markov_top_k;
         dspark_conf_threshold_ =
-            spec.dspark_conf_threshold > 0.0f ? spec.dspark_conf_threshold
-                                             : model.config().dspark_confidence_threshold;
+            spec.dspark_conf_threshold >= 0.0f ? spec.dspark_conf_threshold
+                                              : model.config().dspark_confidence_threshold;
 
         // Encoder input layers: the drafter's own target_layers, overridden by
         // --spec-draft-target-layers. The executor reads this list to know which

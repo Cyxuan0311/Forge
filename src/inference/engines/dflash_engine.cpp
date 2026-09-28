@@ -853,12 +853,22 @@ std::vector<int32_t> dspark_sequential_sample(
     // request form): drop the tail once a position's confidence falls below the
     // threshold, keeping the longest high-confidence prefix.
     if (use_conf && conf_threshold > 0.0f) {
+        size_t keep = out.size();
         for (size_t j = 0; j < confs.size(); ++j) {
             if (confs[j] < conf_threshold) {
-                out.resize(j);
+                keep = j;
                 break;
             }
         }
+        // If the very first position is already below threshold, keep 0 proposals
+        // rather than proposing the unfiltered run: the whole point of the gate is
+        // to not spend the verify pass on tokens we expect to be rejected, and the
+        // executor's --spec-min-acc floor is the right lever for "stop drafting
+        // altogether". Truncating to a single token here instead would be worse
+        // than useless -- one row of speculation cannot pay for the verify forward
+        // it triggers, while a 0-length draft returns control to plain decode
+        // without one.
+        out.resize(keep);
     }
     return out;
 }
