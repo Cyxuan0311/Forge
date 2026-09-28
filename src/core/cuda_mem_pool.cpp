@@ -1,8 +1,10 @@
 #include "forge/cuda_mem_pool.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -80,6 +82,27 @@ void* allocate(size_t bytes) {
         // Driver may be low on memory: drop the cache and retry once.
         clear_cache();
         err = cudaMalloc(&ptr, aligned);
+    }
+    // WSL2 GPU-PV transient: the host may refuse make_resident (-ENOMEM) for
+    // seconds at a time while Windows reclaims backing pages. These failures
+    // clear on their own, so retry with a bounded backoff instead of failing
+    // the (possibly minutes-long) model load on the first blip.
+    if (err != cudaSuccess) {
+        for (int attempt = 1; attempt <= 6; ++attempt) {
+            const int wait_ms = 250 * (1 << (attempt - 1));  // 250..8000 ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+            err = cudaMalloc(&ptr, aligned);
+            if (err == cudaSuccess) {
+                std::fprintf(stderr,
+                             "[cuda_mem_pool] cudaMalloc(%zu) recovered after retry %d "
+                             "(waited %d ms)\n",
+                             aligned, attempt, wait_ms);
+                break;
+            }
+            std::fprintf(stderr,
+                         "[cuda_mem_pool] cudaMalloc(%zu) retry %d/6 failed: %s\n",
+                         aligned, attempt, cudaGetErrorString(err));
+        }
     }
     if (err != cudaSuccess) {
         std::fprintf(stderr, "[cuda_mem_pool] cudaMalloc(%zu) failed: %s\n", aligned,
