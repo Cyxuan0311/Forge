@@ -1,6 +1,7 @@
 #include "forge/engines/dflash_engine.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -779,7 +780,17 @@ std::vector<int32_t> dspark_sequential_sample(
     std::vector<int32_t> out;
     out.reserve(n);
     int32_t prev = anchor_token;  // target vocab id (markov_embed is keyed by it)
-    const bool use_markov = markov_embed && markov_bias && markov_d > 0;
+    // Diagnostic (FORGE_DSPARK_NO_MARKOV=1): drop the Markov bias entirely, so
+    // the parallel backbone's own argmax is what gets proposed. Isolates how much
+    // the semi-autoregressive head actually contributes on a given checkpoint --
+    // the bias is a +/-3 logit shift, which cannot move an argmax separated by a
+    // 15-logit gap but very much can move one separated by 0.5, so the only way
+    // to know is to measure both arms.
+    static const bool no_markov = [] {
+        const char* e = std::getenv("FORGE_DSPARK_NO_MARKOV");
+        return e && e[0] && std::string(e) != "0";
+    }();
+    const bool use_markov = !no_markov && markov_embed && markov_bias && markov_d > 0;
     const bool use_conf = conf_weight && hidden_dim > 0 &&
                           hidden_rows.size() >= static_cast<size_t>(n);
     const int top_k = (cand_top_k > 0 && cand_top_k < vocab) ? cand_top_k : 0;
