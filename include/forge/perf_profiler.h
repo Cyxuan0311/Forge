@@ -6,12 +6,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <memory>
+#include <cstdlib>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef USE_CUDA
@@ -556,6 +558,113 @@ public:
 // split from the rest so layers print in index order and the rest by cost.
 void dump_phase_profile(const char* title, double wall_ms, int n_tokens,
                         const std::vector<std::pair<std::string, PerfRecord>>& rows);
+
+// ---- Leaf timer (diagnostic) ------------------------------------------------
+//
+// Why this exists: PERF_SCOPE cannot attribute cost in an async pipeline. A
+// stream event recorded "now" is appended after every kernel already queued, so
+// when the host runs ahead of the GPU an inner scope's elapsed time includes
+// unrelated work -- measured on MiniCPM5-2B + DSpark as a 26 ms "FFN" whose
+// own children totalled 0.57 ms, and as parents reading far above the sum of
+// their children. Only the OUTERMOST scope of a forward is trustworthy in situ.
+//
+// SYNC_SCOPE is the brute-force alternative for the cases that matter: it
+// cudaDeviceSynchronizes on entry, so the interval it measures brackets exactly
+// the enclosed calls, and accumulates into a named total. Costs a full pipeline
+// drain per scope, so it is for diagnosis only (FORGE_SYNC_PROF=1), never on a
+// hot path.
+//
+// Non-nesting is a hard requirement, and mixing levels is what produced the
+// contradictory numbers above: SYNC_SCOPE only on the innermost op of a chain,
+// never wrapping another SYNC_SCOPE. SYNC_SCOPE_TOTAL gives the outer total so
+// the leaf sum can be checked against it -- a large residual is itself the
+// finding (it means cost sits outside the instrumented ops).
+#ifdef USE_CUDA
+class SyncProfiler {
+public:
+    static SyncProfiler& instance() {
+        static SyncProfiler p;
+        return p;
+    }
+    static double now_ms() {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    static bool enabled() {
+        static const bool v = std::getenv("FORGE_SYNC_PROF") != nullptr;
+        return v;
+    }
+    void add(const char* label, double ms) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        totals_[label] += ms;
+        counts_[label] += 1;
+    }
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        totals_.clear();
+        counts_.clear();
+    }
+    void report(const char* title, const char* reference = nullptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        printf("\n===== SYNC-SCOPE PROFILE: %s =====\n", title);
+        std::vector<std::pair<std::string, double>> rows;
+        double sum = 0.0;
+        for (const auto& [k, v] : totals_) {
+            rows.emplace_back(k, v);
+            sum += v;
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        printf("%-34s %7s %12s %10s\n", "scope", "n", "total(ms)", "avg(ms)");
+        for (const auto& [k, v] : rows) {
+            const long long n = counts_[k];
+            printf("%-34s %7lld %12.2f %10.3f\n", k.c_str(), n, v, v / (double)n);
+        }
+        printf("%-34s %7s %12.2f\n", "LEAF SUM", "", sum);
+        if (reference) {
+            auto it = totals_.find(reference);
+            if (it != totals_.end())
+                printf("%-34s %7s %12.2f   residual=%.2f ms (%.1f%%)\n", reference, "",
+                       it->second, it->second - sum,
+                       100.0 * (it->second - sum) / std::max(1e-9, it->second));
+        }
+        printf("=====================================\n\n");
+    }
+
+private:
+    SyncProfiler() = default;
+    std::mutex mutex_;
+    std::map<std::string, double> totals_;
+    std::map<std::string, long long> counts_;
+};
+
+class SyncScopeTimer {
+public:
+    explicit SyncScopeTimer(const char* label) : label_(label) {
+        if (!SyncProfiler::enabled())
+            return;
+#ifdef USE_CUDA
+        cudaDeviceSynchronize();
+#endif
+        t0_ = SyncProfiler::now_ms();
+    }
+    ~SyncScopeTimer() {
+        if (!SyncProfiler::enabled())
+            return;
+#ifdef USE_CUDA
+        cudaDeviceSynchronize();
+#endif
+        SyncProfiler::instance().add(label_, SyncProfiler::now_ms() - t0_);
+    }
+    SyncScopeTimer(const SyncScopeTimer&) = delete;
+    SyncScopeTimer& operator=(const SyncScopeTimer&) = delete;
+
+private:
+    const char* label_;
+    double t0_ = 0.0;
+};
+#endif  // USE_CUDA
 
 // ---- RAII timer ----
 // Phase 3: 增加 stream 参数，显式记录到指定 CUDA stream。

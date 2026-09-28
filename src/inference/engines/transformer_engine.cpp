@@ -23,6 +23,11 @@
 #include "forge/logger.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
+
+#ifdef USE_CUDA
+using forge::SyncScopeTimer;
+#endif
+#include <cstdio>
 #include "forge/quant_traits.h"
 #include "forge/inference/tensor_device_utils.h"
 
@@ -442,7 +447,7 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
     // Decode path: use fewer threads (memory-bandwidth bound)
     forge::cpu::set_num_threads(ctx_.params().n_threads);
 
-    init_kv_cache(cfg);
+    { SyncScopeTimer t("req/0_init_kv_cache"); init_kv_cache(cfg); }
 
     DeviceTarget first_dev = layer_device_target(0);
 #ifdef USE_CUDA
@@ -1199,6 +1204,11 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     // Imperative execution (original path)
     const auto& cfg = model_.config();
     auto t0 = std::chrono::steady_clock::now();
+#ifdef USE_CUDA
+    // Reference total for the leaf-sum residual. Must NOT nest with the leaf
+    // probes: it is meant to be read as "whole forward" against their sum.
+    SyncScopeTimer t_total("out/0_forward_total");
+#endif
 
     auto cur_hidden = hidden;
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
@@ -1218,6 +1228,9 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             PERF_SCOPE_FMT("forward/layer_%d", layer);
             SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu",
                              req.n_tokens);
+            // No sync-scope probe here on purpose: it would wrap the per-phase
+            // probes inside DflashEngine::forward_layer, and a leaf timer that
+            // contains other leaf timers double counts.
             cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
         }
         if (!cur_hidden) {
@@ -1231,6 +1244,7 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     auto output_norm = weights_.output_norm;
     {
         PERF_SCOPE("forward/output_norm");
+        SyncScopeTimer t_outnorm("out/1_output_norm");
         if (output_norm && cur_hidden->device() != output_norm->device())
             cur_hidden = transfer_hidden(cur_hidden, DeviceTarget(output_norm->device()));
         cur_hidden = ops::rms_norm(cur_hidden, output_norm, cfg.rms_norm_eps);
@@ -1252,7 +1266,12 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     TensorPtr logits;
     {
         PERF_SCOPE("forward/output_proj");
-        // Use specialized output_proj kernel for decode (M=1, large N)
+        SyncScopeTimer t_outproj("out/2_output_proj");
+        // Specialized output_proj kernel for decode (M=1, large N).
+        // M > 1 deliberately stays on the generic path: the split-K
+        // output_proj kernel measured ~10x slower than the MMQ dp4a kernel that
+        // matmul_transB picks for small M (A/B: 3.9 vs 5.3 tok/s end-to-end on
+        // MiniCPM5-2B + DSpark), so it is only worth it for M == 1.
         if (output_weight && output_weight->device() == DeviceType::CUDA && seq_len == 1) {
             int K = static_cast<int>(output_weight->shape()[1]);
             int N = static_cast<int>(output_weight->shape()[0]);

@@ -291,7 +291,20 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     if (perf_decode) {
         forge::PerfProfiler::instance().reset();
         forge::PerfProfiler::instance().enable();
-        forge::PerfProfiler::instance().set_use_cuda_events(true);
+#ifdef USE_CUDA
+        // FORGE_SYNC_PROF=1 arms the leaf timers; the accumulators are reset
+        // here so the report covers the decode loop only.
+        if (forge::SyncProfiler::enabled())
+            forge::SyncProfiler::instance().reset();
+#endif
+        // CUDA-event timing is opt-in (FORGE_PERF_CUDA_EVENTS / --perf-cuda-events):
+        // it is the more faithful DEVICE-time measurement, but each scope then
+        // pays two cudaEventRecord calls. The decode path issues hundreds of
+        // scopes per token on small launch-bound shapes, where that overhead
+        // dominates the very kernels being measured (measured ~5x wall-clock
+        // slowdown on a 2B/42-layer target), so the default is host wall clock.
+        forge::PerfProfiler::instance().set_use_cuda_events(
+            std::getenv("FORGE_PERF_CUDA_EVENTS") != nullptr);
     }
 
     // ---- Decode phase (speculative decoding via SpeculativeExecutor) ----
@@ -450,6 +463,11 @@ decode_done:
         auto& prof = forge::PerfProfiler::instance();
 #ifdef USE_CUDA
         prof.flush_deferred();
+        // Leaf-timer report (FORGE_SYNC_PROF=1). Only meaningful on the decode
+        // loop, so it is gated on the same flag that arms the accumulator in
+        // forward_layers / DflashEngine::forward_layer.
+        if (forge::SyncProfiler::enabled())
+            forge::SyncProfiler::instance().report("drafter forward", "out/0_forward_total");
 #endif
         dump_phase_profile("DECODE-ONLY", result.decode_ms,
                            result.num_generated_tokens, prof.summary());

@@ -81,6 +81,13 @@ static void print_usage(const char* prog) {
             "       --spec-min-acc F       Disable drafting (fall back to plain decode) while acceptance EWMA < F\n"
             "                           (default: 0 = always speculate; useful when the drafter is larger\n"
             "                           than the target, e.g. MiniCPM5-2.6B-DSpark over a 2B target)\n"
+            "       --perf                Print per-phase performance breakdown after generation\n"
+            "                           (requires a build with -DFORGE_PROFILING=ON; host wall clock)\n"
+            "       --perf-cuda-events    Same breakdown timed with CUDA events (device time, but\n"
+            "                           costs several extra cudaEventRecord per scope and slows decode)\n"
+            "       --sync-prof           Leaf-level device timing (FORGE_SYNC_PROF=1 internally):\n"
+            "                           hard-syncs around every op, so it is diagnostic-only and slow.\n"
+            "                           Use with --perf; the leaf sum vs forward total is the signal.\n"
             "       --spec-stats           Print speculation stats after generation\n"
             "       --expert-stats         Print MoE expert router-distribution after generation\n"
             "       --expert-paging        Enable per-expert weight movement (partial activation)\n"
@@ -490,6 +497,26 @@ CliArgs parse_args(int argc, char** argv) {
             }
             args.spec.enabled = true;
             args.spec.min_accept_rate = std::stof(argv[i]);
+        } else if (arg == "--perf") {
+            // Enable the per-phase PerfProfiler breakdown at generation end. Takes
+            // effect only when forge was built with -DFORGE_PROFILING=ON; the
+            // generator's decode-only dump (DECODE-ONLY PROFILE) reads this env.
+            setenv("FORGE_PERF_DECODE", "1", 1);
+        } else if (arg == "--perf-cuda-events") {
+            // Same breakdown, but timed with CUDA events instead of host wall
+            // clock. More faithful per-op DEVICE time (host wall mis-attributes
+            // async queue drains), but each scope then costs two cudaEventRecord
+            // calls, which dominates wall time on launch-bound decode shapes --
+            // measured ~5x end-to-end slowdown on a 2B/42-layer target. Use only
+            // when the device/host split itself is the question.
+            setenv("FORGE_PERF_DECODE", "1", 1);
+            setenv("FORGE_PERF_CUDA_EVENTS", "1", 1);
+        } else if (arg == "--sync-prof") {
+            // Leaf-level device timing. Arms the hard-sync timers that bracket
+            // each op individually; only meaningful together with --perf, and
+            // diagnostic-only (a full pipeline drain per scope).
+            setenv("FORGE_PERF_DECODE", "1", 1);
+            setenv("FORGE_SYNC_PROF", "1", 1);
         } else if (arg == "--spec-ngram-mod") {
             args.spec.enabled = true;
             args.spec.use_ngram_mod = true;

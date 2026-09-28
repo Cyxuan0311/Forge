@@ -6,6 +6,10 @@
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 
+#ifdef USE_CUDA
+using forge::SyncScopeTimer;
+#endif
+
 namespace forge {
 
 bool FfnExecutor::residual_fused(const ModelConfig& cfg, const LayerWeights& lw, int seq_len,
@@ -93,9 +97,13 @@ TensorPtr FfnExecutor::apply(const TensorPtr& x, const TensorPtr& residual, cons
                          lw.w1()->dtype() == DataType::IQ4_XS && lw.w3()->dtype() == DataType::IQ4_XS) {
                     ffn_mid = ops::matmul_transB_fused_ffn_up_iq4_xs(x, lw.w1(), lw.w3());
                 } else {
-                    auto gate = ops::matmul_transB(x, lw.w1());
-                    auto up = ops::matmul_transB(x, lw.w3());
-                    ffn_mid = ops::silu_multiply(gate, up);
+                    TensorPtr gate, up;
+                    { SyncScopeTimer t("ffn/gate_proj");
+                      gate = ops::matmul_transB(x, lw.w1()); }
+                    { SyncScopeTimer t("ffn/up_proj");
+                      up = ops::matmul_transB(x, lw.w3()); }
+                    { SyncScopeTimer t("ffn/silu_mul");
+                      ffn_mid = ops::silu_multiply(gate, up); }
                 }
             }
 
@@ -173,6 +181,7 @@ TensorPtr FfnExecutor::apply(const TensorPtr& x, const TensorPtr& residual, cons
                     ffn_out = ops::matmul_transB_fused_ffn_down_residual_iq4_xs(ffn_mid, lw.w2(),
                                                                                 residual);
                 } else {
+                    SyncScopeTimer t("ffn/down_proj");
                     ffn_out = ops::matmul_transB(ffn_mid, lw.w2());
                 }
             }
