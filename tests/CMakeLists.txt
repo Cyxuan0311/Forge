@@ -514,7 +514,7 @@ if(FORGE_BUILD_BENCHMARKS)
   # linked in -- it is not part of the ordinary test link interface.
   find_package(OpenMP)
   foreach(bench IN ITEMS ffn_q2k moe_multigemv moe_real output_proj_q6k
-                         prefill_gemm cpu_decode)
+                         prefill_gemm cpu_decode dspark_gemm)
     add_executable(forge-bench-${bench} bench_${bench}.cpp)
     # bench_cpu_decode.cpp includes arch headers by repo-relative path
     # ("src/operators/cpu/arch/x86/fused.h"); give it the source root.

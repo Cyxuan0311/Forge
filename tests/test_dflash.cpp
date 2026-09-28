@@ -280,7 +280,8 @@ static void run_dspark_sample_test() {
     std::vector<const float*> rows = {row.data(), row.data(), row.data()};
 
     // No markov head -> independent greedy argmax per row.
-    auto greedy = dspark_sequential_sample(rows, vocab, nullptr, d, nullptr, nullptr, 2, 3);
+    auto greedy = dspark_sequential_sample(rows, vocab, {}, 0, nullptr, 0, nullptr, nullptr, 2, 3,
+                                          0, nullptr, nullptr, 0.0f);
     CHECK((greedy == std::vector<int32_t>{0, 0, 0}), "dspark: no markov -> greedy per row");
 
     // Markov: embed[prev]=prev, bias[v]=v  =>  bias[v]=v*prev added to scores.
@@ -291,7 +292,8 @@ static void run_dspark_sample_test() {
         embed[p] = float(p);
     for (int v = 0; v < vocab; ++v)
         bias[v] = float(v);
-    auto dsp = dspark_sequential_sample(rows, vocab, embed.data(), d, bias.data(), nullptr, 2, 3);
+    auto dsp = dspark_sequential_sample(rows, vocab, {}, 0, embed.data(), d, bias.data(), nullptr,
+                                       2, 3, 0, nullptr, nullptr, 0.0f);
     CHECK((dsp == std::vector<int32_t>{5, 5, 5}), "dspark: markov shifts greedy argmax");
 
     // Reduced draft vocab (draft_vocab=3) + mapping back to target vocab.
@@ -306,13 +308,14 @@ static void run_dspark_sample_test() {
     // anchor=2 (target): j0 prev=2 -> bias [0,2,4] -> scores [1,4,5] argmax draft2 -> map 0
     //                     j1 prev=0 -> bias [0,0,0] -> scores [1,2,1] argmax draft1 -> map 5
     //                     j2 prev=5 -> bias [0,5,10] -> scores [1,7,11] argmax draft2 -> map 0
-    auto reduced = dspark_sequential_sample(drows, draft_vocab, embed.data(), d, dbias.data(),
-                                            idmap.data(), 2, 3);
+    auto reduced = dspark_sequential_sample(drows, draft_vocab, {}, 0, embed.data(), d,
+                                            dbias.data(), idmap.data(), 2, 3, 0, nullptr,
+                                            nullptr, 0.0f);
     CHECK((reduced == std::vector<int32_t>{0, 5, 0}), "dspark: reduced vocab + sequential markov");
 
     // Reduced vocab WITHOUT markov -> independent greedy -> draft 1 -> map 5.
-    auto reduced_greedy =
-        dspark_sequential_sample(drows, draft_vocab, nullptr, d, nullptr, idmap.data(), 2, 3);
+    auto reduced_greedy = dspark_sequential_sample(drows, draft_vocab, {}, 0, nullptr, 0, nullptr,
+                                                   idmap.data(), 2, 3, 0, nullptr, nullptr, 0.0f);
     CHECK((reduced_greedy == std::vector<int32_t>{5, 5, 5}),
           "dspark: reduced vocab no markov -> map only");
 }
