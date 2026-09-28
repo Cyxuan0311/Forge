@@ -44,48 +44,32 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-m" || arg == "--model") {
-            opt.model_path = value_of(i, "--model");
-        } else if (arg == "--host") {
+
+        // Shared verbatim with forge-cli: -m, -ngl, -c, -t, the KV cache dtype
+        // and the separate -ctk/-ctv types, --paged-kv/--cuda-graph/--kv-offload,
+        // --load-mode/--offload-embedding/--prefetch and the whole --kvmem block.
+        // Lives in forge_infer so the two binaries cannot drift again.
+        {
+            std::string err;
+            const forge::ParseResult r =
+                forge::parse_common_arg(arg, argc, argv, i, opt.common, &err);
+            if (r == forge::ParseResult::Ok) continue;
+            if (r == forge::ParseResult::Error) {
+                std::cerr << err << "\n";
+                std::exit(1);
+            }
+        }
+
+        if (arg == "--host") {
             opt.host = value_of(i, "--host");
         } else if (arg == "--port") {
             opt.port = std::stoi(value_of(i, "--port"));
-        } else if (arg == "-ngl" || arg == "--n-gpu-layers") {
-            opt.n_gpu_layers = std::stoi(value_of(i, "--n-gpu-layers"));
-        } else if (arg == "-c" || arg == "--ctx-size") {
-            opt.ctx_size = std::stoi(value_of(i, "--ctx-size"));
         } else if (arg == "--n-keep") {
             opt.n_keep = std::stoi(value_of(i, "--n-keep"));
-        } else if (arg == "-t" || arg == "--threads") {
-            opt.threads = std::stoi(value_of(i, "--threads"));
-        } else if (arg == "--kv-cache-dtype") {
-            opt.kv_cache_dtype = value_of(i, "--kv-cache-dtype");
-        } else if (arg == "--cuda-graph") {
-            opt.cuda_graph = true;
-        } else if (arg == "--paged-kv") {
-            opt.paged_kv = true;
-        } else if (arg == "--kvmem") {
-            opt.kvmem = true;
-            opt.paged_kv = true;  // the tier needs the page pool it caps
-        } else if (arg == "--kvmem-budget") {
-            opt.kvmem_budget = std::stoi(value_of(i, "--kvmem-budget"));
-        } else if (arg == "--kvmem-sink") {
-            opt.kvmem_sink = std::stoi(value_of(i, "--kvmem-sink"));
-        } else if (arg == "--kvmem-gen-reserve") {
-            opt.kvmem_gen_reserve = std::stoi(value_of(i, "--kvmem-gen-reserve"));
-        } else if (arg == "--kvmem-retrieval") {
-            opt.kvmem_retrieval = value_of(i, "--kvmem-retrieval");
-            if (opt.kvmem_retrieval != "recent" && opt.kvmem_retrieval != "embed") {
-                std::cerr << "Error: Invalid --kvmem-retrieval: " << opt.kvmem_retrieval
-                          << ". Valid: recent, embed\n";
-                std::exit(1);
-            }
         } else if (arg == "--log-prefix") {
             opt.log_prompt_prefix = true;
         } else if (arg == "--dequant-cache-mb") {
             opt.dequant_cache_mb = std::stol(value_of(i, "--dequant-cache-mb"));
-        } else if (arg == "--load-mode") {
-            opt.load_mode = value_of(i, "--load-mode");
         } else if (arg == "--api-key") {
             opt.api_key = value_of(i, "--api-key");
         } else if (arg == "--max-inflight") {
@@ -102,39 +86,39 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "  -m, --model PATH        GGUF model path (required)\n"
                 << "      --host HOST         Bind address (default: 127.0.0.1)\n"
                 << "      --port PORT         Listen port (default: 8080)\n"
-                << "  -ngl, --n-gpu-layers N  Layers to offload to GPU (-1 = max)\n"
-                << "  -c,  --ctx-size N       Context window / KV cache size in tokens\n"
-                << "                          (default: the model's native trained context,\n"
-                << "                          reduced only when VRAM cannot hold it; set\n"
-                << "                          explicitly to go beyond it via RoPE scaling)\n"
+                << "  -ngl,--n-gpu-layers N   Layers to offload to GPU (default: auto; also\n"
+                << "                          accepts auto / all / N:M[:K] for multi-GPU)\n"
+                << "  -c, --ctx-size N        Context window / KV cache size in tokens\n"
+                << "                          (default: 0 = the model's native trained\n"
+                << "                          context, reduced only when VRAM cannot hold it)\n"
                 << "  -t, --threads N         CPU threads (default: auto)\n"
-                << "      --kv-cache-dtype T  fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 |\n"
-                << "                          fp8_e5m2 (default: f16; cheaper dtype =\n"
-                << "                          more context for the same VRAM)\n"
+                << "      --kv-cache-dtype T  KV dtype for BOTH K and V (default: f16)\n"
+                << "                          allowed: " << forge::kv_cache_dtype_allowed_values() << "\n"
+                << "      -ctk, --cache-type-k T  KV dtype for K only\n"
+                << "      -ctv, --cache-type-v T  KV dtype for V only\n"
+                << "                          At equal bit width K is the more sensitive of the\n"
+                << "                          two (it feeds softmax(Q.K), where error is\n"
+                << "                          amplified, while V is a convex combination that\n"
+                << "                          smooths it) -- prefer K at higher precision, e.g.\n"
+                << "                          -ctk q8_0 -ctv q4_0.\n"
                 << "      --cuda-graph        Enable CUDA Graph for decode\n"
                 << "      --paged-kv          Use paged KV cache storage (default: off)\n"
                 << "      --kvmem             Enable the tiered KV working set (implies\n"
-                << "                          --paged-kv): a bounded GPU resident window over\n"
-                << "                          host-archived history, so the logical context\n"
-                << "                          (-c) can exceed the GPU pool\n"
+                << "                          --paged-kv)\n"
                 << "      --kvmem-budget N    GPU resident budget in tokens (default: 0 = the\n"
-                << "                          paged pool size; the pool is capped to it)\n"
-                << "      --kvmem-sink N      Prefix tokens pinned resident forever (default 256)\n"
+                << "                          paged pool size)\n"
+                << "      --kvmem-sink N      Prefix tokens pinned resident (default: 256)\n"
                 << "      --kvmem-gen-reserve N  Window slots held back for this turn's output\n"
-                << "                          (default: 0)\n"
-                << "      --kvmem-retrieval M Recall policy for archived history: recent\n"
-                << "                          (default) | embed (reserved)\n"
+                << "      --kvmem-retrieval M recent (default) | embed (reserved)\n"
+                << "      --n-keep N         Leading tokens never evicted on context shift\n"
+                << "      --log-prefix       Diagnostic: per-depth prompt-prefix hashes\n"
                 << "      --dequant-cache-mb MB  Per-weight FP16 dequant cache budget in MB\n"
-                << "                          (default 1024; 0 disables the cache; env\n"
-                << "                          FORGE_DEQUANT_CACHE_MB also honored)\n"
                 << "      --load-mode MODE    mmap | mlock | mmap_mlock (default: mmap)\n"
                 << "      --api-key KEY       Require 'Authorization: Bearer KEY' (default: off)\n"
-                << "      --max-inflight N    Max queued inference requests (default: 4,\n"
-                << "                          excess requests get HTTP 429)\n"
-                << "      --perf              Log per-request perf summary after every\n"
+                << "      --max-inflight N    Max queued requests (default: 4, excess get 429)\n"
+                << "      --perf              Log a per-request perf summary after each\n"
                 << "                          completion (prefill/decode ms, tok/s)\n"
                 << "      --perf-detail       --perf + top operators from PerfProfiler\n"
-                << "                          (operator data needs FORGE_PROFILING=ON build)\n"
                 << "  -h, --help              Show this help\n";
             std::exit(0);
         } else {
@@ -143,23 +127,20 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
         }
     }
 
-    if (opt.model_path.empty()) {
+    if (opt.common.model_path.empty()) {
         std::cerr << "Error: -m/--model is required\n";
         std::exit(1);
     }
-    // KVMem tier validation: a sink larger than the budget would overflow the
-    // window before a single token is written.
-    if (opt.kvmem) {
-        if (opt.kvmem_sink < 0 || opt.kvmem_budget < 0 || opt.kvmem_gen_reserve < 0) {
-            std::cerr << "Error: --kvmem-sink / --kvmem-budget / --kvmem-gen-reserve must be >= 0\n";
-            std::exit(1);
-        }
-        if (opt.kvmem_budget > 0 && opt.kvmem_sink > opt.kvmem_budget) {
-            std::cerr << "Error: --kvmem-sink (" << opt.kvmem_sink
-                      << ") cannot exceed --kvmem-budget (" << opt.kvmem_budget << ")\n";
+    // Cross-flag checks live in forge::validate_common_args() now.
+    {
+        std::string err;
+        if (!forge::validate_common_args(opt.common, &err)) {
+            std::cerr << err << "\n";
             std::exit(1);
         }
     }
+    // Reserve is sized for a request's default max_tokens.
+    opt.common.generation_budget = 512;
     return opt;
 }
 
@@ -211,7 +192,7 @@ int main(int argc, char** argv) {
 
     fsrv::ServerState state;
     std::string error;
-    std::cout << "Loading model: " << opt.model_path << "\n";
+    std::cout << "Loading model: " << opt.common.model_path << "\n";
     if (!state.load(opt, error)) {
         std::cerr << "Error: " << error << "\n";
         return 1;

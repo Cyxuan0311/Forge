@@ -108,7 +108,7 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         // CUDA event timing is only meaningful when GPU offload is active.
         // With -ngl 0 (pure CPU inference) CUDA events record nothing and
         // every operator would report ~0 ms - use wall-clock timers instead.
-        const bool gpu_active = opt.n_gpu_layers != 0;
+        const bool gpu_active = opt.common.n_gpu_layers != 0;
 #ifdef USE_CUDA
         PerfProfiler::instance().set_use_cuda_events(gpu_active);
 #endif
@@ -117,8 +117,8 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     // ---- Tokenizer ----
     auto t0 = std::chrono::high_resolution_clock::now();
     tokenizer_ = std::make_unique<Tokenizer>();
-    if (!tokenizer_->load_from_gguf(opt.model_path)) {
-        error = "Failed to load tokenizer from: " + opt.model_path;
+    if (!tokenizer_->load_from_gguf(opt.common.model_path)) {
+        error = "Failed to load tokenizer from: " + opt.common.model_path;
         return false;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -129,13 +129,13 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     // ---- Model ----
     auto t2 = std::chrono::high_resolution_clock::now();
     model_ = std::make_unique<Model>();
-    if (!opt.load_mode.empty()) {
-        model_->set_load_mode(opt.load_mode);
+    if (!opt.common.load_mode.empty()) {
+        model_->set_load_mode(opt.common.load_mode);
     }
     model_->set_offload_embedding(true);
     model_->set_prefetch(true);
-    if (!model_->load(opt.model_path, opt.n_gpu_layers)) {
-        error = "Failed to load model: " + opt.model_path;
+    if (!model_->load(opt.common.model_path, opt.common.n_gpu_layers)) {
+        error = "Failed to load model: " + opt.common.model_path;
         return false;
     }
     auto t3 = std::chrono::high_resolution_clock::now();
@@ -147,10 +147,10 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     // ---- Inference context ----
     auto t4 = std::chrono::high_resolution_clock::now();
     ctx_ = std::make_unique<InferenceContext>(*model_);
-    if (opt.threads > 0) {
-        ctx_->params_mut().n_threads = opt.threads;
-        ctx_->params_mut().n_threads_batch = opt.threads;
-        std::cout << "CPU threads set to: " << opt.threads << "\n";
+    if (opt.common.threads > 0) {
+        ctx_->params_mut().n_threads = opt.common.threads;
+        ctx_->params_mut().n_threads_batch = opt.common.threads;
+        std::cout << "CPU threads set to: " << opt.common.threads << "\n";
     } else if (model_->device() != DeviceType::CUDA) {
         int t = detect_best_cpu_threads(cfg.hidden_dim, cfg.intermediate_dim);
         ctx_->params_mut().n_threads = t;
@@ -158,7 +158,7 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         std::cout << "CPU threads auto-detected: " << t << "\n";
     }
 
-    if (opt.paged_kv) {
+    if (opt.common.paged_kv) {
         ctx_->params_mut().kv_storage_mode = KVStorageMode::Paged;
         std::cout << "Paged KV cache storage enabled\n";
     }
@@ -169,29 +169,22 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     }
 
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
-    if (tfm_eng) {
-        KVCacheDType kv_dtype = KVCacheDType::F16;
-        if (opt.kv_cache_dtype == "fp32")
-            kv_dtype = KVCacheDType::FP32;
-        else if (opt.kv_cache_dtype == "f16")
-            kv_dtype = KVCacheDType::F16;
-        else if (opt.kv_cache_dtype == "q8_0")
-            kv_dtype = KVCacheDType::Q8_0;
-        else if (opt.kv_cache_dtype == "q4_0")
-            kv_dtype = KVCacheDType::Q4_0;
-        else if (opt.kv_cache_dtype == "fp8_e4m3")
-            kv_dtype = KVCacheDType::FP8_E4M3;
-        else if (opt.kv_cache_dtype == "fp8_e5m2")
-            kv_dtype = KVCacheDType::FP8_E5M2;
-        tfm_eng->set_kv_cache_dtype(kv_dtype);
-        tfm_eng->set_gpu_layers(opt.n_gpu_layers);
-        if (opt.ctx_size > 0) {
-            tfm_eng->set_kv_cache_max_seq_len(opt.ctx_size);
+    // One shared application of the common flags, same as forge-cli. This also
+    // fixes two things the local copy got wrong: it had no else on its dtype
+    // ladder, so a typo'd --kv-cache-dtype silently became f16, and its thread
+    // auto-tune keyed on "no GPU at all" rather than the hybrid-offload case, so
+    // a partial -ngl run left the CPU-resident layers at n_threads=4 while the
+    // GPU idled. It also picks up -ctk/-ctv, which this binary never had.
+    {
+        std::string err;
+        if (!forge::apply_common_args(opt.common, nullptr, *ctx_, tfm_eng, &err)) {
+            error = err;
+            return false;
         }
-        if (opt.cuda_graph && model_->device() == DeviceType::CUDA) {
-            tfm_eng->set_use_graph(true);
-            tfm_eng->set_cuda_graph_enabled(true);
-        }
+    }
+    if (tfm_eng && opt.common.cuda_graph && model_->device() == DeviceType::CUDA) {
+        tfm_eng->set_use_graph(true);
+        tfm_eng->set_cuda_graph_enabled(true);
     }
 
     // ---- KVMem tiered KV: cap the GPU page pool BEFORE init_kv_cache ----
@@ -200,7 +193,7 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     // pools, so it must be set before ctx_->init_kv_cache(). The manager is
     // attached right after, once the pool geometry is known.
     bool kvmem_active = false;
-    if (opt.kvmem) {
+    if (opt.common.kvmem) {
         auto* kv_mem = tfm_eng ? tfm_eng->kv_memory() : nullptr;
         if (!tfm_eng || !kv_mem) {
             std::cerr << "Warning: --kvmem needs a transformer engine with KV memory; "
@@ -214,19 +207,48 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
                       << cfg.n_swa << " sliding-window layer(s); tiered KV disabled\n";
         } else {
             // 0 = keep the device-sized pool; the budget then falls back to it.
-            if (opt.kvmem_budget > 0)
-                kv_mem->storage().set_pool_token_cap(opt.kvmem_budget);
+            if (opt.common.kvmem_budget > 0)
+                kv_mem->storage().set_pool_token_cap(opt.common.kvmem_budget);
             kvmem_active = true;
         }
     }
 
     ctx_->set_engine(std::move(engine));
 
-    ctx_->params_mut().offload_kqv = true;
+    // offload_kqv and offload_embedding now come from the flags (they were
+    // hard-coded here with no way to change them).
+    ctx_->params_mut().offload_kqv = opt.common.offload_kqv;
     ctx_->params_mut().offload_embedding = model_->offload_embedding();
     if (!ctx_->init_kv_cache()) {
         error = "Failed to initialize KV cache";
         return false;
+    }
+
+    // Report the resolved KV geometry. With -ctk/-ctv the K and V types can
+    // differ, and a line naming only one of them makes an asymmetric config
+    // indistinguishable from a symmetric one -- which is how a silent dtype
+    // downgrade stayed invisible in this binary for so long.
+    if (tfm_eng) {
+        auto* kv_mem = tfm_eng->kv_memory();
+        const bool paged = kv_mem && kv_mem->storage().is_paged();
+        KVCacheTypeConfig kv = opt.common.kv_cache_types();
+        size_t bytes = 0;
+        int max_seq = 0;
+        if (paged) {
+            const auto& st = static_cast<const PagedKVStorage&>(kv_mem->storage());
+            bytes = st.nbytes();
+            max_seq = st.max_seq_len();
+        } else {
+            const KVCache* cache = tfm_eng->kv_cache();
+            bytes = cache->nbytes();
+            max_seq = cache->max_seq_len();
+        }
+        const char* kn = kv_cache_dtype_name(kv.type_k);
+        const char* vn = kv_cache_dtype_name(kv.type_v);
+        std::cout << "KV Cache" << (paged ? " (paged)" : "") << ": dtype="
+                  << (kv.type_k == kv.type_v ? kn : std::string(kn) + "/" + vn + " (K/V)")
+                  << ", size=" << (bytes / (1024 * 1024)) << " MB, max_seq=" << max_seq
+                  << "\n";
     }
 
     // ---- Attach the KVMem working-set manager ----
@@ -248,7 +270,7 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
             std::cout << "KVMem tiered KV enabled: budget=" << ws->budget()
                       << ", sink=" << ws->sink_tokens()
                       << ", gen_reserve=" << ws->gen_reserve()
-                      << ", retrieval=" << opt.kvmem_retrieval << "\n"
+                      << ", retrieval=" << opt.common.kvmem_retrieval << "\n"
                       << "  logical ctx=" << kv_mem->max_seq_len()
                       << " tokens, gpu pool=" << pool_tokens
                       << " tokens, page=" << page_size << "\n";
@@ -280,8 +302,8 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     agent_cfg_.native_template_tools = chat_template_->supports_tools();
 
     // Model id = file name without directory / extension.
-    auto slash = opt.model_path.find_last_of("/\\");
-    std::string name = (slash == std::string::npos) ? opt.model_path : opt.model_path.substr(slash + 1);
+    auto slash = opt.common.model_path.find_last_of("/\\");
+    std::string name = (slash == std::string::npos) ? opt.common.model_path : opt.common.model_path.substr(slash + 1);
     auto dot = name.find_last_of('.');
     model_id_ = (dot == std::string::npos) ? name : name.substr(0, dot);
     return true;

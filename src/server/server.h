@@ -24,6 +24,7 @@
 #include "forge/agent/agent_pipeline.h"
 #include "forge/chat_template.h"
 #include "forge/generator.h"
+#include "forge/cli_common_args.h"
 #include "forge/kv_working_set.h"
 #include "forge/model.h"
 #include "forge/prefix_cache.h"
@@ -38,27 +39,26 @@ namespace forge {
 // ---- CLI options ----
 
 struct ServerOptions {
-    std::string model_path;
+    // Flags shared verbatim with forge-cli: model, -ngl, -c, -t, the KV cache
+    // dtype and the separate -ctk/-ctv types, --paged-kv/--cuda-graph/--kv-offload,
+    // --load-mode/--offload-embedding/--prefetch, and the whole --kvmem block.
+    // Parsed by forge::parse_common_arg() and applied by
+    // forge::apply_common_args(), so the two binaries cannot drift again -- which
+    // they had: this struct defaulted --kv-cache-dtype to q8_0 while the CLI
+    // defaulted it to f16, -ngl here was a bare std::stoi (so "-ngl auto"
+    // terminated the process), and a typo'd dtype silently became f16.
+    forge::CommonArgs common;
+
+    // ---- server-only ----
     std::string host = "127.0.0.1";
     int port = 8080;
-    int n_gpu_layers = -1;
-    int ctx_size = 0;  // 0 = auto (KV cap 4096 for long-ctx models); >0 = user context size
-    int n_keep = 0;    // llama.cpp-style: leading tokens never evicted on context shift
-                        // (0 = keep only the system prompt; >0 = keep that many prefix tokens)
-    int threads = -1;  // -1 = auto (probe fused GEMV on CPU, full GPU offload untouched)
-    // q8_0 is the default: ~2x less VRAM than f16 (4x vs fp32) for a ~0.1%
-    // accuracy loss (cosine >= 0.999 vs healthy f16), which roughly doubles the
-    // context length a fixed VRAM budget can hold. f16 / fp8_* remain available
-    // for quality- or throughput-critical setups.
-    std::string kv_cache_dtype = "q8_0";  // fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 | fp8_e5m2
-    bool cuda_graph = false;
-    bool paged_kv = false;  // Use paged KV cache storage (default: contiguous)
+    int n_keep = 0;  // llama.cpp-style: leading tokens never evicted on context shift
+                      // (0 = keep only the system prompt; >0 = keep that many prefix tokens)
     bool log_prompt_prefix = false;  // Diagnostic: per-depth prompt-prefix hashes
     // Budget (MB) for the per-weight FP16 dequant cache used by the TensorCore
     // matmul path. -1 = default (1024 MB); 0 = cache disabled (callers fall
     // back to transient scratch); >0 = explicit budget.
     long dequant_cache_mb = -1;
-    std::string load_mode;   // "" = default (mmap)
     std::string api_key;     // "" = no auth; otherwise "Authorization: Bearer <key>" required
     int max_inflight = 4;    // max queued inference requests (excess -> 429)
     // Per-request performance logging on stdout after every chat completion:
@@ -68,29 +68,12 @@ struct ServerOptions {
     //                 summary line works in any build)
     bool perf = false;
     bool perf_detail = false;
-    // KVMem tiered KV working set (arXiv:2609.04852). --kvmem implies
-    // --paged-kv: the paged pool is capped to the working set and the logical
-    // context (-c) may exceed it, with cold history archived off-device and
-    // recalled per turn by KVWorkingSetManager.
-    bool kvmem = false;
-    int kvmem_budget = 0;       // GPU resident budget (tokens); 0 = the paged pool cap
-    int kvmem_sink = 256;       // prefix tokens pinned resident forever
-    int kvmem_gen_reserve = 0;  // window slots held back for this turn's output
-    std::string kvmem_retrieval = "recent";  // recent | embed (reserved)
+    // The reserve fallback is sized for a request's default max_tokens (512),
+    // which is what this binary's callers use; forge-cli sizes it for -n. Both
+    // go through CommonArgs::kvem_config(), which had been duplicated in each
+    // binary and had drifted (256 in the CLI, 512 here).
+    forge::KVemConfig kvem_config() const { return common.kvem_config(); }
 
-    KVemConfig kvem_config() const {
-        KVemConfig c;
-        c.enabled = kvmem;
-        c.budget_tokens = kvmem_budget;
-        c.sink_tokens = kvmem_sink;
-        // Same reasoning as the CLI: a window that fills before the reply is
-        // done makes the first decode step write past the pool. With no
-        // explicit --kvmem-gen-reserve, reserve the default generation budget
-        // (a request's max_tokens defaults to 512).
-        c.gen_reserve = kvmem_gen_reserve > 0 ? kvmem_gen_reserve : 512;
-        c.retrieval = kvmem_retrieval;
-        return c;
-    }
 };
 
 // ---- Tool calling (OpenAI function-calling contract) ----
