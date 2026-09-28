@@ -29,6 +29,13 @@ struct SpecVerifyResult {
     std::vector<int32_t> accepted_tokens;    // accepted draft tokens
     int32_t resampled = -1;                  // token re-sampled by target at first rejection
     int32_t bonus = -1;                      // bonus token when all drafts accepted
+
+    // Where the DRAFTED token sat in the TARGET's distribution at the first
+    // rejected position, and the target's probability mass on it. Diagnostic: it
+    // separates "the drafter nearly had it" (low rank) from "the drafter was
+    // elsewhere" (high rank), which need opposite fixes. -1 when not applicable.
+    int draft_rank_of_truth = -1;
+    double draft_prob_of_truth = -1.0;
 };
 
 // ---- Runtime statistics ----
@@ -67,10 +74,24 @@ struct SpeculativeStats {
     // is genuinely varying with confidence.
     int64_t n_rounds_by_len[7] = {0};
 
+    // Where the DRAFTED token sat in the TARGET's own distribution, at the first
+    // rejected position. This is the diagnostic that says whether the drafter was
+    // "nearly right and mis-ranked" (low rank) or "elsewhere" (rank 5+), which are
+    // opposite problems. Bucketed: 0 = rank 1, 1-4 = close, 5 aggregates 5+.
+    // It must rank the draft inside the target's row -- ranking the target's own
+    // sampled token reports a meaningless permanent "#1".
+    // Populated only when probe_ranks is set (env-gated): it costs a vocab scan
+    // per rejection.
+    int64_t n_rank_hist[6] = {0};   // idx 5 aggregates rank >= 5
+    double rank_prob_sum = 0.0;
+    int64_t n_rank_samples = 0;
+    bool probe_ranks = false;
+
     void reset();
     double acceptance_rate() const;   // candidate acceptance rate [0,1]
     double tokens_per_step() const;   // avg tokens produced per speculation round (>1 means speedup)
     double acceptance_at(int pos) const;  // -1.0 when that position was never proposed
+    void record_truth_rank(int rank, double prob);
 };
 
 // ---- Configuration ----

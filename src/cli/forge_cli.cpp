@@ -809,6 +809,17 @@ int main(int argc, char** argv) {
                 if (!any) std::cout << " (none)";
                 std::cout << "\n";
             }
+            if (stats.spec.n_rank_samples > 0) {
+                std::cout << "  Draft rank in target dist (at 1st rejection):";
+                static const char* kRankNames[] = {"#1", "#2", "#3", "#4", "#5", "5+"};
+                for (int b = 0; b < 6; ++b) {
+                    if (stats.spec.n_rank_hist[b] == 0) continue;
+                    std::cout << " " << kRankNames[b] << "x" << stats.spec.n_rank_hist[b];
+                }
+                std::cout << std::fixed << std::setprecision(3)
+                          << "  (mean target prob on draft "
+                          << (stats.spec.rank_prob_sum / stats.spec.n_rank_samples) << ")\n";
+            }
             // Proposed length per round: a single dominant bucket means the
             // draft width is effectively constant.
             {

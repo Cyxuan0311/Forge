@@ -1,6 +1,7 @@
 #include "forge/speculative.h"
 
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 
 #include "forge/sampler.h"
@@ -23,6 +24,14 @@ double SpeculativeStats::tokens_per_step() const {
     return n_spec_steps > 0
                ? static_cast<double>(n_output_tokens) / static_cast<double>(n_spec_steps)
                : 0.0;
+}
+
+void SpeculativeStats::record_truth_rank(int rank, double prob) {
+    if (!probe_ranks || rank < 0) return;
+    const int b = rank >= 5 ? 5 : rank;
+    ++n_rank_hist[b];
+    rank_prob_sum += prob;
+    ++n_rank_samples;
 }
 
 double SpeculativeStats::acceptance_at(int pos) const {
@@ -268,12 +277,40 @@ SpecVerifyResult verify_draft_tokens(
     // honoured. This matches llama.cpp common_sampler_sample_and_accept_n
     // (which runs the full sampler chain per row) and guarantees
     // lossless resample-consistency when do_sample=true.
+    static thread_local int draft_rank_probe_ = -1;
+    static thread_local double draft_prob_probe_ = -1.0;
+    draft_rank_probe_ = -1;
+    draft_prob_probe_ = -1.0;
+
     auto sample_row = [&](int row) -> int32_t {
         const float* row_logits =
             logits_all + static_cast<size_t>(row) * static_cast<size_t>(vocab_size);
         int32_t tok = sampler.sample_ptr(row_logits, vocab_size);
         sampler.add_token_to_history(tok);
         return tok;
+    };
+
+    // Rank of a token within one row's logit distribution, and that row's softmax
+    // mass at it. Diagnostic only; skipped unless the caller asked (env-gated at
+    // the call site) so the normal path keeps no extra work.
+    auto rank_and_prob = [&](int row, int32_t tok) {
+        if (tok < 0 || tok >= vocab_size) return;
+        const float* row_logits =
+            logits_all + static_cast<size_t>(row) * static_cast<size_t>(vocab_size);
+        int rank = 0;
+        float max_l = row_logits[0], t_l = row_logits[tok];
+        for (int v = 0; v < vocab_size; ++v) {
+            max_l = std::max(max_l, row_logits[v]);
+            if (row_logits[v] > t_l) ++rank;
+        }
+        double sum = 0.0, hit = 0.0;
+        for (int v = 0; v < vocab_size; ++v) {
+            const double e = std::exp(static_cast<double>(row_logits[v]) - max_l);
+            sum += e;
+            if (v == tok) hit = e;
+        }
+        draft_rank_probe_ = rank;
+        draft_prob_probe_ = sum > 0.0 ? hit / sum : 0.0;
     };
 
     for (int i = 0; i < n_draft; ++i) {
@@ -283,6 +320,13 @@ SpecVerifyResult verify_draft_tokens(
             result.n_accepted++;
         } else {
             result.resampled = tok;
+            // How close was the DRAFT to the target at the position it got wrong?
+            // This must rank the drafted token inside the TARGET's row, not the
+            // target's own sampled token inside the target's row -- the latter is
+            // the argmax by construction and reports a meaningless "#1" always.
+            rank_and_prob(i, draft_tokens[i]);
+            result.draft_rank_of_truth = draft_rank_probe_;
+            result.draft_prob_of_truth = draft_prob_probe_;
             return result;
         }
     }

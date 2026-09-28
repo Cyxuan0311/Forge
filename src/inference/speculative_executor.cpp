@@ -1,5 +1,7 @@
 #include "forge/speculative_executor.h"
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <cstring>
 
@@ -167,6 +169,10 @@ int adaptive_draft_target(double accept_len_ewma, int cur, int max_draft, double
 
 void SpeculativeExecutor::begin_generation(const std::vector<int32_t>& prompt) {
     stats_.reset();
+    {
+        const char* e = std::getenv("FORGE_SPEC_PROBE_RANK");
+        stats_.probe_ranks = e && e[0] && std::string(e) != "0";
+    }
     last_drafter_idx_ = -1;
     adaptive_draft_ = 0;
     accept_ewma_ = -1.0;
@@ -385,6 +391,9 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         PERF_SCOPE("speculative/verify_accept");
         vr = verify_draft_tokens(logits_data, vocab_size, drafts, sampler_, cfg_);
     }
+
+    if (stats_.probe_ranks && vr.draft_rank_of_truth >= 0)
+        stats_.record_truth_rank(vr.draft_rank_of_truth, vr.draft_prob_of_truth);
 
     out.tokens.insert(out.tokens.end(), vr.accepted_tokens.begin(), vr.accepted_tokens.end());
     if (vr.resampled >= 0) {
