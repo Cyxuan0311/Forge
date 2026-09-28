@@ -27,9 +27,17 @@ public:
 
     std::string name() const override { return "dflash"; }
 
-    // Pair with the target engine (shares token_embedding + lm_head). Borrowed
-    // pointers are copied into weights_ so the base forward_layers / output path
-    // works unchanged.
+    // Pair with a target engine. Borrowed pointers are copied into weights_ so
+    // the base forward_layers / output path works unchanged.
+    //
+    // Only the token embedding and the LM head are shared. The DSpark paper is
+    // explicit: "The draft model shares the target model's embedding layer and
+    // language modeling head (both frozen)" -- the draft checkpoint ships its own
+    // final output_norm, and overwriting it with the target's normalized the
+    // draft hidden state with the wrong vector. That hidden is the LM-head input
+    // (so the draft logits were computed from a mis-scaled state) and it is also
+    // what the DSpark confidence head consumes, which is why the head collapsed
+    // to sigmoid(-4) ~ 0.02 on data it was trained on.
     void set_target(InferenceEngine* target) {
         target_ = target;
         if (target_) {
@@ -37,7 +45,8 @@ public:
             weights_.token_embedding = tw.token_embedding;
             weights_.token_embedding_fp32 = tw.token_embedding_fp32;
             weights_.output_weight = tw.output_weight;
-            weights_.output_norm = tw.output_norm;
+            // output_norm deliberately NOT borrowed: the drafter's own norm is
+            // already in weights_ from its GGUF.
         }
     }
     InferenceEngine* target() const { return target_; }

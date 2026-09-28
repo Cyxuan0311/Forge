@@ -550,6 +550,24 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
             } else {
                 LOG_WARN("model load: DSpark confidence head (conf_proj.weight/bias) missing");
             }
+
+            // The drafter's own final output_norm. The generic branch below loads
+            // output_norm.weight, but that is the `else` of this if, so a dflash
+            // GGUF never got one -- DflashEngine::set_target() then supplied the
+            // TARGET's norm in its place, and the draft hidden state was normalized
+            // with the wrong vector. That hidden is the LM-head input (so the draft
+            // logits came from a mis-scaled state) and it is also what the DSpark
+            // confidence head consumes, which is why the head collapsed to
+            // sigmoid(-4) ~ 0.02 on data it was trained on. The DSpark paper
+            // shares only the embedding and the LM head; the norm is the
+            // drafter's own and ships in its GGUF.
+            auto dflash_on = load_tensor("output_norm.weight", last_layer_dev);
+            if (dflash_on) {
+                weight_store_.set("output_norm", dflash_on);
+            } else {
+                LOG_WARN("model load: dflash 'output_norm.weight' missing -- the draft "
+                         "hidden state will not be normalized");
+            }
         } else {
             auto te = load_tensor("token_embd.weight", emb_dev);
             if (!te) {
