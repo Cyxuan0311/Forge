@@ -472,6 +472,18 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
     require_dtype_supported("cuda_matmul_transB/b", OpType::MUL_MAT_TRANSB, b->dtype());
     require_dtype_supported("cuda_matmul_transB/out", OpType::MUL_MAT_TRANSB, out->dtype());
 
+    // A natively-BF16 weight (the GGUF loader no longer expands it) meeting the
+    // FP32 activation chain: narrow the activation and run a Tensor Core GEMM
+    // with FP32 accumulate and FP32 out. Checked BEFORE the all-BF16 gate below,
+    // which would otherwise reject the mixed pairing.
+    if (b->dtype() == DataType::BF16 && a->dtype() == DataType::FP32 &&
+        out->dtype() == DataType::FP32) {
+        cuda::launch_cublas_gemm_bf16_fp32(static_cast<const float*>(a->data()), b->data(),
+                                          static_cast<float*>(out->data()), M, K, N,
+                                          /*transB=*/true, stream);
+        return;
+    }
+
     // Phase 6-A-5: native FP16 storage -> FP16 storage GEMM (FP32 accumulate).
     // Triggered only when A and B are both FP16; the op allocates an FP16 out for
     // this branch. Everything else (FP32 / quantized) keeps the existing path, so

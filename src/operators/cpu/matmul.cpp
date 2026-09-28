@@ -630,6 +630,23 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
     }
     if (a->device() == DeviceType::CUDA &&
         (a->dtype() == DataType::BF16 || b->dtype() == DataType::BF16)) {
+        // A natively-BF16 weight (the GGUF loader no longer expands it) meeting
+        // the FP32 activation chain. Checked before the all-BF16 gate below, which
+        // would reject the mixed pairing: narrow the activation, Tensor Core GEMM,
+        // FP32 accumulate and FP32 out. This is the whole reason a BF16 model does
+        // not land on launch_cublas_sgemm (FP32 SIMT, no Tensor Cores).
+        if (b->dtype() == DataType::BF16 && a->dtype() == DataType::FP32) {
+            if (bias) {
+                throw std::runtime_error("matmul_transB (CUDA BF16 + FP32): bias is not "
+                                         "supported in the native BF16 path yet.");
+            }
+            auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{M, N},
+                                                DeviceType::CUDA);
+#ifdef USE_CUDA
+            cuda_matmul_transB(a, b, out, M, K, N, stream);
+#endif
+            return out;
+        }
         if (a->dtype() != DataType::BF16 || b->dtype() != DataType::BF16) {
             throw std::runtime_error(
                 std::string("matmul_transB (CUDA BF16): BF16 matmul needs all-BF16 A/B, got '") +

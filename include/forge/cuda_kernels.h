@@ -499,6 +499,21 @@ void launch_cublas_sgemm(const float* A, const float* B, float* C, int M, int K,
 void launch_cublas_gemm_fp16_fp32(const float* A, const void* B, float* C, int M, int K, int N,
                                   bool transB, cudaStream_t stream = 0);
 
+// BF16 x BF16 -> FP32 GEMM on Tensor Cores, with an FP32 activation. The
+// mixed-precision companion to launch_cublas_gemm_bf16 (all-BF16 chain): the
+// weight stays BF16 in memory and the activation is narrowed into a small
+// grow-only scratch, FP32 accumulate, FP32 out. Reaches this path whenever a
+// natively-BF16 GGUF weight meets the FP32 activation chain, instead of falling
+// to launch_cublas_sgemm (FP32 SIMT, no Tensor Cores).
+void launch_cublas_gemm_bf16_fp32(const float* A, const void* B, float* C, int M, int K, int N,
+                                  bool transB, cudaStream_t stream = 0);
+
+// FP32 -> BF16 narrowing (round-to-nearest-even). Not a quantization: it only
+// drops the low 16 mantissa bits. Used to match an FP32 activation to a BF16
+// weight before the Tensor Core GEMM.
+void launch_cast_bf16_matrix(const float* data, void* q_data, int num_rows, int row_len,
+                             cudaStream_t stream = 0);
+
 // Phase 6-A-5: native FP16 × FP16 → FP16 GEMM (FP32 accumulate on Tensor Cores).
 // Storage FP16 in/out, FP32 reduction -- matches the 6-A-2..6-A-4 activation
 // policy. Used by the native FP16 matmul route (MUL_MAT_TRANSB) so a weight that
@@ -606,6 +621,7 @@ void launch_output_proj_q5_k(const float* x, const void* q_weight, float* out, i
 
 void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
+
 
 // ---- Output Proj Q4_K Cooperative (small K, e.g., K=1536) ----
 // Uses cooperative warp processing instead of split-K for better lane utilization

@@ -1294,6 +1294,53 @@ void launch_cublas_gemm_fp16(const __half* A, const __half* B, __half* C, int M,
 #endif
 }
 
+// ---- BF16 x BF16 -> FP32 GEMM (Tensor Cores) ----
+// The mixed-precision companion to launch_cublas_gemm_bf16 (which needs an
+// all-BF16 chain). A weight stored natively as BF16 -- the GGUF loader no longer
+// expands it to FP32 -- meets FP32 activations everywhere in the current compute
+// path, so the activation is narrowed into a small grow-only scratch (M*K
+// elements, a few KB at decode shapes) and the product accumulates in FP32.
+//
+// Without this, that combination falls through to launch_cublas_sgemm: an FP32
+// SIMT GEMM with no Tensor Core involvement.
+void launch_cublas_gemm_bf16_fp32(const float* A, const void* B, float* C, int M, int K, int N,
+                                  bool transB, cudaStream_t stream) {
+#if FORGE_USE_CUBLAS
+    cublasHandle_t handle = get_cublas_handle(stream);
+
+    // Private grow-only buffer for the BF16 copy of A: the shared scratch pool is
+    // used by other decode kernels, so keep this one private to avoid aliasing.
+    static void* a_bf16 = nullptr;
+    static size_t a_bf16_capacity = 0;
+    size_t a_bytes = (size_t)M * K * sizeof(uint16_t);
+    if (a_bytes > a_bf16_capacity) {
+        if (a_bf16)
+            cudaFree(a_bf16);
+        cudaMalloc(&a_bf16, a_bytes);
+        a_bf16_capacity = a_bytes;
+    }
+    launch_cast_bf16_matrix(A, a_bf16, M, K, stream);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    cublasGemmEx(handle, opB, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16BF, transB ? K : N, a_bf16,
+                 CUDA_R_16BF, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#else
+    (void)A;
+    (void)B;
+    (void)C;
+    (void)M;
+    (void)K;
+    (void)N;
+    (void)transB;
+    (void)stream;
+#endif
+}
+
 // ---- Phase 6-B-4: native BF16 x BF16 -> BF16 GEMM ----
 // A / B / C are all __nv_bfloat16. Storage is BF16; accumulation runs in FP32
 // (CUBLAS_COMPUTE_32F) on Tensor Cores, then the result is rounded back to BF16
@@ -1622,6 +1669,32 @@ void launch_quantize_f16_matrix(const float* data, void* q_data, int num_rows, i
     int blocks = (total + threads - 1) / threads;
     quantize_f16_matrix_kernel<<<blocks, threads, 0, stream>>>(data, static_cast<uint8_t*>(q_data),
                                                                num_rows, row_len);
+}
+
+// ---- BF16 Cast (FP32 → BF16) ----
+//
+// Not a quantization: every FP32 value is representable in BF16's exponent
+// range, this only drops the low 16 mantissa bits (round-to-nearest-even). The
+// loader hands BF16 weights to the GEMM path untouched, and the activation has
+// to be narrowed to match before cuBLAS will take the Tensor Core route.
+
+__global__ void cast_bf16_matrix_kernel(const float* __restrict__ data,
+                                        uint16_t* __restrict__ q_data, int num_rows,
+                                        int row_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * row_len;
+    if (idx >= total)
+        return;
+    q_data[idx] = static_cast<uint16_t>(__bfloat16_as_ushort(__float2bfloat16(data[idx])));
+}
+
+void launch_cast_bf16_matrix(const float* data, void* q_data, int num_rows, int row_len,
+                             cudaStream_t stream) {
+    int total = num_rows * row_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    cast_bf16_matrix_kernel<<<blocks, threads, 0, stream>>>(data, static_cast<uint16_t*>(q_data),
+                                                           num_rows, row_len);
 }
 
 // ---- FP8 Quantize (FP32 → FP8, per-element, 1 byte/element) ----

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -488,8 +489,28 @@ TensorPtr GgufModel::get_tensor(const std::string& name, DeviceType device) cons
         return nullptr;
     }
 
-    // BF16: convert to FP32 at load time since compute paths don't support BF16 natively
-    if (lt.dtype == DataType::BF16) {
+    // BF16 -> FP32 at load time, but only where FP32 is actually required.
+    //
+    // On CUDA we now keep the tensor in its native BF16 form. Expanding doubled
+    // the footprint of every BF16 weight (a 236M-param DSpark drafter went from
+    // 472 MB to 944 MB), and on a 6 GB card that extra ~335 MB is what pushes the
+    // drafter's weights past the point where they stay resident. Measured on
+    // MiniCPM5-2B + DSpark (200 tokens, same prompt, only this flag differing):
+    //   target KV 2 GB (default): 5.2 -> 8.6 tok/s   (residency relief)
+    //   target KV 336 MB         : 18.4 -> 20.0 tok/s (Tensor Core, memory already fine)
+    // Acceptance rate was unchanged, so this is a pure performance change.
+    // Native BF16 also reaches cuda_matmul_transB's Tensor Core path instead of
+    // launch_cublas_sgemm (FP32 SIMT).
+    //
+    // The CPU path still expands: CPU kernels and the CPU-side drafter heads
+    // (DSPark markov / confidence) read these tensors as float.
+    //
+    // FORGE_BF16_EXPAND=1 restores the old expand-on-CUDA behaviour. Escape hatch
+    // only, since this branch is shared by every BF16 GGUF, not just DSpark
+    // drafters: set it if a BF16 model ever regresses.
+    if (lt.dtype == DataType::BF16 &&
+        (device == DeviceType::CPU || (std::getenv("FORGE_BF16_EXPAND") &&
+                                       std::getenv("FORGE_BF16_EXPAND")[0] == '1'))) {
         int64_t numel = 1;
         for (auto d : lt.shape) numel *= d;
         auto tensor = std::make_shared<Tensor>(DataType::FP32, lt.shape, DeviceType::CPU);
@@ -499,9 +520,6 @@ TensorPtr GgufModel::get_tensor(const std::string& name, DeviceType device) cons
             // BF16 -> FP32: shift the 16-bit value to the upper 16 bits of a 32-bit float
             uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
             std::memcpy(fp32_data + i, &bits, sizeof(float));
-        }
-        if (device == DeviceType::CUDA) {
-            tensor->to_device(DeviceType::CUDA);
         }
         return tensor;
     }
