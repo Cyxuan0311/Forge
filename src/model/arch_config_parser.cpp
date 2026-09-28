@@ -141,6 +141,20 @@ ModelConfig parse_dflash_config(ModelLoader& loader, const std::string& arch) {
         static_cast<int>(loader.get_metadata_int(arch + ".selector_rank", 0));
     cfg.dflash_selector_top_k =
         static_cast<int>(loader.get_metadata_int(arch + ".selector_top_k", 0));
+    cfg.sample_from_anchor =
+        loader.get_metadata_int(arch + ".sample_from_anchor", 0) != 0;
+
+    // DSpark truncated candidate re-ranking (vLLM dspark_draft_topk / apply_bias_gathered).
+    // When unset the checkpoint uses the full-vocab markov bias (topk == 0).
+    cfg.dspark_markov_top_k =
+        static_cast<int>(loader.get_metadata_int("dspark_draft_topk", 0));
+    if (cfg.dspark_markov_top_k == 0)
+        cfg.dspark_markov_top_k =
+            static_cast<int>(loader.get_metadata_int(arch + ".draft_topk", 0));
+    // Confidence-head adaptive draft truncation threshold (forge-side knob; the
+    // checkpoint does not carry it, vLLM defaults to a fixed sigmoid + budget).
+    cfg.dspark_confidence_threshold = static_cast<float>(
+        loader.get_metadata_float(arch + ".confidence_threshold", 0.5));
 
     // 部分 RoPE (partial rope): Qwen3 系 DFlash 转换器把旋转维度写成
     // rope.dimension_sections (mrope 四段布局, [64,0,0,0] = 仅旋转前 64 维,

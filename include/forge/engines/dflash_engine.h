@@ -61,6 +61,14 @@ public:
     // the append (accepted drafts occupy the same positions) or by the next
     // query block before attention reads them.
     void append_context_kv(const std::vector<int32_t>& delta_ids, int64_t start_pos);
+    // Same, but the target hidden states are supplied by the caller instead of
+    // being recomputed. This is the hot path: the delta tokens were already
+    // forwarded by the target during the previous verify forward, so replaying
+    // them through the target is pure duplicated work (a full 42-layer forward
+    // per round, and it also forces the target off its CUDA graph because
+    // capturing layer hiddens disables the graph path). Row j of `hiddens` must
+    // be the encoder input for the delta token at position start_pos + j.
+    void append_context_kv_from_hiddens(const TensorPtr& hiddens, int64_t start_pos);
     // Decoder: [anchor, MASK*N] query block -> [N+1, vocab] logits (non-causal).
     TensorPtr decode(const std::vector<int32_t>& query_ids, int64_t start_pos);
 
@@ -87,6 +95,17 @@ public:
     TensorPtr markov_bias() const;   // [target_vocab, d] or nullptr
     TensorPtr draft_id_map() const;  // [draft_vocab] int32 mapping or nullptr
 
+    // DSpark per-position confidence head (vLLM confidence_head.proj). Returns
+    // nullptr when the drafter has no confidence weights (plain DFlash/markov-only).
+    bool has_confidence_head() const;
+    TensorPtr conf_proj_weight() const;  // [conf_in_dim, 1] or nullptr
+    TensorPtr conf_proj_bias() const;    // [1] or nullptr
+    int conf_in_dim() const;             // input dim of conf_proj (= hidden_dim + markov_d)
+
+    // Draft-model hidden states of the last decode() call, [query_len, hidden_dim]
+    // (CPU). Consumed by the DSpark confidence head; valid only after decode().
+    TensorPtr last_hidden_states() const;
+
 protected:
     // Draft layer: standard GQA block, but attend() is non-causal during the
     // query-block decode (decode_noncausal_). Uses the engine-local executors so
@@ -100,6 +119,12 @@ private:
     // 为 K/V, 再逐层 k_norm (attn_k_norm, 若 use_qk_norm) + RoPE, 写入
     // [start_pos, ...) (不含 reset)
     void write_context_kv(const TensorPtr& prefix_embd, int64_t start_pos);
+    // encode() (fc) + write_context_kv() —— the tail shared by the replay path
+    // and the hiddens-handoff path.
+    void encode_and_write_context_kv(const TensorPtr& target_hiddens, int64_t start_pos);
+    // Zeroed Q placeholder for the K-only RoPE in write_context_kv, cached across
+    // layers (RopeExecutor::apply needs a Q operand; only k_rope is read).
+    TensorPtr dummy_q(int prefix_len, int64_t width, DataType dtype, DeviceType dev);
     // DFlash2 conv/selector 权重归一化: matmul_transB 的 CPU 路径没有 FP16
     // kernel, conv/selector 的标量读取也需要原始浮点, 因此把 FP16/量化权重一次性
     // 转成 FP32 并按源张量缓存 (FP32 权重原样透传, 任意设备)。
@@ -120,6 +145,8 @@ private:
     std::unordered_map<const Tensor*, TensorPtr> dflash2_f32_;  // conv/selector weights → FP32
     std::unordered_map<const Tensor*, TensorPtr> dflash2_f32_cpu_;  // selector weights → host FP32
     TensorPtr dflash2_lattice_;  // last decode()'s selector lattice (CPU FP32)
+    TensorPtr last_hidden_states_;  // last decode()'s draft hidden states (CPU)
+    TensorPtr dummy_q_;  // cached K-only RoPE placeholder, reused across layers
 };
 
 // DSPark sequential Markov sampling (pure, deterministic, testable).
@@ -135,10 +162,22 @@ private:
 // fallback). When `draft_id_map` is non-null the draft logits are over a reduced
 // draft vocabulary; the sampled draft id is mapped back to the target id before
 // being emitted and before becoming `prev` for the next position.
+//
+// cand_top_k > 0 enables vLLM's truncated candidate re-ranking (apply_bias_gathered):
+// the Markov bias is applied only to the top-k base-logit candidates per position,
+// the rest staying -inf (excluded from the argmax). When conf_weight != nullptr the
+// per-position DSpark confidence head (sigmoid(conf_proj([hidden; markov_embed]))) is
+// computed; positions whose confidence < conf_threshold are dropped, truncating the
+// draft to the longest high-confidence prefix (vLLM adaptive verification, single
+// request form). hidden_rows must be aligned 1:1 with `rows`.
 std::vector<int32_t> dspark_sequential_sample(const std::vector<const float*>& rows, int vocab,
+                                              const std::vector<const float*>& hidden_rows, int hidden_dim,
                                               const float* markov_embed, int markov_d,
                                               const float* markov_bias, const int32_t* draft_id_map,
-                                              int32_t anchor_token, int n);
+                                              int32_t anchor_token, int n,
+                                              int cand_top_k,
+                                              const float* conf_weight, const float* conf_bias,
+                                              float conf_threshold);
 
 // DFlash2 block-causal dynamic depthwise conv (llama.cpp build_dflash2_conv,
 // row-major port; exposed for unit tests). Applied twice per attn/ffn sublayer:

@@ -10,6 +10,7 @@
 namespace forge {
 
 class Sampler;
+class Tensor;
 
 // =========================================================================
 // Speculative Decoding public types.
@@ -60,6 +61,18 @@ struct SpeculativeConfig {
     std::vector<int> draft_target_layers;  // override for the encoder's target layers
     int draft_mask_token_id = -1;          // MASK token for the query block (<0 = read from GGUF)
     int draft_n_spec = 5;                  // speculative tokens proposed per round
+
+    // DSpark (MiniCPM5-2.6B-DSpark) tuning knobs, override the GGUF-derived defaults.
+    int dspark_top_k = 0;                  // truncated candidate re-ranking top-k (0 = full vocab)
+    float dspark_conf_threshold = 0.5f;    // confidence-head adaptive draft truncation threshold
+
+    // Acceptance floor below which the drafter is judged net-negative and
+    // speculation is disabled for the rest of the generation (<=0 = never).
+    // Speculation only pays off when cost(draft) + cost(verify) <
+    // (accepted + 1) * cost(plain); with a drafter as large as the target that
+    // needs a high acceptance rate, so a persistently low EWMA is a reliable
+    // signal that the round is costing more than it returns.
+    float min_accept_rate = 0.0f;
 
     // n-gram self-speculative parameters
     bool use_mtp = false;       // DeepSeek-MTP style nextn draft head (qwen35)
@@ -113,6 +126,34 @@ public:
     // Whether this provider tracks global history and should receive
     // accept() even when it was not the drafter (e.g. n-gram pools).
     virtual bool is_global() const { return false; }
+
+    // ---- Target hidden-state handoff (DFlash / DSPark) ----
+    //
+    // Cross-attention drafters (DFlash/DSPark) build their incremental context
+    // KV by projecting the TARGET's multi-layer hidden states. Those states are
+    // already produced by the target's own verify forward, so re-running the
+    // target over the same tokens is pure duplicated work (a full 42-layer
+    // forward per round, and it also forces the target off its CUDA graph).
+    // The executor therefore captures them during the verify forward and hands
+    // them over here; the provider slices the rows it needs.
+    //
+    // This mirrors vLLM's `pass_hidden_states_to_model=True` proposer contract
+    // (vllm/v1/spec_decode/dflash.py:35): the drafter consumes the target's
+    // hidden states straight out of the target forward, never a replay.
+    //
+    // capture_layers(): which target layers to concatenate into the encoder
+    // input. nullptr (default) means the provider does not consume target
+    // hiddens, in which case the executor skips the capture entirely and
+    // leaves the target on its graph.
+    virtual const std::vector<int>* capture_layers() const { return nullptr; }
+
+    // Receive the captured encoder input for the most recent verify forward:
+    // [n_verify_rows, sum(hidden over capture_layers())] on the CPU, row j being
+    // the encoder input for the token at that forward's `start_pos + j`.
+    // Providers must treat it as a single-shot stash: it is replaced after every
+    // verify and cleared whenever an uncaptured token can enter the delta range
+    // (plain-decode confirmations, generation restarts, KV truncation).
+    virtual void set_verify_hiddens(std::shared_ptr<Tensor> /*hiddens*/) {}
 };
 
 using DraftProviderPtr = std::unique_ptr<IDraftProvider>;

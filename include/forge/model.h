@@ -116,6 +116,23 @@ struct ModelConfig {
     int dflash_selector_top_k = 0;    // top-k candidates per block position
     float f_logit_scale = 0.0f;       // target logit scale fed to the selector (0 = disabled)
 
+    // DSpark sample_from_anchor (vLLM dspark/_sample_sequential): when true, the
+    // anchor is query position 0 and ALL n_spec query rows predict a draft token
+    // (row i -> draft token i), with the markov walk seeded by the anchor token.
+    // When false (plain DFlash 1+N), row 0 is a bonus prediction of last_token
+    // itself and is skipped, so only the MASK rows (1..n_block) feed the draft.
+    bool sample_from_anchor = false;
+
+    // DSpark truncated candidate re-ranking (vLLM apply_bias_gathered): when > 0,
+    // the markov bias is applied only to the top-k base-logit candidates per
+    // position (the rest are excluded from the argmax). 0 = full-vocab, matching
+    // vLLM's default when dspark_draft_topk is unset.
+    int dspark_markov_top_k = 0;
+    // DSpark confidence-head adaptive draft truncation: keep a drafted position only
+    // while its confidence (sigmoid of conf_proj over [hidden; markov_embed]) stays
+    // >= this threshold (vLLM adaptive verification, single-request form).
+    float dspark_confidence_threshold = 0.5f;
+
     // ---- BailingMoE3 (Ling 3.0) hybrid MoE + MLA + SSM/KDA ----
     int kda_head_dim = 0;               // attention.key_length (576) for the SSM/linear branch
     int kda_value_dim = 0;              // attention.value_length (128)
@@ -324,6 +341,11 @@ struct ModelWeights {
     // Optional reduced draft vocab: draft logits are over a smaller vocabulary and
     // each draft id is mapped back to the target id via this int32 table.
     TensorPtr dflash_draft_id_to_target_id;  // [draft_vocab] int32
+
+    // DSpark per-position confidence head (vLLM confidence_head.proj). Input is
+    // [draft_hidden; markov_embed] of dim conf_in_dim, output is a single scalar.
+    TensorPtr dflash_conf_proj_weight;  // [conf_in_dim, 1]
+    TensorPtr dflash_conf_proj_bias;    // [1]
 
     // ---- DFlash2 selector (present only for DFlash2) ----
     // selector_prev/next embed the predecessor/successor candidate ids into a

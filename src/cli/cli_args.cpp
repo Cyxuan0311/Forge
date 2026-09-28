@@ -76,6 +76,11 @@ static void print_usage(const char* prog) {
             "       --spec-draft-target-layers LIST  Target layer indices feeding the draft encoder, e.g. \"2,5,8\"\n"
             "       --spec-draft-mask-id N MASK token id for the DFlash query block (default: from GGUF)\n"
             "       --spec-draft-n N       Speculative tokens proposed per round (default: 5)\n"
+            "       --spec-dspark-topk N  DSpark: apply markov bias only to top-N base-logit candidates (0 = full vocab)\n"
+            "       --spec-dspark-conf F   DSpark: drop drafted positions whose confidence < F (default: 0.5)\n"
+            "       --spec-min-acc F       Disable drafting (fall back to plain decode) while acceptance EWMA < F\n"
+            "                           (default: 0 = always speculate; useful when the drafter is larger\n"
+            "                           than the target, e.g. MiniCPM5-2.6B-DSpark over a 2B target)\n"
             "       --spec-stats           Print speculation stats after generation\n"
             "       --expert-stats         Print MoE expert router-distribution after generation\n"
             "       --expert-paging        Enable per-expert weight movement (partial activation)\n"
@@ -464,6 +469,27 @@ CliArgs parse_args(int argc, char** argv) {
             }
             args.spec.enabled = true;
             args.spec.draft_n_spec = std::stoi(argv[i]);
+        } else if (arg == "--spec-dspark-topk") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.dspark_top_k = std::stoi(argv[i]);
+        } else if (arg == "--spec-dspark-conf") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.dspark_conf_threshold = std::stof(argv[i]);
+        } else if (arg == "--spec-min-acc") {
+            if (++i >= argc) {
+                std::cerr << "Error: " << arg << " requires an argument\n";
+                std::exit(1);
+            }
+            args.spec.enabled = true;
+            args.spec.min_accept_rate = std::stof(argv[i]);
         } else if (arg == "--spec-ngram-mod") {
             args.spec.enabled = true;
             args.spec.use_ngram_mod = true;

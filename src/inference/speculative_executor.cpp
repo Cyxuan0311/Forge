@@ -6,6 +6,7 @@
 #include "forge/context.h"
 #include "forge/dflash_draft_provider.h"
 #include "forge/engine.h"
+#include "forge/engines/transformer_engine.h"
 #include "forge/inference/forward_request.h"
 #include "forge/inference/layers/qwen35_recurrent_memory.h"
 #include "forge/kv_cache.h"
@@ -43,7 +44,7 @@ void replay_recurrent(InferenceEngine* engine, InferenceContext& ctx, int32_t la
 
 SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler,
                                          const SpeculativeConfig& cfg)
-    : ctx_(ctx), sampler_(sampler), cfg_(cfg) {
+    : ctx_(ctx), sampler_(sampler), cfg_(cfg), spec_min_acc_(cfg.min_accept_rate) {
     if (!cfg_.enabled)
         return;
 
@@ -115,6 +116,16 @@ SpeculativeExecutor::SpeculativeExecutor(InferenceContext& ctx, Sampler& sampler
         }
         LOG_INFO(std::string("SpeculativeExecutor: chain [") + names +
                  "] n_draft=" + std::to_string(cfg_.n_draft));
+        // The verify forward's target hiddens are captured on behalf of every
+        // provider that declares an encoder layer list (DFlash/DSPark). N-gram /
+        // MTP providers return nullptr here, so the capture stays off and the
+        // target keeps its CUDA graph.
+        for (auto& p : providers_) {
+            if (auto* layers = p->capture_layers()) {
+                if (capture_layers_.empty())
+                    capture_layers_ = *layers;
+            }
+        }
     }
 }
 
@@ -125,6 +136,9 @@ void SpeculativeExecutor::begin_generation(const std::vector<int32_t>& prompt) {
     last_drafter_idx_ = -1;
     adaptive_draft_ = 0;
     accept_ewma_ = -1.0;
+    spec_off_streak_ = 0;
+    spec_off_ = false;
+    invalidate_verify_hiddens();
     for (auto& p : providers_) {
         p->reset();
         p->begin(prompt);
@@ -176,11 +190,43 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         return out;
     }
 
+    // Adaptive early-exit: a persistently low acceptance rate means the drafter
+    // costs more than it returns (e.g. a draft model larger than the target, so
+    // the extra draft forward can never pay off). Require kSpecOffStreak
+    // consecutive low rounds, then disable speculation for the REST of this
+    // generation and let Generator fall back to plain decode at the target's full
+    // speed. One-way: it does not re-enable mid-generation (acceptance is stable
+    // within one prompt), so we don't oscillate back into the slow path.
+    if (spec_min_acc_ > 0.0) {
+        if (spec_off_) {
+            ++stats_.n_fallback_steps;
+            return out;
+        }
+        if (accept_ewma_ >= 0.0 && accept_ewma_ < spec_min_acc_) {
+            if (++spec_off_streak_ >= kSpecOffStreak) {
+                spec_off_ = true;
+                LOG_WARN("SpecExecutor: acceptance EWMA=" +
+                         std::to_string(accept_ewma_ * 100.0) +
+                         "% < floor=" + std::to_string(spec_min_acc_ * 100.0) +
+                         "% -> drafter net-negative, disabling speculation for this "
+                         "generation (falling back to plain decode)");
+                ++stats_.n_fallback_steps;
+                return out;
+            }
+        } else {
+            spec_off_streak_ = 0;
+        }
+    }
+
     std::vector<int32_t> drafts;
     int drafter_idx = -1;
     if (has_chain) {
         for (size_t i = 0; i < providers_.size(); ++i) {
-            auto cand = providers_[i]->draft(in.last_token, n_draft);
+            std::vector<int32_t> cand;
+            {
+                PERF_SCOPE("speculative/draft");
+                cand = providers_[i]->draft(in.last_token, n_draft);
+            }
             if (static_cast<int>(cand.size()) >= std::max(cfg_.n_min, 1)) {
                 drafts = std::move(cand);
                 drafter_idx = static_cast<int>(i);
@@ -194,7 +240,10 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
             return out;
         }
     } else {
-        drafts = provider_->draft(in.last_token, n_draft);
+        {
+            PERF_SCOPE("speculative/draft");
+            drafts = provider_->draft(in.last_token, n_draft);
+        }
         if (static_cast<int>(drafts.size()) < std::max(cfg_.n_min, 1)) {
             ++stats_.n_fallback_steps;
             return out;
@@ -217,33 +266,62 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     if (rmem)
         rmem->snapshot(0);
 
+    // The verify forward already produces the DFlash/DSPark encoder input (the
+    // target's multi-layer hidden states). Capture it here so the next round can
+    // build its context K/V from it instead of re-forwarding the same tokens
+    // through the target. Capture is what disables the graph path
+    // (use_graph = use_graph_ && !captures_layer_hiddens()), so it is only
+    // enabled when a provider actually consumes the hiddens.
+    auto* tf = dynamic_cast<TransformerEngine*>(engine);
+    const bool was_capturing = tf && tf->captures_layer_hiddens();
+    if (tf && !was_capturing)
+        tf->set_capture_layer_hiddens(true);
+
     TensorPtr logits_all;
+    TensorPtr verify_hiddens;
     {
         PERF_SCOPE("speculative/verify_forward");
-        // Verify consumes one logits row per draft token (+1 for resample);
-        // opt in explicitly instead of relying on the engine returning the
-        // full [n_tokens, vocab] buffer by default.
         auto verify_req = ForwardRequest::from_ids(input_ids, in.pos);
         verify_req.return_all_logits = true;
         logits_all = engine->forward_request(verify_req);
+        if (logits_all->device() != DeviceType::CPU)
+            logits_all->to_device(DeviceType::CPU);
+        if (tf)
+            verify_hiddens = tf->take_layer_hiddens(capture_layers_);
     }
+    if (tf && !was_capturing)
+        tf->set_capture_layer_hiddens(false);
+
+    if (!capture_layers_.empty() && !verify_hiddens)
+        LOG_WARN("SpecExecutor: verify forward produced no target hiddens for the capture "
+                 "layers; the drafter will fall back to a target re-forward this round");
+    // Hand the hiddens over: replaces any previous stash. Callers that add tokens
+    // the target did not just compute (plain-decode confirmations) must call
+    // invalidate_verify_hiddens() instead, since a stale stash would silently
+    // encode the wrong token into the drafter's context K/V.
+    for (auto& p : providers_) {
+        if (p->capture_layers())
+            p->set_verify_hiddens(verify_hiddens);
+    }
+    if (provider_ && provider_->capture_layers())
+        provider_->set_verify_hiddens(verify_hiddens);
 
     if (!logits_all || logits_all->ndim() < 2 || logits_all->shape()[0] < n_rows) {
         LOG_WARN("SpeculativeExecutor: verify forward failed, falling back to plain decode");
         ++stats_.n_fallback_steps;
-        // 状态已在 forward 中推进但本轮作废, 恢复到 draft 前, 与 KV 行为对齐。
         if (rmem)
             rmem->rollback(0);
         return out;
-    }
-    if (logits_all->device() != DeviceType::CPU) {
-        logits_all->to_device(DeviceType::CPU);
     }
 
     const int vocab_size = static_cast<int>(logits_all->shape()[1]);
     const float* logits_data = static_cast<const float*>(logits_all->data());
 
-    auto vr = verify_draft_tokens(logits_data, vocab_size, drafts, sampler_, cfg_);
+    SpecVerifyResult vr;
+    {
+        PERF_SCOPE("speculative/verify_accept");
+        vr = verify_draft_tokens(logits_data, vocab_size, drafts, sampler_, cfg_);
+    }
 
     out.tokens.insert(out.tokens.end(), vr.accepted_tokens.begin(), vr.accepted_tokens.end());
     if (vr.resampled >= 0) {
@@ -271,7 +349,10 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         // recurrent 状态回到 draft 前快照, 再重放已接受 token 推进到接受点。
         if (rmem) {
             rmem->rollback(0);
-            replay_recurrent(engine, ctx_, in.last_token, drafts, vr.n_accepted, in.pos);
+            {
+                PERF_SCOPE("speculative/replay");
+                replay_recurrent(engine, ctx_, in.last_token, drafts, vr.n_accepted, in.pos);
+            }
         }
     }
 
@@ -311,9 +392,27 @@ void SpeculativeExecutor::rollback_kv(int64_t valid_end_pos) {
     KVCache* kv = engine ? engine->kv_cache() : nullptr;
     if (kv)
         kv->rollback(valid_end_pos);
+    // Truncating the committed stream can pull an uncaptured token into the next
+    // drafter delta, so the captured-hiddens stash is no longer trustworthy.
+    invalidate_verify_hiddens();
+}
+
+void SpeculativeExecutor::invalidate_verify_hiddens() {
+    for (auto& p : providers_) {
+        if (p->capture_layers())
+            p->set_verify_hiddens(nullptr);
+    }
+    if (provider_ && provider_->capture_layers())
+        provider_->set_verify_hiddens(nullptr);
 }
 
 void SpeculativeExecutor::notify_confirmed(int32_t token) {
+    // This token came from the plain-decode path, so the target never produced
+    // hiddens for it. The next drafter delta may include it, which would make a
+    // stale stash encode the WRONG token into the drafter context K/V (the row
+    // that happens to sit at that index belongs to a rejected draft instead).
+    // Drop the stash so the next round falls back to the replay path.
+    invalidate_verify_hiddens();
     for (auto& p : providers_) {
         p->accept({token});
     }

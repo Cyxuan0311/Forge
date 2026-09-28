@@ -44,10 +44,22 @@ public:
     void accept(const std::vector<int32_t>& tokens) override;
     void reset() override;
     const char* name() const override { return is_dspark_ ? "dspark" : "dflash"; }
-    // DFlash 维护与 target 确认边界严格一致的 committed 账本 (增量上下文 KV 的
-    // 记账依据), 即使某轮未中选也必须接收确认流, 否则账本出现缺口, 下次
-    // 中选时 delta 注入会错位。
+    // DFlash maintains a committed ledger strictly aligned with the target's
+    // confirmation boundary (the bookkeeping basis for the incremental context
+    // KV); it must receive the confirmation stream even for rounds where it
+    // was not selected, otherwise the ledger gets a hole and the next selected
+    // round injects the delta at the wrong offset.
     bool is_global() const override { return true; }
+
+    // Target hidden-state handoff: the encoder input is the concatenation of
+    // the drafter's configured target_layers, which the target's verify forward
+    // already computed. Consuming it removes one full target forward per round.
+    const std::vector<int>* capture_layers() const override;
+    void set_verify_hiddens(std::shared_ptr<Tensor> hiddens) override;
+
+    // Drop the stash. Called when a token that was NOT produced by the captured
+    // verify forward may enter the next delta range.
+    void clear_verify_hiddens();
 
 private:
     struct Impl;

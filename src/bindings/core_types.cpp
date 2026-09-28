@@ -169,7 +169,9 @@ void register_core_types(py::module_& m) {
         .def_readwrite("draft_arch", &SpeculativeConfig::draft_arch)
         .def_readwrite("draft_target_layers", &SpeculativeConfig::draft_target_layers)
         .def_readwrite("draft_mask_token_id", &SpeculativeConfig::draft_mask_token_id)
-        .def_readwrite("draft_n_spec", &SpeculativeConfig::draft_n_spec);
+        .def_readwrite("draft_n_spec", &SpeculativeConfig::draft_n_spec)
+        .def_readwrite("dspark_top_k", &SpeculativeConfig::dspark_top_k)
+        .def_readwrite("dspark_conf_threshold", &SpeculativeConfig::dspark_conf_threshold);
 
     // ---- SpeculativeStats ----
     py::class_<SpeculativeStats>(m, "SpeculativeStats")

@@ -518,6 +518,38 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                              "tensors missing; selector disabled");
                 }
             }
+
+            // DSPark sequential Markov head: markov_w1 (Embedding[vocab, d],
+            // prev-keyed) and markov_w2 (LMHead[vocab, d], candidate-keyed),
+            // stored in GGUF as markov_w1.weight / markov_w2.weight. The loader
+            // reverses dims to [vocab, d] row-major and converts BF16 -> FP32, so
+            // model_weights.cpp consumes them directly as markov_embed / markov_bias
+            // (no transpose needed).
+            auto mw1 = load_tensor("markov_w1.weight", last_layer_dev);
+            auto mw2 = load_tensor("markov_w2.weight", last_layer_dev);
+            if (mw1 && mw2) {
+                weight_store_.set("markov_w1", mw1);
+                weight_store_.set("markov_w2", mw2);
+                LOG_INFO("model load: DSpark markov head loaded (" +
+                         std::to_string(mw1->shape()[0]) + "x" +
+                         std::to_string(mw1->shape()[1]) + ")");
+            } else {
+                LOG_WARN("model load: DSpark markov head (markov_w1/w2.weight) missing");
+            }
+
+            // DSpark per-position confidence head (vLLM confidence_head.proj): tensors
+            // conf_proj.weight [conf_in_dim, 1] and conf_proj.bias [1]. Consumed on CPU
+            // only, so load it to CPU regardless of the layer device placement.
+            auto cw = load_tensor("conf_proj.weight", DeviceType::CPU);
+            auto cb = load_tensor("conf_proj.bias", DeviceType::CPU);
+            if (cw && cb) {
+                weight_store_.set("conf_proj.weight", cw);
+                weight_store_.set("conf_proj.bias", cb);
+                LOG_INFO("model load: DSpark confidence head loaded (in_dim=" +
+                         std::to_string(cw->shape()[0]) + ")");
+            } else {
+                LOG_WARN("model load: DSpark confidence head (conf_proj.weight/bias) missing");
+            }
         } else {
             auto te = load_tensor("token_embd.weight", emb_dev);
             if (!te) {

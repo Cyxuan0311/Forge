@@ -1,6 +1,7 @@
 #include "forge/model_weights.h"
 
 #include <chrono>
+#include <cstring>
 
 #include "forge/arch_registry.h"
 #include "forge/logger.h"
@@ -16,6 +17,84 @@ void LayerWeights::to_device(DeviceType device) {
             t->to_device(device);
         }
     }
+}
+
+// DSpark (vLLM-style) markov head stores markov_w1 / markov_w2 in GGUF as
+// [d, vocab]: dims[0] = d (outer) = 256, dims[1] = vocab (inner) = 130560, so
+// token v's d-vector is COLUMN v in the raw bytes. forge's get_tensor reverses
+// the shape vector (-> [vocab, d] = [130560, 256]) but NOT the bytes, so the
+// loaded tensor has scrambled rows. dspark_sequential_sample needs
+// markov_embed[prev] / markov_bias[v] as contiguous d-vectors, so we transpose to
+// true [vocab, d] row-major.
+//
+// The head is consumed on CPU only, as FP32. It is loaded with the drafter's
+// layer device, which for a BF16 drafter is CUDA -- and the loader keeps BF16
+// weights native there (expanding them doubled the drafter's footprint and cost
+// 19.5x on its weight-reading GEMMs). So the source may arrive as BF16 and is
+// widened to FP32 here. This runs once at load, on CPU, for two [130560, 256]
+// tables; correctness beats the memory here because the head never sees a GEMM.
+// CPU-side FP32 view of a drafter head tensor. A BF16 GGUF weight arrives in its
+// native form when loaded onto a CUDA device (the loader no longer expands it --
+// see GgufModel::get_tensor), and the DSpark heads are read as float on the CPU.
+static TensorPtr to_cpu_f32(const TensorPtr& src) {
+    if (!src)
+        return nullptr;
+    if (src->device() == DeviceType::CPU && src->dtype() == DataType::FP32)
+        return src;
+    const int64_t numel = src->numel();
+    auto out = std::make_shared<Tensor>(DataType::FP32, src->shape(), DeviceType::CPU);
+    float* o = static_cast<float*>(out->data());
+    if (src->dtype() == DataType::BF16) {
+        const auto* in = static_cast<const uint16_t*>(src->data());
+        for (int64_t i = 0; i < numel; ++i) {
+            const uint32_t bits = static_cast<uint32_t>(in[i]) << 16;
+            std::memcpy(o + i, &bits, sizeof(float));
+        }
+        return out;
+    }
+    if (src->dtype() != DataType::FP32)
+        throw std::runtime_error("to_cpu_f32: expected FP32 or BF16, got '" +
+                                 dtype_name(src->dtype()) + "'");
+    // FP32 on another device: stage through a device copy.
+    auto staged = std::make_shared<Tensor>(DataType::FP32, src->shape(), DeviceType::CPU);
+    staged->copy_from(*src);
+    return staged;
+}
+
+static TensorPtr transpose_markov_head(const TensorPtr& src) {
+    if (!src)
+        return nullptr;
+    TensorPtr s = src;
+    if (s->device() != DeviceType::CPU)
+        s->to_device(DeviceType::CPU);  // in-place: head is CPU-only
+    const auto& shp = s->shape();
+    if (shp.size() != 2)
+        return nullptr;
+    // forge shape after reverse = [vocab, d] = [shp[0], shp[1]]
+    const int64_t vocab = shp[0], D = shp[1];
+    auto out = std::make_shared<Tensor>(DataType::FP32,
+                                        std::vector<int64_t>{vocab, D}, DeviceType::CPU);
+    const int64_t total = vocab * D;
+    float* o = static_cast<float*>(out->data());
+    if (s->dtype() == DataType::BF16) {
+        const auto* in = static_cast<const uint16_t*>(s->data());
+        for (int64_t v = 0; v < vocab; ++v)
+            for (int64_t d = 0; d < D; ++d) {
+                const uint32_t bits = static_cast<uint32_t>(in[d * vocab + v]) << 16;
+                std::memcpy(o + v * D + d, &bits, sizeof(float));
+            }
+        (void)total;
+        return out;
+    }
+    if (s->dtype() != DataType::FP32)
+        throw std::runtime_error("transpose_markov_head: expected FP32 or BF16 head, got '" +
+                                 dtype_name(s->dtype()) + "'");
+    const float* in = static_cast<const float*>(s->data());
+    // out[v, d] = in[d, v]  (raw GGUF [d, vocab] -> row-major [vocab, d])
+    for (int64_t v = 0; v < vocab; ++v)
+        for (int64_t d = 0; d < D; ++d)
+            o[v * D + d] = in[d * vocab + v];
+    return out;
 }
 
 bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
@@ -56,13 +135,71 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         dflash_output_norm_enc = store.get("output_norm_enc.weight");
 
     // DSPark sequential Markov head (optional; absent for plain DFlash).
+    // Two naming conventions are supported:
+    //  - forge's older Qwen DFlash2 checkpoint: `markov_embed` / `markov_bias`
+    //    already in [target_vocab, d] row-major form.
+    //  - vLLM-style DSpark (e.g. MiniCPM5-2.6B-DSpark): `markov_w1`
+    //    (Embedding[vocab, d], keyed by prev token) and `markov_w2`
+    //    (LMHead[vocab, d], keyed by candidate v), stored in GGUF as [d, vocab];
+    //    we transpose them to [vocab, d] so the markov walk can index
+    //    markov_embed[prev] / markov_bias[v] as contiguous d-vectors.
+    //    (vLLM qwen3_dspark.py:71-72: markov_w1 -> embed, markov_w2 -> bias.)
     dflash_markov_embed = store.get("markov_embed");
     if (!dflash_markov_embed)
         dflash_markov_embed = store.get("markov_embed.weight");
     dflash_markov_bias = store.get("markov_bias");
     if (!dflash_markov_bias)
         dflash_markov_bias = store.get("markov_bias.weight");
+    if (!dflash_markov_embed || !dflash_markov_bias) {
+        // vLLM DSpark (qwen3_dspark.py:71-72): markov_w1 = Embedding[vocab, d]
+        // (prev-keyed embed), markov_w2 = LMHead[vocab, d] (candidate-keyed bias).
+        // The GGUF loader already reverses dims to [vocab, d] row-major and converts
+        // BF16 -> FP32, so we use them directly. The head is consumed on CPU only,
+        // so stage it to CPU once (the drafter itself may live on GPU).
+        TensorPtr mw1 = store.get("markov_w1");
+        if (!mw1)
+            mw1 = store.get("markov_w1.weight");
+        TensorPtr mw2 = store.get("markov_w2");
+        if (!mw2)
+            mw2 = store.get("markov_w2.weight");
+        if (mw1 && mw2) {
+            // vLLM qwen3_dspark.py:71-72: markov_w1 = Embedding[vocab, d] (prev-keyed
+            // embed), markov_w2 = LMHead[vocab, d] (candidate-keyed bias). GGUF stores
+            // them as [d, vocab]; transpose to true [vocab, d] row-major so
+            // markov_embed[prev] / markov_bias[v] are contiguous d-vectors. The head is
+            // consumed on CPU, so transpose_markov_head also stages it to CPU.
+            dflash_markov_embed = transpose_markov_head(mw1);  // prev-keyed
+            dflash_markov_bias = transpose_markov_head(mw2);   // candidate-keyed
+        }
+    }
     dflash_draft_id_to_target_id = store.get("draft_id_to_target_id");
+
+    // DSpark per-position confidence head (optional; requires has_confidence_head).
+    // conf_proj.weight is [conf_in_dim, 1] (conf_in_dim = hidden_dim + markov_d); it
+    // is consumed on CPU only, so the engine accessor stages it to CPU on demand.
+    dflash_conf_proj_weight = store.get("conf_proj.weight");
+    if (!dflash_conf_proj_weight)
+        dflash_conf_proj_weight = store.get("confidence_head.proj.weight");
+    dflash_conf_proj_bias = store.get("conf_proj.bias");
+    if (!dflash_conf_proj_bias)
+        dflash_conf_proj_bias = store.get("confidence_head.proj.bias");
+    // dspark_sequential_sample reads the confidence projection as float, and it
+    // is loaded with the drafter's layer device -- which for a BF16 drafter keeps
+    // the weight in native BF16. Widen once here (a [conf_in_dim, 1] vector, so
+    // this is free) so the engine accessor can hand out a plain CPU FP32 tensor.
+    dflash_conf_proj_weight = to_cpu_f32(dflash_conf_proj_weight);
+    dflash_conf_proj_bias = to_cpu_f32(dflash_conf_proj_bias);
+
+    if (dflash_markov_embed && dflash_markov_bias) {
+        LOG_INFO("DSpark markov head loaded: embed=" +
+                 std::to_string(dflash_markov_embed->shape()[0]) + "x" +
+                 std::to_string(dflash_markov_embed->shape()[1]) + " bias=" +
+                 std::to_string(dflash_markov_bias->shape()[0]) + "x" +
+                 std::to_string(dflash_markov_bias->shape()[1]) +
+                 " confidence=" + (dflash_conf_proj_weight ? "yes" : "no"));
+    } else {
+        LOG_INFO("DSpark markov head NOT loaded");
+    }
 
     // DFlash2 selector weights (present only for DFlash2 GGUFs).
     dflash_selector_prev = store.get("dflash_selector_prev");

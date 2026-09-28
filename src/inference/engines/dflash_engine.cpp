@@ -10,6 +10,11 @@
 #include "forge/inference/layers/qwen35_recurrent_memory.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
+#include "forge/perf_profiler.h"
+
+#ifdef USE_CUDA
+using forge::SyncScopeTimer;
+#endif
 #include "forge/quant_traits.h"
 
 namespace forge {
@@ -230,7 +235,7 @@ DflashEngine::DflashEngine(Model& model, InferenceContext& ctx)
       dflash_attn_(kv_cache_, kv_memory_ ? &kv_memory_->storage() : nullptr) {}
 
 TensorPtr DflashEngine::forward_request(const ForwardRequest& req) {
-    init_kv_cache(model_.config());
+    { SyncScopeTimer t("dfr/0_init_kv_cache"); init_kv_cache(model_.config()); }
     DeviceType first_dev = layer_device(0);
     TensorPtr hidden;
     if (req.input_embeddings) {
@@ -312,28 +317,53 @@ void DflashEngine::write_context_kv(const TensorPtr& prefix_embd, int64_t start_
         // 在主机端解引用对侧指针导致段错误 (drafter --spec-draft-ngl 1/5 时崩溃)。
         const DeviceType ldev = lw.wk() ? lw.wk()->device() : layer_device(layer);
         TensorPtr feat_l = transfer_hidden(feature, ldev);
-        TensorPtr K = ops::matmul_transB(feat_l, lw.wk());
-        TensorPtr V = ops::matmul_transB(feat_l, lw.wv());
+        TensorPtr K, V;
+        {
+            PERF_SCOPE("dflash/ctx_proj");
+            K = ops::matmul_transB(feat_l, lw.wk());
+            V = ops::matmul_transB(feat_l, lw.wv());
+        }
         // 逐层 k_norm (per-head RMSNorm), 与 forward_layer 的 QK-Norm 分支一致,
         // 置于 RoPE 之前 (vLLM dflash: fused GEMM -> k_norm -> RoPE)。
         if (cfg.use_qk_norm && lw.attn_k_norm()) {
+            PERF_SCOPE("dflash/ctx_kvnorm");
             K = NormExecutor::apply_qk_norm(K, lw.attn_k_norm(), num_kv_heads, head_dim,
                                             cfg.rms_norm_eps, ldev);
         }
         // RoPE applies to K (and Q); build a dummy Q so we can reuse apply() and
-        // take the rotated K. V is intentionally left un-rotated.
-        TensorPtr q_dummy = std::make_shared<Tensor>(
-            K->dtype(), std::vector<int64_t>{prefix_len, num_heads * head_dim}, ldev);
-        q_dummy->zero_();
-        auto rope = dflash_rope_.apply(q_dummy, K, cfg, start_pos, prefix_len, ldev);
-        if (kv_cache_.update(layer, 0, start_pos, rope.k_rope, V, prefix_len) < 0) {
-            throw std::runtime_error(
-                "KV cache overflow at layer " + std::to_string(layer) +
-                ": write_pos=" + std::to_string(start_pos) +
-                " seq_len=" + std::to_string(prefix_len) +
-                " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+        // take the rotated K. V is intentionally left un-rotated. The dummy Q is
+        // allocated once and reused across layers: the ROPE result is read from
+        // k_rope only, so a zeroed buffer of the right shape is sufficient and
+        // saves a per-layer allocation + memset.
+        TensorPtr q_dummy = dummy_q(prefix_len, num_heads * head_dim, K->dtype(), ldev);
+        TensorPtr k_rope;
+        {
+            PERF_SCOPE("dflash/ctx_rope");
+            auto rope = dflash_rope_.apply(q_dummy, K, cfg, start_pos, prefix_len, ldev);
+            k_rope = rope.k_rope;
+        }
+        {
+            PERF_SCOPE("dflash/ctx_cache");
+            if (kv_cache_.update(layer, 0, start_pos, k_rope, V, prefix_len) < 0) {
+                throw std::runtime_error(
+                    "KV cache overflow at layer " + std::to_string(layer) +
+                    ": write_pos=" + std::to_string(start_pos) +
+                    " seq_len=" + std::to_string(prefix_len) +
+                    " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+            }
         }
     }
+}
+
+TensorPtr DflashEngine::dummy_q(int prefix_len, int64_t width, DataType dtype, DeviceType dev) {
+    if (!dummy_q_ || dummy_q_->shape()[1] != width || dummy_q_->device() != dev) {
+        dummy_q_ = std::make_shared<Tensor>(dtype, std::vector<int64_t>{prefix_len, width}, dev);
+    }
+    if (prefix_len > dummy_q_->shape()[0]) {
+        dummy_q_ = std::make_shared<Tensor>(dtype, std::vector<int64_t>{prefix_len, width}, dev);
+    }
+    dummy_q_->zero_();
+    return dummy_q_;
 }
 
 void DflashEngine::precompute_context_kv(const TensorPtr& prefix_embd, int64_t start_pos) {
@@ -390,11 +420,23 @@ void DflashEngine::append_context_kv(const std::vector<int32_t>& delta_ids,
                  "skipping context injection");
         return;
     }
-    TensorPtr feature = encode(hiddens);
     // 不 reset: 增量追加本批 token 的 K/V (vLLM dflash 的增量上下文模式)。
-    write_context_kv(feature, start_pos);
+    encode_and_write_context_kv(hiddens, start_pos);
     if (rmem)
         rmem->snapshot(0, /*slot=*/1);
+}
+
+void DflashEngine::append_context_kv_from_hiddens(const TensorPtr& hiddens, int64_t start_pos) {
+    if (!hiddens || hiddens->shape()[0] == 0)
+        return;
+    // Hiddens come from the target's own verify forward, so there is no replay:
+    // the live conv/ssm state was already advanced past these positions by that
+    // forward and must not be touched here.
+    encode_and_write_context_kv(hiddens, start_pos);
+}
+
+void DflashEngine::encode_and_write_context_kv(const TensorPtr& hiddens, int64_t start_pos) {
+    write_context_kv(encode(hiddens), start_pos);
 }
 
 void DflashEngine::precompute_context_kv(const std::vector<int32_t>& prefix_ids,
@@ -426,7 +468,11 @@ TensorPtr DflashEngine::decode(const std::vector<int32_t>& query_ids, int64_t st
     // Greedy sampling and the DFlash2 selector read every row of the block; the
     // sparse-logits fast path (last row only) would truncate the output.
     req.return_all_logits = true;
-    TensorPtr logits = forward_request(req);
+    TensorPtr logits;
+    {
+        PERF_SCOPE("dflash/fwd_forward");
+        logits = forward_request(req);
+    }
     decode_noncausal_ = false;
     // Query-block 行是一次性 KV 占用: block forward 期间行间经各层写出的 K/V
     // 互相可见 (non-causal), forward 结束后 cache 里的 MASK 残行对后续 forward
@@ -443,6 +489,7 @@ TensorPtr DflashEngine::decode(const std::vector<int32_t>& query_ids, int64_t st
     const bool dflash2 = is_dflash2();
 
     if (dflash2 && logits && logits->ndim() >= 2 && n >= 2) {
+        PERF_SCOPE("dflash/stage_cpu_logits");
         const auto& cfg = model_.config();
         // DFlash2 feeds these logits to the selector, so they carry the target's
         // output transforms (upstream dflash.cpp: logit scale, then softcap).
@@ -470,10 +517,20 @@ TensorPtr DflashEngine::decode(const std::vector<int32_t>& query_ids, int64_t st
                 logits, t_embd_cpu, cfg, sel_prev, sel_next, sel_hidden, query_ids[0]);
         }
     }
+
+    // Expose the draft-model hidden states for the DSpark confidence head. Staged to
+    // CPU since the confidence head is CPU-only; valid until the next decode() call.
+    TensorPtr h = take_last_hidden();
+    if (h && h->device() != DeviceType::CPU) {
+        PERF_SCOPE("dflash/d2h_hidden");
+        h->to_device(DeviceType::CPU);
+    }
+    last_hidden_states_ = h;
     return logits;
 }
 
 TensorPtr DflashEngine::forward_layer(const TensorPtr& hidden, const LayerExecutionContext& lctx) {
+    PERF_SCOPE("dflash/layer_total");
     const auto& cfg = lctx.config;
     const int layer_idx = lctx.layer_idx;
     const int seq_len = lctx.seq_len();
@@ -489,7 +546,9 @@ TensorPtr DflashEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     const bool has_qkv_bias = (lw.bq() && lw.bq()->numel() > 0);
 
     // 1. Pre-attention norm
-    TensorPtr pre_attn_norm = NormExecutor::apply(hidden, lw.attn_norm(), nullptr, norm_type, eps);
+    TensorPtr pre_attn_norm;
+    { SyncScopeTimer t("dfl/1_attn_norm");
+      pre_attn_norm = NormExecutor::apply(hidden, lw.attn_norm(), nullptr, norm_type, eps); }
 
     // DFlash2: block-causal dynamic depthwise conv around each attn/ffn sublayer
     // (upstream dflash.cpp). The dynamic coefficients are projected from the
@@ -506,10 +565,13 @@ TensorPtr DflashEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
     }
 
     // 2. QKV projection
-    auto qkv = AttentionExecutor::project_qkv(pre_attn_norm, lw, has_qkv_bias, dev, seq_len);
+    AttentionExecutor::QKVResult qkv;
+    { SyncScopeTimer t("dfl/2_qkv_proj");
+      qkv = AttentionExecutor::project_qkv(pre_attn_norm, lw, has_qkv_bias, dev, seq_len); }
     TensorPtr q = qkv.q, k = qkv.k, v = qkv.v;
 
     // 3. QK-Norm (per-head RMSNorm)
+    { SyncScopeTimer t("dfl/3_qk_norm");
     if (cfg.use_qk_norm) {
         if (lw.attn_q_norm()) {
             q = NormExecutor::apply_qk_norm(q, lw.attn_q_norm(), num_heads, head_dim,
@@ -519,37 +581,46 @@ TensorPtr DflashEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
             k = NormExecutor::apply_qk_norm(k, lw.attn_k_norm(), num_kv_heads, head_dim,
                                             cfg.rms_norm_eps, dev);
         }
-    }
+    } }
 
     // 4. RoPE
-    auto rope = dflash_rope_.apply(q, k, cfg, start_pos, seq_len, dev);
+    RopeExecutor::Result rope;
+    { SyncScopeTimer t("dfl/4_rope");
+      rope = dflash_rope_.apply(q, k, cfg, start_pos, seq_len, dev); }
     TensorPtr q_rope = rope.q_rope, k_rope = rope.k_rope;
 
     // 5. KV cache update (contiguous; the drafter owns a non-paged cache)
+    { SyncScopeTimer t("dfl/5_kv_update");
     if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {
         throw std::runtime_error(
             "KV cache overflow at layer " + std::to_string(layer_idx) +
             ": write_pos=" + std::to_string(start_pos) +
             " seq_len=" + std::to_string(seq_len) +
             " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
-    }
+    } }
 
     // 6. Attention. Non-causal during the query-block decode.
     const bool causal = !decode_noncausal_;
-    TensorPtr attn_out =
-        dflash_attn_.attend(q_rope, cfg, layer_idx, seq_len, dev, nullptr, lctx.seq_id(), causal);
+    TensorPtr attn_out;
+    { SyncScopeTimer t("dfl/6_attention");
+      attn_out = dflash_attn_.attend(q_rope, cfg, layer_idx, seq_len, dev, nullptr, lctx.seq_id(), causal); }
 
     // 7. Attention output projection
-    TensorPtr attn_proj = ops::matmul_transB(attn_out, lw.wo());
+    TensorPtr attn_proj;
+    { SyncScopeTimer t("dfl/7_attn_proj");
+      attn_proj = ops::matmul_transB(attn_out, lw.wo()); }
     if (d2_attn_conv) {
         attn_proj = build_dflash2_conv(attn_proj, attn_dynamic,
                                        dflash2_weight_f32(lw.dflash_attn_conv_base()), 1, cfg);
     }
 
     // 8/9. Sequential residual: norm -> attn -> residual -> ffn -> residual
-    TensorPtr hidden_after_attn = ops::add(hidden, attn_proj);
-    TensorPtr ffn_normed =
-        NormExecutor::apply(hidden_after_attn, lw.ffn_norm(), nullptr, norm_type, eps);
+    TensorPtr hidden_after_attn;
+    { SyncScopeTimer t("dfl/8_resid1");
+      hidden_after_attn = ops::add(hidden, attn_proj); }
+    TensorPtr ffn_normed;
+    { SyncScopeTimer t("dfl/9_ffn_norm");
+      ffn_normed = NormExecutor::apply(hidden_after_attn, lw.ffn_norm(), nullptr, norm_type, eps); }
 
     const bool d2_ffn_conv =
         cfg.dflash_selector_top_k > 0 && lw.dflash_ffn_conv_proj() != nullptr;
@@ -560,12 +631,16 @@ TensorPtr DflashEngine::forward_layer(const TensorPtr& hidden, const LayerExecut
         ffn_normed = build_dflash2_conv(ffn_normed, ffn_dynamic,
                                         dflash2_weight_f32(lw.dflash_ffn_conv_base()), 0, cfg);
     }
-    TensorPtr ffn_out = FfnExecutor::apply(ffn_normed, hidden_after_attn, cfg, lw, seq_len, dev);
+    TensorPtr ffn_out;
+    // No probe around the FFN: it would wrap the ffn/* leaves. Those are the
+    // real breakdown of this region.
+    ffn_out = FfnExecutor::apply(ffn_normed, hidden_after_attn, cfg, lw, seq_len, dev);
     if (d2_ffn_conv) {
         ffn_out = build_dflash2_conv(ffn_out, ffn_dynamic,
                                      dflash2_weight_f32(lw.dflash_ffn_conv_base()), 1, cfg);
     }
-    return ops::add(hidden_after_attn, ffn_out);
+    { SyncScopeTimer t("dfl/11_resid2");
+      return ops::add(hidden_after_attn, ffn_out); }
 }
 
 TensorPtr DflashEngine::dflash2_weight_f32(const TensorPtr& w) {
@@ -594,6 +669,17 @@ TensorPtr DflashEngine::dflash2_weight_f32(const TensorPtr& w) {
         auto* o = static_cast<float*>(f32->data());
         for (int64_t i = 0; i < cur->numel(); ++i)
             o[i] = fp16_detail::float_from_bits(fp16_detail::half_to_float_bits(in[i]));
+    } else if (cur->dtype() == DataType::BF16) {
+        // The loader keeps BF16 weights native on CUDA (expanding them doubled the
+        // drafter's footprint -- see GgufModel::get_tensor), so a BF16 drafter
+        // hands these over as BF16. The conv kernels are scalar CPU loops.
+        f32 = std::make_shared<Tensor>(DataType::FP32, cur->shape(), DeviceType::CPU);
+        const auto* in = static_cast<const uint16_t*>(cur->data());
+        auto* o = static_cast<float*>(f32->data());
+        for (int64_t i = 0; i < cur->numel(); ++i) {
+            const uint32_t bits = static_cast<uint32_t>(in[i]) << 16;
+            std::memcpy(o + i, &bits, sizeof(float));
+        }
     } else {
         throw std::runtime_error("DFlash2 conv: unsupported weight dtype " +
                                  dtype_name(cur->dtype()));
@@ -653,36 +739,126 @@ TensorPtr DflashEngine::draft_id_map() const {
     return ensure_cpu(weights_.dflash_draft_id_to_target_id);
 }
 
-std::vector<int32_t> dspark_sequential_sample(const std::vector<const float*>& rows, int vocab,
-                                              const float* markov_embed, int markov_d,
-                                              const float* markov_bias, const int32_t* draft_id_map,
-                                              int32_t anchor_token, int n) {
+bool DflashEngine::has_confidence_head() const {
+    return weights_.dflash_conf_proj_weight && weights_.dflash_conf_proj_bias;
+}
+TensorPtr DflashEngine::conf_proj_weight() const {
+    return ensure_cpu(weights_.dflash_conf_proj_weight);  // [conf_in_dim, 1]
+}
+TensorPtr DflashEngine::conf_proj_bias() const {
+    return ensure_cpu(weights_.dflash_conf_proj_bias);  // [1]
+}
+int DflashEngine::conf_in_dim() const {
+    return weights_.dflash_conf_proj_weight
+               ? static_cast<int>(weights_.dflash_conf_proj_weight->shape()[0])
+               : 0;
+}
+TensorPtr DflashEngine::last_hidden_states() const {
+    return last_hidden_states_;
+}
+
+// Scalar dot product of two length-n float vectors (markov bias term). Kept scalar
+// and simple: the matvec is memory-bandwidth bound (the [V, d] bias tensor is ~130MB
+// and read once per query position), so SIMD on the inner product is not on the
+// critical path. markov_d is a multiple of 8 but the tail loop keeps it correct.
+static inline float dot_markov(const float* a, const float* b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i)
+        s += a[i] * b[i];
+    return s;
+}
+
+std::vector<int32_t> dspark_sequential_sample(
+    const std::vector<const float*>& rows, int vocab,
+    const std::vector<const float*>& hidden_rows, int hidden_dim,
+    const float* markov_embed, int markov_d,
+    const float* markov_bias, const int32_t* draft_id_map,
+    int32_t anchor_token, int n,
+    int cand_top_k,
+    const float* conf_weight, const float* conf_bias, float conf_threshold) {
     std::vector<int32_t> out;
     out.reserve(n);
     int32_t prev = anchor_token;  // target vocab id (markov_embed is keyed by it)
+    const bool use_markov = markov_embed && markov_bias && markov_d > 0;
+    const bool use_conf = conf_weight && hidden_dim > 0 &&
+                          hidden_rows.size() >= static_cast<size_t>(n);
+    const int top_k = (cand_top_k > 0 && cand_top_k < vocab) ? cand_top_k : 0;
+
+    // Scratch for the truncated candidate re-ranking (vLLM apply_bias_gathered).
+    std::vector<int32_t> cand_idx;
+    std::vector<float> cand_val;
+    if (top_k > 0) {
+        cand_idx.resize(top_k);
+        cand_val.resize(top_k);
+    }
+    std::vector<float> confs;
+    if (use_conf)
+        confs.reserve(n);
+
     for (int j = 0; j < n; ++j) {
         const float* row = (j < static_cast<int>(rows.size())) ? rows[j] : rows.back();
+        // markov bias vector for this step: mbuf[v] = dot(markov_bias[v], embed[prev]).
+        // embed[prev] is reused across all v, so hoist it out of the vocab loop.
+        const float* eb = use_markov ? markov_embed + static_cast<int64_t>(prev) * markov_d : nullptr;
+
         int best = 0;
-        float best_score = row[0];
-        for (int v = 0; v < vocab; ++v) {
-            float score = row[v];
-            if (markov_embed && markov_bias && markov_d > 0) {
-                const float* eb = markov_embed + static_cast<int64_t>(prev) * markov_d;
-                const float* wb = markov_bias + static_cast<int64_t>(v) * markov_d;
-                float b = 0.0f;
-                for (int k = 0; k < markov_d; ++k)
-                    b += wb[k] * eb[k];
-                score += b;
+        float best_score = 0.0f;
+        if (top_k > 0) {
+            // Truncated candidate re-ranking: rank base logits, add markov bias only to
+            // the top-k candidates, then argmax within that set (others stay -inf).
+            dflash2_top_k(row, vocab, top_k, cand_idx, cand_val);
+            best = cand_idx[0];
+            best_score = cand_val[0] + (eb ? dot_markov(markov_bias + static_cast<int64_t>(best) * markov_d, eb, markov_d) : 0.0f);
+            for (int c = 1; c < top_k; ++c) {
+                const int v = cand_idx[c];
+                const float score = cand_val[c] + (eb ? dot_markov(markov_bias + static_cast<int64_t>(v) * markov_d, eb, markov_d) : 0.0f);
+                if (score > best_score) {
+                    best_score = score;
+                    best = v;
+                }
             }
-            if (score > best_score) {
-                best_score = score;
-                best = v;
+        } else {
+            best = 0;
+            best_score = row[0];
+            for (int v = 1; v < vocab; ++v) {
+                const float score = row[v] + (eb ? dot_markov(markov_bias + static_cast<int64_t>(v) * markov_d, eb, markov_d) : 0.0f);
+                if (score > best_score) {
+                    best_score = score;
+                    best = v;
+                }
             }
         }
+
         if (draft_id_map)
             best = draft_id_map[best];  // reduced draft vocab -> target
         out.push_back(best);
+
+        if (use_conf) {
+            // Confidence head: sigmoid(conf_proj([hidden; markov_embed])). Input is the
+            // concatenation of this position's draft hidden state and the markov embed
+            // of the previously sampled token; conf_proj is [conf_in_dim, 1].
+            const float* h = hidden_rows[j];
+            float acc = conf_bias ? conf_bias[0] : 0.0f;
+            for (int k = 0; k < hidden_dim; ++k)
+                acc += conf_weight[k] * h[k];
+            if (eb)
+                for (int k = 0; k < markov_d; ++k)
+                    acc += conf_weight[hidden_dim + k] * eb[k];
+            confs.push_back(1.0f / (1.0f + std::exp(-acc)));
+        }
         prev = best;  // next markov step keys on the (mapped) target vocab id
+    }
+
+    // Confidence-head adaptive draft truncation (vLLM adaptive verification, single-
+    // request form): drop the tail once a position's confidence falls below the
+    // threshold, keeping the longest high-confidence prefix.
+    if (use_conf && conf_threshold > 0.0f) {
+        for (size_t j = 0; j < confs.size(); ++j) {
+            if (confs[j] < conf_threshold) {
+                out.resize(j);
+                break;
+            }
+        }
     }
     return out;
 }

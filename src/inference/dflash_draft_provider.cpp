@@ -16,6 +16,7 @@
 #include "forge/model.h"
 #include "forge/model_loader.h"
 #include "forge/ninf_model.h"
+#include "forge/perf_profiler.h"
 #include "forge/sampler.h"
 
 namespace forge {
@@ -65,6 +66,21 @@ float top_probability(const float* logits, int vocab_size) {
     return sum > 0.0 ? static_cast<float>(1.0 / sum) : 0.0f;
 }
 
+// Leading `rows` rows of a 2D tensor, as an independent contiguous copy.
+// A Tensor::view() would inherit the parent's nbytes() (a reshape, not a slice),
+// which makes the downstream device transfer over-read, so materialize instead.
+// The block is a handful of rows, so the copy is negligible.
+std::shared_ptr<Tensor> leading_rows(const TensorPtr& t, int64_t rows) {
+    const int64_t cols = t->shape()[1];
+    auto out = std::make_shared<Tensor>(t->dtype(), std::vector<int64_t>{rows, cols}, t->device());
+    const size_t row_bytes = static_cast<size_t>(cols) * dtype_size(t->dtype());
+    const auto* src = static_cast<const uint8_t*>(t->data());
+    auto* dst = static_cast<uint8_t*>(out->data());
+    for (int64_t r = 0; r < rows; ++r)
+        std::memcpy(dst + r * row_bytes, src + r * row_bytes, row_bytes);
+    return out;
+}
+
 }  // namespace
 
 struct DFlashDraftProvider::Impl {
@@ -83,10 +99,36 @@ struct DFlashDraftProvider::Impl {
     bool is_dspark = false;
     bool valid = false;
 
+    // DSpark tuning (vLLM apply_bias_gathered + adaptive verification). Defaults
+    // come from the drafter GGUF (ModelConfig); the CLI overrides when > 0.
+    int dspark_top_k_ = 0;                 // 0 = full-vocab markov bias
+    float dspark_conf_threshold_ = 0.5f;   // confidence truncation threshold
+
     int64_t committed_len = 0;
     std::vector<int32_t> committed_ids;
     // drafter KV 中已写入上下文 K/V 的位置数 (持久化, 逐轮增量追加)
     int64_t kv_filled = 0;
+
+    // ---- Target hidden handoff (P0: skip the redundant target replay) ----
+    // `verify_hiddens_` is the encoder input for the tokens the target's most
+    // recent verify forward already processed, [rows, n_embd_inp_enc] on CPU.
+    // `verify_hiddens_pos_` is the kv_filled value the stash is anchored to: the
+    // verify forward ran at exactly that position, so stash row j is the encoder
+    // input for the token at kv_filled + j. Any advance of kv_filled (an append)
+    // or an uncaptured confirmation invalidates it.
+    std::shared_ptr<Tensor> verify_hiddens_;
+    int64_t verify_hiddens_pos_ = -1;
+    int64_t verify_hiddens_rows_ = 0;
+    std::vector<int> capture_layers;
+    // Set once the replay path has been used at least once, so the log can tell
+    // "handoff never landed" apart from "handoff is simply not available yet".
+    bool saw_handoff_ = false;
+    bool warned_replay_ = false;
+
+    bool handoff_covers(int64_t ctx_end) const {
+        return verify_hiddens_ && verify_hiddens_pos_ == kv_filled &&
+               ctx_end - kv_filled <= verify_hiddens_rows_;
+    }
 
     Impl(const SpeculativeConfig& spec, InferenceContext& tctx, InferenceEngine& t,
          int target_vocab)
@@ -103,20 +145,40 @@ struct DFlashDraftProvider::Impl {
           model_path(spec.draft_model_path),
           gpu_layers(spec.draft_gpu_layers >= 0
                          ? spec.draft_gpu_layers
-                         : (dynamic_cast<const TransformerEngine*>(&t)
-                                ? dynamic_cast<const TransformerEngine*>(&t)->gpu_layers()
-                                : tctx.params().gpu_layers)),
+                         : -1),  // drafter is tiny: default to full GPU so it
+                                 // never inherits the target's partial -ngl and
+                                 // avoids its own CPU/GPU boundary sync. Only
+                                 // an explicit --spec-draft-ngl overrides this.
           vocab_size(target_vocab),
           p_min(spec.p_min),
           n_spec(std::max(1, spec.draft_n_spec)),
           mask_token_id_(spec.draft_mask_token_id >= 0 ? spec.draft_mask_token_id : -1),
           is_dspark(spec.draft_arch == "dspark"),
+          dspark_top_k_(spec.dspark_top_k),
+          dspark_conf_threshold_(spec.dspark_conf_threshold),
           target(&t) {
         register_runtime();
 
         if (model_path.empty() || !model.load(model_path, gpu_layers)) {
             LOG_WARN("DFlashDraftProvider: failed to load drafter model '" + model_path + "'");
             return;
+        }
+
+        // DSpark tuning: the CLI flags (SpeculativeConfig) override the GGUF-derived
+        // defaults parsed into ModelConfig.
+        dspark_top_k_ = spec.dspark_top_k > 0 ? spec.dspark_top_k
+                                              : model.config().dspark_markov_top_k;
+        dspark_conf_threshold_ =
+            spec.dspark_conf_threshold > 0.0f ? spec.dspark_conf_threshold
+                                             : model.config().dspark_confidence_threshold;
+
+        // Encoder input layers: the drafter's own target_layers, overridden by
+        // --spec-draft-target-layers. The executor reads this list to know which
+        // target layers to capture during the verify forward.
+        capture_layers = model.config().target_layers;
+        if (!spec.draft_target_layers.empty()) {
+            capture_layers.assign(spec.draft_target_layers.begin(),
+                                  spec.draft_target_layers.end());
         }
 
         // MASK token id resolution chain (mirrors vLLM get_parallel_drafting_token_id):
@@ -197,6 +259,20 @@ struct DFlashDraftProvider::Impl {
         valid = true;
         LOG_INFO(std::string("DFlashDraftProvider: ready (") + (is_dspark ? "dspark" : "dflash") +
                  ") n_spec=" + std::to_string(n_spec) + " (incremental context KV)");
+        if (capture_layers.empty()) {
+            LOG_WARN("DFlashDraftProvider: no encoder target_layers resolved from the drafter "
+                     "GGUF; the target will be re-forwarded every round to extract hiddens. "
+                     "Pass --spec-draft-target-layers LIST to avoid it.");
+        } else {
+            std::string joined;
+            for (int l : capture_layers) {
+                if (!joined.empty())
+                    joined += ",";
+                joined += std::to_string(l);
+            }
+            LOG_INFO("DFlashDraftProvider: reusing target hidden states from the verify "
+                     "forward (target_layers=" + joined + ")");
+        }
     }
 
     void reset() {
@@ -205,6 +281,13 @@ struct DFlashDraftProvider::Impl {
         committed_len = 0;
         committed_ids.clear();
         kv_filled = 0;
+        clear_verify_hiddens();
+    }
+
+    void clear_verify_hiddens() {
+        verify_hiddens_.reset();
+        verify_hiddens_pos_ = -1;
+        verify_hiddens_rows_ = 0;
     }
 };
 
@@ -229,6 +312,32 @@ void DFlashDraftProvider::begin(const std::vector<int32_t>& prompt) {
     impl_->committed_len = static_cast<int64_t>(prompt.size());
 }
 
+const std::vector<int>* DFlashDraftProvider::capture_layers() const {
+    if (!valid() || impl_->capture_layers.empty())
+        return nullptr;
+    return &impl_->capture_layers;
+}
+
+void DFlashDraftProvider::set_verify_hiddens(std::shared_ptr<Tensor> hiddens) {
+    if (!valid())
+        return;
+    if (!hiddens) {
+        clear_verify_hiddens();
+        return;
+    }
+    // The verify forward started at the position this provider had just anchored
+    // kv_filled to (the query block's own start position), so stash row j is the
+    // encoder input for the token at kv_filled + j.
+    impl_->verify_hiddens_ = std::move(hiddens);
+    impl_->verify_hiddens_pos_ = impl_->kv_filled;
+    impl_->verify_hiddens_rows_ = impl_->verify_hiddens_->shape()[0];
+}
+
+void DFlashDraftProvider::clear_verify_hiddens() {
+    if (impl_)
+        impl_->clear_verify_hiddens();
+}
+
 std::vector<int32_t> DFlashDraftProvider::draft(int32_t last_token, int n_draft) {
     std::vector<int32_t> result;
     if (!valid() || !impl_->engine || n_draft <= 0)
@@ -250,9 +359,20 @@ std::vector<int32_t> DFlashDraftProvider::draft(int32_t last_token, int n_draft)
     // 只由配置上限与训练块大小决定, 不随 adaptive n_draft 变化。返回值仍截断到
     // 本轮请求的 n, executor 的 adaptive/budget 语义不变。
     // DFlash2 的 conv/selector 还要求块宽不超过训练时的 dflash.block_size。
+    const bool sfa = impl_->model.config().sample_from_anchor;
+    // DSpark sample_from_anchor (vLLM): the query block has n_spec positions with
+    // the anchor as position 0 and ALL n_spec rows are sampled (row i predicts
+    // draft token i); the markov walk is seeded by the anchor token. Plain DFlash
+    // (1+N) uses an anchor + n_block MASK rows, skipping row 0 (a bonus prediction
+    // of last_token itself).
     int n_block = impl_->n_spec;
     if (impl_->model.config().dflash_block_size > 1)
         n_block = std::min(impl_->model.config().dflash_block_size - 1, impl_->n_spec);
+    const int block = impl_->model.config().dflash_block_size;
+    int query_len = sfa ? impl_->n_spec : n_block + 1;
+    if (sfa && block > 1)
+        query_len = std::min(query_len, block);  // drafter trained on blocks of `block`
+    const int n_rows = sfa ? query_len : n_block;
 
     // 1. 增量注入上下文 K/V: delta = committed_ids[kv_filled, committed_len-1)。
     //    末位的 anchor 不经 target 重放镜像, 而是作为 query block 首行在它的真实
@@ -262,26 +382,62 @@ std::vector<int32_t> DFlashDraftProvider::draft(int32_t last_token, int n_draft)
     //    从 anchor 位置起重写, 每轮 O(delta), 不再整前缀重建。
     const int64_t ctx_end = impl_->committed_len - 1;
     if (impl_->kv_filled < ctx_end) {
-        std::vector<int32_t> delta(impl_->committed_ids.begin() + impl_->kv_filled,
-                                   impl_->committed_ids.begin() + ctx_end);
-        impl_->engine->append_context_kv(delta, impl_->kv_filled);
+        const int64_t delta_n = ctx_end - impl_->kv_filled;
+        // Fast path: the target's verify forward already produced the encoder
+        // input for exactly these tokens (stash row j == position kv_filled + j),
+        // so the context K/V is built without touching the target at all. This
+        // removes a full 42-layer target forward per round -- measured at ~200ms
+        // on a 2B/42-layer target, i.e. ~35% of the whole decode wall clock.
+        if (impl_->handoff_covers(ctx_end)) {
+            TensorPtr rows = leading_rows(impl_->verify_hiddens_, delta_n);
+            {
+                PERF_SCOPE("dspark/append_kv");
+                impl_->engine->append_context_kv_from_hiddens(rows, impl_->kv_filled);
+            }
+            impl_->saw_handoff_ = true;
+            impl_->clear_verify_hiddens();
+        } else {
+            // Fallback: replay the delta through the target. Costs one target
+            // forward, but only on rounds where no captured hiddens are available
+            // (first round, or after a plain-decode confirmation invalidated them).
+            std::vector<int32_t> delta(impl_->committed_ids.begin() + impl_->kv_filled,
+                                       impl_->committed_ids.begin() + ctx_end);
+            {
+                PERF_SCOPE("dspark/append_kv");
+                impl_->engine->append_context_kv(delta, impl_->kv_filled);
+            }
+            if (!impl_->saw_handoff_ && !impl_->warned_replay_) {
+                impl_->warned_replay_ = true;
+                LOG_WARN("DFlashDraftProvider: target hidden handoff unavailable -- falling back "
+                         "to re-forwarding the delta through the target (much slower).");
+            }
+            impl_->clear_verify_hiddens();
+        }
         impl_->kv_filled = ctx_end;
     }
 
-    // 2. query block: [anchor=last_token, MASK*n_block] (non-causal forward),
-    //    anchor 置于它的真实位置 committed_len-1 (上游 dp.pos0)。
-    std::vector<int32_t> query(static_cast<size_t>(n_block) + 1);
+    // 2. query block: [anchor=last_token, MASK*(query_len-1)] (non-causal forward),
+    //    anchor 置于它的真实位置 committed_len-1 (上游 dp.pos0). For sample_from_anchor
+    //    (DSpark) query_len == n_spec and row 0 IS the first draft prediction; for
+    //    plain DFlash (1+N) query_len == n_block+1 and row 0 is a bonus.
+    std::vector<int32_t> query(static_cast<size_t>(query_len));
     query[0] = last_token;
-    for (int i = 1; i <= n_block; ++i)
+    for (int i = 1; i < query_len; ++i)
         query[static_cast<size_t>(i)] = impl_->mask_token_id_;
 
-    TensorPtr logits = impl_->engine->decode(query, impl_->committed_len - 1);
+    TensorPtr logits;
+    {
+        PERF_SCOPE("dspark/decode");
+        logits = impl_->engine->decode(query, impl_->committed_len - 1);
+    }
     if (!logits || logits->ndim() < 2) {
         LOG_WARN("DFlashDraftProvider: decode failed; skipping draft");
         return result;
     }
-    if (logits->device() != DeviceType::CPU)
+    if (logits->device() != DeviceType::CPU) {
+        PERF_SCOPE("dspark/d2h");
         logits->to_device(DeviceType::CPU);
+    }
 
     // 3. sample n_block tokens. DFlash takes greedy argmax of each row (parallel,
     //    position-independent drafts); DSPark walks the rows left-to-right and
@@ -310,12 +466,18 @@ std::vector<int32_t> DFlashDraftProvider::draft(int32_t last_token, int n_draft)
 
     if (impl_->is_dspark && impl_->engine->has_markov_head()) {
         std::vector<const float*> rows;
-        rows.reserve(n_block);
-        // Row 0 is the anchor/bonus position: its logits predict last_token
-        // itself and are never part of the draft (vLLM samples only the MASK
-        // rows at offsets >= 1, see _prepare_dflash_inputs_kernel). Skip it.
-        for (int j = 0; j < n_block; ++j)
-            rows.push_back(data + static_cast<int64_t>(j + 1) * vocab);
+        rows.reserve(n_rows);
+        if (sfa) {
+            // sample_from_anchor (vLLM DSpark): row 0 is the anchor position and IS
+            // the first draft prediction; sample every row 0..n_rows-1.
+            for (int j = 0; j < n_rows; ++j)
+                rows.push_back(data + static_cast<int64_t>(j) * vocab);
+        } else {
+            // Plain DFlash (1+N): row 0 is a bonus prediction of last_token itself
+            // and is skipped; only the MASK rows (1..n_block) feed the draft.
+            for (int j = 0; j < n_block; ++j)
+                rows.push_back(data + static_cast<int64_t>(j + 1) * vocab);
+        }
         TensorPtr me = impl_->engine->markov_embed();
         TensorPtr mb = impl_->engine->markov_bias();
         TensorPtr idmap = impl_->engine->draft_id_map();
@@ -323,11 +485,44 @@ std::vector<int32_t> DFlashDraftProvider::draft(int32_t last_token, int n_draft)
         const float* mbp = mb ? static_cast<const float*>(mb->data()) : nullptr;
         const int32_t* idp = idmap ? static_cast<const int32_t*>(idmap->data()) : nullptr;
         const int md = me ? static_cast<int>(me->shape()[1]) : 0;
-        result = dspark_sequential_sample(rows, vocab, mep, md, mbp, idp, last_token, n_block);
+
+        // DSpark confidence head: build per-position hidden rows aligned 1:1 with the
+        // logits rows, and pull the confidence projection weights.
+        const float* hidden_data = nullptr;
+        int hidden_dim = 0;
+        TensorPtr hidden = impl_->engine->last_hidden_states();
+        if (hidden && hidden->ndim() >= 2) {
+            hidden_data = static_cast<const float*>(hidden->data());
+            hidden_dim = static_cast<int>(hidden->shape()[1]);
+        }
+        std::vector<const float*> hidden_rows;
+        hidden_rows.reserve(rows.size());
+        if (hidden_data) {
+            if (sfa) {
+                for (int j = 0; j < n_rows; ++j)
+                    hidden_rows.push_back(hidden_data + static_cast<int64_t>(j) * hidden_dim);
+            } else {
+                for (int j = 0; j < n_block; ++j)
+                    hidden_rows.push_back(hidden_data + static_cast<int64_t>(j + 1) * hidden_dim);
+            }
+        }
+        TensorPtr cw = impl_->engine->has_confidence_head() ? impl_->engine->conf_proj_weight() : nullptr;
+        TensorPtr cb = impl_->engine->has_confidence_head() ? impl_->engine->conf_proj_bias() : nullptr;
+        const float* cwp = cw ? static_cast<const float*>(cw->data()) : nullptr;
+        const float* cbp = cb ? static_cast<const float*>(cb->data()) : nullptr;
+        {
+            PERF_SCOPE("dspark/markov_sample");
+            result = dspark_sequential_sample(
+                rows, vocab, hidden_rows, hidden_dim, mep, md, mbp, idp, last_token,
+                static_cast<int>(rows.size()), impl_->dspark_top_k_, cwp, cbp,
+                impl_->dspark_conf_threshold_);
+        }
         // p_min confidence gate still applies: drop the tail if the first markov
         // position is below threshold (rare for DSPark, kept for parity).
         if (impl_->p_min > 0.0f && !result.empty()) {
-            const float* row0 = data + vocab;  // first MASK row, not the anchor
+            // For sample_from_anchor the first draft prediction IS row 0 (anchor);
+            // otherwise it is the first MASK row (row 1).
+            const float* row0 = sfa ? data : (data + vocab);
             if (top_probability(row0, vocab) < impl_->p_min)
                 result.clear();
         }

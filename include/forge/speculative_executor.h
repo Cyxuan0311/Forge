@@ -61,6 +61,11 @@ public:
     // path, keeping a model draft context synchronized between rounds.
     void notify_confirmed(int32_t token);
 
+    // Drop the captured target-hiddens stash held by the providers. Required
+    // whenever a token enters the committed stream that the capturing verify
+    // forward did not compute (plain-decode confirmations, KV truncation).
+    void invalidate_verify_hiddens();
+
     const SpeculativeStats& stats() const { return stats_; }
     SpeculativeStats& stats_mut() { return stats_; }
 
@@ -77,6 +82,23 @@ private:
     // low-acceptance round does not force the full (costly) forward over 5 rows.
     int adaptive_draft_ = 0;       // current effective n_draft (0 = uninitialized)
     double accept_ewma_ = -1.0;     // EWMA acceptance rate over recent rounds
+
+    // Adaptive early-exit: when the acceptance EWMA stays below `spec_min_acc_`
+    // for kSpecOffStreak consecutive rounds, speculation is judged net-negative
+    // (e.g. a drafter larger than the target, so the extra draft forward can
+    // never pay off) and is disabled for the REST of this generation -- a plain
+    // decode fallback runs at the target's full speed. One-way: it does not
+    // re-enable mid-generation, since acceptance is stable within one prompt.
+    // Only engages once accept_ewma_ is initialized (>0 rounds seen).
+    double spec_min_acc_ = 0.0;     // floor from cfg_.min_accept_rate (<=0 disables)
+    int spec_off_streak_ = 0;       // consecutive rounds below floor
+    bool spec_off_ = false;         // speculation disabled for this generation
+    static constexpr int kSpecOffStreak = 5;
+
+    // Target layers to capture out of the verify forward for the DFlash/DSPark
+    // encoder. Empty means no provider consumes them, so the target keeps its
+    // CUDA graph (capture forces the imperative path).
+    std::vector<int> capture_layers_;
 };
 
 }  // namespace forge
