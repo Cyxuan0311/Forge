@@ -771,16 +771,55 @@ int main(int argc, char** argv) {
         std::cout << "\n\n";
         forge_print_stats_line(stats);
 
-        // Print speculative decoding stats if requested
-        if (args.spec.print_stats && args.spec.enabled && stats.spec.n_spec_steps > 0) {
+        // Print speculative decoding stats if requested. Not gated on
+        // n_spec_steps: a run where every round fell back is precisely the case
+        // worth seeing, and it used to print nothing at all.
+        if (args.spec.print_stats && args.spec.enabled &&
+            (stats.spec.n_spec_steps > 0 || stats.spec.n_fallback_steps > 0)) {
             std::cout << "\n  --- Speculative Decoding Stats ---\n";
             std::cout << "  Spec steps:      " << stats.spec.n_spec_steps << "\n";
             std::cout << "  Fallback steps:  " << stats.spec.n_fallback_steps << "\n";
+            // Attribute the fallbacks: the total alone cannot distinguish "the
+            // drafter is wrong" from "the drafter was never asked for anything".
+            if (stats.spec.n_fallback_steps > 0) {
+                std::cout << "    no-draft:      " << stats.spec.n_fb_no_draft << "\n";
+                std::cout << "    min-acc floor: " << stats.spec.n_fb_min_acc << "\n";
+                std::cout << "    verify failed: " << stats.spec.n_fb_verify_fail << "\n";
+                std::cout << "    empty result:  " << stats.spec.n_fb_empty << "\n";
+                std::cout << "    guard/other:   " << stats.spec.n_fb_guard << "\n";
+            }
             std::cout << "  Draft tokens:    " << stats.spec.n_draft_tokens << "\n";
             std::cout << "  Accepted tokens: " << stats.spec.n_accepted_tokens << "\n";
             std::cout << std::fixed << std::setprecision(1);
             std::cout << "  Acceptance rate: " << (stats.spec.acceptance_rate() * 100.0) << "%\n";
             std::cout << "  Tokens/step:     " << stats.spec.tokens_per_step() << "\n";
+            // Acceptance by proposed position. A steep falloff is normal and
+            // expected; a low value at position 0 means the drafter's first guess
+            // is wrong, which is a conditioning problem rather than a depth one.
+            {
+                static const char* kPosNames[] = {"", "0", "1", "2", "3", "4", "5"};
+                bool any = false;
+                std::cout << "  Acceptance by position:";
+                for (int p = 0; p < 6; ++p) {
+                    const double a = stats.spec.acceptance_at(p);
+                    if (a < 0.0) continue;
+                    any = true;
+                    std::cout << " " << kPosNames[p + 1] << "=" << (a * 100.0) << "%";
+                }
+                if (!any) std::cout << " (none)";
+                std::cout << "\n";
+            }
+            // Proposed length per round: a single dominant bucket means the
+            // draft width is effectively constant.
+            {
+                static const char* kLenNames[] = {"0", "1", "2", "3", "4-5", "6-7", "8+"};
+                std::cout << "  Rounds by draft length:";
+                for (int b = 0; b < 7; ++b) {
+                    if (stats.spec.n_rounds_by_len[b] == 0) continue;
+                    std::cout << " " << kLenNames[b] << "x" << stats.spec.n_rounds_by_len[b];
+                }
+                std::cout << "\n";
+            }
         }
 
         // Print MoE expert router-distribution stats if requested

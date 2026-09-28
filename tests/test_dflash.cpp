@@ -321,6 +321,71 @@ static void run_dspark_sample_test() {
 }
 
 // =========================================================================
+// Part 4b -- DSpark confidence truncation
+// =========================================================================
+//
+// The confidence gate keeps the longest prefix at or above the threshold. Three
+// cases matter and were all wrong at some point:
+//   1. threshold 0 must mean "off" (it is the value the CLI passes to disable
+//      the gate); if 0 were treated as "unset" it would silently resolve to the
+//      GGUF default of 0.5 and truncate anyway.
+//   2. a mid-stream drop truncates to that position, not to 0.
+//   3. a drop at position 0 yields 0 tokens, not the unfiltered run -- one row
+//      of speculation cannot pay for the verify forward it triggers.
+static void run_dspark_conf_test() {
+    std::printf("\n--- DSPark confidence truncation ---\n");
+    const int vocab = 6, d = 1, n = 4;
+
+    std::vector<float> row(vocab, 1.0f);
+    row[0] = 10.0f;  // argmax 0
+    std::vector<const float*> rows(n, row.data());
+
+    // h=1 hidden dim so the confidence head is just conf_weight[0] * h + bias.
+    const int h = 1;
+    std::vector<float> hrow(n * h);
+    std::vector<float> cw(h);   // conf_weight[0] = 1
+    std::vector<float> cb(1);   // conf_bias[0] = 0
+    cw[0] = 1.0f;
+    cb[0] = 0.0f;
+    std::vector<const float*> hrows(n);
+    for (int j = 0; j < n; ++j) {
+        hrows[j] = hrow.data() + j * h;
+        hrow[j] = 0.0f;  // conf = sigmoid(0) = 0.5
+    }
+
+    // threshold 0 -> gate disabled, all 4 rows returned.
+    auto all = dspark_sequential_sample(rows, vocab, hrows, h, nullptr, 0, nullptr, nullptr, 2, n,
+                                        0, cw.data(), cb.data(), 0.0f);
+    CHECK((static_cast<int>(all.size()) == n), "dspark conf: threshold 0 disables truncation");
+
+    // Every position at exactly 0.5 confidence: threshold 0.5 keeps all (>= is the
+    // comparison), threshold 0.6 keeps none.
+    auto keep_all = dspark_sequential_sample(rows, vocab, hrows, h, nullptr, 0, nullptr, nullptr,
+                                             2, n, 0, cw.data(), cb.data(), 0.5f);
+    CHECK((static_cast<int>(keep_all.size()) == n), "dspark conf: threshold == conf keeps all");
+    auto keep_none = dspark_sequential_sample(rows, vocab, hrows, h, nullptr, 0, nullptr,
+                                              nullptr, 2, n, 0, cw.data(), cb.data(), 0.6f);
+    CHECK(keep_none.empty(), "dspark conf: drop at position 0 yields no tokens");
+
+    // Descending confidence: +4, +2, -2, -4 -> sigmoid ~0.982/0.881/0.119/0.018.
+    // A threshold of 0.5 must keep exactly the first 2.
+    hrow[0] = 4.0f;
+    hrow[1] = 2.0f;
+    hrow[2] = -2.0f;
+    hrow[3] = -4.0f;
+    auto prefix = dspark_sequential_sample(rows, vocab, hrows, h, nullptr, 0, nullptr, nullptr, 2,
+                                           n, 0, cw.data(), cb.data(), 0.5f);
+    CHECK((static_cast<int>(prefix.size()) == 2),
+          "dspark conf: keeps longest above-threshold prefix");
+    CHECK((prefix == std::vector<int32_t>{0, 0}), "dspark conf: prefix content unchanged");
+
+    // Threshold below every confidence -> never truncates.
+    auto untrunc = dspark_sequential_sample(rows, vocab, hrows, h, nullptr, 0, nullptr, nullptr, 2,
+                                            n, 0, cw.data(), cb.data(), 0.01f);
+    CHECK((static_cast<int>(untrunc.size()) == n), "dspark conf: low threshold keeps all");
+}
+
+// =========================================================================
 // Part 5 -- context-KV injection consistency (real dflash GGUF; NO target needed)
 // =========================================================================
 //
@@ -658,6 +723,7 @@ int main() {
     run_config_parse_test();
     run_kvcache_swa_test();
     run_dspark_sample_test();
+    run_dspark_conf_test();
     run_dflash2_unit_test();
     run_context_kv_injection_test();
 

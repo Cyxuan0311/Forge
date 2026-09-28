@@ -25,6 +25,11 @@ double SpeculativeStats::tokens_per_step() const {
                : 0.0;
 }
 
+double SpeculativeStats::acceptance_at(int pos) const {
+    if (pos < 0 || pos >= kMaxTrackedPos || n_proposed[pos] == 0) return -1.0;
+    return static_cast<double>(n_accepted_at[pos]) / static_cast<double>(n_proposed[pos]);
+}
+
 // =========================================================================
 // NgramDraftProvider -- rolling-hash indexed suffix matching
 // =========================================================================

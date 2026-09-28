@@ -34,6 +34,7 @@
 #include "forge/ninf_model.h"
 #include "forge/sampler.h"
 #include "forge/speculative.h"
+#include "forge/speculative_executor.h"
 #include "forge/arch_registry.h"
 
 using namespace forge;
@@ -510,12 +511,92 @@ static void run_model_draft_smoke_test(Model& target_model, const ContextParams&
     }
 }
 
+// -------------------------------------------------------------------------
+// Adaptive draft sizing law (no model required).
+//
+// This exists as a regression test for a specific failure: the rule used to be
+// n_draft *= (0.5 + acceptance_rate). At any acceptance rate below 0.5 that
+// multiplier is under 1, so the draft shrank every single round and could never
+// grow back -- it walked 7 -> 1 within six rounds and stayed there for the rest
+// of the generation, making draft tokens ~= spec steps regardless of the
+// configured --spec-draft. It was also self-reinforcing: a shorter draft scores a
+// higher rate at unchanged drafter quality, so the controller drove itself to 1.
+// -------------------------------------------------------------------------
+static void run_adaptive_draft_tests() {
+    std::printf("\n--- adaptive draft sizing ---\n");
+    constexpr int kMax = 7;
+
+    // No measurement yet -> hold steady, do not collapse.
+    CHECK(adaptive_draft_target(-1.0, 5, kMax) == 5, "adaptive: no data holds current");
+    CHECK(adaptive_draft_target(-1.0, 1, kMax) == 1, "adaptive: no data does not rescue a 1");
+
+    // Never exceeds the configured ceiling, whatever the signal says.
+    CHECK(adaptive_draft_target(50.0, kMax, kMax) == kMax, "adaptive: clamped to ceiling");
+
+    // The regression: a mediocre drafter must NOT ratchet to 1. Feeding a steady
+    // 1.5 tokens/round from the starting ceiling must converge somewhere useful
+    // and stay there.
+    {
+        int n = kMax;
+        double ewma = -1.0;
+        for (int i = 0; i < 200; ++i) {
+            const double round_len = 1.5;
+            ewma = (ewma < 0.0) ? round_len : 0.7 * ewma + 0.3 * round_len;
+            n = adaptive_draft_target(ewma, n, kMax);
+        }
+        CHECK(n > 1, "adaptive: steady 1.5 tok/round does not collapse to 1");
+        // 1.5 * 1.3 = 1.95 -> ceil 2, +1 = 3.
+        CHECK(n == 3, "adaptive: converges to ~accepted_len*gain+1");
+    }
+
+    // Strong drafter grows toward the ceiling.
+    {
+        int n = 1;
+        double ewma = -1.0;
+        for (int i = 0; i < 200; ++i) {
+            const double round_len = 5.0;
+            ewma = (ewma < 0.0) ? round_len : 0.7 * ewma + 0.3 * round_len;
+            n = adaptive_draft_target(ewma, n, kMax);
+        }
+        CHECK(n == kMax, "adaptive: strong drafter reaches the ceiling");
+    }
+
+    // Weak drafter does shrink -- but to a floor that still speculates, and it
+    // must recover when quality returns.
+    {
+        int n = kMax;
+        double ewma = -1.0;
+        for (int i = 0; i < 50; ++i) {
+            const double round_len = 0.2;
+            ewma = (ewma < 0.0) ? round_len : 0.7 * ewma + 0.3 * round_len;
+            n = adaptive_draft_target(ewma, n, kMax);
+        }
+        CHECK(n == 1, "adaptive: weak drafter shrinks to 1");
+        // Quality recovers -> must climb back off 1. The old rule could not.
+        for (int i = 0; i < 100; ++i) {
+            const double round_len = 4.0;
+            ewma = 0.7 * ewma + 0.3 * round_len;
+            n = adaptive_draft_target(ewma, n, kMax);
+        }
+        CHECK(n == kMax, "adaptive: recovers after quality returns");
+    }
+
+    // Slew limit: one row per call, so one noisy round cannot swing the draft.
+    CHECK(adaptive_draft_target(6.0, 2, kMax) == 3, "adaptive: grows at most 1 per round");
+    CHECK(adaptive_draft_target(0.0, 5, kMax) == 4, "adaptive: shrinks at most 1 per round");
+
+    // Degenerate ceilings do not produce a 0 or negative draft.
+    CHECK(adaptive_draft_target(2.0, 3, 0) == 0, "adaptive: max_draft 0 -> 0");
+    CHECK(adaptive_draft_target(2.0, 1, 1) == 1, "adaptive: max_draft 1 -> 1");
+}
+
 int main() {
     std::printf("=== forge-spec-test ===\n");
 
     register_forge_runtime();
     run_verify_unit_tests();
     run_ngram_index_tests();
+    run_adaptive_draft_tests();
 
     const std::string model_path = pick_test_model();
     if (model_path.empty()) {

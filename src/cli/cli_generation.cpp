@@ -125,11 +125,10 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     stats.num_generated_tokens = result.num_generated_tokens;
     stats.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     if (result.spec_stats) {
-        stats.spec.n_spec_steps = result.spec_stats->n_spec_steps;
-        stats.spec.n_fallback_steps = result.spec_stats->n_fallback_steps;
-        stats.spec.n_draft_tokens = result.spec_stats->n_draft_tokens;
-        stats.spec.n_accepted_tokens = result.spec_stats->n_accepted_tokens;
-        stats.spec.n_output_tokens = result.spec_stats->n_output_tokens;
+        // Copy the whole struct rather than a hand-picked field list, which is
+        // how the fallback-reason and per-position counters silently read as
+        // zero in --spec-stats output.
+        stats.spec = *result.spec_stats;
     }
 
     return stats;
@@ -215,11 +214,10 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     stats.num_generated_tokens = result.num_generated_tokens;
     stats.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     if (result.spec_stats) {
-        stats.spec.n_spec_steps = result.spec_stats->n_spec_steps;
-        stats.spec.n_fallback_steps = result.spec_stats->n_fallback_steps;
-        stats.spec.n_draft_tokens = result.spec_stats->n_draft_tokens;
-        stats.spec.n_accepted_tokens = result.spec_stats->n_accepted_tokens;
-        stats.spec.n_output_tokens = result.spec_stats->n_output_tokens;
+        // Copy the whole struct rather than a hand-picked field list, which is
+        // how the fallback-reason and per-position counters silently read as
+        // zero in --spec-stats output.
+        stats.spec = *result.spec_stats;
     }
 
     return stats;
