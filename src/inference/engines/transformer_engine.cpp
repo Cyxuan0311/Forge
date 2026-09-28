@@ -110,11 +110,16 @@ TensorPtr TransformerEngine::take_layer_hiddens(const std::vector<int>& layers) 
     // Gather the requested layers, copying each to CPU so we can concatenate
     // them row-wise on the host. copy_from() is a synchronous d2h copy for
     // CUDA->CPU, so the source tensors are left untouched.
+    //
+    // Indices follow the vLLM aux-hidden-state convention: 0 is the embedding and
+    // k is the output of layer k, so the vector holds num_layers + 1 entries and a
+    // request for the last layer is in range.
     std::vector<TensorPtr> selected;
     selected.reserve(layers.size());
     for (int li : layers) {
         if (li < 0 || li >= static_cast<int>(layer_hiddens_.size()) || !layer_hiddens_[li]) {
-            LOG_WARN("take_layer_hiddens: layer " + std::to_string(li) + " unavailable");
+            LOG_WARN("take_layer_hiddens: layer " + std::to_string(li) + " unavailable (" +
+                     std::to_string(layer_hiddens_.size()) + " captured)");
             continue;
         }
         const TensorPtr& t = layer_hiddens_[li];
@@ -1211,6 +1216,13 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
 #endif
 
     auto cur_hidden = hidden;
+    if (captures_layer_hiddens()) {
+        // Index convention, matching vLLM's aux hidden states: index 0 is the
+        // embedding, index k is the OUTPUT of layer k. See the note after the
+        // layer loop for why this is the OUTPUT and not the input.
+        layer_hiddens_.reserve(cfg.num_layers + 1);
+        layer_hiddens_.push_back(cur_hidden);
+    }
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
         DeviceTarget layer_dev = layer_device_target(layer);
 #ifdef USE_CUDA
@@ -1218,12 +1230,6 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             cudaSetDevice(layer_dev.device_id);
 #endif
         cur_hidden = transfer_hidden(cur_hidden, layer_dev);
-        if (captures_layer_hiddens()) {
-            // 捕获"层输入" (HF hidden_states 约定, 与 llama.cpp 的 t_layer_inp
-            // 一致): 层 i 的输入 = 层 i-1 的输出, DFlash 转换器的 target_layers
-            // 特征即取自该点。此前捕获的是层输出, 特征整体偏一层。
-            layer_hiddens_.push_back(cur_hidden);
-        }
         {
             PERF_SCOPE_FMT("forward/layer_%d", layer);
             SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu",
@@ -1237,6 +1243,24 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             fprintf(stderr, "[FATAL] Layer %d returned NULL!\n", layer);
             fflush(stderr);
             return nullptr;
+        }
+        if (captures_layer_hiddens()) {
+            // Index layer+1 is this layer's OUTPUT. That is what a DFlash/DSpark
+            // `target_layers = [k, ...]` entry denotes upstream: vLLM calls
+            // `_maybe_add_hidden_state` AFTER `layer(...)` returns and records
+            // `hidden_states + residual` under `idx + 1`, so index k is layer k's
+            // output, and concatenates the selected layers in that order.
+            //
+            // This used to capture the layer INPUT (the HF `hidden_states[i]`
+            // reading), which makes index k the output of layer k-1 and puts
+            // every encoder feature one whole layer early. Measured on
+            // MiniCPM5-2B + DSpark, shifting to the output convention moved
+            // position-0 acceptance 24.7% -> 21.3%, i.e. within noise, so it was
+            // not the cause of the low acceptance on this pair. It is still fixed:
+            // the checkpoints were trained against the output convention, and a
+            // one-layer shift on the deeper entries of the list is exactly where
+            // it would start to matter.
+            layer_hiddens_.push_back(cur_hidden);
         }
     }
 
