@@ -244,6 +244,19 @@ struct DFlashDraftProvider::Impl {
             return;
         }
         engine->set_target(target);
+        // The GGUF decides the block layout: sample_from_anchor means the anchor
+        // row is a sampled prediction, which is what the DSpark path assumes when
+        // it indexes rows. A DSpark checkpoint declares general.architecture =
+        // "dflash", so --spec-draft-arch dflash on one used to leave is_dspark
+        // false while sample_from_anchor stayed true -- the two disagreed, the
+        // row math was sized for the wrong layout, and draft() read past the
+        // returned logits. Follow the checkpoint and warn on the disagreement.
+        if (model.config().sample_from_anchor && !is_dspark) {
+            LOG_WARN("DFlashDraftProvider: drafter sets sample_from_anchor but "
+                     "--spec-draft-arch said dflash; using the checkpoint's DSpark "
+                     "layout (pass --spec-draft-arch dspark to silence this)");
+            is_dspark = true;
+        }
         if (is_dspark) {
             engine->set_dspark(true);
             if (!engine->has_markov_head()) {
@@ -374,6 +387,19 @@ std::vector<int32_t> DFlashDraftProvider::draft(int32_t last_token, int n_draft)
     if (sfa && block > 1)
         query_len = std::min(query_len, block);  // drafter trained on blocks of `block`
     const int n_rows = sfa ? query_len : n_block;
+
+    // The GGUF is the authority on the block layout (sample_from_anchor), and
+    // everything below indexes rows against it. Guard the two places that can
+    // otherwise read past the returned logits:
+    //   - query block width must be >= 2 (an anchor plus at least one row),
+    //   - the drafter is trained for exactly block_size; a narrower block leaves
+    //     stale MASK rows visible (see the rollback note in DflashEngine::decode),
+    //     and a wider one is not what the weights saw.
+    if (query_len < 2) {
+        LOG_WARN("DFlashDraftProvider: computed query block width " +
+                 std::to_string(query_len) + " < 2; skipping draft");
+        return result;
+    }
 
     // 1. 增量注入上下文 K/V: delta = committed_ids[kv_filled, committed_len-1)。
     //    末位的 anchor 不经 target 重放镜像, 而是作为 query block 首行在它的真实

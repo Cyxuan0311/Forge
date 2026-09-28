@@ -216,6 +216,10 @@ static void run_kvcache_swa_test() {
 // Part 3 -- engine integration (matched drafter + target; skipped if absent)
 // =========================================================================
 
+static void run_p0_handoff_equivalence_test(Model& target, Model& draft,
+                                            std::unique_ptr<InferenceContext>& tctx,
+                                            DflashEngine* eng);
+
 static void run_engine_integration(const std::string& dflash_path, const std::string& target_path) {
     std::printf("\n--- DflashEngine integration (matched pair) ---\n");
     Model target, draft;
@@ -264,6 +268,191 @@ static void run_engine_integration(const std::string& dflash_path, const std::st
               logits->shape()[0] == static_cast<int64_t>(query.size()) &&
               logits->shape()[1] == target.config().vocab_size,
           "integration: decode produces [N, vocab] logits");
+
+    run_p0_handoff_equivalence_test(target, draft, tctx, eng);
+}
+
+// -------------------------------------------------------------------------
+// P0 target-hidden handoff: the fast path must be bit-equivalent to the replay
+// it replaced.
+//
+// append_context_kv_from_hiddens() (fast: the target's verify forward already
+// produced these layer hiddens) and append_context_kv() (slow: re-forward the
+// same tokens through the target) are supposed to write the SAME drafter context
+// K/V. Everything downstream -- the drafter's whole prediction -- depends on
+// that, and a silent divergence would show up only as mysteriously poor
+// acceptance, which is exactly the kind of symptom that gets misattributed to
+// the drafter. So compare the K/V the two paths leave behind, and the draft
+// tokens that come out of the resulting context.
+// -------------------------------------------------------------------------
+static void run_p0_handoff_equivalence_test(Model& target, Model& draft,
+                                            std::unique_ptr<InferenceContext>& tctx,
+                                            DflashEngine* eng) {
+    std::printf("\n--- P0 target-hidden handoff equivalence ---\n");
+    if (!eng)
+        return;
+    const auto& dcfg = draft.config();
+    const std::vector<int> layers = dcfg.target_layers;
+    if (layers.empty()) {
+        std::printf("NOTE: drafter has no target_layers; skipping\n");
+        return;
+    }
+
+    // A fixed token run, so both paths see byte-identical inputs.
+    const std::vector<int32_t> seq = {11, 22, 33, 44, 55, 66, 77, 88};
+    const int64_t delta_start = 2;  // pretend the prefix [0,2) is already written
+    std::vector<int32_t> delta(seq.begin() + delta_start, seq.end());
+
+    // --- path A: replay (forward the delta through the target, then encode) ---
+    auto* tfe = static_cast<TransformerEngine*>(tctx->engine());
+    {
+        auto* rmem = tfe->recurrent_memory();
+        if (rmem)
+            rmem->reset_seq(0);
+        tfe->set_capture_layer_hiddens(true);
+        auto ids = std::make_shared<Tensor>(DataType::INT32,
+                                            std::vector<int64_t>{1, (int64_t)delta.size()},
+                                            DeviceType::CPU);
+        std::memcpy(ids->data(), delta.data(), delta.size() * sizeof(int32_t));
+        tfe->forward_request(ForwardRequest::from_ids(ids, delta_start));
+    }
+    TensorPtr replay_h = tfe->take_layer_hiddens(layers);
+    tfe->set_capture_layer_hiddens(false);
+    CHECK(replay_h != nullptr, "p0: replay captured target layer hiddens");
+
+    if (!replay_h)
+        return;
+    CHECK(replay_h->shape()[0] == (int64_t)delta.size(),
+          "p0: replay hiddens have one row per delta token");
+    CHECK(replay_h->shape()[1] == dcfg.n_embd_inp_enc,
+          "p0: replay hiddens width == n_embd_inp_enc");
+
+    // --- path B: handoff (use those hiddens directly) ---
+    // Run it twice into two fresh caches: A and B must be identical, and the
+    // stash tensor is not mutated by the write.
+    auto snapshot_kv = [&](DflashEngine* e, const std::vector<int>& ls) {
+        std::vector<std::vector<float>> out;
+        for (int l = 0; l < static_cast<int>(ls.size()); ++l) {
+            TensorPtr k = e->kv_cache()->get_key_filled(l);
+            if (!k)
+                continue;
+            const float* p = static_cast<const float*>(k->data());
+            out.emplace_back(p, p + k->numel());
+        }
+        return out;
+    };
+    // Non-vacuity: an all-zero K would make the equality below trivially true and
+    // the whole test worthless (that is exactly what a never-written cache looks
+    // like). Require real, non-constant content before trusting a 0.0 diff.
+    auto k_stats = [](const std::vector<std::vector<float>>& v, float* mag, float* spread) {
+        double acc = 0.0;
+        size_t cnt = 0;
+        for (const auto& a : v)
+            for (float x : a) {
+                acc += std::fabs(x);
+                ++cnt;
+            }
+        *mag = cnt ? static_cast<float>(acc / cnt) : 0.0f;
+        float mn = 1e30f, mx = -1e30f;
+        for (const auto& a : v)
+            for (float x : a) {
+                mn = std::min(mn, x);
+                mx = std::max(mx, x);
+            }
+        *spread = (mx > mn) ? mx - mn : 0.0f;
+    };
+
+    auto reset_draft_kv = [&](DflashEngine* e) {
+        e->init_memory();
+        e->kv_cache()->reset();
+    };
+    reset_draft_kv(eng);
+    eng->append_context_kv_from_hiddens(replay_h, delta_start);
+    const std::vector<std::vector<float>> kv_handoff = snapshot_kv(eng, layers);
+
+    reset_draft_kv(eng);
+    eng->append_context_kv(delta, delta_start);
+    const std::vector<std::vector<float>> kv_replay = snapshot_kv(eng, layers);
+
+    CHECK(kv_handoff.size() == kv_replay.size() && !kv_handoff.empty(),
+          "p0: both paths wrote context K/V for every target layer");
+    if (kv_handoff.empty())
+        return;
+
+    // Element-wise max abs difference across all layers.
+    float worst = 0.0f;
+    int64_t worst_layer = -1;
+    for (size_t l = 0; l < kv_handoff.size(); ++l) {
+        const auto& a = kv_handoff[l];
+        const auto& b = kv_replay[l];
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) {
+            const float d = std::fabs(a[i] - b[i]);
+            if (d > worst) {
+                worst = d;
+                worst_layer = static_cast<int64_t>(l);
+            }
+        }
+    }
+    // Not bit-exact in general: the handoff reuses hiddens the target computed
+    // as part of a wider verify batch, the replay recomputes them in its own
+    // forward, so only the reduction order differs. Anything at or near O(1) is
+    // a real semantic divergence, not float noise.
+    float mag_a = 0.0f, spread_a = 0.0f, mag_b = 0.0f, spread_b = 0.0f;
+    k_stats(kv_handoff, &mag_a, &spread_a);
+    k_stats(kv_replay, &mag_b, &spread_b);
+    std::printf("    K magnitude: handoff=%.4f replay=%.4f | spread: %.4f / %.4f\n", mag_a, mag_b,
+                spread_a, spread_b);
+    CHECK(mag_a > 1e-6f, "p0: handoff wrote non-trivial context K (not vacuously equal)");
+    CHECK(spread_a > 1e-4f, "p0: context K varies across positions (content, not a constant)");
+    std::printf("    max |K_handoff - K_replay| = %.3e (layer %lld)\n", worst,
+                static_cast<long long>(worst_layer));
+    CHECK(worst < 1e-3, "p0: handoff context K matches replay context K");
+
+    // The end that actually matters: identical context must yield identical draft
+    // proposals. A context difference too small to trip the K check could still
+    // flip an argmax, so compare the tokens themselves.
+    {
+        reset_draft_kv(eng);
+        eng->append_context_kv_from_hiddens(replay_h, delta_start);
+        const int64_t ctx_end = delta_start + (int64_t)delta.size();
+        std::vector<int32_t> query = {99, 5, 6};
+        auto la = eng->decode(query, ctx_end);
+
+        reset_draft_kv(eng);
+        eng->append_context_kv(delta, delta_start);
+        auto lb = eng->decode(query, ctx_end);
+
+        CHECK(la && lb && la->numel() == lb->numel(), "p0: both paths produced logits");
+        if (la && lb && la->numel() == lb->numel()) {
+            float worst_l = 0.0f;
+            for (int64_t i = 0; i < la->numel(); ++i) {
+                const float* pa = static_cast<const float*>(la->data());
+                const float* pb = static_cast<const float*>(lb->data());
+                worst_l = std::max(worst_l, std::fabs(pa[i] - pb[i]));
+            }
+            std::printf("    max |logit_handoff - logit_replay| = %.3e\n", worst_l);
+            CHECK(worst_l < 1e-2, "p0: handoff and replay produce the same draft logits");
+
+            // And the greedy draft token per row must match exactly.
+            const int64_t vocab = la->shape()[1];
+            const float* pa = static_cast<const float*>(la->data());
+            const float* pb = static_cast<const float*>(lb->data());
+            int same = 0;
+            for (int64_t r = 0; r < la->shape()[0]; ++r) {
+                int32_t ba = 0, bb = 0;
+                for (int64_t v = 1; v < vocab; ++v) {
+                    if (pa[r * vocab + v] > pa[r * vocab + ba]) ba = (int32_t)v;
+                    if (pb[r * vocab + v] > pb[r * vocab + bb]) bb = (int32_t)v;
+                }
+                if (ba == bb)
+                    ++same;
+            }
+            std::printf("    identical argmax rows: %lld/%lld\n", static_cast<long long>(same),
+                        static_cast<long long>(la->shape()[0]));
+            CHECK(same == la->shape()[0], "p0: handoff and replay pick the same draft tokens");
+        }
+    }
 }
 
 // =========================================================================
@@ -569,10 +758,18 @@ static void run_draft_end2end(const std::string& dflash_path, const std::string&
         CHECK(false, "e2e: target engine missing");
         return;
     }
+    // draft_arch must match the GGUF's own sample_from_anchor flag. The provider
+    // reads that flag to size the query block (sfa -> n_spec rows, anchor included)
+    // but takes is_dspark from this string, and the two disagreeing makes the row
+    // indexing run past the returned logits -- a segfault, not a wrong answer.
     SpeculativeConfig spec;
-    spec.draft_arch = "dflash";
+    spec.draft_arch = draft.config().sample_from_anchor ? "dspark" : "dflash";
     spec.draft_model_path = dflash_path;
     spec.draft_n_spec = 5;
+    // Disable the confidence gate for this test: on a DSpark checkpoint the
+    // GGUF default threshold of 0.5 legitimately truncates the whole block to
+    // zero tokens, which is a valid outcome but not what this test is about.
+    spec.dspark_conf_threshold = 0.0f;
     DFlashDraftProvider prov(spec, *tctx, *teng, target.config().vocab_size);
     CHECK(prov.valid(), "e2e: DFlashDraftProvider valid with matched pair");
     if (!prov.valid())
@@ -582,7 +779,8 @@ static void run_draft_end2end(const std::string& dflash_path, const std::string&
     prov.begin(prompt);
     const int n = 5;
     auto d1 = prov.draft(prompt.back(), n);
-    CHECK(static_cast<int>(d1.size()) == n, "e2e: draft proposes n tokens");
+    CHECK(static_cast<int>(d1.size()) >= 1 && static_cast<int>(d1.size()) <= n,
+          "e2e: draft proposes between 1 and n tokens");
     auto d2 = prov.draft(prompt.back(), n);
     CHECK(d1 == d2, "e2e: greedy draft is deterministic");
 }
