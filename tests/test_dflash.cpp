@@ -490,7 +490,10 @@ static void run_dspark_sample_test() {
     std::vector<float> drow(draft_vocab, 1.0f);
     drow[1] = 2.0f;  // argmax draft 1
     std::vector<const float*> drows = {drow.data(), drow.data(), drow.data()};
-    std::vector<int32_t> idmap = {4, 5, 0};     // draft 0->4, 1->5, 2->0
+    // draft_id_to_target_id is an ADDITIVE offset table (vLLM map_draft_to_target:
+    // target = draft + table[draft]), not an index map. Offsets chosen so the
+    // intended targets stay 0->4, 1->5, 2->0.
+    std::vector<int32_t> idmap = {4, 4, -2};
     std::vector<float> dbias(draft_vocab * d);  // bias[v_draft]=v_draft
     for (int v = 0; v < draft_vocab; ++v)
         dbias[v] = float(v);
@@ -507,6 +510,26 @@ static void run_dspark_sample_test() {
                                                    idmap.data(), 2, 3, 0, nullptr, nullptr, 0.0f);
     CHECK((reduced_greedy == std::vector<int32_t>{5, 5, 5}),
           "dspark: reduced vocab no markov -> map only");
+
+    // The map is additive, not an index lookup. These two encodings happen to
+    // agree on target 5 for draft 1 but disagree everywhere else, so the
+    // expectations above only hold under the additive reading: index semantics
+    // would give {0, 4, 0} and {4, 4, 4}.
+    //
+    // Regression guard: reading the table as an index emits a different token for
+    // every reduced-vocab draft, which is silent (no error, no shape mismatch)
+    // and only shows up as collapsed acceptance.
+    {
+        // offsets {+1, +0, +0} over draft_vocab 3 -> targets 1, 1, 2
+        const std::vector<int32_t> off = {1, 0, 0};
+        std::vector<float> urow(draft_vocab, 1.0f);
+        urow[2] = 5.0f;  // argmax draft 2
+        std::vector<const float*> urows = {urow.data(), urow.data()};
+        auto mapped = dspark_sequential_sample(urows, draft_vocab, {}, 0, nullptr, 0, nullptr,
+                                               off.data(), 0, 2, 0, nullptr, nullptr, 0.0f);
+        CHECK((mapped == std::vector<int32_t>{2, 2}),
+              "dspark: draft_id_to_target_id is an additive offset, not an index map");
+    }
 }
 
 // =========================================================================

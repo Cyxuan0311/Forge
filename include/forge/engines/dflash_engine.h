@@ -93,7 +93,7 @@ public:
     bool has_markov_head() const;
     TensorPtr markov_embed() const;  // [target_vocab, d] or nullptr
     TensorPtr markov_bias() const;   // [target_vocab, d] or nullptr
-    TensorPtr draft_id_map() const;  // [draft_vocab] int32 mapping or nullptr
+    TensorPtr draft_id_map() const;  // [draft_vocab] int32 ADDITIVE offset table or nullptr
 
     // DSpark per-position confidence head (vLLM confidence_head.proj). Returns
     // nullptr when the drafter has no confidence weights (plain DFlash/markov-only).
@@ -161,7 +161,10 @@ private:
 // nothing and each row is sampled greedily and independently (a DFlash-style
 // fallback). When `draft_id_map` is non-null the draft logits are over a reduced
 // draft vocabulary; the sampled draft id is mapped back to the target id before
-// being emitted and before becoming `prev` for the next position.
+// being emitted and before becoming `prev` for the next position. The table is an
+// ADDITIVE offset, matching vLLM's map_draft_to_target:
+//   target_id = draft_id + draft_id_map[draft_id]
+// (not an index lookup, and 0 means "unchanged").
 //
 // cand_top_k > 0 enables vLLM's truncated candidate re-ranking (apply_bias_gathered):
 // the Markov bias is applied only to the top-k base-logit candidates per position,

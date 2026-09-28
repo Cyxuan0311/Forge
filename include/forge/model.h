@@ -340,7 +340,9 @@ struct ModelWeights {
     TensorPtr dflash_markov_bias;   // [target_vocab, d]
     // Optional reduced draft vocab: draft logits are over a smaller vocabulary and
     // each draft id is mapped back to the target id via this int32 table.
-    TensorPtr dflash_draft_id_to_target_id;  // [draft_vocab] int32
+    // [draft_vocab] int32 ADDITIVE offset table (vLLM map_draft_to_target:
+    // target_id = draft_id + table[draft_id]), not an index map. 0 = unchanged.
+    TensorPtr dflash_draft_id_to_target_id;
 
     // DSpark per-position confidence head (vLLM confidence_head.proj). Input is
     // [draft_hidden; markov_embed] of dim conf_in_dim, output is a single scalar.

@@ -829,8 +829,21 @@ std::vector<int32_t> dspark_sequential_sample(
             }
         }
 
-        if (draft_id_map)
-            best = draft_id_map[best];  // reduced draft vocab -> target
+        if (draft_id_map) {
+            // vLLM's map_draft_to_target is an ADDITIVE offset table, not an
+            // index map:
+            //     return draft_ids + self.draft_id_to_target_id[draft_ids]
+            // Reading it as an index (`target = table[draft]`) silently emits a
+            // different token for every reduced-vocab draft, which is invisible
+            // until acceptance collapses. Offset 0 means "same id", so this is
+            // also a no-op for a table full of zeros.
+            //
+            // No bounds check: the result is a TARGET id and the target vocab is
+            // not in scope here (`vocab` is the draft logits width), so clamping
+            // against it would corrupt legitimate mappings. vLLM does not clamp
+            // either -- a bad offset is a malformed checkpoint.
+            best += draft_id_map[best];
+        }
         out.push_back(best);
 
         if (use_conf) {
