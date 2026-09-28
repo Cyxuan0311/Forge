@@ -934,7 +934,8 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     // 256K-native model allocated its entire KV in host memory and was
     // OOM-killed (observed: 15 GB RSS in the spec-verify test).
     const size_t per_token_bytes =
-        (size_t)kv_num_layers * kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim);
+        (size_t)kv_num_layers *
+        kv_token_bytes(kv_cache_type_config_.type_k, kv_cache_type_config_.type_v, kv_dim);
     if (per_token_bytes > 0) {
         // Headroom: a fixed margin plus one micro-batch of prefill
         // activations (hidden states + attention output), so a long
@@ -1011,8 +1012,9 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
              std::to_string(cfg.num_kv_heads) + ", head_dim=" + std::to_string(cfg.head_dim) +
              ", max_seq_len=" + std::to_string(kv_max_seq) +
              ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU"));
-    const size_t kv_bytes = (size_t)kv_num_layers * (size_t)kv_max_seq *
-                            kv_token_bytes(kv_cache_dtype_, kv_cache_dtype_, kv_dim);
+    const size_t kv_bytes =
+        (size_t)kv_num_layers * (size_t)kv_max_seq *
+        kv_token_bytes(kv_cache_type_config_.type_k, kv_cache_type_config_.type_v, kv_dim);
     LOG_INFO("KV cache estimated size: " + std::to_string(kv_bytes / (1024 * 1024)) +
              " MB (native trained context=" + std::to_string(cfg.max_seq_len) + ")");
 
@@ -1025,8 +1027,12 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
     // path (generic_engine/phimoe_engine branch on kv_memory_->is_paged()).
     if (!paged) {
         // Allocate KV cache on the primary device.
+        // The per-K/V pair, not the legacy scalar: init_quantized() has had an
+        // asymmetric overload all along, but this call site passed one type for
+        // both, so -ctk/-ctv were silently collapsed on the contiguous path (the
+        // paged path below already took the pair).
         kv_cache_.init_quantized(kv_num_layers, cfg.num_kv_heads, cfg.head_dim, kv_max_seq,
-                                 kv_dev, kv_cache_dtype_);
+                                 kv_dev, kv_cache_type_config_);
 
         // Phase 6: set per-layer memory policies from arch config.
         // SlidingWindow layers use ring buffer eviction; Full layers grow linearly.
@@ -1065,9 +1071,7 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         // free device memory instead of the historical hard-coded 32.
         const int page_size = ctx_.params().page_size > 0 ? ctx_.params().page_size : 16;
         const int max_num_seqs = ctx_.params().max_num_seqs;  // 0 => auto-size
-        KVCacheTypeConfig kv_config;
-        kv_config.type_k = kv_cache_dtype_;
-        kv_config.type_v = kv_cache_dtype_;
+        KVCacheTypeConfig kv_config = kv_cache_type_config_;
         // Phase 6: set layer policies before init so SWA pools are sized correctly
         if (cfg.n_swa > 0) {
             std::vector<KVLayerPolicy> policies(kv_num_layers, KVLayerPolicy::Full);

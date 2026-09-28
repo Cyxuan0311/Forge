@@ -156,15 +156,32 @@ CliArgs parse_args(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
+
+        // Shared with forge-server: -m, -ngl, -c, -t, the KV cache dtype and the
+        // separate -ctk/-ctv types, --paged-kv/--cuda-graph/--kv-offload,
+        // --load-mode/--offload-embedding/--prefetch and the whole --kvmem block.
+        // Lives in forge_infer so the two binaries cannot drift again. Handled
+        // here, ahead of the CLI-only chain below.
+        {
+            std::string err;
+            const forge::ParseResult r =
+                forge::parse_common_arg(arg, argc, argv, i, args.common, &err);
+            if (r == forge::ParseResult::Ok) continue;
+            if (r == forge::ParseResult::Error) {
+                std::cerr << err << "\n";
+                std::exit(1);
+            }
+        }
+
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             std::exit(0);
-        } else if (arg == "-m" || arg == "--model") {
+        } else if (arg == "-m" || arg == "--model") {  // shared parser owns this
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.model_path = argv[i];
+            args.common.model_path = argv[i];
         } else if (arg == "-p" || arg == "--prompt") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
@@ -184,9 +201,9 @@ CliArgs parse_args(int argc, char** argv) {
             }
             std::string val = argv[i];
             if (val == "auto" || val == "-1") {
-                args.n_gpu_layers = -1;  // auto: all layers on GPU (llama.cpp auto default)
+                args.common.n_gpu_layers = -1;  // auto: all layers on GPU (llama.cpp auto default)
             } else if (val == "all" || val == "-2") {
-                args.n_gpu_layers = -2;  // all: explicit all-on-GPU
+                args.common.n_gpu_layers = -2;  // all: explicit all-on-GPU
             } else {
                 // Check for multi-GPU syntax: N:M or N:M:K...
                 size_t colon_pos = val.find(':');
@@ -197,28 +214,28 @@ CliArgs parse_args(int argc, char** argv) {
                         size_t next = val.find(':', pos);
                         std::string part = val.substr(pos, next - pos);
                         if (!part.empty()) {
-                            args.gpu_layers_per_dev.push_back(std::stoi(part));
+                            args.common.gpu_layers_per_dev.push_back(std::stoi(part));
                         }
                         if (next == std::string::npos) break;
                         pos = next + 1;
                     }
                     // Sum all per-device layers as total gpu_layers
-                    args.n_gpu_layers = 0;
-                    for (int n : args.gpu_layers_per_dev) args.n_gpu_layers += n;
+                    args.common.n_gpu_layers = 0;
+                    for (int n : args.common.gpu_layers_per_dev) args.common.n_gpu_layers += n;
                 } else {
-                    args.n_gpu_layers = std::stoi(val);
+                    args.common.n_gpu_layers = std::stoi(val);
                 }
             }
         } else if (arg == "-kvo" || arg == "--kv-offload") {
-            args.offload_kqv = true;
+            args.common.offload_kqv = true;
         } else if (arg == "-nkvo" || arg == "--no-kv-offload") {
-            args.offload_kqv = false;
+            args.common.offload_kqv = false;
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.threads = std::stoi(argv[i]);
+            args.common.threads = std::stoi(argv[i]);
         } else if (arg == "-b" || arg == "--batch-size") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
@@ -230,21 +247,9 @@ CliArgs parse_args(int argc, char** argv) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.n_ctx = std::stoi(argv[i]);
-            if (args.n_ctx < 0) {
+            args.common.ctx_size = std::stoi(argv[i]);
+            if (args.common.ctx_size < 0) {
                 std::cerr << "Error: --ctx-size must be >= 0 (0 = auto = model native length)\n";
-                std::exit(1);
-            }
-        } else if (arg == "--kv-cache-dtype") {
-            if (++i >= argc) {
-                std::cerr << "Error: " << arg << " requires an argument\n";
-                std::exit(1);
-            }
-            args.kv_cache_dtype = argv[i];
-            if (args.kv_cache_dtype != "fp32" && args.kv_cache_dtype != "f16" &&
-                args.kv_cache_dtype != "q8_0" && args.kv_cache_dtype != "q4_0" &&
-                args.kv_cache_dtype != "fp8_e4m3" && args.kv_cache_dtype != "fp8_e5m2") {
-                std::cerr << "Error: Unsupported KV cache dtype: " << args.kv_cache_dtype << "\n";
                 std::exit(1);
             }
         } else if (arg == "--temp" || arg == "--temperature") {
@@ -306,38 +311,38 @@ CliArgs parse_args(int argc, char** argv) {
             }
             args.system_prompt = argv[i];
         } else if (arg == "--cuda-graph") {
-            args.cuda_graph = true;
+            args.common.cuda_graph = true;
         } else if (arg == "--paged-kv") {
-            args.paged_kv = true;
+            args.common.paged_kv = true;
         } else if (arg == "--kvmem") {
-            args.kvmem = true;
-            args.paged_kv = true;  // the tier needs the page pool it caps
+            args.common.kvmem = true;
+            args.common.paged_kv = true;  // the tier needs the page pool it caps
         } else if (arg == "--kvmem-budget") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.kvmem_budget = std::stoi(argv[i]);
+            args.common.kvmem_budget = std::stoi(argv[i]);
         } else if (arg == "--kvmem-sink") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.kvmem_sink = std::stoi(argv[i]);
+            args.common.kvmem_sink = std::stoi(argv[i]);
         } else if (arg == "--kvmem-gen-reserve") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.kvmem_gen_reserve = std::stoi(argv[i]);
+            args.common.kvmem_gen_reserve = std::stoi(argv[i]);
         } else if (arg == "--kvmem-retrieval") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.kvmem_retrieval = argv[i];
-            if (args.kvmem_retrieval != "recent" && args.kvmem_retrieval != "embed") {
-                std::cerr << "Error: Invalid --kvmem-retrieval: " << args.kvmem_retrieval
+            args.common.kvmem_retrieval = argv[i];
+            if (args.common.kvmem_retrieval != "recent" && args.common.kvmem_retrieval != "embed") {
+                std::cerr << "Error: Invalid --kvmem-retrieval: " << args.common.kvmem_retrieval
                           << ". Valid: recent, embed\n";
                 std::exit(1);
             }
@@ -346,22 +351,22 @@ CliArgs parse_args(int argc, char** argv) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
                 std::exit(1);
             }
-            args.load_mode = argv[i];
-            if (args.load_mode != "mmap" && args.load_mode != "mlock" && args.load_mode != "mmap_mlock") {
-                std::cerr << "Error: Invalid --load-mode: " << args.load_mode
+            args.common.load_mode = argv[i];
+            if (args.common.load_mode != "mmap" && args.common.load_mode != "mlock" && args.common.load_mode != "mmap_mlock") {
+                std::cerr << "Error: Invalid --load-mode: " << args.common.load_mode
                           << ". Valid: mmap, mlock, mmap_mlock\n";
                 std::exit(1);
             }
         } else if (arg == "--offload-embedding") {
-            args.offload_embedding = true;
+            args.common.offload_embedding = true;
         } else if (arg == "--no-offload-embedding") {
-            args.offload_embedding = false;
+            args.common.offload_embedding = false;
         } else if (arg == "--no-jinja") {
             args.no_jinja = true;
         } else if (arg == "--prefetch") {
-            args.prefetch = true;
+            args.common.prefetch = true;
         } else if (arg == "--no-prefetch") {
-            args.prefetch = false;
+            args.common.prefetch = false;
         } else if (arg == "--info") {
             args.info_only = true;
         } else if (arg == "--bench") {
@@ -582,19 +587,18 @@ CliArgs parse_args(int argc, char** argv) {
         args.no_sample = true;
     }
 
-    // KVMem tier validation: the working set needs the page pool to cap, and a
-    // sink larger than the budget would force an overflow on every prompt.
-    if (args.kvmem) {
-        if (args.kvmem_sink < 0 || args.kvmem_budget < 0 || args.kvmem_gen_reserve < 0) {
-            std::cerr << "Error: --kvmem-sink / --kvmem-budget / --kvmem-gen-reserve must be >= 0\n";
-            std::exit(1);
-        }
-        if (args.kvmem_budget > 0 && args.kvmem_sink > args.kvmem_budget) {
-            std::cerr << "Error: --kvmem-sink (" << args.kvmem_sink
-                      << ") cannot exceed --kvmem-budget (" << args.kvmem_budget << ")\n";
+    // Cross-flag checks live in forge::validate_common_args() now (the KVMem
+    // budget/sink rule forge-server carried a near-identical copy of, which is
+    // how the two drifted).
+    {
+        std::string err;
+        if (!forge::validate_common_args(args.common, &err)) {
+            std::cerr << err << "\n";
             std::exit(1);
         }
     }
+    // The KVMem reserve is sized for this run's generation budget.
+    args.common.generation_budget = args.n_predict > 0 ? args.n_predict : 256;
 
     if (args.prompt.empty() && !args.info_only && !args.bench) {
         args.interactive = true;

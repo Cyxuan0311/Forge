@@ -446,7 +446,7 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    if (args.model_path.empty()) {
+    if (args.common.model_path.empty()) {
         std::cerr << "Error: Please specify a model path (-m, --model)\n";
         std::cerr << "Use --help for usage information\n";
         return 1;
@@ -460,8 +460,8 @@ int main(int argc, char** argv) {
     // ---- Load tokenizer ----
     auto t0 = std::chrono::high_resolution_clock::now();
     Tokenizer tokenizer;
-    if (!tokenizer.load_from_gguf(args.model_path)) {
-        std::cerr << "Error: Failed to load tokenizer from: " << args.model_path << "\n";
+    if (!tokenizer.load_from_gguf(args.common.model_path)) {
+        std::cerr << "Error: Failed to load tokenizer from: " << args.common.model_path << "\n";
         return 1;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -477,19 +477,19 @@ int main(int argc, char** argv) {
     Model model;
 
     // Apply memory tuning options before loading
-    if (!args.load_mode.empty()) {
-        model.set_load_mode(args.load_mode);
+    if (!args.common.load_mode.empty()) {
+        model.set_load_mode(args.common.load_mode);
     }
-    model.set_offload_embedding(args.offload_embedding);
-    model.set_prefetch(args.prefetch);
+    model.set_offload_embedding(args.common.offload_embedding);
+    model.set_prefetch(args.common.prefetch);
 
     // --info only prints metadata, so it must never offload weights. With the
     // default -ngl -1 (all layers on GPU) a model larger than VRAM died here
     // ("CUDA malloc failed" -> uncaught -> core dump) before printing anything.
-    const int load_gpu_layers = args.info_only ? 0 : args.n_gpu_layers;
-    bool load_ok = model.load(args.model_path, load_gpu_layers);
+    const int load_gpu_layers = args.info_only ? 0 : args.common.n_gpu_layers;
+    bool load_ok = model.load(args.common.model_path, load_gpu_layers);
     if (!load_ok) {
-        std::cerr << "Error: Failed to load model: " << args.model_path << "\n";
+        std::cerr << "Error: Failed to load model: " << args.common.model_path << "\n";
         return 1;
     }
     auto t3 = std::chrono::high_resolution_clock::now();
@@ -549,7 +549,7 @@ int main(int argc, char** argv) {
     // CPU threads are tuned later (after the engine reports its real backend),
     // because some engines (bailingmoe3) cannot offload to GPU and must still
     // get properly auto-detected threads even when -ngl -1 was requested.
-    if (args.paged_kv) {
+    if (args.common.paged_kv) {
         ctx.params_mut().kv_storage_mode = KVStorageMode::Paged;
         std::cout << "Paged KV cache storage enabled\n";
     }
@@ -565,54 +565,30 @@ int main(int argc, char** argv) {
     }
 
     auto* tfm_eng = dynamic_cast<TransformerEngine*>(engine.get());
+
+    // One shared application of every common flag (model, -ngl, -c, -t, the KV
+    // dtype pair, --cuda-graph, offload switches). forge-server calls the same
+    // function, so the two can no longer disagree about a default or drop a flag.
+    {
+        std::string err;
+        if (!forge::apply_common_args(args.common, nullptr, ctx, tfm_eng, &err)) {
+            std::cerr << err << "\n";
+            return 1;
+        }
+    }
     if (tfm_eng) {
-        KVCacheDType kv_dtype = KVCacheDType::F16;
-        if (args.kv_cache_dtype == "fp32")
-            kv_dtype = KVCacheDType::FP32;
-        else if (args.kv_cache_dtype == "f16")
-            kv_dtype = KVCacheDType::F16;
-        else if (args.kv_cache_dtype == "q8_0")
-            kv_dtype = KVCacheDType::Q8_0;
-        else if (args.kv_cache_dtype == "q4_0")
-            kv_dtype = KVCacheDType::Q4_0;
-        else if (args.kv_cache_dtype == "fp8_e4m3")
-            kv_dtype = KVCacheDType::FP8_E4M3;
-        else if (args.kv_cache_dtype == "fp8_e5m2")
-            kv_dtype = KVCacheDType::FP8_E5M2;
-        tfm_eng->set_kv_cache_dtype(kv_dtype);
-        // -c/--ctx-size caps the KV cache instead of trusting the model's native
-        // length. Without it a 256K-native model sizes KV from raw free memory
-        // (observed: 23808 tokens -> multi-GB host KV -> swap thrash on a 15GB box).
-        if (args.n_ctx > 0) {
-            tfm_eng->set_kv_cache_max_seq_len(args.n_ctx);
-        }
-        if (!args.gpu_layers_per_dev.empty()) {
-            tfm_eng->set_gpu_layers(args.n_gpu_layers, args.gpu_layers_per_dev);
-        } else {
-            tfm_eng->set_gpu_layers(args.n_gpu_layers);
-        }
-        // CPU thread auto-tune: only when the engine will actually run on CPU.
-        // This fixes the bailingmoe3 -ngl -1 case, where model.device() reports
-        // CUDA (so the old gate skipped tuning) even though the engine runs CPU.
-        if (args.threads > 0) {
-            ctx.params_mut().n_threads = args.threads;
-            ctx.params_mut().n_threads_batch = args.threads;
-            std::cout << "CPU threads set to: " << args.threads << "\n";
-        } else if (args.n_gpu_layers < cfg.num_layers) {
-            // Hybrid offload: some layers still run on CPU, so we must tune CPU
-            // threads even though uses_gpu() is true. The old gate
-            // (!uses_gpu()) skipped tuning here and left the CPU-resident layers
-            // running at the default n_threads=4, making CPU the decode
-            // bottleneck while the GPU sat idle.
-            int t = forge::detect_best_cpu_threads(cfg.hidden_dim,
-                                                   cfg.intermediate_dim);
-            ctx.params_mut().n_threads = t;
-            ctx.params_mut().n_threads_batch = t;
-            std::cout << "CPU threads auto-detected (hybrid offload): " << t << "\n";
-        }
-        if (args.cuda_graph && tfm_eng->uses_gpu()) {
+        if (args.common.cuda_graph && tfm_eng->uses_gpu()) {
             tfm_eng->set_use_graph(true);
             tfm_eng->set_cuda_graph_enabled(true);
+        }
+        // -b/--batch-size was parsed but never read, so it did nothing. Wire it
+        // to the forward-batch budget it always claimed to control.
+        if (args.batch_size > 0) ctx.params_mut().n_batch = args.batch_size;
+        if (args.common.threads > 0) {
+            std::cout << "CPU threads set to: " << args.common.threads << "\n";
+        } else if (args.common.n_gpu_layers < cfg.num_layers) {
+            std::cout << "CPU threads auto-detected (hybrid offload): "
+                      << ctx.params().n_threads << "\n";
         }
         if (args.expert_stats || args.expert_paging) {
             tfm_eng->set_expert_paging(args.expert_paging);
@@ -642,7 +618,7 @@ int main(int argc, char** argv) {
     // ctx.init_kv_cache() runs. The manager is attached afterwards, once the
     // pool geometry is known.
     bool kvmem_active = false;
-    if (args.kvmem) {
+    if (args.common.kvmem) {
         auto* kv_mem = tfm_eng ? tfm_eng->kv_memory() : nullptr;
         if (!tfm_eng || !kv_mem) {
             std::cerr << "Warning: --kvmem needs a transformer engine with KV memory; "
@@ -656,15 +632,15 @@ int main(int argc, char** argv) {
                       << cfg.n_swa << " sliding-window layer(s); tiered KV disabled\n";
         } else {
             // 0 = keep the device-sized pool; the budget then falls back to it.
-            if (args.kvmem_budget > 0)
-                kv_mem->storage().set_pool_token_cap(args.kvmem_budget);
+            if (args.common.kvmem_budget > 0)
+                kv_mem->storage().set_pool_token_cap(args.common.kvmem_budget);
             kvmem_active = true;
         }
     }
 
     ctx.set_engine(std::move(engine));
 
-    ctx.params_mut().offload_kqv = args.offload_kqv;
+    ctx.params_mut().offload_kqv = args.common.offload_kqv;
     ctx.params_mut().offload_embedding = model.offload_embedding();
     ctx.init_kv_cache();
     if (tfm_eng) {
@@ -684,15 +660,25 @@ int main(int argc, char** argv) {
             }
         };
         auto* kv_mem = tfm_eng->kv_memory();
+        // Report K and V separately. With -ctk/-ctv they can differ, and a line
+        // that only named one of them made an asymmetric config indistinguishable
+        // from a symmetric one. llama.cpp does the same (llama-kv-cache.cpp:301).
+        const auto type_str = [&](const KVCacheTypeConfig& c) {
+            const char* k = kv_cache_dtype_name(c.type_k);
+            const char* v = kv_cache_dtype_name(c.type_v);
+            return c.type_k == c.type_v ? std::string(k)
+                                       : std::string(k) + "/" + v + " (K/V)";
+        };
         if (kv_mem && kv_mem->storage().is_paged()) {
             const auto& st = static_cast<const PagedKVStorage&>(kv_mem->storage());
-            std::cout << "KV Cache (paged): dtype=" << kv_dtype_to_name(st.kv_type_k())
+            KVCacheTypeConfig c{st.kv_type_k(), st.kv_type_v()};
+            std::cout << "KV Cache (paged): dtype=" << type_str(c)
                       << ", size=" << format_bytes(st.nbytes())
                       << ", max_seq=" << st.max_seq_len()
                       << " (pool_tokens=" << st.max_pool_tokens() << ")\n";
         } else {
             const KVCache* cache = tfm_eng->kv_cache();
-            std::cout << "KV Cache: dtype=" << kv_dtype_to_name(cache->kv_dtype())
+            std::cout << "KV Cache: dtype=" << type_str(cache->kv_config())
                       << ", size=" << format_bytes(cache->nbytes())
                       << ", max_seq=" << cache->max_seq_len() << "\n";
         }
@@ -712,12 +698,12 @@ int main(int argc, char** argv) {
         } else {
             const int page_size = kv_mem->storage().page_size();
             const int pool_tokens = kv_mem->max_pool_tokens();
-            auto ws = std::make_unique<KVWorkingSetManager>(args.kvem_config(), page_size,
+            auto ws = std::make_unique<KVWorkingSetManager>(args.common.kvem_config(), page_size,
                                                            pool_tokens);
             std::cout << "KVMem tiered KV enabled: budget=" << ws->budget()
                       << ", sink=" << ws->sink_tokens()
                       << ", gen_reserve=" << ws->gen_reserve()
-                      << ", retrieval=" << args.kvmem_retrieval << "\n"
+                      << ", retrieval=" << args.common.kvmem_retrieval << "\n"
                       << "  logical ctx=" << kv_mem->max_seq_len()
                       << " tokens, gpu pool=" << pool_tokens
                       << " tokens, page=" << page_size << "\n";
@@ -745,7 +731,7 @@ int main(int argc, char** argv) {
 
     // ---- Benchmark mode ----
     if (args.bench) {
-        run_benchmark(ctx, tokenizer, args.n_gpu_layers);
+        run_benchmark(ctx, tokenizer, args.common.n_gpu_layers);
         return 0;
     }
 

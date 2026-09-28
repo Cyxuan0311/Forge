@@ -31,7 +31,23 @@ public:
     // report the real backend, so the CLI still auto-tunes CPU threads instead
     // of silently leaving them at the default when GPU is unavailable.
     virtual bool uses_gpu() const { return gpu_layers_ != 0; }
-    void set_kv_cache_dtype(KVCacheDType dtype) { kv_cache_dtype_ = dtype; }
+    void set_kv_cache_dtype(KVCacheDType dtype) {
+        kv_cache_dtype_ = dtype;
+        kv_cache_type_config_.type_k = dtype;
+        kv_cache_type_config_.type_v = dtype;
+    }
+    // Per-K/V cache types. set_kv_cache_dtype() collapses both to one value,
+    // which is the only thing the old --kv-cache-dtype could express; this is
+    // what -ctk / -ctv need. The KV cache and its storage already carry
+    // asymmetric types (KVCacheTypeConfig, KVCache::kv_config()), so nothing
+    // downstream had to change -- the types were only ever forced to agree here.
+    void set_kv_cache_type_config(const KVCacheTypeConfig& cfg) {
+        kv_cache_type_config_ = cfg;
+        // Keep the legacy scalar in sync so any reader that has not been
+        // converted sees K's type rather than a stale default.
+        kv_cache_dtype_ = cfg.type_k;
+    }
+    const KVCacheTypeConfig& kv_cache_type_config() const { return kv_cache_type_config_; }
     // User-requested KV cache context size (0 = auto: min(model max_seq_len,
     // KV_MAX_SEQ_CAP)). Larger values let long agent sessions (e.g. opencode)
     // keep more history; the CUDA free-memory check still shrinks if needed.
@@ -181,6 +197,8 @@ protected:
     std::unique_ptr<KVMemory> kv_memory_;
     ModelWeights weights_;
     KVCacheDType kv_cache_dtype_ = KVCacheDType::Q8_0;
+    // Authoritative K/V pair; kv_cache_dtype_ mirrors type_k for legacy readers.
+    KVCacheTypeConfig kv_cache_type_config_{KVCacheDType::Q8_0, KVCacheDType::Q8_0};
     int kv_cache_max_seq_len_ = 0;  // 0 = auto cap
     int gpu_layers_ = -1;
     std::vector<DeviceTarget> layer_devices_;  // per-layer (device_type, device_id) assignment

@@ -16,6 +16,7 @@
 #endif
 
 #include "forge/chat_template.h"
+#include "forge/cli_common_args.h"
 #include "forge/kv_working_set.h"
 #include "forge/prefix_cache.h"
 #include "forge/speculative.h"
@@ -33,28 +34,22 @@ class VisionEncoder;
 // ============================================================================
 
 struct CliArgs {
-    // Basic
-    std::string model_path;
+    // Flags shared verbatim with forge-server: model, -ngl, -c, -t, the KV cache
+    // dtype and the separate -ctk/-ctv types, paged/cuda-graph/kv-offload,
+    // load-mode/embedding-offload/prefetch, and the whole --kvmem block. Parsed by
+    // forge::parse_common_arg() and applied by forge::apply_common_args(), so
+    // the two binaries cannot drift again (they had: different --kv-cache-dtype
+    // defaults, and the server accepted a typo'd dtype as f16 without a word).
+    forge::CommonArgs common;
+
+    // ---- CLI-only ----
     std::string prompt;
     std::string mmproj_path;
     std::string image_path;
-
-    // Performance tuning
-    int n_gpu_layers = -1;
-    std::vector<int> gpu_layers_per_dev;   // -ngl N:M => [N, M] (Phase 5 multi-GPU)
-    bool offload_kqv = true;  // true = KV on GPU when layers on GPU
-    int threads = -1;
-    int batch_size = 512;
-    int n_ctx = 0;  // 0 = auto (model native length, clamped to fit memory); >0 = explicit KV cap
     int n_predict = -1;
-    std::string kv_cache_dtype = "f16";  // fp32 | f16 | q8_0 | q4_0 | fp8_e4m3 | fp8_e5m2
-    bool cuda_graph = false;  // Phase 10: CUDA Graph for decode
-    bool paged_kv = false;    // Use paged KV cache storage (default: contiguous)
-
-    // Memory / load tuning
-    std::string load_mode;          // "mmap" (default), "mlock", "mmap_mlock"
-    bool offload_embedding = true;  // true = token_embedding follows first layer device
-    bool prefetch = true;           // warm page cache at load (--no-prefetch disables)
+    // Max tokens per forward_batch() call. This was parsed and then read nowhere,
+    // so -b silently did nothing; apply_common_args now wires it to n_batch.
+    int batch_size = 512;
 
     // Sampling control
     float temperature = 0.7f;
@@ -88,30 +83,6 @@ struct CliArgs {
     bool expert_paging = false;  // enable per-expert weight movement (ExpertPageCache)
     int expert_budget_mb = 0;    // VRAM budget for resident experts, MB (0 = unbounded)
 
-    // KVMem tiered KV working set (arXiv:2609.04852). --kvmem turns paged mode on
-    // and attaches a tiered working set so the logical context (-c) can exceed the
-    // GPU pool; the remaining knobs mirror kvmem-llama.cpp's flags. Requires
-    // --paged-kv (or sets it itself).
-    bool kvmem = false;         // enable tiered KV working set
-    int kvmem_budget = 0;       // GPU resident budget (tokens); 0 = the paged pool cap
-    int kvmem_sink = 256;       // tokens pinned resident forever at the prefix
-    int kvmem_gen_reserve = 0;  // window slots reserved for this turn's output
-    std::string kvmem_retrieval = "recent";  // foundational recall: recent | embed
-
-    forge::KVemConfig kvem_config() const {
-        forge::KVemConfig c;
-        c.enabled = kvmem;
-        c.budget_tokens = kvmem_budget;
-        c.sink_tokens = kvmem_sink;
-        // The window must not fill before the reply is done: a full window makes
-        // the first decode step write past the pool ("page pool exhausted").
-        // With no explicit --kvmem-gen-reserve, reserve this run's generation
-        // budget (the -n default is 256 when -n is not given).
-        c.gen_reserve = kvmem_gen_reserve > 0 ? kvmem_gen_reserve
-                                             : (n_predict > 0 ? n_predict : 256);
-        c.retrieval = kvmem_retrieval;
-        return c;
-    }
 };
 
 CliArgs parse_args(int argc, char** argv);

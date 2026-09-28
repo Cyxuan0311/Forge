@@ -55,9 +55,9 @@ void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
     std::cout << "  " << cli_color::green("Model:") << " " << cli_color::bold(cfg.arch_type)
               << " (" << cli_color::cyan(std::to_string(cfg.num_layers)) << " layers)\n";
     std::cout << "  " << cli_color::green("Device:") << " "
-              << cli_color::bold(args.n_gpu_layers == 0 ? "CPU" : "CUDA") << "\n";
+              << cli_color::bold(args.common.n_gpu_layers == 0 ? "CPU" : "CUDA") << "\n";
     std::cout << "  " << cli_color::green("GPU layers:") << " "
-              << cli_color::cyan(std::to_string(args.n_gpu_layers)) << "\n";
+              << cli_color::cyan(std::to_string(args.common.n_gpu_layers)) << "\n";
     std::cout << "  " << cli_color::green("Commands:") << " "
               << cli_color::dim("/quit, /clear, /system, /image, /save, /help") << "\n";
     std::cout << "\n";
