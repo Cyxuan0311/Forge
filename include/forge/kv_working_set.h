@@ -105,8 +105,8 @@ struct KVemConfig {
 //                      here.
 //   kept_rope_off    : the logical position of window slot 0. Window slot w
 //                      maps to logical position kept_rope_off + w.
-//   new_to_compute   : prompt tokens in [kept_logical_len, prompt.size()) to
-//                      forward, written to window slots
+//   new_to_compute   : prompt tokens in [head_shift + kept_logical_len,
+//                      prompt.size()) to forward, written to window slots
 //                      [kept_window_len, kept_window_len + new_to_compute).
 //   new_window_len   : window slots occupied once the prefill lands
 //                      (== kept_window_len + new_to_compute).
@@ -176,17 +176,22 @@ public:
     const Stats& stats() const { return stats_; }
 
 private:
-    int64_t common_prefix_len(const std::vector<int32_t>& a,
-                              const std::vector<int32_t>& b) const;
-
     KVemConfig cfg_;
     int page_size_ = 16;
     int budget_ = 0;
 
     // Previous turn's logical history; source of the common-prefix match.
+    // Invariant: window slot w holds the token logical_hist_[w] (the window
+    // always starts at logical position 0 of the shifted space below).
     std::vector<int32_t> logical_hist_;
     int64_t last_win_len_ = 0;
     int64_t last_rope_off_ = 0;
+
+    // Logical position p corresponds to prompt index p + head_shift_.
+    // > 0 only after a single prompt exceeded the whole budget and its head
+    // was clipped (the last-resort path); the shift keeps the logical history
+    // aligned with the *next* prompt so the common-prefix match survives.
+    int64_t head_shift_ = 0;
 
     // Current turn's window state.
     int64_t window_len_ = 0;

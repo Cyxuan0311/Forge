@@ -27,16 +27,6 @@ KVWorkingSetManager::KVWorkingSetManager(KVemConfig config, int page_size, int p
              " retrieval=" + cfg_.retrieval + " page_size=" + std::to_string(page_size_));
 }
 
-int64_t KVWorkingSetManager::common_prefix_len(const std::vector<int32_t>& a,
-                                               const std::vector<int32_t>& b) const {
-    const int64_t n = std::min<int64_t>(static_cast<int64_t>(a.size()),
-                                        static_cast<int64_t>(b.size()));
-    int64_t i = 0;
-    while (i < n && a[static_cast<size_t>(i)] == b[static_cast<size_t>(i)])
-        ++i;
-    return i;
-}
-
 int64_t KVWorkingSetManager::archived_tokens() const {
     // Everything before the window start that has not already been dropped.
     const int64_t begin = std::max<int64_t>(0, rope_off_);
@@ -56,10 +46,21 @@ KVemTurnPlan KVWorkingSetManager::on_prompt(const std::vector<int32_t>& prompt, 
     KVemTurnPlan plan;
 
     // ---- 1. Common-prefix match against the previous logical history ----
-    // The match is measured in *logical* space, so it survives window
-    // eviction: what matters is whether the KV for logical position p is still
-    // resident in a window slot, which we track separately below.
-    const int64_t match = common_prefix_len(logical_hist_, prompt);
+    // The match is measured in *logical* space against the shifted prompt:
+    // logical position p corresponds to prompt index p + head_shift_ (the shift
+    // is 0 unless a previous single-prompt overflow clipped a prompt head).
+    // It survives window eviction: what matters is whether the KV for logical
+    // position p is still resident in a window slot, tracked separately below.
+    int64_t match = 0;
+    {
+        const int64_t avail =
+            static_cast<int64_t>(prompt.size()) - head_shift_;
+        const int64_t n = std::min<int64_t>(
+            static_cast<int64_t>(logical_hist_.size()), std::max<int64_t>(0, avail));
+        while (match < n && logical_hist_[static_cast<size_t>(match)] ==
+                                prompt[static_cast<size_t>(head_shift_ + match)])
+            ++match;
+    }
 
     // Tokens whose KV is still in the window are the ones we can keep. The
     // window covers logical [rope_off_, rope_off_ + last_win_len_).
@@ -89,19 +90,26 @@ KVemTurnPlan KVWorkingSetManager::on_prompt(const std::vector<int32_t>& prompt, 
                  " tokens) -- the pinned prefix was evicted by budget pressure");
     }
 
-    plan.kept_logical_len = resident_begin + keep_window;
+    // kept_logical_len is the logical position of the first token the forward
+    // must produce. When the prompt diverges before the window start (match <
+    // resident_begin: a new conversation on a server that already archived
+    // history), every resident slot is stale -- recompute from the divergence
+    // point instead of claiming the stale window start, which would silently
+    // drop the prompt tokens in between.
+    plan.kept_logical_len = std::min(resident_begin, match) + keep_window;
     plan.kept_window_len = keep_window;
     plan.kept_rope_off = resident_begin;
 
     // ---- 3. Prompt side: everything after the common prefix is new ----
     // NOTE: tokens in [match, resident_begin) are *not* resident (they were
     // archived or evicted) and also no longer match the current prompt, so
-    // they are recomputed from the earliest non-resident position.
-    int64_t recompute_from = plan.kept_logical_len;
+    // they are recomputed from the earliest non-resident position. The prompt
+    // index of logical position p is p + head_shift_.
+    int64_t recompute_from = head_shift_ + plan.kept_logical_len;
 
-    // ---- 4. Window assembly + staleness drop ----
-    // The window must hold: recall(optional) + prompt tail + gen_reserve.
-    const int64_t tail = static_cast<int64_t>(prompt.size()) - recompute_from;
+    // ---- 4. Window assembly + pressure handling ----
+    // The window must hold: kept prefix + prompt tail + gen_reserve.
+    int64_t tail = static_cast<int64_t>(prompt.size()) - recompute_from;
     int64_t room = static_cast<int64_t>(budget_) - plan.kept_window_len;
     if (room < 0)
         room = 0;
@@ -125,16 +133,73 @@ KVemTurnPlan KVWorkingSetManager::on_prompt(const std::vector<int32_t>& prompt, 
     if (usable < 0) usable = 0;
 
     if (tail > usable) {
-        plan.dropped_archived = static_cast<int>(tail - usable);
-        recompute_from = static_cast<int64_t>(prompt.size()) - usable;
-        plan.truncated_prompt = true;
-        stats_.dropped_tokens += plan.dropped_archived;
-        LOG_WARN("KVMem: prompt tail (" + std::to_string(tail) +
-                 " tokens) exceeds window room (" + std::to_string(usable) +
-                 ") -- dropping " + std::to_string(plan.dropped_archived) +
-                 " tokens of stale history (budget=" + std::to_string(budget_) +
-                 ", sink=" + std::to_string(cfg_.sink_tokens) +
-                 ", gen_reserve=" + std::to_string(gr) + ")");
+        // Pressure: window + generation reserve exceeds the budget. The keep
+        // size does not change feasibility (an evicted resident token just
+        // moves into the recompute set -- the window always spans from the
+        // earliest surviving logical token to the prompt end), so the knobs
+        // are the reserve and, as a last resort, clipping the oldest history
+        // through head_shift_.
+        const int64_t window_need =
+            static_cast<int64_t>(prompt.size()) - head_shift_;
+        const int64_t gr_fit = static_cast<int64_t>(budget_) - window_need;
+        if (gr_fit >= 0) {
+            // Shrink the reserve instead of losing context: decode hard-stops
+            // at plan.max_generate, so a smaller reserve only caps the reply
+            // length. No prompt token and no resident token is lost.
+            LOG_WARN("KVMem: prompt tail (" + std::to_string(tail) +
+                     " tokens) exceeds window room (" + std::to_string(usable) +
+                     ") -- shrinking gen_reserve " + std::to_string(gr) + " -> " +
+                     std::to_string(gr_fit) + " (budget=" +
+                     std::to_string(budget_) + ")");
+            gr = gr_fit;
+        } else {
+            // Last resort: even a zero reserve cannot hold the prompt. Clip
+            // the oldest history (head_shift_ += clip) and evict the whole
+            // window: without a physical page-table shift the kept slot
+            // prefix cannot represent a clipped head, and a stale prefix
+            // would desync the next turn's match.
+            const int64_t reserve =
+                std::min<int64_t>(cfg_.gen_reserve, budget_ / 4);
+            const int64_t clip = window_need + reserve - budget_;
+            head_shift_ += clip;
+            stats_.dropped_tokens += clip;
+            if (plan.kept_window_len > 0) {
+                plan.dropped_archived +=
+                    static_cast<int>(plan.kept_window_len);
+                stats_.dropped_tokens += plan.kept_window_len;
+                plan.kept_window_len = 0;
+                plan.kept_logical_len = resident_begin;
+            }
+            gr = reserve;
+            plan.truncated_prompt = true;
+            LOG_WARN("KVMem: prompt (" + std::to_string(prompt.size()) +
+                     " tokens, head_shift " + std::to_string(head_shift_ - clip) +
+                     " -> " + std::to_string(head_shift_) +
+                     ") exceeds the whole window budget -- clipping " +
+                     std::to_string(clip) +
+                     " oldest history tokens (budget=" +
+                     std::to_string(budget_) +
+                     ", reserve=" + std::to_string(gr) + ")");
+        }
+        room = static_cast<int64_t>(budget_) - plan.kept_window_len;
+        usable = room - gr;
+        if (usable < 0)
+            usable = 0;
+        recompute_from = head_shift_ + plan.kept_logical_len;
+        tail = static_cast<int64_t>(prompt.size()) - recompute_from;
+    }
+
+    // The engine samples the first token from the last prefill row, so the
+    // forward needs at least one token (the untiered prefix-reuse path makes
+    // the same guarantee by clamping prefix_len to prompt_len-1). A
+    // byte-identical consecutive prompt -- a client retrying after a transport
+    // error -- would otherwise forward an empty batch; recompute the resident
+    // window's last token instead.
+    if (recompute_from >= static_cast<int64_t>(prompt.size())) {
+        if (plan.kept_window_len > 0)
+            --plan.kept_window_len;
+        --plan.kept_logical_len;
+        --recompute_from;
     }
 
     plan.new_to_compute.assign(prompt.begin() + static_cast<size_t>(recompute_from), prompt.end());
@@ -154,17 +219,17 @@ KVemTurnPlan KVWorkingSetManager::on_prompt(const std::vector<int32_t>& prompt, 
                   std::to_string(plan.new_window_len) + " budget=" + std::to_string(budget_));
     }
 
-    if (plan.dropped_archived > 0)
-        stats_.dropped_tokens += plan.dropped_archived;
-
     // ---- 5. Commit state ----
-    // rope_off_ / last_rope_off_ are the logical position of *window slot 0*,
-    // which is kept_rope_off — NOT new_rope_off (the logical position of the
-    // first newly-written token). Next turn's on_prompt() reads last_rope_off_
-    // as "slot 0 maps to this logical position"; committing new_rope_off would
-    // shift every resident token's rope position by kept_window_len and desync
-    // multi-turn reuse after the first turn.
-    logical_hist_ = prompt;
+    // logical_hist_ mirrors the window content exactly: slot w holds the token
+    // logical_hist_[w], so next turn's common-prefix match measures precisely
+    // which resident slots the new prompt can reuse. Kept slots stay, the newly
+    // computed tail extends it. Tokens generated during decode land past
+    // new_window_len and are deliberately NOT folded in: they are not reusable
+    // (the next prompt re-encodes them inside its tail) and folding them would
+    // claim slots the plan no longer tracks.
+    logical_hist_.resize(static_cast<size_t>(plan.kept_window_len));
+    logical_hist_.insert(logical_hist_.end(), plan.new_to_compute.begin(),
+                         plan.new_to_compute.end());
     last_win_len_ = plan.new_window_len;
     last_rope_off_ = plan.kept_rope_off;
     window_len_ = plan.new_window_len;
