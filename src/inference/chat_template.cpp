@@ -130,14 +130,12 @@ std::string ChatTemplateEngine::render_jinja(const ChatTemplateInput& input) con
     if (!input.system_prompt.empty()) {
         msgs.push_back(json{{"role", "system"}, {"content", input.system_prompt}});
     }
-    bool any_tool_calls = false;
     int call_seq = 0;
     for (const auto& msg : input.messages) {
         json jm = json{{"role", msg.role}, {"content", msg.content}};
         if (!msg.reasoning_content.empty())
             jm["reasoning_content"] = msg.reasoning_content;
         if (!msg.tool_calls.empty()) {
-            any_tool_calls = true;
             json tcs = json::array();
             for (const auto& tc : msg.tool_calls) {
                 json args = json::parse(tc.arguments_json, nullptr, false);
@@ -175,12 +173,12 @@ std::string ChatTemplateEngine::render_jinja(const ChatTemplateInput& input) con
             ctx_json["tools"] = std::move(wrapped);
         }
     }
-    // Templates that interleave replayed calls into assistant content at
-    // <tool_sep> markers also render a fallback copy unless told the calls
-    // were already handled (undefined == false). We always replay via the
-    // template's own tool_calls path, so mark it done.
-    if (any_tool_calls)
-        ctx_json["has_tool_sep"] = true;
+    // Deliberately NOT setting `has_tool_sep`. Dialects like MiniCPM's only
+    // surface replayed tool calls from their trailing `not has_tool_sep`
+    // block; the interleaved branch above accumulates via `{% set %}` inside a
+    // for loop, which Jinja scoping keeps local to the iteration. Claiming the
+    // calls were already inlined silently drops them, replaying the assistant
+    // turn as an empty message.
 
     jinja::context ctx(tmpl_source_);
     jinja::global_from_json(ctx, ctx_json, false);
