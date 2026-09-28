@@ -376,7 +376,18 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
                 } else {
                     json delta = json::object();
                     if (!r.tool_calls.empty()) {
-                        delta["tool_calls"] = build_tool_calls_array(r.tool_calls);
+                        // Streaming shape requires a per-call `index` (OpenAI
+                        // spec); clients accumulate deltas by index.
+                        json tcs = json::array();
+                        for (size_t i = 0; i < r.tool_calls.size(); ++i) {
+                            const auto& tc = r.tool_calls[i];
+                            tcs.push_back({{"index", i},
+                                           {"id", tc.id},
+                                           {"type", tc.type},
+                                           {"function", {{"name", tc.name},
+                                                         {"arguments", tc.arguments}}}});
+                        }
+                        delta["tool_calls"] = tcs;
                         delta["content"] = json(nullptr);
                     } else if (tools_stream) {
                         // Tools were offered but the model answered in prose.
@@ -539,9 +550,21 @@ bool parse_responses_request(const httplib::Request& http_req,
 // Build the Responses "output" array from a chat result. The message item
 // reuses the id that was announced via response.output_item.added so streaming
 // clients can correlate the final item with the deltas they already received.
+// function_call items carry explicit `id`s: the @ai-sdk/openai Responses
+// schema (zod) rejects items without `id`, which silently drops the tool call
+// and leaves the client with an empty "stop" turn.
 json build_responses_output(const fsrv::ChatCompletionResult& r,
-                            const std::string& message_item_id) {
+                            const std::string& message_item_id,
+                            const std::string& reasoning_item_id,
+                            const std::vector<std::string>& fc_ids) {
     json items = json::array();
+    // Reasoning item first (mirrors OpenAI ordering: reasoning -> message ->
+    // function_call) when <think> content was separated during generation.
+    if (!reasoning_item_id.empty() && !r.reasoning.empty()) {
+        items.push_back(json{{"id", reasoning_item_id},
+                             {"type", "reasoning"},
+                             {"summary", json::array()}});
+    }
     // A response may carry both a prose message and function-call items.
     if (!r.text.empty()) {
         items.push_back(json{{"id", message_item_id},
@@ -551,8 +574,10 @@ json build_responses_output(const fsrv::ChatCompletionResult& r,
                              {"content", json::array({json{{"type", "output_text"},
                                                            {"text", r.text}}})}});
     }
-    for (const auto& tc : r.tool_calls) {
-        items.push_back(json{{"type", "function_call"},
+    for (size_t i = 0; i < r.tool_calls.size(); ++i) {
+        const auto& tc = r.tool_calls[i];
+        items.push_back(json{{"id", i < fc_ids.size() ? fc_ids[i] : gen_id("fc")},
+                             {"type", "function_call"},
                              {"status", "completed"},
                              {"name", tc.name},
                              {"arguments", tc.arguments},
@@ -617,7 +642,11 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
         out["created_at"] = unix_now();
         out["model"] = state.model_id();
         out["status"] = "completed";
-        out["output"] = build_responses_output(r, "");
+        std::vector<std::string> fc_ids;
+        fc_ids.reserve(r.tool_calls.size());
+        for (size_t i = 0; i < r.tool_calls.size(); ++i)
+            fc_ids.push_back(gen_id("fc"));
+        out["output"] = build_responses_output(r, "", "", fc_ids);
         out["usage"] = responses_usage(r);
         res.set_content(out.dump(), "application/json");
         return;
@@ -696,8 +725,43 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
                                 {"delta", delta}});
             };
 
+            // Reasoning (<think>) deltas stream as a separate Responses
+            // reasoning item + summary events, the same wire shape OpenAI uses
+            // for o-series models. The item is announced lazily on the first
+            // delta (most turns have no thinking) at the next free output
+            // index; the message item keeps index 0.
+            const std::string rs_id = gen_id("rs");
+            int next_output_index = 1;  // 0 is the message item
+            int rs_output_index = -1;
+            bool rs_part_added = false;
+            auto on_reasoning = [&](const std::string& delta) -> bool {
+                if (!sink.is_writable())
+                    return false;
+                if (rs_output_index < 0) {
+                    rs_output_index = next_output_index++;
+                    sse("response.output_item.added",
+                        json{{"output_index", rs_output_index},
+                             {"item", json{{"id", rs_id},
+                                           {"type", "reasoning"},
+                                           {"summary", json::array()}}}});
+                }
+                if (!rs_part_added) {
+                    rs_part_added = true;
+                    sse("response.reasoning_summary_part.added",
+                        json{{"item_id", rs_id},
+                             {"output_index", rs_output_index},
+                             {"summary_index", 0},
+                             {"part", json{{"type", "summary_text"}, {"text", ""}}}});
+                }
+                return sse("response.reasoning_summary_text.delta",
+                           json{{"item_id", rs_id},
+                                {"output_index", rs_output_index},
+                                {"summary_index", 0},
+                                {"delta", delta}});
+            };
+
             try {
-                r = state.chat_completion(creq, on_token);
+                r = state.chat_completion(creq, on_token, on_reasoning);
             } catch (const fsrv::ContextLengthExceededError& e) {
                 error_text = e.what();
                 error_type = "invalid_request_error";
@@ -734,6 +798,28 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
                                {"content_index", 0},
                                {"delta", r.text}});
             }
+            // Close the reasoning item (if it streamed) before finishing the
+            // message item, mirroring OpenAI's event order.
+            if (rs_output_index >= 0) {
+                sse("response.reasoning_summary_text.done",
+                    json{{"item_id", rs_id},
+                         {"output_index", rs_output_index},
+                         {"summary_index", 0},
+                         {"text", r.reasoning}});
+                sse("response.reasoning_summary_part.done",
+                    json{{"item_id", rs_id},
+                         {"output_index", rs_output_index},
+                         {"summary_index", 0},
+                         {"part", json{{"type", "summary_text"}, {"text", r.reasoning}}}});
+                sse("response.output_item.done",
+                    json{{"output_index", rs_output_index},
+                         {"item", json{{"id", rs_id},
+                                       {"type", "reasoning"},
+                                       {"summary", json::array({json{
+                                            {"type", "summary_text"},
+                                            {"text", r.reasoning}}})}}}});
+            }
+
             sse("response.output_text.done",
                 json{{"item_id", item_id},
                      {"output_index", 0},
@@ -748,26 +834,34 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
                                    {"content", json::array({json{{"type", "output_text"},
                                                                  {"text", r.text}}})}}}});
 
-            // Function-call output items (indexed after the message item).
-            int fidx = 1;
+            // Function-call output items. `id` is mandatory: the @ai-sdk/openai
+            // zod schema rejects id-less items, which silently dropped tool
+            // calls and turned agent turns into empty "stop" answers.
+            std::vector<std::string> fc_ids;
+            fc_ids.reserve(r.tool_calls.size());
             for (const auto& tc : r.tool_calls) {
-                json item = json{{"type", "function_call"},
+                json item = json{{"id", gen_id("fc")},
+                                 {"type", "function_call"},
                                  {"name", tc.name},
                                  {"arguments", tc.arguments},
                                  {"call_id", tc.id},
                                  {"status", "completed"}};
+                fc_ids.push_back(item["id"].get<std::string>());
                 sse("response.output_item.added",
-                    json{{"output_index", fidx}, {"item", item}});
+                    json{{"output_index", next_output_index}, {"item", item}});
                 sse("response.output_item.done",
-                    json{{"output_index", fidx}, {"item", item}});
-                ++fidx;
+                    json{{"output_index", next_output_index}, {"item", item}});
+                ++next_output_index;
             }
 
             json done_obj = json{{"id", id},
                                  {"object", "response"},
                                  {"status", "completed"},
                                  {"model", state.model_id()},
-                                 {"output", build_responses_output(r, item_id)},
+                                 {"output", build_responses_output(
+                                                r, item_id,
+                                                rs_output_index >= 0 ? rs_id : std::string(),
+                                                fc_ids)},
                                  {"usage", responses_usage(r)}};
             sse("response.completed", json{{"response", done_obj}});
             sink.done();
