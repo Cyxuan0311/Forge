@@ -86,6 +86,13 @@ add_executable(forge-mixed-attn-test test_mixed_attn.cpp)
 forge_link_native(forge-mixed-attn-test)
 add_test(NAME mixed-attn COMMAND forge-mixed-attn-test)
 
+# q4_0 encoding agreement between the CPU and CUDA KV paths. These were two
+# different encodings differing by 8 per element, and the bad commit that
+# "unified" them the wrong way passed a CPU-only test.
+add_executable(forge-q4-0-encoding-test test_q4_0_encoding.cpp)
+forge_link_native(forge-q4-0-encoding-test)
+add_test(NAME q4-0-encoding COMMAND forge-q4-0-encoding-test)
+
 # Hadamard activation rotation (Phase 5): orthonormality, self-inverse,
 # dot-product preservation, and the full attention identity on CPU and CUDA.
 add_executable(forge-attn-rot-test test_attn_rot.cpp)

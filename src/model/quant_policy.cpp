@@ -112,11 +112,22 @@ static void quantize_q4_0_cpu(const float* data, uint8_t* q_data, int n) {
         uint16_t df = fp32_to_fp16(d);
         std::memcpy(q_data + b * 18, &df, 2);
         uint8_t* qs = q_data + b * 18 + 2;
+        // Nibble is UNSIGNED and OFFSET BY 8, matching every CUDA q4_0 writer and
+        // reader (launch_quantize_q4_0_matrix, quantize_row_q4_0,
+        // dequant_q4_0_kernel) as well as the KV path in kv_cache.cpp. This used
+        // to store a sign-extended int4, which is the same 16 levels but shifted
+        // by 8 in the byte, so anything that dequantized these weights on the GPU
+        // read every value 8 too large. The (int)(x + 8.5f) truncation matches the
+        // CUDA writers bit for bit; std::round would differ at half-integers.
         for (int i = 0; i < 16; ++i) {
             int i0 = s + i, i1 = s + i + 16;
-            int8_t v0 = (i0 < e) ? static_cast<int8_t>(std::round(std::max(-8.0f, std::min(7.0f, data[i0] * id)))) : 0;
-            int8_t v1 = (i1 < e) ? static_cast<int8_t>(std::round(std::max(-8.0f, std::min(7.0f, data[i1] * id)))) : 0;
-            qs[i] = (static_cast<uint8_t>(v0) & 0x0F) | ((static_cast<uint8_t>(v1) & 0x0F) << 4);
+            // Out-of-range tail elements encode 0.0 -> nibble 8 -> decodes to 0,
+            // matching the CUDA writers; short-circuiting to 0 would decode to -8*d.
+            float x0 = (i0 < e) ? data[i0] * id : 0.0f;
+            float x1 = (i1 < e) ? data[i1] * id : 0.0f;
+            uint8_t v0 = static_cast<uint8_t>(std::min(15, std::max(0, static_cast<int>(x0 + 8.5f))));
+            uint8_t v1 = static_cast<uint8_t>(std::min(15, std::max(0, static_cast<int>(x1 + 8.5f))));
+            qs[i] = (v0 & 0x0F) | ((v1 & 0x0F) << 4);
         }
     }
 }

@@ -25,28 +25,53 @@ namespace forge {
 
 // ---- fp16 helpers (CPU) ----
 
+// Round-to-nearest-even float32 -> float16.
+//
+// This used to truncate the mantissa (mant >> 13) with no rounding at all. That
+// is a third CPU/CUDA divergence on top of the nibble encoding: CUDA's
+// __float2half rounds to nearest, so for most values the two produced fp16
+// scales differing by 1 ULP, and therefore whole q4_0/q8_0 blocks whose stored
+// bytes differed. It is also a systematic downward bias on every KV scale, i.e.
+// every block was quantized slightly more coarsely than it needed to be.
 static inline uint16_t fp32_to_fp16(float f) {
     uint32_t x;
     std::memcpy(&x, &f, sizeof(uint32_t));
-    uint32_t sign = (x >> 31) & 1;
-    uint32_t exp = (x >> 23) & 0xFF;
-    uint32_t mant = x & 0x7FFFFF;
-    uint16_t h;
+    const uint32_t sign = (x >> 31) & 1u;
+    const uint32_t exp = (x >> 23) & 0xFFu;
+    uint32_t mant = x & 0x7FFFFFu;
 
-    if (exp == 0xFF) {
-        h = (sign << 15) | 0x7C00 | (mant ? 1 : 0);
-    } else if (exp >= 143) {
-        h = (sign << 15) | 0x7C00;
-    } else if (exp >= 113) {
-        h = (sign << 15) | ((exp - 112) << 10) | (mant >> 13);
-    } else if (exp >= 103) {
-        uint32_t sub_exp = 126 - exp;
-        uint32_t sub_mant = (mant | 0x800000) >> (sub_exp + 13);
-        h = (sign << 15) | sub_mant;
-    } else {
-        h = (sign << 15);
+    if (exp == 0xFF) {  // inf / nan
+        return static_cast<uint16_t>((sign << 15) | 0x7C00u | (mant ? (mant >> 13) | 1u : 0u));
     }
-    return h;
+
+    int e = static_cast<int>(exp) - 127;
+    if (e >= 16) {  // overflow -> inf
+        return static_cast<uint16_t>((sign << 15) | 0x7C00u);
+    }
+    if (e >= -14) {  // normal
+        uint32_t m = mant >> 13;
+        const uint32_t rem = mant & 0x1FFFu;
+        // Round half to even.
+        if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) {
+            ++m;
+            if (m == 0x400u) {  // mantissa overflow bumped the exponent
+                m = 0;
+                ++e;
+                if (e >= 16) return static_cast<uint16_t>((sign << 15) | 0x7C00u);
+            }
+        }
+        return static_cast<uint16_t>((sign << 15) | (static_cast<uint32_t>(e + 15) << 10) | m);
+    }
+    if (e >= -24) {  // subnormal
+        mant |= 0x800000u;
+        const int shift = 13 - (-14 - e) + 1;  // bring msb into place, keep one guard bit
+        uint32_t m = mant >> shift;
+        const uint32_t rem = mant & ((1u << shift) - 1u);
+        const uint32_t half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (m & 1u))) ++m;
+        return static_cast<uint16_t>((sign << 15) | m);
+    }
+    return static_cast<uint16_t>(sign << 15);  // underflow -> zero
 }
 
 static inline float fp16_to_fp32(uint16_t h) {
@@ -356,16 +381,33 @@ static void quantize_q4_0_cpu(const float* data, uint8_t* q_data, int n) {
         std::memcpy(q_data + b * 18, &d_fp16, 2);
 
         uint8_t* qs = q_data + b * 18 + 2;
+        // Nibble is UNSIGNED and OFFSET BY 8: value = (nibble - 8) * d.
+        //
+        // This used to store a sign-extended int4 instead, i.e. the raw two's
+        // complement nibble. Both encode the same 16 levels and the same
+        // negative scale, so the quantizer is identical -- but the bytes differ
+        // by exactly 8 on every element, and therefore so does the decode. The
+        // CUDA writers (launch_quantize_q4_0_matrix, quantize_row_q4_0) have
+        // always used the +8 form and every CUDA reader assumed it, so a row
+        // written by this function and read on the GPU came back shifted by 8.
+        // Both forms are now byte-identical, so which writer produced a row no
+        // longer matters.
+        //
+        // The (int)(x + 8.5f) truncation is deliberate and matches the CUDA
+        // writers exactly. Using std::round here instead would disagree at exact
+        // half-integers and break byte-identity again.
         for (int i = 0; i < 16; ++i) {
             int idx0 = start + i;
             int idx1 = start + i + 16;
-            int8_t v0 = (idx0 < end) ? static_cast<int8_t>(std::round(
-                                           std::max(-8.0f, std::min(7.0f, data[idx0] * id))))
-                                     : 0;
-            int8_t v1 = (idx1 < end) ? static_cast<int8_t>(std::round(
-                                           std::max(-8.0f, std::min(7.0f, data[idx1] * id))))
-                                     : 0;
-            qs[i] = (static_cast<uint8_t>(v0) & 0x0F) | ((static_cast<uint8_t>(v1) & 0x0F) << 4);
+            // No out-of-range short circuit: an element past the end of a partial
+            // tail block is encoded as 0.0, which maps to nibble 8 and decodes to
+            // exactly 0. Short-circuiting to nibble 0 would decode to -8*d, and
+            // would also make the tail bytes differ from the CUDA writer's.
+            float x0 = (idx0 < end) ? data[idx0] * id : 0.0f;
+            float x1 = (idx1 < end) ? data[idx1] * id : 0.0f;
+            uint8_t v0 = static_cast<uint8_t>(std::min(15, std::max(0, static_cast<int>(x0 + 8.5f))));
+            uint8_t v1 = static_cast<uint8_t>(std::min(15, std::max(0, static_cast<int>(x1 + 8.5f))));
+            qs[i] = (v0 & 0x0F) | ((v1 & 0x0F) << 4);
         }
     }
 }
@@ -383,12 +425,10 @@ static void dequantize_q4_0_cpu(const uint8_t* q_data, float* out, int n) {
         int start = b * BLOCK;
         for (int i = 0; i < 16; ++i) {
             uint8_t packed = qs[i];
-            int8_t v0 = packed & 0x0F;
-            if (v0 & 0x08)
-                v0 -= 16;
-            int8_t v1 = (packed >> 4) & 0x0F;
-            if (v1 & 0x08)
-                v1 -= 16;
+            // (nibble - 8), NOT sign extension: see the writer for why. These
+            // two differ by 8 on every element.
+            int v0 = static_cast<int>(packed & 0x0F) - 8;
+            int v1 = static_cast<int>((packed >> 4) & 0x0F) - 8;
             int idx0 = start + i;
             int idx1 = start + i + 16;
             if (idx0 < n)
