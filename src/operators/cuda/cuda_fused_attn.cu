@@ -15,15 +15,20 @@
 #include "forge/cuda_kernels.h"
 #include "forge/fp8_utils.h"
 
-// int4 sign extension, matching dequantize_q4_0_cpu() in kv_cache.cpp.
 //
-// The KV cache is written by Forge's own quantize_q4_0_cpu(), which stores a
-// SIGN-EXTENDED int4 (scale is amax / -8, i.e. negative). Reading those bytes as
-// (n & 0xF) - 8 -- the convention GGUF *weights* use, and the one this kernel
-// previously used -- is a different function: it shifts every value by 8 and
-// flips the sign of the upper half, so attention saw corrupted K and V. Output
-// stayed fluent, which is why it never showed up as garbage.
-#define FORGE_SEXT4(n) ((n) >= 8 ? (n) - 16 : (n))
+// q4_0 nibble decode. The nibble is stored UNSIGNED and OFFSET BY 8: both
+// writers this kernel must agree with -- cuda::launch_quantize_q4_0_matrix
+// (contiguous cache) and quantize_row_q4_0 (paged cache) -- encode
+// nibble = clamp(round(x/d) + 8, 0, 15), so the decode is (n & 0xF) - 8.
+//
+// Do not "fix" this to sign-extension. dequantize_q4_0_cpu() in kv_cache.cpp
+// does use a sign-extended int4 with a negative scale, so the CPU and CUDA
+// q4_0 encodings genuinely differ. Reading CUDA-written rows with the CPU
+// convention is wrong by +8 on every element. A test that fills a cache with
+// quantize_row() (the CPU quantizer) and compares against dequantize_q4_0_cpu()
+// will pass a wrong kernel and reject a right one, because it only ever checks
+// CPU-to-CPU self-consistency. See kv-quant-q4-0.md.
+#define FORGE_Q4_0_NIBBLE(n) (((n) & 0x0F) - 8)
 
 namespace forge {
 namespace cuda {
@@ -101,8 +106,8 @@ __global__ void fused_attn_q4_0_decode_kernel(const float* __restrict__ Q,
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
-                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
+                int val_lo = FORGE_Q4_0_NIBBLE(qs[i] & 0x0F);
+                int val_hi = FORGE_Q4_0_NIBBLE((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 dot += s_q[idx_lo] * (val_lo * k_scale);
@@ -130,8 +135,8 @@ __global__ void fused_attn_q4_0_decode_kernel(const float* __restrict__ Q,
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
-                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
+                int val_lo = FORGE_Q4_0_NIBBLE(qs[i] & 0x0F);
+                int val_hi = FORGE_Q4_0_NIBBLE((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 local_acc[idx_lo] = local_acc[idx_lo] * correction + weight * (val_lo * v_scale);
@@ -238,8 +243,8 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
-                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
+                int val_lo = FORGE_Q4_0_NIBBLE(qs[i] & 0x0F);
+                int val_hi = FORGE_Q4_0_NIBBLE((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 dot += s_q[idx_lo] * (val_lo * k_scale);
@@ -267,8 +272,8 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
-                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
+                int val_lo = FORGE_Q4_0_NIBBLE(qs[i] & 0x0F);
+                int val_hi = FORGE_Q4_0_NIBBLE((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 local_acc[idx_lo] = local_acc[idx_lo] * correction + weight * (val_lo * v_scale);

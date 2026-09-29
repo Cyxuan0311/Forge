@@ -70,8 +70,13 @@ struct FmtQ4_0 {
     static constexpr int ELEMS = 32;
     static constexpr int BYTES = 18;
 
-    // int4 sign extension, matching dequantize_q4_0_cpu() in kv_cache.cpp.
-    static __device__ __forceinline__ int sext4(int n) { return n >= 8 ? n - 16 : n; }
+    // Unsigned nibble offset by 8, which is what the writers actually produce:
+    // cuda::launch_quantize_q4_0_matrix and quantize_row_q4_0 both encode
+    // nibble = clamp(round(x/d) + 8, 0, 15). dequantize_q4_0_cpu() uses a
+    // sign-extended int4 instead, so these two conventions are NOT the same
+    // function -- they differ by 8 on every element -- and only the former is
+    // correct for a row the CUDA cache write path produced.
+    static __device__ __forceinline__ int q4_0_nibble(int n) { return (n & 0x0F) - 8; }
 
     static __device__ __forceinline__ void dot_block(const uint8_t* p, const float* q, int off,
                                                      float& acc) {
@@ -81,8 +86,8 @@ struct FmtQ4_0 {
         const uint8_t* qs = p + sizeof(__half);
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            const int lo = sext4(qs[i] & 0x0F);
-            const int hi = sext4((qs[i] >> 4) & 0x0F);
+            const int lo = q4_0_nibble(qs[i] & 0x0F);
+            const int hi = q4_0_nibble((qs[i] >> 4) & 0x0F);
             acc += q[off + i] * (lo * sc);
             acc += q[off + i + 16] * (hi * sc);
         }
@@ -96,8 +101,8 @@ struct FmtQ4_0 {
         const uint8_t* qs = p + sizeof(__half);
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            const int lo = sext4(qs[i] & 0x0F);
-            const int hi = sext4((qs[i] >> 4) & 0x0F);
+            const int lo = q4_0_nibble(qs[i] & 0x0F);
+            const int hi = q4_0_nibble((qs[i] >> 4) & 0x0F);
             acc[off + i] = acc[off + i] * corr + w * (lo * sc);
             acc[off + i + 16] = acc[off + i + 16] * corr + w * (hi * sc);
         }

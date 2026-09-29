@@ -93,6 +93,78 @@ struct Rng {
     }
 };
 
+// Write a row exactly as the CUDA KV cache write path does.
+static void quantize_row_engine(KVCacheDType dt, const float* src, uint8_t* dst, int n) {
+#ifdef USE_CUDA
+    switch (dt) {
+    case KVCacheDType::F16:
+        cuda::launch_quantize_f16_matrix(src, dst, 1, n, 0);
+        return;
+    case KVCacheDType::Q8_0:
+        cuda::launch_quantize_q8_0_matrix(src, dst, 1, n, 0);
+        return;
+    case KVCacheDType::Q4_0:
+        cuda::launch_quantize_q4_0_matrix(src, dst, 1, n, 0);
+        return;
+    default:
+        break;
+    }
+#endif
+    KVCache::quantize_row(dt, src, dst, n);
+}
+
+// Minimal IEEE fp16 -> fp32. Avoids fp16_compat.h, which defines its own __half
+// and collides with CUDA's once cuda_kernels.h is included in the same TU.
+static float fp16_to_float_cpu(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t man = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;  // +/-0
+        } else {
+            int e = -1;
+            uint32_t m = man;
+            do {
+                ++e;
+                m <<= 1;
+            } while ((m & 0x400u) == 0);
+            bits = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (man << 13);  // inf / nan
+    } else {
+        bits = sign | ((exp + (127 - 15)) << 23) | (man << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Read a row back the way the fused kernel does, i.e. the CUDA-side convention.
+// For q4_0 this is unsigned-offset-by-8, which differs from
+// dequantize_q4_0_cpu(); see the note in run_pair().
+static void dequantize_as_engine_reads(KVCacheDType dt, const uint8_t* src, float* out, int n) {
+    if (dt == KVCacheDType::Q4_0) {
+        const int nb = (n + 31) / 32;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* bp = src + b * 18;
+            float d;
+            d = fp16_to_float_cpu(*reinterpret_cast<const uint16_t*>(bp));
+            const uint8_t* qs = bp + 2;
+            const int start = b * 32, end = std::min(start + 32, n);
+            for (int i = 0; i < 16; ++i) {
+                const int i0 = start + i, i1 = start + i + 16;
+                if (i0 < end) out[i0] = static_cast<float>((qs[i] & 0x0F) - 8) * d;
+                if (i1 < end) out[i1] = static_cast<float>((qs[i] >> 4) - 8) * d;
+            }
+        }
+        return;
+    }
+    KVCache::dequantize_row(dt, src, out, n);
+}
+
 static bool run_pair(KVCacheDType tk, KVCacheDType tv, int head_dim, int num_kv_heads, int num_heads,
                      int kv_len, bool* launched, float* max_err) {
     const int kv_dim = num_kv_heads * head_dim;
@@ -113,25 +185,36 @@ static bool run_pair(KVCacheDType tk, KVCacheDType tv, int head_dim, int num_kv_
     const size_t k_stride = KVCache::block_nbytes(tk, kv_dim);
     const size_t v_stride = KVCache::block_nbytes(tv, kv_dim);
     std::vector<uint8_t> kq(blocks * k_stride), vq(blocks * v_stride);
+    // Quantize with the WRITER THE ENGINE ACTUALLY USES.
+    //
+    // KVCache::quantize_row() dispatches to the CPU quantizer, but on a CUDA
+    // layer the cache is written by cuda::launch_quantize_*_matrix. Those two
+    // disagree for q4_0: the CPU path stores a sign-extended int4, the CUDA path
+    // stores an unsigned nibble offset by 8. The first version of this test used
+    // only the CPU pair, so it checked CPU-writer against CPU-reader and passed
+    // a kernel that was wrong for every row the engine ever wrote -- which is
+    // how a "pre-existing bug" fix ended up breaking q4_0 KV outright (answer
+    // accuracy fell from 10/16 to 4/16 end to end).
+    //
+    // So: write with the device writer, and read the reference back through the
+    // same decode the kernel performs. That makes the test sensitive to the
+    // writer/reader agreement that actually matters, instead of to the
+    // self-consistency of a path the engine does not take.
     for (int r = 0; r < blocks; ++r) {
-        KVCache::quantize_row(tk, kf.data() + static_cast<size_t>(r) * kv_dim,
-                              kq.data() + static_cast<size_t>(r) * k_stride,
-                              kv_dim);
-        KVCache::quantize_row(tv, vf.data() + static_cast<size_t>(r) * kv_dim,
-                              vq.data() + static_cast<size_t>(r) * v_stride,
-                              kv_dim);
+        quantize_row_engine(tk, kf.data() + static_cast<size_t>(r) * kv_dim,
+                            kq.data() + static_cast<size_t>(r) * k_stride, kv_dim);
+        quantize_row_engine(tv, vf.data() + static_cast<size_t>(r) * kv_dim,
+                            vq.data() + static_cast<size_t>(r) * v_stride, kv_dim);
     }
     // The reference must see what the KERNEL sees, i.e. the dequantized values.
     std::vector<std::vector<float>> k_rows(kv_len), v_rows(kv_len);
     for (int j = 0; j < kv_len; ++j) {
         k_rows[j].resize(kv_dim);
         v_rows[j].resize(kv_dim);
-        KVCache::dequantize_row(
-            tk, kq.data() + static_cast<size_t>(j) * k_stride,
-            k_rows[j].data(), kv_dim);
-        KVCache::dequantize_row(
-            tv, vq.data() + static_cast<size_t>(j) * v_stride,
-            v_rows[j].data(), kv_dim);
+        dequantize_as_engine_reads(tk, kq.data() + static_cast<size_t>(j) * k_stride,
+                                   k_rows[j].data(), kv_dim);
+        dequantize_as_engine_reads(tv, vq.data() + static_cast<size_t>(j) * v_stride,
+                                   v_rows[j].data(), kv_dim);
     }
 
     std::vector<float> q(static_cast<size_t>(num_heads) * head_dim);
@@ -196,17 +279,17 @@ static bool run_monomorphic(KVCacheDType dt, int head_dim, int num_kv_heads, int
     std::vector<uint8_t> kq(blocks * stride), vq(blocks * stride);
     std::vector<std::vector<float>> k_rows(kv_len), v_rows(kv_len);
     for (int r = 0; r < blocks; ++r) {
-        KVCache::quantize_row(dt, kf.data() + static_cast<size_t>(r) * kv_dim,
+        quantize_row_engine(dt, kf.data() + static_cast<size_t>(r) * kv_dim,
                               kq.data() + static_cast<size_t>(r) * stride, kv_dim);
-        KVCache::quantize_row(dt, vf.data() + static_cast<size_t>(r) * kv_dim,
+        quantize_row_engine(dt, vf.data() + static_cast<size_t>(r) * kv_dim,
                               vq.data() + static_cast<size_t>(r) * stride, kv_dim);
     }
     for (int j = 0; j < kv_len; ++j) {
         k_rows[j].resize(kv_dim);
         v_rows[j].resize(kv_dim);
-        KVCache::dequantize_row(dt, kq.data() + static_cast<size_t>(j) * stride, k_rows[j].data(),
+        dequantize_as_engine_reads(dt, kq.data() + static_cast<size_t>(j) * stride, k_rows[j].data(),
                                 kv_dim);
-        KVCache::dequantize_row(dt, vq.data() + static_cast<size_t>(j) * stride, v_rows[j].data(),
+        dequantize_as_engine_reads(dt, vq.data() + static_cast<size_t>(j) * stride, v_rows[j].data(),
                                 kv_dim);
     }
     std::vector<float> q(static_cast<size_t>(num_heads) * head_dim);
@@ -247,6 +330,30 @@ static bool run_monomorphic(KVCacheDType dt, int head_dim, int num_kv_heads, int
 }
 
 static void test_pair(const char* name, KVCacheDType tk, KVCacheDType tv, int head_dim) {
+    char msg[160];
+    // Sweep the GQA geometry as well as the dtype pair. num_kv_heads == num_heads
+    // means kv_groups == 1, i.e. every head maps to its own KV head, and that is
+    // a different k_head/v_head offset path than the grouped case. The first
+    // version of this test only ever used num_kv_heads = 2, so the MHA case was
+    // never checked -- and it is the geometry MiniCPM5-2B actually uses, where
+    // the kernel produced garbage that this test could not see.
+    for (auto geom : {std::make_pair(2, 16), std::make_pair(16, 16), std::make_pair(4, 16)}) {
+        const int nkv = geom.first, nh = geom.second;
+        bool launched = false;
+        float err = 0.0f;
+        const bool ran = run_pair(tk, tv, head_dim, nkv, nh, 37, &launched, &err);
+        std::snprintf(msg, sizeof(msg), "%s head_dim=%d heads=%d kv_heads=%d runs", name, head_dim,
+                      nh, nkv);
+        CHECK(ran && launched, msg);
+        if (!ran || !launched) continue;
+        const bool ok = err < 2e-2f;
+        std::snprintf(msg, sizeof(msg), "%s head_dim=%d heads=%d kv_heads=%d matches CPU (%.2e)",
+                      name, head_dim, nh, nkv, err);
+        CHECK(ok, msg);
+    }
+}
+
+static void test_pair_old(const char* name, KVCacheDType tk, KVCacheDType tv, int head_dim) {
     bool launched = false;
     float err = 0.0f;
     const bool ran = run_pair(tk, tv, head_dim, 2, 16, 37, &launched, &err);
