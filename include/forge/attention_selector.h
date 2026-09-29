@@ -51,6 +51,10 @@ enum class AttentionPath {
     CUDA_FUSED_Q8_0_DECODE,      // CUDA GQA decode with Q8_0 KV
     CUDA_FUSED_FP8_E4M3_DECODE,  // CUDA GQA decode with FP8 E4M3 KV
     CUDA_FUSED_FP8_E5M2_DECODE,  // CUDA GQA decode with FP8 E5M2 KV
+    // K and V in DIFFERENT formats (-ctk/-ctv), read straight from the cache
+    // with independent row sizes. Replaces the FP32 materialisation fallback
+    // that an asymmetric pair used to land in.
+    CUDA_FUSED_MIXED_DECODE,
 
     // CUDA fused quantized prefill (Phase 2-B): KV stays in its quantized form
     // and is dequantized on the fly inside the kernel. Long-context win = no

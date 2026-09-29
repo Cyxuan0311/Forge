@@ -700,6 +700,19 @@ void launch_fused_flash_attention_gqa_decode_q8_0(const float* Q, const void* q_
                                                   const float* mask_row = nullptr,
                                                   cudaStream_t stream = 0);
 
+// Mixed-dtype fused GQA decode: K and V may be stored in different formats with
+// independent row sizes. k_fmt / v_fmt are 0 = q8_0, 1 = q4_0, 2 = f16.
+//
+// Returns false for an unsupported (head_dim, format) combination; the caller
+// must then fall back to the materialising path and say so, never silently.
+bool launch_fused_flash_attention_gqa_decode_mixed(const float* Q, const void* q_K, const void* q_V,
+                                                   float* O, int kv_len, int num_heads,
+                                                   int num_kv_heads, int head_dim,
+                                                   size_t k_row_size, size_t v_row_size,
+                                                   int k_fmt, int v_fmt,
+                                                   const float* mask_row = nullptr,
+                                                   cudaStream_t stream = 0);
+
 // FP8 fused GQA decode (online dequant). q_K/q_V point at the quantized cache.
 void launch_fused_flash_attention_gqa_decode_fp8_e4m3(
     const float* Q, const void* q_K, const void* q_V, float* O, int kv_len, int num_heads,

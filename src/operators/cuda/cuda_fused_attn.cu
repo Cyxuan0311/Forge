@@ -15,6 +15,16 @@
 #include "forge/cuda_kernels.h"
 #include "forge/fp8_utils.h"
 
+// int4 sign extension, matching dequantize_q4_0_cpu() in kv_cache.cpp.
+//
+// The KV cache is written by Forge's own quantize_q4_0_cpu(), which stores a
+// SIGN-EXTENDED int4 (scale is amax / -8, i.e. negative). Reading those bytes as
+// (n & 0xF) - 8 -- the convention GGUF *weights* use, and the one this kernel
+// previously used -- is a different function: it shifts every value by 8 and
+// flips the sign of the upper half, so attention saw corrupted K and V. Output
+// stayed fluent, which is why it never showed up as garbage.
+#define FORGE_SEXT4(n) ((n) >= 8 ? (n) - 16 : (n))
+
 namespace forge {
 namespace cuda {
 
@@ -91,8 +101,8 @@ __global__ void fused_attn_q4_0_decode_kernel(const float* __restrict__ Q,
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = (qs[i] & 0x0F) - 8;
-                int val_hi = ((qs[i] >> 4) & 0x0F) - 8;
+                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
+                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 dot += s_q[idx_lo] * (val_lo * k_scale);
@@ -120,8 +130,8 @@ __global__ void fused_attn_q4_0_decode_kernel(const float* __restrict__ Q,
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = (qs[i] & 0x0F) - 8;
-                int val_hi = ((qs[i] >> 4) & 0x0F) - 8;
+                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
+                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 local_acc[idx_lo] = local_acc[idx_lo] * correction + weight * (val_lo * v_scale);
@@ -228,8 +238,8 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = (qs[i] & 0x0F) - 8;
-                int val_hi = ((qs[i] >> 4) & 0x0F) - 8;
+                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
+                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 dot += s_q[idx_lo] * (val_lo * k_scale);
@@ -257,8 +267,8 @@ __global__ void fused_attn_q4_0_decode_large_online_kernel(
 
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                int val_lo = (qs[i] & 0x0F) - 8;
-                int val_hi = ((qs[i] >> 4) & 0x0F) - 8;
+                int val_lo = FORGE_SEXT4(qs[i] & 0x0F);
+                int val_hi = FORGE_SEXT4((qs[i] >> 4) & 0x0F);
                 int idx_lo = bi * 32 + i;
                 int idx_hi = bi * 32 + i + 16;
                 local_acc[idx_lo] = local_acc[idx_lo] * correction + weight * (val_lo * v_scale);

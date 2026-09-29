@@ -68,6 +68,26 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
                 break;  // Unsupported symmetric type → FP32 fallback
             }
         }
+        // Asymmetric K/V (-ctk/-ctv). The mixed kernel is templated on the pair,
+        // so it handles the symmetric cases too -- but the symmetric ones keep
+        // their existing dedicated paths so a refactor here cannot perturb the
+        // well-tuned f16 / q8_0 / q4_0 decode throughput.
+        if (p.has_quantized_kv && p.kv_type_k != p.kv_type_v) {
+            const auto fmt = [](KVCacheDType d) {
+                switch (d) {
+                case KVCacheDType::Q8_0: return 0;
+                case KVCacheDType::Q4_0: return 1;
+                case KVCacheDType::F16:  return 2;
+                default: return -1;
+                }
+            };
+            // The kernel covers head_dim 64/96/128 and the {q8_0,q4_0,f16}
+            // formats; anything else must fall through to materialisation.
+            const bool hd_ok = p.head_dim == 64 || p.head_dim == 96 || p.head_dim == 128;
+            if (hd_ok && fmt(p.kv_type_k) >= 0 && fmt(p.kv_type_v) >= 0) {
+                return AttentionPath::CUDA_FUSED_MIXED_DECODE;
+            }
+        }
         if (p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
             switch (p.kv_type_k) {
             case KVCacheDType::Q4_0:
@@ -100,10 +120,11 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
             if (!warned_mixed) {
                 warned_mixed = true;
                 std::fprintf(stderr,
-                             "[Forge WARN] asymmetric KV cache (K=%s, V=%s): no fused mixed-dtype "
-                             "attention kernel yet, falling back to FP32 materialization of the "
-                             "filled rows. Output is correct; throughput is not optimal.\n",
-                             kv_cache_dtype_name(p.kv_type_k), kv_cache_dtype_name(p.kv_type_v));
+                             "[Forge WARN] asymmetric KV cache (K=%s, V=%s) with head_dim=%d: no "
+                             "fused mixed-dtype kernel for this combination, falling back to FP32 "
+                             "materialization. Output is correct; throughput is not optimal.\n",
+                             kv_cache_dtype_name(p.kv_type_k), kv_cache_dtype_name(p.kv_type_v),
+                             p.head_dim);
             }
         }
         return AttentionPath::CUDA_FP32_DECODE;

@@ -9,6 +9,7 @@
 #include "forge/attention_selector.h"
 #include "forge/cuda_kernels.h"
 #include "forge/dtype_contract.h"
+#include "forge/kv_cache_dtype.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 
@@ -990,6 +991,50 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
             total_len, num_heads, num_kv_heads, head_dim, mask, true);
 #endif
         break;
+
+    case AttentionPath::CUDA_FUSED_MIXED_DECODE: {
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        {
+            void* d_q_K = kv_cache_.d_q_key_cache(layer_idx);
+            void* d_q_V = kv_cache_.d_q_value_cache(layer_idx);
+            // Independent row sizes: the two sides are stored at different
+            // precisions, so a shared row size would mis-stride one of them.
+            const auto& kv_cfg = kv_cache_.kv_config();
+            const int kv_dim = num_kv_heads * head_dim;
+            const size_t k_row_size = KVCache::block_nbytes(kv_cfg.type_k, kv_dim);
+            const size_t v_row_size = KVCache::block_nbytes(kv_cfg.type_v, kv_dim);
+            const auto fmt = [](KVCacheDType d) {
+                switch (d) {
+                case KVCacheDType::Q8_0: return 0;
+                case KVCacheDType::Q4_0: return 1;
+                case KVCacheDType::F16:  return 2;
+                default: return -1;
+                }
+            };
+            const bool ok = cuda::launch_fused_flash_attention_gqa_decode_mixed(
+                static_cast<const float*>(q->data()), d_q_K, d_q_V,
+                static_cast<float*>(attn_out->data()), total_len, num_heads, num_kv_heads, head_dim,
+                k_row_size, v_row_size, fmt(kv_cfg.type_k), fmt(kv_cfg.type_v), mask_row, 0);
+            // The selector already gated on this, so a false here means the two
+            // disagree. Fail loudly rather than emit an uninitialised output.
+            if (!ok) {
+                throw std::runtime_error(
+                    std::string("fused mixed-dtype attention: launcher refused the requested "
+                                "combination (K=") +
+                    kv_cache_dtype_name(kv_cfg.type_k) + ", V=" +
+                    kv_cache_dtype_name(kv_cfg.type_v) +
+                    ", head_dim=" + std::to_string(head_dim) + ")");
+            }
+        }
+#else
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, kv_cache_.get_key_filled(layer_idx), kv_cache_.get_value_filled(layer_idx), seq_len,
+            total_len, num_heads, num_kv_heads, head_dim, mask, true);
+#endif
+        break;
+    }
 
     case AttentionPath::CUDA_FUSED_FP8_E4M3_DECODE:
 #ifdef USE_CUDA

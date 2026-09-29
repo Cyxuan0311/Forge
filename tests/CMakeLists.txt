@@ -78,6 +78,14 @@ add_executable(forge-args-test test_args.cpp)
 forge_link_native(forge-args-test)
 add_test(NAME args COMMAND forge-args-test)
 
+# Mixed-dtype fused attention (-ctk/-ctv): every (K,V) format pair the selector
+# can route to the mixed kernel, checked against a CPU FP32 reference computed
+# from the dequantized rows. Guards the per-head byte offsets (the two sides
+# have different block geometries) and the q4_0 nibble convention. Needs CUDA.
+add_executable(forge-mixed-attn-test test_mixed_attn.cpp)
+forge_link_native(forge-mixed-attn-test)
+add_test(NAME mixed-attn COMMAND forge-mixed-attn-test)
+
 # Speculative decoding (Phase 1): draft-token verification, batched forward
 # parity, and greedy end-to-end parity. Needs tinyllama gguf; skipped gracefully
 # when the fixture is absent.
