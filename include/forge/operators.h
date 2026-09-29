@@ -2,6 +2,7 @@
 
 #include "operator_activation.h"
 #include "operator_attention.h"
+#include "operator_attn_rot.h"
 #include "operator_elementwise.h"
 #include "operator_embedding.h"
 #include "operator_matmul.h"

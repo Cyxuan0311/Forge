@@ -283,6 +283,7 @@ add_library(
   src/inference/engines/generic_engine.cpp
   src/inference/layers/norm_executor.cpp
   src/inference/layers/rope_executor.cpp
+  src/inference/layers/attn_rot_executor.cpp
   src/inference/layers/attention_selector.cpp
   src/inference/layers/attention_executor.cpp
   src/inference/layers/ffn_executor.cpp

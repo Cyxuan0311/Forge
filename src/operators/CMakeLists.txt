@@ -45,6 +45,7 @@ if(CUDAToolkit_FOUND)
             cuda/cuda_quant.cu
             cuda/cuda_gemm.cu
             cuda/cuda_fused_attn.cu
+            cuda/cuda_attn_rot.cu
             cuda/cuda_fused_attn_mixed.cu
             cuda/cuda_tiled_prefill.cu
             cuda/cuda_paged_kv.cu

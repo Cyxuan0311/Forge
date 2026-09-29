@@ -86,6 +86,12 @@ add_executable(forge-mixed-attn-test test_mixed_attn.cpp)
 forge_link_native(forge-mixed-attn-test)
 add_test(NAME mixed-attn COMMAND forge-mixed-attn-test)
 
+# Hadamard activation rotation (Phase 5): orthonormality, self-inverse,
+# dot-product preservation, and the full attention identity on CPU and CUDA.
+add_executable(forge-attn-rot-test test_attn_rot.cpp)
+forge_link_native(forge-attn-rot-test)
+add_test(NAME attn-rot COMMAND forge-attn-rot-test)
+
 # Speculative decoding (Phase 1): draft-token verification, batched forward
 # parity, and greedy end-to-end parity. Needs tinyllama gguf; skipped gracefully
 # when the fixture is absent.
