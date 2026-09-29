@@ -97,30 +97,37 @@ unless the context simply does not fit.
   path here) store V inside the K tensor, so `type_k` and `type_v` must match.
   Asymmetric is rejected for those.
 
-## Current throughput ceiling
+## Throughput
 
-All fused quantized attention kernels are monomorphic: one row size, one block
-layout, one dtype for both K and V. An asymmetric pair therefore has no fused
-kernel and falls back to materialising the filled rows to FP32 before the
-attention. The result is **correct** — only rows `[dequantized_filled, filled)`
-are re-materialised — but it costs memory traffic, and it is measurably noisier:
-
-```
-MiniCPM5-2B, -c 16384, ~1.5k-token prompt, 120 generated tokens, 3 runs
--ctk q8_0 -ctv q8_0   22.9 / 22.7 / 22.7 tok/s   (fused)
--ctk q8_0 -ctv q4_0   21.6 / 26.1 / 21.2 tok/s   (materialise fallback)
-```
-
-Comparable median, wider spread. Forge prints a one-line warning when this path is
-taken so it is never mistaken for a regression:
+Asymmetric pairs run a fused mixed-dtype kernel: K and V are templated
+independently, each with its own block geometry and its own row size, so the head
+slice is read at the right offset on each side. Pairs outside `head_dim ∈
+{64, 96, 128}` and the `{q8_0, q4_0, f16}` formats are refused by the launcher
+and fall back to materialisation, with a warning — never silently.
 
 ```
-[Forge WARN] asymmetric KV cache (K=q8_0, V=q4_0): no fused mixed-dtype
-attention kernel yet, falling back to FP32 materialization of the filled rows.
+MiniCPM5-2B, -c 16384, ~1.5k-token prompt, 120 generated tokens, 5 runs each
+-ctk q8_0 -ctv q8_0   median 22.6 tok/s   spread 1%    (symmetric, unchanged)
+-ctk q8_0 -ctv q4_0   median 21.2 tok/s   spread 1%
+-ctk f16  -ctv q4_0   median 20.4 tok/s
 ```
 
-Mixed-dtype fused kernels (`<TypeK, TypeV>` with independent row sizes) are the
-follow-up that removes this branch.
+Two things to be clear about:
+
+- **Asymmetric is not faster.** It is ~6% slower than the symmetric fused path at
+  equal configuration. The q4_0 unpacking costs more ALU than the 40% smaller V
+  rows save in a launch-bound decode. Choose `q8_0/q4_0` for **memory**, not speed.
+- The win is over the old behaviour. An asymmetric pair used to have no fused
+  kernel at all and fell back to materialising the filled rows to FP32, which
+  measured 21.2–26.1 tok/s across runs. The mixed kernel holds 1% spread. So it
+  buys stability and the memory saving, not throughput.
+
+Note also that generated-text hashes are **not** a valid regression signal for
+any of this: greedy decoding on this GPU path is not bit-reproducible run to run
+(the same binary and flags produce different output across runs). Correctness of
+the kernels is verified numerically instead — `forge-mixed-attn-test` fills a real
+KV cache through the same `quantize_row()` the engine uses and compares against
+attention computed on the CPU from the dequantized rows.
 
 ## What is not implemented yet
 
@@ -143,3 +150,18 @@ attention: roughly 2–3% on prefill and 7–12% on decode.
 Forge does not do this yet, so the aggressive settings above should be treated as
 memory-first, quality-second. `q8_0` on K is the conservative choice and is
 where most of the win is anyway.
+
+## A note on verifying changes here
+
+Do not validate KV-quantization work by diffing generated text against a previous
+build. Greedy decoding on this GPU path is not bit-reproducible run to run, so
+such a diff measures noise. Use `forge-mixed-attn-test`, which checks each kernel
+numerically against a CPU reference built from the dequantized rows. That is what
+caught the q4_0 convention bug below.
+
+`q4_0` deserves a specific warning: Forge's own `quantize_q4_0_cpu()` stores a
+sign-extended int4 with a negative scale, which is **not** the convention GGUF
+*weights* use (`(nibble & 0xF) - 8` with a positive scale). Reading q4_0 KV with
+the weights convention shifts every value by 8 and flips the sign of half the
+range, while still producing fluent text. The KV kernels were doing that until
+they were fixed; any new q4_0 reader must use `FORGE_SEXT4`.
