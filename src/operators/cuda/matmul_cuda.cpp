@@ -484,6 +484,18 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
         return;
     }
 
+    // FP16 weight (F16 GGUF) meeting the FP32 activation chain: mirror the BF16
+    // mixed path -- narrow the activation to FP16 scratch and run a Tensor Core
+    // GEMM with FP32 accumulate and FP32 out. Without this the call falls to
+    // gemv_dispatch_row, which has no FP16 kernel registered and fails loudly.
+    if (b->dtype() == DataType::FP16 && a->dtype() == DataType::FP32 &&
+        out->dtype() == DataType::FP32) {
+        cuda::launch_cublas_gemm_fp16_fp32(static_cast<const float*>(a->data()), b->data(),
+                                          static_cast<float*>(out->data()), M, K, N,
+                                          /*transB=*/true, stream);
+        return;
+    }
+
     // Phase 6-A-5: native FP16 storage -> FP16 storage GEMM (FP32 accumulate).
     // Triggered only when A and B are both FP16; the op allocates an FP16 out for
     // this branch. Everything else (FP32 / quantized) keeps the existing path, so

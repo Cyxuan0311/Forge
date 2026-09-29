@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../core/platform.h"
+#include "forge/fp16_compat.h"
 #include "forge/logger.h"
 
 #ifdef USE_CUDA
@@ -520,6 +521,23 @@ TensorPtr GgufModel::get_tensor(const std::string& name, DeviceType device) cons
             // BF16 -> FP32: shift the 16-bit value to the upper 16 bits of a 32-bit float
             uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
             std::memcpy(fp32_data + i, &bits, sizeof(float));
+        }
+        return tensor;
+    }
+
+    // FP16 follows the same CPU-only expansion policy as BF16 above: CPU
+    // kernels and the embedding row lookups read weights as float, and a
+    // zero-copy native-FP16 tensor would be silently misread there. CUDA keeps
+    // the native form (embedding/matmul have FP16-aware kernels).
+    if (lt.dtype == DataType::FP16 && device == DeviceType::CPU) {
+        int64_t numel = 1;
+        for (auto d : lt.shape) numel *= d;
+        auto tensor = std::make_shared<Tensor>(DataType::FP32, lt.shape, DeviceType::CPU);
+        const uint16_t* f16_data = static_cast<const uint16_t*>(src);
+        float* fp32_data = static_cast<float*>(tensor->data());
+        for (int64_t i = 0; i < numel; ++i) {
+            fp32_data[i] =
+                fp16_detail::float_from_bits(fp16_detail::half_to_float_bits(f16_data[i]));
         }
         return tensor;
     }

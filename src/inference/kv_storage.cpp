@@ -641,7 +641,7 @@ bool PagedKVStorage::write_kv_seq(int layer, int seq_id, int64_t pos, int seq_le
         size_t v_row_bytes = KVCache::block_nbytes(kv_config_.type_v, kv_dim);
         cuda::launch_kv_scatter(k_data, v_data, d_key_page_ptrs_[layer], d_value_page_ptrs_[layer],
                                 d_page_ids, seq_len, pos, page_size_, kv_dim, k_row_bytes,
-                                v_row_bytes, kv_config_.type_k, 0);
+                                v_row_bytes, kv_config_.type_k, kv_config_.type_v, 0);
 
         // Update host-side page metadata (filled cursor). The kernel wrote the
         // device data; we only track how full each touched page is.
@@ -855,6 +855,16 @@ TensorPtr PagedKVStorage::read_key_seq(int layer, int seq_id) const {
     if (logical_len == 0)
         return nullptr;
 
+    // Host-side materialisation is only possible when the page data actually
+    // lives on the host. For a CUDA-backed paged pool, q_row()/fp32_row() return
+    // DEVICE pointers, and dequantize_row() below is a host function: it would
+    // dereference device memory on the CPU and segfault. The rest of this class
+    // already documents that CUDA paged storage cannot materialise rows
+    // (read_key*/read_value* return null by design) -- this returns null so that
+    // contract is actually honoured, and the caller picks a paged kernel or
+    // reports that the combination is unsupported, instead of crashing.
+    if (device_ == DeviceType::CUDA) return nullptr;
+
     int kv_dim = (layer < (int)kv_dims_.size()) ? kv_dims_[layer] : kv_dims_[0];
     auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{logical_len, kv_dim},
                                         DeviceType::CPU);
@@ -895,6 +905,16 @@ TensorPtr PagedKVStorage::read_value_seq(int layer, int seq_id) const {
     int logical_len = (int)table.logical_len;
     if (logical_len == 0)
         return nullptr;
+
+    // Host-side materialisation is only possible when the page data actually
+    // lives on the host. For a CUDA-backed paged pool, q_row()/fp32_row() return
+    // DEVICE pointers, and dequantize_row() below is a host function: it would
+    // dereference device memory on the CPU and segfault. The rest of this class
+    // already documents that CUDA paged storage cannot materialise rows
+    // (read_key*/read_value* return null by design) -- this returns null so that
+    // contract is actually honoured, and the caller picks a paged kernel or
+    // reports that the combination is unsupported, instead of crashing.
+    if (device_ == DeviceType::CUDA) return nullptr;
 
     int kv_dim = (layer < (int)kv_dims_.size()) ? kv_dims_[layer] : kv_dims_[0];
     auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{logical_len, kv_dim},

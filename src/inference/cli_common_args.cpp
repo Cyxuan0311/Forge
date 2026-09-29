@@ -310,7 +310,10 @@ bool apply_common_args(const CommonArgs& a, Model* model, InferenceContext& ctx,
 
     if (!a.gpu_layers_per_dev.empty()) {
         engine->set_gpu_layers(a.n_gpu_layers, a.gpu_layers_per_dev);
-    } else if (a.n_gpu_layers != 0) {
+    } else {
+        // n_gpu_layers == 0 (CPU-only) must reach the engine too: skipping it
+        // left gpu_layers_ at the -1 (auto) default, so the engine targeted CUDA
+        // for execution while the weights were loaded on CPU.
         engine->set_gpu_layers(a.n_gpu_layers);
     }
 

@@ -133,6 +133,16 @@ void launch_multiply_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_b
 void launch_embedding_fp32(const float* weight, const int32_t* indices, float* out, int num_indices,
                            int embed_dim, int vocab_size, bool transposed, cudaStream_t stream = 0);
 
+// Native FP16/BF16 weight table row-gather (out is always FP32). GGUF F16/BF16
+// models keep token_embd in the 2-byte format; reading those bytes as float
+// silently produces garbage (every second element lands on a real row start).
+void launch_embedding_fp16(const void* weight, const int32_t* indices, float* out, int num_indices,
+                           int embed_dim, int vocab_size, bool transposed = false,
+                           cudaStream_t stream = 0);
+void launch_embedding_bf16(const void* weight, const int32_t* indices, float* out, int num_indices,
+                           int embed_dim, int vocab_size, bool transposed = false,
+                           cudaStream_t stream = 0);
+
 void launch_embedding_q4_0(const void* q_weight, const int32_t* indices, float* out,
                            int num_indices, int embed_dim, int vocab_size, bool transposed = false,
                            cudaStream_t stream = 0);
@@ -792,6 +802,9 @@ FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp8_e5m2);
 //   k_page_ptrs/v_page_ptrs: device array of page base pointers (per layer)
 //   page_ids:          device array, logical page idx -> physical page id
 //   k_row_bytes/v_row_bytes: bytes per K/V row (kv_dim * dtype element size)
+//   type_k/type_v: cache dtype per side. Separate because -ctk/-ctv allow an
+//                  asymmetric pair; passing one dtype for both wrote V with K's
+//                  block layout into storage sized for V's.
 //
 // launch_paged_flash_attention_gqa_decode_*: paged decode (seq_len==1)
 //   Q:                 device FP32 query, [num_heads, head_dim]
@@ -802,7 +815,7 @@ FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp8_e5m2);
 void launch_kv_scatter(const float* k_src, const float* v_src, void* const* k_page_ptrs,
                        void* const* v_page_ptrs, const int32_t* page_ids, int n_tokens, int64_t pos,
                        int page_size, int kv_dim, size_t k_row_bytes, size_t v_row_bytes,
-                       KVCacheDType dtype, cudaStream_t stream = 0);
+                       KVCacheDType type_k, KVCacheDType type_v, cudaStream_t stream = 0);
 
 void launch_paged_flash_attention_gqa_decode_q4_0(
     const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs, const int32_t* page_ids,

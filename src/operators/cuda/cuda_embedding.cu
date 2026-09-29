@@ -33,6 +33,69 @@ void launch_embedding_fp32(const float* weight, const int32_t* indices, float* o
                                                      vocab_size, transposed);
 }
 
+// ---- FP16 / BF16 Embedding ----
+// Native half-precision weight rows gathered straight from the table; out is
+// always FP32. Without these the caller would misread the 2-byte weights as
+// float (only every other element lands on a real row start).
+
+__global__ void embedding_fp16_kernel(const __half* weight, const int32_t* indices, float* out,
+                                      int num_indices, int embed_dim, int vocab_size,
+                                      bool transposed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int token_idx = idx / embed_dim;
+    int dim_idx = idx % embed_dim;
+
+    if (token_idx < num_indices) {
+        int vocab_idx = indices[token_idx];
+        if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+            out[idx] = 0.0f;
+        } else if (transposed) {
+            out[idx] = __half2float(weight[dim_idx * vocab_size + vocab_idx]);
+        } else {
+            out[idx] = __half2float(weight[vocab_idx * embed_dim + dim_idx]);
+        }
+    }
+}
+
+void launch_embedding_fp16(const void* weight, const int32_t* indices, float* out, int num_indices,
+                           int embed_dim, int vocab_size, bool transposed, cudaStream_t stream) {
+    int total = num_indices * embed_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    embedding_fp16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(weight), indices, out, num_indices, embed_dim, vocab_size,
+        transposed);
+}
+
+__global__ void embedding_bf16_kernel(const __nv_bfloat16* weight, const int32_t* indices,
+                                      float* out, int num_indices, int embed_dim, int vocab_size,
+                                      bool transposed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int token_idx = idx / embed_dim;
+    int dim_idx = idx % embed_dim;
+
+    if (token_idx < num_indices) {
+        int vocab_idx = indices[token_idx];
+        if (vocab_idx < 0 || vocab_idx >= vocab_size) {
+            out[idx] = 0.0f;
+        } else if (transposed) {
+            out[idx] = __bfloat162float(weight[dim_idx * vocab_size + vocab_idx]);
+        } else {
+            out[idx] = __bfloat162float(weight[vocab_idx * embed_dim + dim_idx]);
+        }
+    }
+}
+
+void launch_embedding_bf16(const void* weight, const int32_t* indices, float* out, int num_indices,
+                           int embed_dim, int vocab_size, bool transposed, cudaStream_t stream) {
+    int total = num_indices * embed_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    embedding_bf16_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(weight), indices, out, num_indices, embed_dim, vocab_size,
+        transposed);
+}
+
 // ---- Q4_0 Embedding ----
 
 __global__ void embedding_q4_0_kernel(const uint8_t* q_weight, const int32_t* indices, float* out,

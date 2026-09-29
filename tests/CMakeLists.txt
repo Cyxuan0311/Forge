@@ -86,6 +86,12 @@ add_executable(forge-mixed-attn-test test_mixed_attn.cpp)
 forge_link_native(forge-mixed-attn-test)
 add_test(NAME mixed-attn COMMAND forge-mixed-attn-test)
 
+# Paged KV device write/read agreement. Splits the paged q4_0 wrong-answer bug
+# between the writer and the reader by driving the real device code.
+add_executable(forge-paged-kv-numerics-test test_paged_kv_numerics.cpp)
+forge_link_native(forge-paged-kv-numerics-test)
+add_test(NAME paged-kv-numerics COMMAND forge-paged-kv-numerics-test)
+
 # q4_0 encoding agreement between the CPU and CUDA KV paths. These were two
 # different encodings differing by 8 per element, and the bad commit that
 # "unified" them the wrong way passed a CPU-only test.

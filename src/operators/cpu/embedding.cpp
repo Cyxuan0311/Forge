@@ -559,6 +559,16 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                     out->zero_();
                 }
             }
+        } else if (weight->dtype() == DataType::FP16) {
+            cuda::launch_embedding_fp16(weight->data(),
+                                        static_cast<const int32_t*>(indices->data()),
+                                        static_cast<float*>(out->data()), num_indices, embed_dim,
+                                        vocab_size, transposed);
+        } else if (weight->dtype() == DataType::BF16) {
+            cuda::launch_embedding_bf16(weight->data(),
+                                        static_cast<const int32_t*>(indices->data()),
+                                        static_cast<float*>(out->data()), num_indices, embed_dim,
+                                        vocab_size, transposed);
         } else {
             cuda::launch_embedding_fp32(static_cast<const float*>(weight->data()),
                                         static_cast<const int32_t*>(indices->data()),

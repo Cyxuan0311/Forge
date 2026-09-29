@@ -222,7 +222,14 @@ __device__ __forceinline__ void quantize_row_q4_0(const float* __restrict__ src,
 // kv_dim:     elements per K/V row (= num_kv_heads * head_dim).
 // =========================================================================
 
-template <typename RowFn>  // RowFn: void(const float* src, uint8_t* dst, int n)
+// KRowFn / VRowFn: void(const float* src, uint8_t* dst, int n).
+// They are separate template parameters because K and V can have
+// different cache dtypes (-ctk/-ctv). They used to be one RowFn applied to both,
+// while the caller passed v_row_bytes sized for V's dtype: for an asymmetric
+// config the V rows were written with K's block layout into storage sized for
+// V's, running off the end of the page. --paged-kv -ctk q8_0 -ctv q4_0 segfaulted
+// 3 times out of 3.
+template <typename KRowFn, typename VRowFn>
 __global__ void kv_scatter_kernel(const float* __restrict__ k_src, const float* __restrict__ v_src,
                                   void* const* __restrict__ k_page_ptrs,
                                   void* const* __restrict__ v_page_ptrs,
@@ -244,9 +251,9 @@ __global__ void kv_scatter_kernel(const float* __restrict__ k_src, const float* 
     const float* k_row_src = k_src + (size_t)tok * kv_dim;
     const float* v_row_src = v_src + (size_t)tok * kv_dim;
 
-    RowFn()(k_row_src, k_dst, kv_dim);
+    KRowFn()(k_row_src, k_dst, kv_dim);
     __syncthreads();
-    RowFn()(v_row_src, v_dst, kv_dim);
+    VRowFn()(v_row_src, v_dst, kv_dim);
 }
 
 // Row functor types for template dispatch
@@ -272,39 +279,41 @@ struct RowFnQ4_0 {
 // Writes n_tokens K/V rows starting at logical position `pos` into the paged
 // KV cache, quantizing to `dtype` in-place on device.
 // =========================================================================
+// type_k and type_v are separate because -ctk/-ctv allow an asymmetric pair.
+template <typename KRowFn, typename VRowFn>
+static void scatter_with(int n_tokens, const float* k_src, const float* v_src,
+                         void* const* k_page_ptrs, void* const* v_page_ptrs, const int32_t* page_ids,
+                         int64_t pos, int page_size, int kv_dim, size_t k_row_bytes,
+                         size_t v_row_bytes, cudaStream_t stream) {
+    kv_scatter_kernel<KRowFn, VRowFn><<<n_tokens, 256, 0, stream>>>(
+        k_src, v_src, k_page_ptrs, v_page_ptrs, page_ids, n_tokens, pos, page_size, kv_dim,
+        k_row_bytes, v_row_bytes);
+}
+
 void launch_kv_scatter(const float* k_src, const float* v_src, void* const* k_page_ptrs,
                        void* const* v_page_ptrs, const int32_t* page_ids, int n_tokens, int64_t pos,
                        int page_size, int kv_dim, size_t k_row_bytes, size_t v_row_bytes,
-                       KVCacheDType dtype, cudaStream_t stream) {
+                       KVCacheDType type_k, KVCacheDType type_v, cudaStream_t stream) {
     if (n_tokens <= 0)
         return;
-    int threads = 256;
-
-    switch (dtype) {
-    case KVCacheDType::F16:
-        kv_scatter_kernel<RowFnF16><<<n_tokens, threads, 0, stream>>>(
-            k_src, v_src, k_page_ptrs, v_page_ptrs, page_ids, n_tokens, pos, page_size, kv_dim,
-            k_row_bytes, v_row_bytes);
-        break;
-    case KVCacheDType::FP32:
-        kv_scatter_kernel<RowFnFP32><<<n_tokens, threads, 0, stream>>>(
-            k_src, v_src, k_page_ptrs, v_page_ptrs, page_ids, n_tokens, pos, page_size, kv_dim,
-            k_row_bytes, v_row_bytes);
-        break;
-    case KVCacheDType::Q8_0:
-        kv_scatter_kernel<RowFnQ8_0><<<n_tokens, threads, 0, stream>>>(
-            k_src, v_src, k_page_ptrs, v_page_ptrs, page_ids, n_tokens, pos, page_size, kv_dim,
-            k_row_bytes, v_row_bytes);
-        break;
-    case KVCacheDType::Q4_0:
-        kv_scatter_kernel<RowFnQ4_0><<<n_tokens, threads, 0, stream>>>(
-            k_src, v_src, k_page_ptrs, v_page_ptrs, page_ids, n_tokens, pos, page_size, kv_dim,
-            k_row_bytes, v_row_bytes);
-        break;
-    default:
-        fprintf(stderr, "[ERROR] launch_kv_scatter: unsupported dtype=%d\n",
-                static_cast<int>(dtype));
-        break;
+    const auto kfn = [&](auto kf, auto vf) {
+        scatter_with<decltype(kf), decltype(vf)>(n_tokens, k_src, v_src, k_page_ptrs, v_page_ptrs,
+                                                 page_ids, pos, page_size, kv_dim, k_row_bytes,
+                                                 v_row_bytes, stream);
+    };
+    // 3x3 dispatch on (K, V).
+    if (type_k == KVCacheDType::F16 && type_v == KVCacheDType::F16) kfn(RowFnF16{}, RowFnF16{});
+    else if (type_k == KVCacheDType::F16 && type_v == KVCacheDType::Q8_0) kfn(RowFnF16{}, RowFnQ8_0{});
+    else if (type_k == KVCacheDType::F16 && type_v == KVCacheDType::Q4_0) kfn(RowFnF16{}, RowFnQ4_0{});
+    else if (type_k == KVCacheDType::Q8_0 && type_v == KVCacheDType::F16) kfn(RowFnQ8_0{}, RowFnF16{});
+    else if (type_k == KVCacheDType::Q8_0 && type_v == KVCacheDType::Q8_0) kfn(RowFnQ8_0{}, RowFnQ8_0{});
+    else if (type_k == KVCacheDType::Q8_0 && type_v == KVCacheDType::Q4_0) kfn(RowFnQ8_0{}, RowFnQ4_0{});
+    else if (type_k == KVCacheDType::Q4_0 && type_v == KVCacheDType::F16) kfn(RowFnQ4_0{}, RowFnF16{});
+    else if (type_k == KVCacheDType::Q4_0 && type_v == KVCacheDType::Q8_0) kfn(RowFnQ4_0{}, RowFnQ8_0{});
+    else if (type_k == KVCacheDType::Q4_0 && type_v == KVCacheDType::Q4_0) kfn(RowFnQ4_0{}, RowFnQ4_0{});
+    else {
+        fprintf(stderr, "[ERROR] launch_kv_scatter: unsupported dtype pair K=%d V=%d\n",
+                static_cast<int>(type_k), static_cast<int>(type_v));
     }
 }
 
