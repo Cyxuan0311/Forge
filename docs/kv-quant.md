@@ -151,17 +151,89 @@ Forge does not do this yet, so the aggressive settings above should be treated a
 memory-first, quality-second. `q8_0` on K is the conservative choice and is
 where most of the win is anyway.
 
+## Hadamard rotation (`-rkq`)
+
+Quantization error is set by the largest value in each block, so a few large
+activations degrade all 31 of their neighbours. Rotation fixes that at the cost
+of three small transforms per layer: with `R` orthonormal, `(Rq).(Rk) = q.k` so
+caching `Rk` and rotating `q` the same way leaves every logit identical, and
+`sum_i p_i (R v_i) = R (sum_i p_i v_i)` so the output is `R` applied to the true
+output and `R^-1` recovers it. A Hadamard matrix is used because it is symmetric
+(hence self-inverse) and spreads any single large component over all
+coordinates instead of leaving it to dominate one block.
+
+`-rkq` / `--rope-k-quant` enables it; it is off by default, and it only engages
+when K or V is actually quantized, since an f16 cache has nothing to gain.
+
+Quality, 8 factual prompts x 4 runs, scored on whether the expected answer
+appears (greedy decoding here is not bit-reproducible, so a single run proves
+nothing; 24/32 is the ceiling, since 8 prompts are missed by f16 too):
+
+| K / V        | without `-rkq` | with `-rkq` |
+|--------------|----------------|--------------|
+| f16 (ref)    | 24/32          | –            |
+| `q8_0/q8_0`  | 24/32          | 24/32        |
+| `q8_0/q4_0`  | 20/32          | **24/32**    |
+| `q4_0/q4_0`  | 24/32          | 24/32        |
+| `f16/q4_0`   | –              | 24/32        |
+
+So it closes the whole `q8_0/q4_0` gap to f16 and is neutral elsewhere — which
+is the right shape, since a 4-bit V is the only case here that loses anything.
+Cost is about 1% (median 21.6 → 21.4 tok/s at `-c 16384`), well under the
+2–3% prefill / 7–12% decode llama.cpp reports, because this is a
+Walsh-Hadamard butterfly at O(n log n) rather than a dense O(n²) product.
+
+Rotation is **not** unconditionally good, and the test deliberately does not
+assert that it reduces quantization error — it prints the measured numbers
+instead. For a per-block-amax quantiser the effect changes sign with the outlier
+ratio (8x outlier: 2.8x better; 1000x: 33x *worse*), because spreading a dominant
+coordinate raises the scale of every block it touches. On this model's real K
+the effect is favourable — measured 1.7x lower `q4_0` K reconstruction error
+across all 44 layers, none worse — but that is an empirical property of the
+model, not a theorem, which is why it is a flag.
+
+## q4_0 has two different encodings — read this before touching a KV reader
+
+Forge does not agree with itself on how a `q4_0` KV row is encoded:
+
+| path | writer | nibble encoding |
+|------|--------|-----------------|
+| CPU cache | `quantize_q4_0_cpu()` | **sign-extended** int4, `d = amax / -8` |
+| CUDA cache | `launch_quantize_q4_0_matrix()`, `quantize_row_q4_0()` | **unsigned, offset by 8**, `d = amax / -8` |
+
+The scale is negative in both. The payload is not. The two are different
+functions — they differ by 8 on *every* element. A CUDA layer is written by the
+CUDA writer, so the fused attention kernels must decode with `(n & 0xF) - 8`.
+`dequantize_q4_0_cpu()` will misread a CUDA-written row.
+
+This has already cost one bad commit. The CPU/CUDA split was mistaken for a
+single bug ("the CUDA kernels use the weights convention, that is wrong"),
+"fixed" to sign extension, and that broke every `q4_0` KV cache end to end
+(answer accuracy 24/32 → 4/32). The commit that introduced the break was
+validated by a unit test that filled the cache with the CPU quantizer and
+compared against the CPU dequantizer — a test of CPU-writer against CPU-reader,
+which cannot detect a CPU/CUDA mismatch. `forge-mixed-attn-test` now writes
+through the engine's actual writer and reads back through the decode the kernel
+performs.
+
+The split itself is still there and is still latent. Reconciling it is a
+deliberate decision with its own migration story, not something to slip into a
+bug fix.
+
 ## A note on verifying changes here
 
 Do not validate KV-quantization work by diffing generated text against a previous
-build. Greedy decoding on this GPU path is not bit-reproducible run to run, so
-such a diff measures noise. Use `forge-mixed-attn-test`, which checks each kernel
-numerically against a CPU reference built from the dequantized rows. That is what
-caught the q4_0 convention bug below.
+build. Greedy decoding on this GPU path is not bit-reproducible run to run — the
+same binary and flags produce different text across runs — so such a diff
+measures noise. Worse, a *broken* quantized path frequently still produces
+fluent text, because softmax absorbs a bounded per-element error; every
+regression in the history above passed a prose check.
 
-`q4_0` deserves a specific warning: Forge's own `quantize_q4_0_cpu()` stores a
-sign-extended int4 with a negative scale, which is **not** the convention GGUF
-*weights* use (`(nibble & 0xF) - 8` with a positive scale). Reading q4_0 KV with
-the weights convention shifts every value by 8 and flips the sign of half the
-range, while still producing fluent text. The KV kernels were doing that until
-they were fixed; any new q4_0 reader must use `FORGE_SEXT4`.
+Use instead:
+
+- `forge-mixed-attn-test` — each kernel against a reference built from the
+  dequantized rows, written through the engine's real writers.
+- `forge-attn-rot-test` — orthonormality, self-inverse, the dot-product
+  identity, the full attention identity, CPU-vs-CUDA agreement.
+- A repeated-sample quality score, as in the `-rkq` table above. Sample it
+  several times; a single run is noise.

@@ -28,6 +28,7 @@
 | `-t, --threads N` | auto | Number of CPU threads |
 | `-b, --batch-size N` | `512` | Max tokens per prefill forward (sets `ContextParams::n_batch`) |
 | `--kv-cache-dtype TYPE` | `f16` | KV dtype for **both** K and V: `fp32`, `f16`, `q8_0`, `q4_0`, `q4_k`, `fp8_e4m3`, `fp8_e5m2` |
+-rkq, --rope-k-quant    Hadamard-rotate Q/K/V before a quantized KV cache (-nrkq to disable)
 | `-ctk, --cache-type-k TYPE` | | KV dtype for **K only** (overrides `--kv-cache-dtype`) |
 | `-ctv, --cache-type-v TYPE` | | KV dtype for **V only** (overrides `--kv-cache-dtype`) |
 

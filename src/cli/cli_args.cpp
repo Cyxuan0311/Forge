@@ -31,6 +31,9 @@ static void print_usage(const char* prog) {
            "                           Multi-GPU: -ngl N:M (e.g., -ngl 16:16 = GPU0:16 layers + GPU1:16 layers)\n"
            "  -kvo,--kv-offload           Offload KV cache to GPU (default: on)\n"
            "  -nkvo,--no-kv-offload        Keep KV cache on CPU (for long context + small VRAM)\n"
+           "  -rkq,--rope-k-quant          Hadamard-rotate Q/K/V before a quantized KV cache;\n"
+           "                               improves 4-bit V quality for ~1%% throughput\n"
+           "  -nrkq,--no-rope-k-quant      Disable the above (default)\n"
            "  -t,  --threads N           CPU threads (default: auto)\n"
            "  -b,  --batch-size N        Prompt processing batch size (default: 512)\n"
            "  -c,  --ctx-size N          Context window / KV cache size in tokens (default: 0 = model\n"
@@ -247,6 +250,10 @@ CliArgs parse_args(int argc, char** argv) {
             args.common.offload_kqv = true;
         } else if (arg == "-nkvo" || arg == "--no-kv-offload") {
             args.common.offload_kqv = false;
+        } else if (arg == "-rkq" || arg == "--rope-k-quant") {
+            args.common.rope_k_quant = true;
+        } else if (arg == "-nrkq" || arg == "--no-rope-k-quant") {
+            args.common.rope_k_quant = false;
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";
