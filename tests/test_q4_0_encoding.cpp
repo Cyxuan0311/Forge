@@ -270,6 +270,51 @@ int main() {
         check(m == 0.0, "an all-zero block round trips to exactly zero (not a constant offset)");
     }
 
+    // Negative-skewed blocks: the level set must be derived from the max
+    // ABSOLUTE value. All three writers must agree, which is what
+    // "CPU writer bytes == CUDA writer bytes" checks; this pins the scale rule
+    // on its own so a writer that derived it from a signed value would be caught
+    // even if the byte comparison were loosened.
+    //
+    // The bound is 1/8 = 12.5%, not something tighter: with d = -amax/8 and
+    // nibble in 0..15 the levels run from +amax down to only -0.875*amax, so
+    // -amax is not representable and a block whose extreme is negative always
+    // costs a full step at that point. That is a property of the format, so a
+    // block that saturates to exactly 0.125 is correct, and a symmetric positive
+    // block measures better (0.074) purely because of that asymmetry.
+    {
+        std::vector<float> neg(64), pos(64);
+        for (int i = 0; i < 64; ++i) {
+            neg[i] = -(1.0f + 0.01f * i);
+            pos[i] = 1.0f + 0.01f * i;
+        }
+        const std::vector<uint8_t> qn = write_cpu(neg), qp = write_cpu(pos);
+        const std::vector<float> bn = read_cpu(qn, 64), bp = read_cpu(qp, 64);
+
+        // Bound from the scale that was actually stored, for the same reason as
+        // the main loop: fp16 rounding puts 7*|d| a hair either side of
+        // 0.875*amax, so a hard-coded 0.125 is not the right predicate.
+        double worst = 0;
+        for (int b = 0; b < 2; ++b) {
+            float amax = 0;
+            for (int i = b * 32; i < b * 32 + 32; ++i)
+                amax = std::max(amax, std::fabs(neg[i]));
+            const float d =
+                std::fabs(fp16_to_f32(*reinterpret_cast<const uint16_t*>(qn.data() + b * 18)));
+            worst = std::max<double>(worst, std::max(0.5 * d, static_cast<double>(amax) - 7.0 * d));
+        }
+        double rn = 0, rp = 0;
+        for (int i = 0; i < 64; ++i) {
+            rn = std::max(rn, std::fabs(static_cast<double>(bn[i] - neg[i])));
+            rp = std::max(rp, std::fabs(static_cast<double>(bp[i] - pos[i])));
+        }
+        std::snprintf(buf, sizeof(buf),
+                      "negative-skewed block within the format's saturation bound "
+                      "(%.4e and %.4e <= %.4e)",
+                      rn, rp, worst);
+        check(rn <= worst + 1e-6 && rp <= worst + 1e-6, buf);
+    }
+
     // Negative-only data: the asymmetric end of the level set, where sign
     // extension and offset-by-8 diverge most.
     {

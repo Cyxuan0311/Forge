@@ -160,16 +160,28 @@ __device__ __forceinline__ void quantize_row_q4_0(const float* __restrict__ src,
         int start = bi * QK;
         int end = min(start + QK, n);
 
+        // Scale from amax (the max ABSOLUTE value), matching
+        // launch_quantize_q4_0_matrix and the CPU writers.
+        //
+        // This used to use max_val, the *signed* value of the
+        // largest-magnitude element. Note what that is and is not: |max_val| is
+        // always amax here, since max_val tracks whichever element set amax, so
+        // the scale MAGNITUDE was always right and only its SIGN varied. A
+        // sign-flipped scale just mirrors the level set, and the decoder reads
+        // the sign back out of the stored per-block d, so the pair stayed
+        // self-consistent -- measured quantisation error on one-sided data is
+        // actually slightly LOWER with the signed scale, because the level set
+        // then faces the side the data is on.
+        //
+        // So this was an inconsistency rather than a miscompute, and it is
+        // worth fixing for that reason: with all three writers agreeing, a row
+        // written by any of them is byte-identical, which is what the q4_0
+        // encoding test asserts and what makes provenance irrelevant. Do not
+        // read this as a fix for a wrong-answer bug.
         float amax = 0.0f;
-        float max_val = 0.0f;
-        for (int i = start; i < end; ++i) {
-            float a = fabsf(src[i]);
-            if (amax < a) {
-                amax = a;
-                max_val = src[i];
-            }
-        }
-        float d = max_val / -8.0f;
+        for (int i = start; i < end; ++i)
+            amax = fmaxf(amax, fabsf(src[i]));
+        float d = amax / -8.0f;
         if (d == 0.0f)
             d = -1.0f;
         float id = 1.0f / d;
