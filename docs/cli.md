@@ -26,8 +26,10 @@
 |--------|---------|-------------|
 | `-ngl, --n-gpu-layers N` | `-1` | Number of layers to offload to GPU (`-1` = all, `0` = CPU only) |
 | `-t, --threads N` | auto | Number of CPU threads |
-| `-b, --batch-size N` | `512` | Batch size for prompt processing |
-| `--kv-cache-dtype TYPE` | `fp32` | KV cache data type (`fp32` or `q4_0`) |
+| `-b, --batch-size N` | `512` | Max tokens per prefill forward (sets `ContextParams::n_batch`) |
+| `--kv-cache-dtype TYPE` | `f16` | KV dtype for **both** K and V: `fp32`, `f16`, `q8_0`, `q4_0`, `q4_k`, `fp8_e4m3`, `fp8_e5m2` |
+| `-ctk, --cache-type-k TYPE` | | KV dtype for **K only** (overrides `--kv-cache-dtype`) |
+| `-ctv, --cache-type-v TYPE` | | KV dtype for **V only** (overrides `--kv-cache-dtype`) |
 
 ### Sampling
 
@@ -44,7 +46,6 @@
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-i, --interactive` | off | Interactive chat mode |
-| `--stream` | on | Stream output token by token |
 | `--no-stream` | off | Disable streaming output |
 | `--system-prompt TEXT` | — | System prompt for chat |
 
@@ -70,13 +71,13 @@
 ### Single Prompt
 
 ```bash
-./forge-cli -m model.gguf -p "What is machine learning?" --stream
+./forge-cli -m model.gguf -p "What is machine learning?"
 ```
 
 ### CPU-Only Inference
 
 ```bash
-./forge-cli -m model.gguf --device cpu --n-gpu-layers 0
+./forge-cli -m model.gguf -ngl 0
 ```
 
 ### Custom Sampling Parameters
@@ -118,6 +119,6 @@
 
 ## Performance Tuning
 
-- **GPU**: Use `--n-gpu-layers -1` to offload all layers. Set `--kv-cache-dtype q4_0` to reduce VRAM usage.
-- **CPU**: Increase `--threads` to match your CPU core count. Use `--batch-size 1024` for faster prompt processing.
+- **GPU**: Use `--n-gpu-layers -1` to offload all layers. Set `-ctk q8_0 -ctv q4_0` to cut KV memory ~2.5x vs f16 with far less quality loss than quantising K (see `kv-quant.md`).
+- **CPU**: Increase `--threads` to match your CPU core count. Use `--batch-size 1024` for faster prefill.
 - **Sampling**: Lower `--temp` for more deterministic output; higher for more creativity.

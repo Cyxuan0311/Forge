@@ -27,7 +27,9 @@
 | `-ngl, --n-gpu-layers N` | `-1` | 卸载到 GPU 的层数（`-1` = 全部，`0` = 仅 CPU） |
 | `-t, --threads N` | auto | CPU 线程数 |
 | `-b, --batch-size N` | `512` | Prompt 处理时的批大小 |
-| `--kv-cache-dtype TYPE` | `fp32` | KV 缓存数据类型（`fp32` 或 `q4_0`） |
+| `--kv-cache-dtype TYPE` | `f16` | K 与 V **同时**使用的 KV 缓存数据类型：`fp32`, `f16`, `q8_0`, `q4_0`, `q4_k`, `fp8_e4m3`, `fp8_e5m2` |
+| `-ctk, --cache-type-k TYPE` | | **仅 K** 使用的 KV 缓存数据类型（覆盖 `--kv-cache-dtype`） |
+| `-ctv, --cache-type-v TYPE` | | **仅 V** 使用的 KV 缓存数据类型（覆盖 `--kv-cache-dtype`） |
 
 ### 采样
 
@@ -44,7 +46,6 @@
 | 选项 | 默认 | 说明 |
 |------|------|------|
 | `-i, --interactive` | 关闭 | 交互式对话模式 |
-| `--stream` | 开启 | 逐 token 流式输出 |
 | `--no-stream` | 关闭 | 禁用流式输出 |
 | `--system-prompt TEXT` | — | 系统提示词 |
 
@@ -76,7 +77,7 @@
 ### 仅 CPU 推理
 
 ```bash
-./forge-cli -m model.gguf --device cpu --n-gpu-layers 0
+./forge-cli -m model.gguf -ngl 0
 ```
 
 ### 自定义采样参数
@@ -118,6 +119,6 @@
 
 ## 性能调优
 
-- **GPU**：使用 `--n-gpu-layers -1` 将所有层卸载到 GPU。设置 `--kv-cache-dtype q4_0` 可减少显存占用。
+- **GPU**：使用 `--n-gpu-layers -1` 将所有层卸载到 GPU。设置 `-ctk q8_0 -ctv q4_0` 可在质量损失远小于直接量化 K 的前提下把 KV 显存降到 f16 的约 1/2.5（见 `kv-quant.md`）。
 - **CPU**：增加 `--threads` 匹配 CPU 核心数。使用 `--batch-size 1024` 加快 prompt 处理速度。
 - **采样**：降低 `--temp` 获得更确定的输出；提高则增加创造性。
