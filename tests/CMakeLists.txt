@@ -70,6 +70,14 @@ endfunction()
 # -- they are handled by the QEMU cross section below.
 # -----------------------------------------------------------------------------
 
+# Shared argument layer (forge-cli / forge-server): KV dtype parsing and
+# validation, the common flag parser, and the speculative flag parser. Host-only
+# and model-free -- it is the regression net that keeps the two binaries from
+# drifting apart again.
+add_executable(forge-args-test test_args.cpp)
+forge_link_native(forge-args-test)
+add_test(NAME args COMMAND forge-args-test)
+
 # Speculative decoding (Phase 1): draft-token verification, batched forward
 # parity, and greedy end-to-end parity. Needs tinyllama gguf; skipped gracefully
 # when the fixture is absent.

@@ -25,6 +25,7 @@
 #include "forge/chat_template.h"
 #include "forge/generator.h"
 #include "forge/cli_common_args.h"
+#include "forge/cli_spec_args.h"
 #include "forge/kv_working_set.h"
 #include "forge/model.h"
 #include "forge/prefix_cache.h"
@@ -48,6 +49,14 @@ struct ServerOptions {
     // defaulted it to f16, -ngl here was a bare std::stoi (so "-ngl auto"
     // terminated the process), and a typo'd dtype silently became f16.
     forge::CommonArgs common;
+
+    // Speculative decoding. Shared with forge-cli through
+    // forge::parse_spec_arg() (see cli_spec_args.h) so the two agree on every
+    // default and validation rule. The server previously had no speculation at
+    // all: no --spec* flags, and no SpeculativeConfig ever reached
+    // ContextParams, so Generator's `speculative_config.enabled` was never true
+    // and the spec_stats branch in handle_chat was unreachable.
+    forge::SpeculativeConfig spec;
 
     // ---- server-only ----
     std::string host = "127.0.0.1";

@@ -9,6 +9,8 @@
 
 #include "cli_common.h"
 
+#include "forge/cli_spec_args.h"
+
 static void print_usage(const char* prog) {
     std::cout
         << "Forge CLI - Lightweight LLM inference tool v0.5.0\n"
@@ -168,6 +170,21 @@ CliArgs parse_args(int argc, char** argv) {
                 forge::parse_common_arg(arg, argc, argv, i, args.common, &err);
             if (r == forge::ParseResult::Ok) continue;
             if (r == forge::ParseResult::Error) {
+                std::cerr << err << "\n";
+                std::exit(1);
+            }
+        }
+
+        // Speculative decoding, shared with forge-server. The server had none of
+        // these flags and never put a SpeculativeConfig into ContextParams, so
+        // Generator never enabled speculation there and the server's own
+        // spec_stats reporting was unreachable.
+        {
+            std::string err;
+            const forge::SpecParseResult r =
+                forge::parse_spec_arg(arg, argc, argv, i, args.spec, &err);
+            if (r == forge::SpecParseResult::Ok) continue;
+            if (r == forge::SpecParseResult::Error) {
                 std::cerr << err << "\n";
                 std::exit(1);
             }

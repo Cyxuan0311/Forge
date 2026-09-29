@@ -60,6 +60,18 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             }
         }
 
+        // Speculative decoding, shared with forge-cli.
+        {
+            std::string err;
+            const forge::SpecParseResult r =
+                forge::parse_spec_arg(arg, argc, argv, i, opt.spec, &err);
+            if (r == forge::SpecParseResult::Ok) continue;
+            if (r == forge::SpecParseResult::Error) {
+                std::cerr << err << "\n";
+                std::exit(1);
+            }
+        }
+
         if (arg == "--host") {
             opt.host = value_of(i, "--host");
         } else if (arg == "--port") {
@@ -116,6 +128,24 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "      --load-mode MODE    mmap | mlock | mmap_mlock (default: mmap)\n"
                 << "      --api-key KEY       Require 'Authorization: Bearer KEY' (default: off)\n"
                 << "      --max-inflight N    Max queued requests (default: 4, excess get 429)\n"
+                << "\n"
+                << "Speculative decoding (shared with forge-cli):\n"
+                << "      --spec             Enable speculative decoding (n-gram draft)\n"
+                << "      --spec-model PATH  DSpark/DFlash draft model GGUF\n"
+                << "      --spec-draft-arch NAME  dflash | dspark\n"
+                << "      --spec-draft N     Max drafted tokens per round (default: 5)\n"
+                << "      --spec-draft-n N   Speculative tokens proposed per round (default: 5)\n"
+                << "      --spec-draft-ngl N GPU layers for the draft model\n"
+                << "      --spec-draft-target-layers LIST  Target layer indices, e.g. \"2,5,8\"\n"
+                << "      --spec-draft-mask-id N   MASK token id (default: from GGUF)\n"
+                << "      --spec-dspark-topk N     DSpark markov top-k (0 = full vocab)\n"
+                << "      --spec-dspark-conf F     DSpark confidence truncation (0 = off)\n"
+                << "      --spec-min-acc F   Disable drafting while acceptance EWMA < F\n"
+                << "      --no-adaptive-draft      Always draft the full --spec-draft budget\n"
+                << "      --spec-n-min N, --spec-p-min F, --spec-ngram-n N,\n"
+                << "      --spec-ngram-min N, --spec-ngram-mod[-n|-min|-max],\n"
+                << "      --no-ngram, --spec-mtp, --spec-stats   See forge-cli --help\n"
+                << "\n"
                 << "      --perf              Log a per-request perf summary after each\n"
                 << "                          completion (prefill/decode ms, tok/s)\n"
                 << "      --perf-detail       --perf + top operators from PerfProfiler\n"

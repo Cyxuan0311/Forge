@@ -215,6 +215,18 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
 
     ctx_->set_engine(std::move(engine));
 
+    // Speculative decoding. The server never set this, so Generator's gate on
+    // params().speculative_config.enabled was always false and the spec_stats
+    // reporting further down was unreachable. Mirrors what cli_generation.cpp
+    // does for the CLI.
+    if (opt.spec.enabled) {
+        ctx_->params_mut().speculative_config = opt.spec;
+        std::cout << "Speculative decoding: arch="
+                  << (opt.spec.draft_arch.empty() ? "n-gram" : opt.spec.draft_arch)
+                  << ", n_draft=" << opt.spec.n_draft
+                  << ", draft_n=" << opt.spec.draft_n_spec << "\n";
+    }
+
     // offload_kqv and offload_embedding now come from the flags (they were
     // hard-coded here with no way to change them).
     ctx_->params_mut().offload_kqv = opt.common.offload_kqv;
