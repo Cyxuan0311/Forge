@@ -2,6 +2,8 @@
 
 #include <cstdio>
 
+#include "forge/kv_cache_dtype.h"
+
 namespace forge {
 
 AttentionPath choose_attention_path(const AttentionProblem& p) {
@@ -82,7 +84,28 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
                 break;  // Unsupported symmetric type → FP32 fallback
             }
         }
-        // FP32 or asymmetric KV → standard FP32 decode kernel
+        // FP32, or an ASYMMETRIC K/V pair.
+        //
+        // Every fused quantized kernel is monomorphic: it takes one q_row_size
+        // and hard-codes one block layout for both K and V, so a mixed pair has
+        // no fused path and materializes the filled rows to FP32 instead. That
+        // is correct -- dequantize_layer() only re-materializes rows
+        // [dequantized_filled, filled) -- but it costs memory traffic and it
+        // measured noticeably variable (21.2-26.1 tok/s across runs where the
+        // symmetric q8_0/q8_0 path held 22.7-22.9), so it must not read as a
+        // silent no-op. Log it once per process; the mixed-dtype fused kernels
+        // are the follow-up that removes this branch.
+        if (p.has_quantized_kv && p.kv_type_k != p.kv_type_v) {
+            static bool warned_mixed = false;
+            if (!warned_mixed) {
+                warned_mixed = true;
+                std::fprintf(stderr,
+                             "[Forge WARN] asymmetric KV cache (K=%s, V=%s): no fused mixed-dtype "
+                             "attention kernel yet, falling back to FP32 materialization of the "
+                             "filled rows. Output is correct; throughput is not optimal.\n",
+                             kv_cache_dtype_name(p.kv_type_k), kv_cache_dtype_name(p.kv_type_v));
+            }
+        }
         return AttentionPath::CUDA_FP32_DECODE;
     }
 
