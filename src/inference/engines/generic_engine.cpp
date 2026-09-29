@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include "forge/cuda_kernels.h"
+#include "forge/inference/layers/attn_rot_executor.h"
 #include "forge/logger.h"
 #include "forge/model.h"
 #include "forge/operators.h"
@@ -185,6 +186,32 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
         k_rope = rope_result.k_rope;
     }
 
+    // ---- 4b. Hadamard rotation (only when something is quantized) ----
+    // Q and K share one rotation so their dot product is preserved, V is rotated
+    // in 64-wide sub-blocks, and the attention output is un-rotated below.
+    // Gated on the KV types because with an f16 cache there is nothing to gain
+    // and three transforms per layer is pure cost.
+    {
+        const auto& kv_cfg = kv_cache_.kv_config();
+        const bool k_q = kv_cfg.type_k != KVCacheDType::FP32 && kv_cfg.type_k != KVCacheDType::F16;
+        const bool v_q = kv_cfg.type_v != KVCacheDType::FP32 && kv_cfg.type_v != KVCacheDType::F16;
+        if (rope_k_quant() && (k_q || v_q) && q_rope && k_rope && v) {
+            // This must run on EVERY call, not once. Every new token contributes a
+            // new K/V row, and a row that is not rotated before it reaches the
+            // cache is read back as though it had been. The first version latched
+            // on "have we rotated yet" to guard against a rotation-setting change,
+            // which meant only the very first token was ever rotated and the
+            // un-rotated queries were then dotted against that one rotated row --
+            // end-to-end answer accuracy fell from 18/24 to 6/24.
+            if (!rot_.enabled() || rot_.order() != head_dim) rot_.configure(true, head_dim, dev);
+            if (rot_.enabled()) {
+                rot_.apply_qk(q_rope, k_rope, nullptr, nullptr);
+                rot_.apply_v(v);
+                rotating_ = true;
+            }
+        }
+    }
+
     // ---- 5. KV cache update ----
     {
         PERF_SCOPE("layer/kv_cache_update");
@@ -262,6 +289,13 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
         PERF_SCOPE("layer/attention");
         attn_out = attention_executor_.attend(q_rope, cfg, layer_idx, seq_len, dev,
                                               nullptr, lctx.seq_id());
+        // Self-inverse: same transform that went in comes back out. Only needed
+        // for V, and only when V was actually rotated.
+        if (rot_.enabled() && rotating_) {
+            const auto& kv_cfg = kv_cache_.kv_config();
+            if (kv_cfg.type_v != KVCacheDType::FP32 && kv_cfg.type_v != KVCacheDType::F16)
+                attn_out = rot_.undo_v(attn_out);
+        }
     }
 
     // ---- 7. Attention output projection (optionally fused with residual) ----

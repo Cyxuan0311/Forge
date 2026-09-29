@@ -61,6 +61,10 @@ struct ModelConfig {
     int full_attention_interval = 0;  // attention layer interval in hybrid arch
     bool use_ssm = false;             // whether model has SSM layers
 
+    // LFM2 shortconv operator layers: total conv window length (l_cache).
+    // Kernel width = l_cache; recurrent state keeps the last (l_cache - 1) rows.
+    int shortconv_l_cache = 0;
+
     // MRoPE (Multi-dimensional RoPE) support for Qwen3.5
     int rope_dimension_count = 0;                   // number of dimensions to apply RoPE (e.g., 64)
     int rope_dimension_sections[4] = {0, 0, 0, 0};  // sections for MRoPE [t, h, w, extra]
@@ -196,6 +200,7 @@ enum class LayerType : int {
     FullAttention = 0,    // Standard full attention layer
     LinearAttention = 1,  // Linear/recurrent attention (e.g., Gated Delta Net)
     MLA = 2,              // Multi-head Latent Attention (DeepSeek V2/V3)
+    ShortConv = 3,        // Causal depthwise short conv (LFM2 operator layers)
 };
 
 // Per-layer weight container using canonical names
@@ -255,6 +260,11 @@ struct LayerWeights {
     TensorPtr attn_k_norm() const { return get("attn_k_norm"); }
     TensorPtr post_attention_norm() const { return get("post_attention_norm"); }
     TensorPtr post_ffn_norm() const { return get("post_ffn_norm"); }
+
+    // LFM2 shortconv operator layers
+    TensorPtr shortconv_conv() const { return get("shortconv_conv"); }
+    TensorPtr shortconv_in_proj() const { return get("shortconv_in_proj"); }
+    TensorPtr shortconv_out_proj() const { return get("shortconv_out_proj"); }
 
     // Qwen35 linear attention / SSM
     TensorPtr attn_qkv() const { return get("attn_qkv"); }

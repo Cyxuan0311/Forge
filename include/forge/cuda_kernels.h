@@ -924,5 +924,11 @@ void launch_ssm_gated_delta_net(const float* q, const float* k, const float* v, 
 void launch_ssm_gated_norm(float* delta_out, const float* z, const float* norm_w, int seq_len,
                            int head_v_dim, int num_v_heads, float eps, cudaStream_t stream = 0);
 
+// ---- LFM2 shortconv ----
+// Splits the fused shortconv in_proj output [T, 3H] (b|c|x chunks) into
+// bx = b⊙x and gate = c in one pass.
+void launch_lfm2_bcx_split(const float* bcx, float* bx, float* gate, int seq_len, int hidden,
+                           cudaStream_t stream = 0);
+
 }  // namespace cuda
 }  // namespace forge

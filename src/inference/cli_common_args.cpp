@@ -78,6 +78,10 @@ ParseResult parse_bool_flag(const std::string& arg, bool& out) {
         out = true;
     } else if (arg == "--kvmem") {
         out = true;
+    } else if (arg == "-rkq" || arg == "--rope-k-quant") {
+        out = true;
+    } else if (arg == "-nrkq" || arg == "--no-rope-k-quant") {
+        out = false;
     } else if (arg == "--offload-embedding") {
         out = true;
     } else if (arg == "--no-offload-embedding") {
@@ -113,6 +117,7 @@ std::vector<std::string> common_arg_names() {
             "-t/--threads",       "--kv-cache-dtype",       "-ctk/--cache-type-k",
             "-ctv/--cache-type-v", "--kvo/--no-kv-offload",  "--paged-kv",
             "--cuda-graph",       "--kvmem",                "--kvmem-budget",
+            "-rkq/--rope-k-quant",  "-nrkq/--no-rope-k-quant",
             "--kvmem-sink",       "--kvmem-gen-reserve",    "--kvmem-retrieval",
             "--load-mode",        "--offload-embedding",    "--no-prefetch"};
 }
@@ -239,6 +244,9 @@ ParseResult parse_common_arg(const std::string& arg, int argc, char** argv, int&
         b = &out.cuda_graph;
     else if (arg == "--kvmem")
         b = &out.kvmem;
+    else if (arg == "-rkq" || arg == "--rope-k-quant" || arg == "-nrkq" ||
+             arg == "--no-rope-k-quant")
+        b = &out.rope_k_quant;
     else if (arg == "--offload-embedding" || arg == "--no-offload-embedding")
         b = &out.offload_embedding;
     else if (arg == "--prefetch" || arg == "--no-prefetch")
@@ -274,6 +282,7 @@ bool apply_common_args(const CommonArgs& a, Model* model, InferenceContext& ctx,
     }
 
     auto& params = ctx.params_mut();
+
     params.offload_kqv = a.offload_kqv;
     params.offload_embedding = a.offload_embedding;
     params.kv_storage_mode = a.paged_kv ? KVStorageMode::Paged : KVStorageMode::Contiguous;
@@ -294,6 +303,7 @@ bool apply_common_args(const CommonArgs& a, Model* model, InferenceContext& ctx,
         return false;
     }
     if (!v.warning.empty()) LOG_WARN("KV cache: " + v.warning);
+    engine->set_rope_k_quant(a.rope_k_quant);
     engine->set_kv_cache_type_config(kv);
 
     if (a.ctx_size > 0) engine->set_kv_cache_max_seq_len(a.ctx_size);

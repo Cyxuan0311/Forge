@@ -22,6 +22,7 @@
 #include "forge/engines/dflash_engine.h"
 #include "forge/engines/gemma4_engine.h"
 #include "forge/engines/generic_engine.h"
+#include "forge/engines/lfm2_engine.h"
 #include "forge/engines/phimoe_engine.h"
 #include "forge/engines/qwen35_engine.h"
 #include "forge/engines/spark25_engine.h"
@@ -226,6 +227,21 @@ static ArchCapabilityAutoRegister _cap_spark25("spark2_5",
                                                ArchCapability{.use_gqa = true,
                                                               .use_neox_rope = true,
                                                               .ffn_activation = ActivationType::GeGLU});
+
+// ============================================================================
+// LFM2 / LFM2.5 (LiquidAI: hybrid shortconv operator + GQA attention,
+// tied embeddings, QK-norm + NeoX RoPE)
+// ============================================================================
+
+static EngineAutoRegister _eng_lfm2(
+    "lfm2", [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        return std::make_unique<Lfm2Engine>(m, c);
+    });
+static ConfigParserAutoRegister _cfg_lfm2("lfm2", parse_lfm2_config);
+static WeightInitAutoRegister _winit_lfm2("lfm2", init_lfm2_layer_weights);
+static ArchCapabilityAutoRegister _cap_lfm2("lfm2",
+                                            ArchCapability{.use_gqa = true,
+                                                           .use_qk_norm = true});
 
 // ============================================================================
 // BailingMoE3 (Ling 3.0: hybrid MoE + MLA + SSM/KDA recurrent attention)

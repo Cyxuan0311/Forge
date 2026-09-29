@@ -10,6 +10,7 @@
 #include "forge/inference/layers/attention_executor.h"
 #include "forge/inference/layers/ffn_executor.h"
 #include "forge/inference/layers/norm_executor.h"
+#include "forge/inference/layers/attn_rot_executor.h"
 #include "forge/inference/layers/rope_executor.h"
 
 namespace forge {
@@ -34,6 +35,11 @@ protected:
 
 private:
     RopeExecutor rope_executor_;
+    // Hadamard rotation state. rotating_ records whether this decode step's K/V
+    // rows went in rotated, so the attention output knows whether to un-rotate.
+    // It is per-step, not a one-shot latch: every token needs its own row rotated.
+    AttnRotExecutor rot_;
+    bool rotating_ = false;
     AttentionExecutor attention_executor_;
 };
 

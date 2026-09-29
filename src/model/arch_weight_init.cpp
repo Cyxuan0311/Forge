@@ -119,6 +119,32 @@ void init_qwen35_layer_weights(LayerWeightInitContext& ctx) {
     load_if_present(store, lw, "ssm_out", base + ".ssm_out");
 }
 
+// LFM2 / LFM2.5: hybrid shortconv + GQA attention. Attention layers use the
+// qwen35-style canonical attn_* names (no wq/wk/wv); shortconv layers carry
+// conv/in_proj/out_proj. FFN slots (w1/w2/w3) are shared by both block kinds.
+void init_lfm2_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+    load_if_present(store, lw, "w1", base + ".gate_proj");
+    load_if_present(store, lw, "w2", base + ".down_proj");
+    load_if_present(store, lw, "w3", base + ".up_proj");
+
+    load_if_present(store, lw, "attn_q", base + ".attn_q");
+    load_if_present(store, lw, "attn_k", base + ".attn_k");
+    load_if_present(store, lw, "attn_v", base + ".attn_v");
+    load_if_present(store, lw, "attn_output", base + ".attn_output");
+    load_if_present(store, lw, "attn_q_norm", base + ".attn_q_norm");
+    load_if_present(store, lw, "attn_k_norm", base + ".attn_k_norm");
+
+    load_if_present(store, lw, "shortconv_conv", base + ".shortconv_conv");
+    load_if_present(store, lw, "shortconv_in_proj", base + ".shortconv_in_proj");
+    load_if_present(store, lw, "shortconv_out_proj", base + ".shortconv_out_proj");
+}
+
 // Spark-X2.5: standard GQA slots (fused attn_qkv already split into wq/wk/wv by
 // the model loader) plus the per-head sigmoid attention output gate.
 void init_spark25_layer_weights(LayerWeightInitContext& ctx) {

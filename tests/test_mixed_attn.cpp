@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "forge/kv_cache.h"
@@ -377,16 +378,29 @@ int main() {
 #ifdef USE_CUDA
     // The pairs the selector can route here. Symmetric ones are included so the
     // new kernel is shown equal to the monomorphic ones it stands in for.
-    struct { const char* n; KVCacheDType k, v; } pairs[] = {
-        {"q8_0/q8_0", KVCacheDType::Q8_0, KVCacheDType::Q8_0},
-        {"q4_0/q4_0", KVCacheDType::Q4_0, KVCacheDType::Q4_0},
-        {"f16/f16",   KVCacheDType::F16,  KVCacheDType::F16},
-        {"q8_0/q4_0", KVCacheDType::Q8_0, KVCacheDType::Q4_0},
-        {"q4_0/q8_0", KVCacheDType::Q4_0, KVCacheDType::Q8_0},
-        {"q8_0/f16",  KVCacheDType::Q8_0, KVCacheDType::F16},
-        {"f16/q8_0",  KVCacheDType::F16,  KVCacheDType::Q8_0},
-        {"f16/q4_0",  KVCacheDType::F16,  KVCacheDType::Q4_0},
-    };
+    // All 9 combinations of {q8_0, q4_0, f16}, generated rather than listed.
+    //
+    // The hand-written list had 8 entries and omitted q4_0/f16, so that pair had
+    // no coverage and -ctk q4_0 -ctv f16 crashed the process with a thrown
+    // "launcher refused the requested combination". Enumerating the cross
+    // product means a new format cannot be added to the launcher's dispatch
+    // table without this test noticing.
+    const KVCacheDType types[] = {KVCacheDType::Q8_0, KVCacheDType::Q4_0, KVCacheDType::F16};
+    const char* names[] = {"q8_0", "q4_0", "f16"};
+    struct { const char* n; KVCacheDType k, v; } pairs[9];
+    int np = 0;
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            static std::string buf[9];
+            buf[np] = std::string(names[a]) + "/" + names[b];
+            pairs[np].n = buf[np].c_str();
+            pairs[np].k = types[a];
+            pairs[np].v = types[b];
+            ++np;
+        }
+    }
+    CHECK(np == 9, "all 9 dtype pairs enumerated");
+
     for (const auto& p : pairs) {
         for (int hd : {64, 96, 128}) test_pair(p.n, p.k, p.v, hd);
     }

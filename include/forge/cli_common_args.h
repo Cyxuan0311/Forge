@@ -64,6 +64,9 @@ struct CommonArgs {
 
     // ---- KVMem tiered KV working set (arXiv:2609.04852) ----
     bool kvmem = false;
+    // Hadamard-rotate activations before a quantized KV cache. Off by default: it
+    // costs three transforms per layer and only pays off when K or V is quantized.
+    bool rope_k_quant = false;
     int kvmem_budget = 0;
     int kvmem_sink = 256;
     int kvmem_gen_reserve = 0;

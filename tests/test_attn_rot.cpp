@@ -378,6 +378,56 @@ int main() {
         TensorPtr d = vec1d(std::vector<float>(64, 1.0f), DeviceType::CUDA);
         check(!ops::hadamard_rotate(d, 48), "CUDA launcher refuses order 48 instead of guessing");
         check(!ops::hadamard_rotate(d, 1024), "CUDA launcher refuses order 1024");
+
+        // The executor's own entry points on a DEVICE tensor. This is the path
+        // the engine uses and the one that segfaulted in the first version: the
+        // executor had its own CPU-only loop while the tests only ever drove the
+        // op, so the two device paths were never compared. The engine calls
+        // apply_qk/apply_v/undo_v, not the op, so these are the real contract.
+        for (int n : {64, 128}) {
+            std::vector<float> v(2 * n);  // [rows=2, order=n]
+            for (int i = 0; i < 2 * n; ++i)
+                v[i] = std::sin(0.31f * i) + 0.2f * (i % 7);
+
+            AttnRotExecutor e;
+            e.configure(true, n, DeviceType::CUDA);
+            check(e.enabled(), "executor enabled for a CUDA head_dim");
+
+            TensorPtr q = vec1d(v, DeviceType::CUDA), k = vec1d(v, DeviceType::CUDA);
+            e.apply_qk(q, k, nullptr, nullptr);
+            cudaDeviceSynchronize();
+            const std::vector<float> gq = pull(q);
+            TensorPtr hq = vec1d(v);
+            ops::hadamard_rotate(hq, n);
+            const std::vector<float> eq = read(hq);
+            double qerr = 0;
+            for (size_t i = 0; i < gq.size(); ++i)
+                qerr = std::max<double>(qerr, std::fabs(gq[i] - eq[i]));
+            std::snprintf(buf, sizeof(buf), "executor apply_qk on CUDA (n=%d) == CPU, err %.2e", n,
+                          qerr);
+            check(qerr < 1e-5, buf);
+
+            // Dot product must survive on device too.
+            const double ddev = dot(gq, pull(k));
+            const double dcpu = dot(eq, read(hq));
+            std::snprintf(buf, sizeof(buf), "executor apply_qk on CUDA preserves q.k: %.6f vs %.6f",
+                          ddev, dcpu);
+            check(std::fabs(ddev - dcpu) < 1e-3 * std::max(1.0, std::fabs(dcpu)), buf);
+
+            // apply_v / undo_v round trip on device.
+            TensorPtr vv = vec1d(v, DeviceType::CUDA);
+            e.apply_v(vv);
+            cudaDeviceSynchronize();
+            e.undo_v(vv);
+            cudaDeviceSynchronize();
+            const std::vector<float> rt = pull(vv);
+            double verr = 0;
+            for (size_t i = 0; i < rt.size(); ++i)
+                verr = std::max<double>(verr, std::fabs(rt[i] - v[i]));
+            std::snprintf(buf, sizeof(buf), "executor apply_v+undo_v on CUDA (n=%d) == input, err %.2e",
+                          n, verr);
+            check(verr < 1e-4, buf);
+        }
     }
 
     std::printf("\n=== %d/%d checks passed ===\n", g_pass, g_pass + g_fail);

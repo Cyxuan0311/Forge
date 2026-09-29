@@ -122,6 +122,26 @@ static const ArchWeightMapping qwen35_mapping = {
     .tie_embeddings = false,
 };
 
+static const ArchWeightMapping lfm2_mapping = {
+    .token_embedding = {{"token_embd.weight"}},
+    // LFM2 names its final norm "token_embd_norm" (llama.cpp OUTPUT_NORM_LFM2).
+    .output_norm = {{"token_embd_norm.weight"}},
+    .output_weight = {{"output.weight"}},  // absent -> tied to token_embd
+    .layer =
+        {
+            .attn_norm = {{"attn_norm.weight"}},
+            .ffn_norm = {{"ffn_norm.weight"}},
+            .gate_proj = {{"ffn_gate.weight"}},
+            .down_proj = {{"ffn_down.weight"}},
+            .up_proj = {{"ffn_up.weight"}},
+            .attn_q = {{"attn_q.weight"}},
+            .attn_k = {{"attn_k.weight"}},
+            .attn_v = {{"attn_v.weight"}},
+        },
+    .layer_prefix_pattern = "blk.{}",
+    .tie_embeddings = true,
+};
+
 static const std::unordered_map<std::string, const ArchWeightMapping*> arch_mappings = {
     {"llama", &llama_mapping},
     {"mistral", &mistral_mapping},
@@ -133,6 +153,7 @@ static const std::unordered_map<std::string, const ArchWeightMapping*> arch_mapp
     {"deepseek_v2", &deepseek_v2_mapping},
     {"deepseek_v3", &deepseek_v2_mapping},
     {"qwen35", &qwen35_mapping},
+    {"lfm2", &lfm2_mapping},
     {"gemma4", &llama_mapping},  // Gemma4 uses GGUF naming, not HuggingFace
 };
 

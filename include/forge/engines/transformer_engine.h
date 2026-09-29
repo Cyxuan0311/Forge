@@ -41,6 +41,12 @@ public:
     // what -ctk / -ctv need. The KV cache and its storage already carry
     // asymmetric types (KVCacheTypeConfig, KVCache::kv_config()), so nothing
     // downstream had to change -- the types were only ever forced to agree here.
+    // Runtime inference setting, not a model property: the model is held by const
+    // reference, and whether rotation is worth it depends on the KV dtype chosen
+    // at run time, not on what the GGUF says.
+    void set_rope_k_quant(bool v) { rope_k_quant_ = v; }
+    bool rope_k_quant() const { return rope_k_quant_; }
+
     void set_kv_cache_type_config(const KVCacheTypeConfig& cfg) {
         kv_cache_type_config_ = cfg;
         // Keep the legacy scalar in sync so any reader that has not been
@@ -199,6 +205,7 @@ protected:
     KVCacheDType kv_cache_dtype_ = KVCacheDType::Q8_0;
     // Authoritative K/V pair; kv_cache_dtype_ mirrors type_k for legacy readers.
     KVCacheTypeConfig kv_cache_type_config_{KVCacheDType::Q8_0, KVCacheDType::Q8_0};
+    bool rope_k_quant_ = false;
     int kv_cache_max_seq_len_ = 0;  // 0 = auto cap
     int gpu_layers_ = -1;
     std::vector<DeviceTarget> layer_devices_;  // per-layer (device_type, device_id) assignment

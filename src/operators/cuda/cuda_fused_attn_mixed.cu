@@ -281,6 +281,12 @@ bool launch_fused_flash_attention_gqa_decode_mixed(const float* Q, const void* q
         LAUNCH_MIXED_HD(FmtQ4_0, FmtQ4_0);
     } else if (k_fmt == 0 && v_fmt == 2) {
         LAUNCH_MIXED_HD(FmtQ8_0, FmtF16);
+    } else if (k_fmt == 1 && v_fmt == 2) {
+        // Was missing. A legitimate -ctk q4_0 -ctv f16 reached here and the
+        // launcher refused, which the executor turns into a thrown
+        // std::runtime_error: i.e. a supported dtype combination crashed the
+        // process instead of running or falling back.
+        LAUNCH_MIXED_HD(FmtQ4_0, FmtF16);
     } else if (k_fmt == 2 && v_fmt == 0) {
         LAUNCH_MIXED_HD(FmtF16, FmtQ8_0);
     } else if (k_fmt == 2 && v_fmt == 1) {

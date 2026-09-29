@@ -957,7 +957,9 @@ static bool u_is_ascii_punctsym(uint32_t c) {
 }  // namespace
 
 std::vector<std::string> Tokenizer::bpe_pre_tokenize(const std::string& text) const {
-    if (pre_type_ == "spark2_5") {
+    // lfm2 maps to llama.cpp's LLAMA3 pre type (digits <=3 grouping, llama3
+    // word/punct rules) — the same rule set the spark2_5 splitter implements.
+    if (pre_type_ == "spark2_5" || pre_type_ == "lfm2") {
         return bpe_pre_tokenize_spark25(text);
     }
 

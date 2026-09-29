@@ -334,5 +334,33 @@ void launch_ssm_gated_norm(
         delta_out, z, norm_w, seq_len, head_v_dim, num_v_heads, eps);
 }
 
+// ============================================================================
+// LFM2 shortconv: split the fused in_proj output [T, 3H] (chunks b|c|x) into
+//   bx[s,c]   = b[s,c] * x[s,c]   (conv input)
+//   gate[s,c] = c[s,c]            (post-conv gate)
+// in a single pass (llama.cpp lfm2.cpp build_shortconv_block).
+// ============================================================================
+__global__ void lfm2_bcx_split_kernel(const float* __restrict__ bcx,
+                                      float* __restrict__ bx,
+                                      float* __restrict__ gate,
+                                      int seq_len, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * hidden;
+    if (idx >= total) return;
+
+    int row = (idx / hidden) * 3 * hidden;
+    int c = idx % hidden;
+    bx[idx] = bcx[row + c] * bcx[row + 2 * hidden + c];
+    gate[idx] = bcx[row + hidden + c];
+}
+
+void launch_lfm2_bcx_split(const float* bcx, float* bx, float* gate,
+                           int seq_len, int hidden, cudaStream_t stream) {
+    int total = seq_len * hidden;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    lfm2_bcx_split_kernel<<<blocks, threads, 0, stream>>>(bcx, bx, gate, seq_len, hidden);
+}
+
 }  // namespace cuda
 }  // namespace forge

@@ -312,6 +312,45 @@ ModelConfig parse_qwen35_config(ModelLoader& loader, const std::string& arch) {
 }
 
 // ============================================================================
+// LFM2 / LFM2.5 (LiquidAI): hybrid shortconv + full attention, tied embeddings.
+// Per-layer `attention.head_count_kv`: 0 => shortconv operator layer,
+// >0 => GQA full attention (QK-norm, NeoX RoPE). No GDN/SSM layers.
+// ============================================================================
+ModelConfig parse_lfm2_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    cfg.tie_embeddings = true;
+    // LFM2 GGUF stores Q/K in the HF rotate-half layout (llama.cpp converts it
+    // with NEOX rope kernels and no load-time permute), so keep the weights
+    // as-is: use_neox_rope=false skips inverse_neox_permute_rows (same reason
+    // as phimoe/spark2_5). rope_type=NeoX still selects half-split RoPE pairing.
+    cfg.use_neox_rope = false;
+    cfg.rope_type = RopeType::NeoX;
+    cfg.use_qk_norm = true;
+
+    // Hybrid layer topology from the per-layer head_count_kv array. The scalar
+    // read in parse_common_gguf_config sees an array and falls back to
+    // num_heads, so re-derive it here.
+    auto kv_heads = loader.get_metadata_int_array(arch + ".attention.head_count_kv", {});
+    cfg.head_count_kv.assign(kv_heads.begin(), kv_heads.end());
+    if (!cfg.head_count_kv.empty()) {
+        int max_kv = 0;
+        for (int h : cfg.head_count_kv) max_kv = std::max(max_kv, h);
+        cfg.num_kv_heads = max_kv > 0 ? max_kv : cfg.num_kv_heads;
+    } else {
+        // Scalar (or missing) KV heads: uniform model, treat all layers as
+        // full attention unless shortconv tensors say otherwise (they do).
+        cfg.head_count_kv.assign(cfg.num_layers, cfg.num_kv_heads);
+    }
+    cfg.use_gqa = (cfg.num_kv_heads != cfg.num_heads);
+
+    cfg.shortconv_l_cache =
+        static_cast<int>(loader.get_metadata_int(arch + ".shortconv.l_cache", 0));
+    cfg.rope_dimension_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+    return cfg;
+}
+
+// ============================================================================
 // BailingMoE3 (Ling 3.0): hybrid MoE + MLA + SSM/KDA recurrent attention.
 // Per-layer `attention.head_count_kv`: 0 => SSM/KDA recurrent branch,
 // >0 => MLA branch (kv heads = 1). Rope is NORM-style (interleaved pairs).

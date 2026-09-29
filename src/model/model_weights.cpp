@@ -279,6 +279,16 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
             bool is_recurrent = (i < (int)config.head_count_kv.size()) &&
                                 config.head_count_kv[i] == 0;
             lw.layer_type = is_recurrent ? LayerType::LinearAttention : LayerType::MLA;
+        } else if (config.arch_type == "lfm2") {
+            // LiquidAI LFM2: head_count_kv[i]==0 => shortconv operator layer,
+            // >0 => GQA full attention. The tensor presence check covers GGUFs
+            // whose head_count_kv is scalar (parse_lfm2_config then fills the
+            // array with the scalar for every layer).
+            std::string lbase = "layers." + std::to_string(i);
+            bool is_conv = (i < (int)config.head_count_kv.size() &&
+                            config.head_count_kv[i] == 0) ||
+                           store.has(lbase + ".shortconv_in_proj");
+            lw.layer_type = is_conv ? LayerType::ShortConv : LayerType::FullAttention;
         } else if (config.use_mla) {
             lw.layer_type = LayerType::MLA;
         } else {
@@ -316,9 +326,21 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
 
         if (lw.layer_type == LayerType::FullAttention && !is_qwen35) {
             bool is_gemma4 = (config.arch_type == "gemma4");
-            // Gemma4: wv is optional (may use wk as fallback)
-            if (!lw.wq() || !lw.wk() || (!is_gemma4 && !lw.wv()) || !lw.wo()) {
+            bool is_lfm2 = (config.arch_type == "lfm2");
+            // Gemma4: wv is optional (may use wk as fallback);
+            // lfm2 attention layers use the canonical attn_* names.
+            if (is_lfm2) {
+                if (!lw.attn_q() || !lw.attn_k() || !lw.attn_v() || !lw.attn_output()) {
+                    LOG_ERROR("Missing attention weights for layer " + std::to_string(i));
+                    return false;
+                }
+            } else if (!lw.wq() || !lw.wk() || (!is_gemma4 && !lw.wv()) || !lw.wo()) {
                 LOG_ERROR("Missing attention weights for layer " + std::to_string(i));
+                return false;
+            }
+        } else if (lw.layer_type == LayerType::ShortConv) {
+            if (!lw.shortconv_conv() || !lw.shortconv_in_proj() || !lw.shortconv_out_proj()) {
+                LOG_ERROR("Missing shortconv weights for layer " + std::to_string(i));
                 return false;
             }
         } else if (lw.layer_type == LayerType::MLA) {

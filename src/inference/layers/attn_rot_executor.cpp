@@ -114,17 +114,13 @@ static void hadamard_rotate_inplace(float* p, int order) {
 void AttnRotExecutor::transform_last_dim_(const TensorPtr& x, int order, bool /*inverse*/) const {
     if (!x)
         return;
-    const int n = static_cast<int>(x->shape().back());
-    if (order <= 0 || n % order != 0)
-        return;
-    float* p = static_cast<float*>(x->data());
-    const int64_t rows = x->numel() / n;
-    const int chunks = n / order;
-    for (int64_t r = 0; r < rows; ++r) {
-        float* row = p + r * n;
-        for (int c = 0; c < chunks; ++c)
-            hadamard_rotate_inplace(row + c * order, order);
-    }
+    // Route through the op, which dispatches on device. Doing the loop inline
+    // here is what shipped the first version, and it dereferenced a device
+    // pointer on the host: the executor methods are the ones actually called
+    // from the engine, while the op is what the test exercised, so a CPU-only
+    // implementation of exactly these two paths type-checked and passed every
+    // test and then segfaulted on the first real quantized run.
+    ops::hadamard_rotate(x, order);
 }
 
 void AttnRotExecutor::apply_qk(const TensorPtr& q, const TensorPtr& k, TensorPtr* q_out,
@@ -169,22 +165,25 @@ bool hadamard_rotate(const TensorPtr& x, int order) {
     const int n = static_cast<int>(x->shape().back());
     if (n % order != 0)
         return false;
+    // The unit of work is an `order`-wide vector, and there are numel/order of
+    // them -- NOT numel/last_dim. The distinction matters whenever n > order,
+    // which is exactly the V case (head_dim 128 rotated in 64-wide sub-blocks):
+    // with rows = numel/n the kernel would launch a single block and silently
+    // leave the second sub-block unrotated, so V's upper half would have been
+    // rotated and the lower half not.
+    const int64_t vecs = x->numel() / order;
+    if (vecs <= 0)
+        return false;
 #ifdef USE_CUDA
     if (x->device() == DeviceType::CUDA) {
-        const int64_t rows = x->numel() / n;
         return cuda::launch_hadamard_rotate(static_cast<const float*>(x->data()),
-                                           static_cast<float*>(x->data()),
-                                           static_cast<int>(rows), order);
+                                            static_cast<float*>(x->data()),
+                                            static_cast<int>(vecs), order);
     }
 #endif
     float* p = static_cast<float*>(x->data());
-    const int64_t rows = x->numel() / n;
-    const int chunks = n / order;
-    for (int64_t r = 0; r < rows; ++r) {
-        float* row = p + r * n;
-        for (int c = 0; c < chunks; ++c)
-            hadamard_rotate_inplace(row + c * order, order);
-    }
+    for (int64_t i = 0; i < vecs; ++i)
+        hadamard_rotate_inplace(p + i * order, order);
     return true;
 }
 

@@ -577,6 +577,11 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
             weight_store_.set("token_embedding", te);
 
             auto on = load_tensor("output_norm.weight", last_layer_dev);
+            if (!on) {
+                // LFM2 stores the final norm as token_embd_norm.weight
+                // (llama.cpp LLM_TENSOR_OUTPUT_NORM_LFM2).
+                on = load_tensor("token_embd_norm.weight", last_layer_dev);
+            }
             if (on)
                 weight_store_.set("output_norm", on);
 
@@ -683,6 +688,20 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 set_if(base + ".ssm_alpha", blk + ".ssm_alpha.weight");
                 set_if(base + ".ssm_beta", blk + ".ssm_beta.weight");
                 set_if(base + ".ssm_out", blk + ".ssm_out.weight");
+            } else if (config_.arch_type == "lfm2") {
+                // LFM2: hybrid shortconv operator + GQA attention layers. The
+                // canonical attn_* names mirror the qwen35 branch so the
+                // engine's attention path is shared; shortconv weights follow
+                // llama.cpp tensor names (blk.{i}.shortconv.{conv,in_proj,out_proj}).
+                set_if(base + ".attn_q", blk + ".attn_q.weight");
+                set_if(base + ".attn_k", blk + ".attn_k.weight");
+                set_if(base + ".attn_v", blk + ".attn_v.weight");
+                set_if(base + ".attn_output", blk + ".attn_output.weight");
+                set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
+                set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
+                set_if(base + ".shortconv_conv", blk + ".shortconv.conv.weight");
+                set_if(base + ".shortconv_in_proj", blk + ".shortconv.in_proj.weight");
+                set_if(base + ".shortconv_out_proj", blk + ".shortconv.out_proj.weight");
             } else if (config_.arch_type == "spark2_5") {
                 // Spark-X2.5: fused attn_qkv [n_embd_q+2*n_embd_kv, n_embd] splits into
                 // wq/wk/wv along dim0 (row ranges stay block-aligned for GGUF quants,

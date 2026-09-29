@@ -10,6 +10,7 @@ namespace forge {
 void init_gqa_layer_weights(LayerWeightInitContext& ctx);
 void init_mla_layer_weights(LayerWeightInitContext& ctx);
 void init_qwen35_layer_weights(LayerWeightInitContext& ctx);
+void init_lfm2_layer_weights(LayerWeightInitContext& ctx);
 void init_falcon_layer_weights(LayerWeightInitContext& ctx);
 void init_gemma4_layer_weights(LayerWeightInitContext& ctx);
 void init_spark25_layer_weights(LayerWeightInitContext& ctx);
