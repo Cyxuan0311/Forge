@@ -258,24 +258,26 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
 
     uint64_t tensor_count, metadata_count;
     size_t offset = 8;
-    if (version >= 3) {
-        if (offset + 16 > size)
-            return fail("truncated GGUF header (need 16 bytes for tensor/metadata counts)");
-        std::memcpy(&tensor_count, data + offset, 8);
-        offset += 8;
-        std::memcpy(&metadata_count, data + offset, 8);
-        offset += 8;
-    } else {
-        if (offset + 8 > size)
-            return fail("truncated GGUF header (need 8 bytes for tensor/metadata counts)");
-        uint32_t tc, mc;
-        std::memcpy(&tc, data + offset, 4);
-        offset += 4;
-        std::memcpy(&mc, data + offset, 4);
-        offset += 4;
-        tensor_count = tc;
-        metadata_count = mc;
+    // Both counts are 64-bit from GGUF v2 onward. v2 and v3 are identical in
+    // this header layout, so gating on `version >= 3` (as this used to) read v2
+    // files as two u32s and desynchronised the whole file by 8 bytes.
+    // llama.cpp reads both as int64 unconditionally and rejects v1 outright
+    // (gguf.cpp: "GGUFv1 is no longer supported"), so v1 is refused here too
+    // rather than parsed with a layout that nothing else uses.
+    if (version < 2) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "GGUF version %u is not supported (need v2 or newer; v1 is no longer "
+                      "readable by the reference implementation)",
+                      version);
+        return fail(buf);
     }
+    if (offset + 16 > size)
+        return fail("truncated GGUF header (need 16 bytes for tensor/metadata counts)");
+    std::memcpy(&tensor_count, data + offset, 8);
+    offset += 8;
+    std::memcpy(&metadata_count, data + offset, 8);
+    offset += 8;
     snap.tensor_count = tensor_count;
     snap.metadata_count = metadata_count;
 
@@ -417,23 +419,71 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
     const size_t info_start = offset;
 
     // Pass 1 (sequential): locate each record's start offset. Pure arithmetic.
+    //
+    // `index_end` is the position just past the last record, and it is what the
+    // data section starts from. It used to be a block-local `off` that went out of
+    // scope, so the code fell back to `offset` -- the end of the METADATA -- and
+    // every tensor's file_offset was short by the whole tensor index. Nothing
+    // printed file_offset, so it was invisible until --validate needed it.
     std::vector<size_t> record_offsets(tensor_count);
+    size_t index_end = info_start;
     {
         size_t off = info_start;
         for (uint64_t i = 0; i < tensor_count; ++i) {
             record_offsets[i] = off;
-            size_t name_len_off = off;
+            if (off + 8 > size) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "truncated tensor index at tensor %llu (offset %zu, file size %zu)",
+                              (unsigned long long)i, off, size);
+                return fail(buf);
+            }
             uint64_t name_len = 0;
-            if (name_len_off + 8 <= size)
-                std::memcpy(&name_len, data + name_len_off, 8);
-            off = name_len_off + 8 + name_len;
+            std::memcpy(&name_len, data + off, 8);
+            off += 8;
+            if (name_len > size - off) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "tensor %llu name length %llu runs past end of file (size %zu)",
+                              (unsigned long long)i, (unsigned long long)name_len, size);
+                return fail(buf);
+            }
+            off += static_cast<size_t>(name_len);
+            if (off + 4 > size) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf), "truncated tensor %llu: no ndim (offset %zu)",
+                              (unsigned long long)i, off);
+                return fail(buf);
+            }
             uint32_t ndim = 0;
-            if (off + 4 <= size)
-                std::memcpy(&ndim, data + off, 4);
+            std::memcpy(&ndim, data + off, 4);
             off += 4;
+            // GGUF caps ndim at 4. Checking it here also bounds the multiplication
+            // below, and a nonsense ndim is the cheapest sign of a misparse.
+            if (ndim > 4) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf), "tensor %llu has ndim %u (GGUF allows at most 4)",
+                              (unsigned long long)i, ndim);
+                return fail(buf);
+            }
+            if (static_cast<size_t>(ndim) * 8 > size - off) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "truncated tensor %llu: %u dims do not fit (offset %zu, size %zu)",
+                              (unsigned long long)i, ndim, off, size);
+                return fail(buf);
+            }
             off += static_cast<size_t>(ndim) * 8;  // dims
-            off += 4 + 8;                          // dtype + offset
+            if (off + 12 > size) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "truncated tensor %llu: no dtype+offset (offset %zu, size %zu)",
+                              (unsigned long long)i, off, size);
+                return fail(buf);
+            }
+            off += 4 + 8;  // dtype + offset
         }
+        index_end = off;
     }
 
     uint64_t alignment = 32;
@@ -441,7 +491,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
     if (it_align != snap.meta_int.end())
         alignment = static_cast<uint64_t>(it_align->second);
 
-    size_t data_start = record_offsets.empty() ? info_start : offset;
+    size_t data_start = record_offsets.empty() ? info_start : index_end;
     if (data_start % alignment != 0)
         data_start += alignment - (data_start % alignment);
 

@@ -566,7 +566,7 @@ std::string render_json(const LoadedModel& m, const RenderOptions& o) {
     }
     out += st.by_dtype.empty() ? "],\n" : "\n" + IND + "],\n";
 // layers
-    const size_t nlay = std::max(o.top_layers > 0 ? static_cast<size_t>(o.top_layers)
+    const size_t nlay = std::min(o.top_layers > 0 ? static_cast<size_t>(o.top_layers)
                                                    : st.layer_bytes.size(),
                                  st.layer_bytes.size());
     out += IND + "\"layers\": [";
@@ -636,8 +636,8 @@ std::string render_yaml(const LoadedModel& m, const RenderOptions& o) {
         out += "    count: " + std::to_string(d.count) + "\n";
         out += "    elements: " + std::to_string(d.elements) + "\n";
     }
-    const size_t nlay = std::max(o.top_layers > 0 ? static_cast<size_t>(o.top_layers)
-                                                  : st.layer_bytes.size(),
+    const size_t nlay = std::min(o.top_layers > 0 ? static_cast<size_t>(o.top_layers)
+                                                   : st.layer_bytes.size(),
                                  st.layer_bytes.size());
     if (nlay) {
         out += "layers:\n";
@@ -753,8 +753,8 @@ std::string render_csv(const LoadedModel& m, const RenderOptions& o) {
         out += join({d.name, std::to_string(d.bytes), std::to_string(d.count),
                      std::to_string(d.elements)}) +
                "\n";
-    const size_t nlay = std::max(o.top_layers > 0 ? static_cast<size_t>(o.top_layers)
-                                                 : st.layer_bytes.size(),
+    const size_t nlay = std::min(o.top_layers > 0 ? static_cast<size_t>(o.top_layers)
+                                                   : st.layer_bytes.size(),
                                  st.layer_bytes.size());
     if (nlay) {
         out += "# layers\n";
