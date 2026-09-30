@@ -14,12 +14,14 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <string>
 #include <vector>
 
 #include "forge/gguf_model.h"
+#include "inspect/arch_ops.h"
 #include "perf/gguf_scanner.h"
 #include "report.h"
 
@@ -280,6 +282,184 @@ int main() {
 
     const std::string ini = forge::inspect::render_ini(lm, ro);
     check(ini.find("[summary]") != std::string::npos, "ini has summary section");
+
+    // ---- memory / KV estimate ----
+    {
+        // bytes-per-element must match KVCache::block_nbytes(), i.e. include the
+        // per-block scale. Using the nominal bit width would understate q8_0 by
+        // 6% and q4_0 by 11%.
+        check(std::fabs(forge::inspect::kv_bytes_per_element("f16") - 2.0) < 1e-12, "f16 is 2 B/elem");
+        check(std::fabs(forge::inspect::kv_bytes_per_element("q8_0") - 34.0 / 32.0) < 1e-12,
+              "q8_0 is 34/32 B/elem (scale included)");
+        check(std::fabs(forge::inspect::kv_bytes_per_element("q4_0") - 18.0 / 32.0) < 1e-12,
+              "q4_0 is 18/32 B/elem (scale included)");
+        check(forge::inspect::kv_bytes_per_element("nope") < 0, "unknown dtype is rejected");
+        // The engine's KVCacheDType has no BF16/Q5_K/Q6_K. BF16 would silently hit
+        // block_nbytes' `default` branch and be stored as 4 B/elem, so the tool must
+        // refuse rather than advertise a cache Forge cannot allocate.
+        check(forge::inspect::kv_bytes_per_element("bf16") < 0, "bf16 is not a KV dtype");
+        check(forge::inspect::kv_bytes_per_element("q5_k") < 0, "q5_k is not a KV dtype");
+        check(forge::inspect::kv_bytes_per_element("q6_k") < 0, "q6_k is not a KV dtype");
+
+        // Per-row block rounding must match KVCache::block_nbytes exactly. These row
+        // sizes are deliberately NOT multiples of the block, where a flat
+        // bytes/element ratio would under-count.
+        check(forge::inspect::kv_row_bytes("f16", 512) == 1024, "f16 row = 2 B/elem");
+        check(forge::inspect::kv_row_bytes("q8_0", 512) == 16 * 34,
+              "q8_0 row of 512 is exactly 16 blocks of 34 B");
+        check(forge::inspect::kv_row_bytes("q4_0", 512) == 16 * 18, "q4_0 row is 16 blocks of 18 B");
+        check(forge::inspect::kv_row_bytes("q4_k", 512) == 2 * 144, "q4_k row is 2 blocks of 144 B");
+        check(forge::inspect::kv_row_bytes("fp8_e4m3", 512) == 512, "fp8 row = 1 B/elem");
+        check(forge::inspect::kv_row_bytes("q8_0", 33) == 2 * 34, "q8_0 row of 33 needs 2 blocks");
+        check(forge::inspect::kv_row_bytes("q8_0", 520) == 17 * 34,
+              "q8_0 row of 520 pads up to 17 blocks, not 16.25");
+        check(forge::inspect::kv_row_bytes("q4_0", 520) == 17 * 18, "q4_0 row of 520 pads to 17 blocks");
+        check(forge::inspect::kv_row_bytes("q4_k", 300) == 2 * 144, "q4_k row of 300 pads to 2 blocks");
+        check(forge::inspect::kv_row_bytes("q8_0", 0) == 0, "empty row costs nothing");
+
+        std::string canon;
+        check(forge::inspect::parse_kv_dtype("Q8_0", &canon) && canon == "q8_0",
+              "kv dtype parse is case-insensitive");
+        check(forge::inspect::parse_kv_dtype("fp16", &canon) && canon == "f16", "fp16 alias");
+        check(!forge::inspect::parse_kv_dtype("q7_0", &canon), "unknown kv dtype rejected");
+        check(!forge::inspect::parse_kv_dtype("bf16", &canon),
+              "bf16 rejected: the engine has no BF16 KV cache");
+
+        const auto& ai = lm.arch;
+        // The fixture is a uniform 4-layer model: 4 layers, 32 heads, no kv key so
+        // kv heads fall back to 32, head_dim = 4096/32 = 128.
+        check(ai.head_dim == 128, "head_dim derived as hidden/heads when not stated");
+        check(ai.kv_estimable, "uniform model is estimable");
+
+        const auto me16 = forge::inspect::estimate_memory(snap1, ai, 2048, "f16", -1);
+        check(me16.ok, "f16 estimate produced");
+        // 2 (K+V) * 4 layers * 32 heads * 128 dim * 2 B = 65536 B/token
+        check(me16.kv_bytes_per_token == 2 * 4 * 32 * 128 * 2, "f16 kv bytes/token");
+        check(me16.kv_bytes_total == me16.kv_bytes_per_token * 2048, "kv total = per-token x ctx");
+        check(me16.weight_bytes == st1.total_bytes, "weight bytes come from the tensors");
+
+        const auto me8 = forge::inspect::estimate_memory(snap1, ai, 2048, "q8_0", -1);
+        check(me8.kv_bytes_per_token == me16.kv_bytes_per_token * 34 / 64,
+              "q8_0 kv is 17/16 of f16 (34B vs 32B per block)");
+
+        // End-to-end rounding: force a 512-element row (8 kv heads x 64 head dim), which
+        // is exactly the LFM2 shape, and confirm the total follows the padded row size
+        // rather than the nominal rate.
+        {
+            // 8 kv heads x 64 head dim = 512 elements: exactly 16 q8_0 blocks, so this
+            // is the unpadded case (and the shape the LFM2.5 model actually has).
+            auto lfm2 = ai;
+            lfm2.n_kv_heads = 8;
+            lfm2.head_dim = 64;
+            const auto m = forge::inspect::estimate_memory(snap1, lfm2, 512, "f16", -1);
+            check(m.kv_bytes_per_token == 2 * 4 * 1024, "f16 hybrid row total");
+            check(m.kv_bytes_total == 8192 * 512, "f16 hybrid total at ctx=512");
+            check(m.bytes_per_elem == 2.0, "f16 bytes/elem is exactly 2");
+            const auto mq = forge::inspect::estimate_memory(snap1, lfm2, 512, "q8_0", -1);
+            check(mq.kv_bytes_per_token == 2 * 4 * 16 * 34, "q8_0 unpadded row total");
+            check(mq.bytes_per_elem == 34.0 / 32.0, "unpadded q8_0 is at the nominal rate");
+
+            // 520 elements per row is NOT a multiple of 32, so the row must round up
+            // to 17 blocks. This is where a flat bytes/element ratio goes wrong.
+            auto padded = ai;
+            padded.n_kv_heads = 8;
+            padded.head_dim = 65;  // 8*65 = 520
+            const auto mp = forge::inspect::estimate_memory(snap1, padded, 512, "q8_0", -1);
+            check(mp.kv_bytes_per_token == 2 * 4 * 578, "q8_0 padded row is 578 B, not 552.5");
+            check(mp.kv_bytes_per_token > 2 * 4 * 520 * 34 / 32,
+                  "padded q8_0 row costs more than the flat ratio suggests");
+            check(mp.bytes_per_elem > 34.0 / 32.0,
+                  "effective bytes/elem is above nominal for a padded row");
+        }
+
+        // Context scaling must be linear, and the per-token figure must not change.
+        const auto me4k = forge::inspect::estimate_memory(snap1, ai, 4096, "f16", -1);
+        check(me4k.kv_bytes_per_token == me16.kv_bytes_per_token, "per-token cost is ctx-independent");
+        check(me4k.kv_bytes_total == 2 * me16.kv_bytes_total, "kv total doubles with ctx");
+
+        // VRAM budget: fits generously, does not fit tightly.
+        const int64_t weights = me16.weight_bytes;
+        const auto big = forge::inspect::estimate_memory(snap1, ai, 2048, "f16",
+                                                         weights * 4 + me16.compute_reserve);
+        check(big.fits, "generous vram budget fits");
+        check(big.headroom_bytes > 0, "positive headroom when it fits");
+        check(big.layers_to_offload == -1, "no offload suggested when it fits");
+
+        // Build a budget that needs exactly half the layers on the CPU: budget_for_weights
+        // is 2.5 layers' worth, so 2 stay resident and 2 are offloaded.
+        const int64_t per_layer = weights / 4;
+        const int64_t half_budget =
+            (5 * per_layer) / 2 + me16.kv_bytes_total + me16.compute_reserve;
+        const auto half = forge::inspect::estimate_memory(snap1, ai, 2048, "f16", half_budget);
+        check(!half.fits, "half-sized budget does not fit");
+        check(half.layers_to_offload == 2, "half-sized budget offloads exactly 2 of 4 layers");
+        check(half.layers_resident == 2, "and reports 2 layers resident");
+
+        // Offloading every layer is not always enough: the embedding is outside any
+        // layer group, so a budget below the KV+compute reserve can never be met.
+        const auto starved = forge::inspect::estimate_memory(snap1, ai, 2048, "f16", weights / 2);
+        check(!starved.fits, "starved budget does not fit");
+        check(starved.layers_to_offload == 4, "starved budget offloads all 4 layers");
+        check(starved.layers_resident == 0, "starved budget leaves 0 layers resident");
+
+        // Not estimable: strip the head dim.
+        auto blind = ai;
+        blind.head_dim = 0;
+        blind.kv_estimable = false;
+        const auto none = forge::inspect::estimate_memory(snap1, blind, 2048, "f16", -1);
+        check(!none.ok && !none.reason.empty(), "missing metadata refuses to estimate, with a reason");
+
+        const auto render = forge::inspect::render_memory(snap1, ai, me16);
+        check(render.find("kv / token") != std::string::npos, "memory render has kv/token");
+        check(render.find("total") != std::string::npos, "memory render has a total");
+
+        // Machine formats carry it when requested, and stay valid json.
+        forge::inspect::RenderOptions mo;
+        mo.memory = true;
+        mo.ctx = 2048;
+        mo.kv_dtype = "f16";
+        const std::string mj = forge::inspect::render_json(lm, mo);
+        check(mj.find("\"memory\"") != std::string::npos, "json carries the memory block");
+        // Braces must balance or the output is unparseable.
+        int depth = 0;
+        bool neg = false;
+        for (char c : mj) {
+            if (c == '{') ++depth;
+            if (c == '}') { --depth; if (depth < 0) neg = true; }
+        }
+        check(depth == 0 && !neg, "json with memory block is brace-balanced");
+        const std::string mj_off = forge::inspect::render_json(lm, forge::inspect::RenderOptions());
+        check(mj_off.find("\"memory\"") == std::string::npos,
+              "json omits memory unless asked");
+    }
+
+    // ---- arch family comes from one table (was duplicated) ----
+    {
+        check(forge::inspect::family_for_arch("llama") == forge::inspect::ArchFamily::Gqa,
+              "llama is gqa");
+        check(forge::inspect::family_for_arch("gemma2") == forge::inspect::ArchFamily::Gemma,
+              "gemma2 is gemma");
+        check(forge::inspect::family_for_arch("deepseek_v3") == forge::inspect::ArchFamily::Mla,
+              "deepseek_v3 is mla");
+        check(forge::inspect::family_for_arch("qwen35") == forge::inspect::ArchFamily::Hybrid,
+              "qwen35 is hybrid");
+        check(forge::inspect::family_for_arch("nonesuch") == forge::inspect::ArchFamily::Unknown,
+              "unknown arch is Unknown");
+        // The family string and the operator pipeline must agree, which is the
+        // whole point of having one table.
+        const char* fname = forge::inspect::family_name(forge::inspect::family_for_arch("qwen35"));
+        check(std::string(fname) == "hybrid", "family_name(hybrid) == hybrid");
+        check(forge::inspect::pipeline_for("qwen35") != nullptr, "qwen35 has a pipeline");
+        check(forge::inspect::pipeline_for("llama") != nullptr, "llama has a pipeline");
+        check(forge::inspect::pipeline_for("nonesuch") == nullptr, "unknown arch has no pipeline");
+        // Every arch with a pipeline must resolve to a non-Unknown family, or the
+        // two tables have drifted again.
+        for (const char* a : {"llama", "gemma", "gemma2", "deepseek", "deepseek_v2",
+                              "deepseek_v3", "phimoe", "gemma4", "qwen35", "qwen2", "mistral",
+                              "phi3", "falcon", "yi", "qwen", "qwen3vl"})
+            check(forge::inspect::family_for_arch(a) != forge::inspect::ArchFamily::Unknown,
+                  std::string("arch has a family: ").append(a).c_str());
+    }
 
     const std::string peaks = forge::inspect::render_peak_tensors(snap1, 3);
     check(peaks.size() >= 3, "peak tensors rendered");

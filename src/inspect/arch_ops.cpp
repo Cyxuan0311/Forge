@@ -105,28 +105,66 @@ ArchOpPipeline qwen35_pipeline() {
 
 }  // namespace
 
+ArchFamily family_for_arch(const std::string& arch) {
+    // Single source of truth for arch -> family. sniff_arch() and pipeline_for()
+    // both call this, so they cannot disagree about what family an arch is in.
+    static const struct {
+        const char* arch;
+        ArchFamily family;
+    } kTable[] = {
+        {"llama", ArchFamily::Gqa},     {"mistral", ArchFamily::Gqa},
+        {"yi", ArchFamily::Gqa},        {"qwen", ArchFamily::Gqa},
+        {"qwen2", ArchFamily::Gqa},     {"qwen3vl", ArchFamily::Gqa},
+        {"phi3", ArchFamily::Gqa},      {"falcon", ArchFamily::Gqa},
+        {"gemma", ArchFamily::Gemma},   {"gemma2", ArchFamily::Gemma},
+        {"deepseek", ArchFamily::Mla},  {"deepseek_v2", ArchFamily::Mla},
+        {"deepseek_v3", ArchFamily::Mla},
+        {"phimoe", ArchFamily::Moe},    {"gemma4", ArchFamily::Moe},
+        {"qwen35", ArchFamily::Hybrid},
+    };
+    for (const auto& e : kTable) {
+        if (arch == e.arch)
+            return e.family;
+    }
+    return ArchFamily::Unknown;
+}
+
+const char* family_name(ArchFamily f) {
+    switch (f) {
+    case ArchFamily::Gqa: return "gqa";
+    case ArchFamily::Gemma: return "gemma";
+    case ArchFamily::Mla: return "mla";
+    case ArchFamily::Moe: return "moe";
+    case ArchFamily::Hybrid: return "hybrid";
+    case ArchFamily::Unknown: break;
+    }
+    return "";
+}
+
 const ArchOpPipeline* pipeline_for(const std::string& arch) {
-    // Group architectures into known families.
-    if (arch == "llama" || arch == "mistral" || arch == "yi" || arch == "qwen" ||
-        arch == "qwen2" || arch == "qwen3vl" || arch == "phi3" || arch == "falcon") {
+    switch (family_for_arch(arch)) {
+    case ArchFamily::Gqa: {
         static const auto p = gqa_pipeline();
         return &p;
     }
-    if (arch == "gemma" || arch == "gemma2") {
+    case ArchFamily::Gemma: {
         static const auto p = gemma_pipeline();
         return &p;
     }
-    if (arch == "deepseek" || arch == "deepseek_v2" || arch == "deepseek_v3") {
+    case ArchFamily::Mla: {
         static const auto p = mla_pipeline();
         return &p;
     }
-    if (arch == "phimoe" || arch == "gemma4") {
+    case ArchFamily::Moe: {
         static const auto p = moe_pipeline();
         return &p;
     }
-    if (arch == "qwen35") {
+    case ArchFamily::Hybrid: {
         static const auto p = qwen35_pipeline();
         return &p;
+    }
+    case ArchFamily::Unknown:
+        break;
     }
     return nullptr;
 }

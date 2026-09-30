@@ -58,6 +58,40 @@
 | `-v, --verbose` | 启用详细日志 |
 | `-h, --help` | 显示帮助信息 |
 
+### `forge-inspect`
+
+独立的 GGUF 分析工具。读取模型文件，输出元数据、tensor 布局、dtype 直方图、
+算子流水线，并可选给出 KV/显存估算。
+
+```bash
+# 人类可读摘要
+forge-inspect model.gguf
+
+# 能不能装下？按 4K 上下文和 6 GiB 显卡计算
+forge-inspect -M --ctx 4096 --vram 6144 model.gguf
+
+# q8_0 KV 相比 f16 可省一半缓存
+forge-inspect -M --ctx 4096 --kv-dtype q8_0 model.gguf
+
+# 机器可读，便于脚本处理
+forge-inspect -M -f json model.gguf | jq .memory
+```
+
+| 选项 | 说明 |
+|------|------|
+| `-M, --memory` | KV 缓存 + 显存估算 |
+| `--ctx N` | 假定的上下文长度（默认用模型自身的训练长度） |
+| `--kv-dtype D` | `f16`、`fp32`、`q8_0`、`q4_0`、`q4_k`、`fp8_e4m3`、`fp8_e5m2` |
+| `--vram MB` | 用于比对的预算；输出超出/剩余量以及需卸载的层数 |
+| `-f, --format` | `text`、`table`、`markdown`、`json`、`yaml`、`csv`、`ini` |
+| `--metadata` | 打印全部元数据键值 |
+| `-t, --tree [D]` | 深度为 `D` 的 tensor 树 |
+
+估算口径与 Forge 引擎自身一致，因此数值与引擎输出的 `KV Cache` 相同。
+量化 KV 的大小包含每块的 scale，且每行向上取整到整块；可选 dtype 列表与引擎
+实际可存储的类型完全一致（没有 BF16，也没有 K-quant 的 KV cache）。
+混合架构（LFM2、Qwen3.5）还会标注真正含注意力的层数——它通常远小于总层数。
+
 ## 示例
 
 ### 交互式对话

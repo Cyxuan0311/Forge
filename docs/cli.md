@@ -59,6 +59,43 @@
 | `-v, --verbose` | Enable verbose logging |
 | `-h, --help` | Show help message |
 
+### `forge-inspect`
+
+A separate tool for GGUF analysis. It reads a model file and reports its
+metadata, tensor layout, dtype histogram, operator pipeline, and an optional
+KV/VRAM estimate.
+
+```bash
+# human-readable summary
+forge-inspect model.gguf
+
+# will it fit? assume 4K context and a 6 GiB card
+forge-inspect -M --ctx 4096 --vram 6144 model.gguf
+
+# q8_0 KV halves the cache versus f16
+forge-inspect -M --ctx 4096 --kv-dtype q8_0 model.gguf
+
+# machine-readable, for scripting
+forge-inspect -M -f json model.gguf | jq .memory
+```
+
+| Option | Description |
+|--------|-------------|
+| `-M, --memory` | KV cache + VRAM estimate |
+| `--ctx N` | Context length to assume (default: the model's trained length) |
+| `--kv-dtype D` | `f16`, `fp32`, `q8_0`, `q4_0`, `q4_k`, `fp8_e4m3`, `fp8_e5m2` |
+| `--vram MB` | Budget to check against; reports over/under and how many layers to offload |
+| `-f, --format` | `text`, `table`, `markdown`, `json`, `yaml`, `csv`, `ini` |
+| `--metadata` | Dump all metadata key/value pairs |
+| `-t, --tree [D]` | Tensor tree to depth `D` |
+
+The estimate follows the same accounting Forge itself uses, so the number
+matches the engine's own `KV Cache` report. Quantized sizes include the
+per-block scale and round each row up to a whole block, and the dtype list is
+exactly the set the engine can store — there is no BF16 or K-quant KV cache.
+Hybrid architectures (LFM2, Qwen3.5) also report how many layers actually hold
+attention, since that is often far fewer than the layer count.
+
 ## Examples
 
 ### Interactive Chat

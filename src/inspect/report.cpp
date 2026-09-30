@@ -19,6 +19,13 @@ std::string label(const char* s) {
     return col::paint(s, col::Style::Dim);
 }
 
+// Fixed-point with 3 decimals, for small ratios like "0.563 B/elem".
+std::string fmt_fixed(double v, int decimals = 3) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.*f", decimals, v);
+    return buf;
+}
+
 std::string human_bytes(int64_t bytes) {
     static const char* units[] = {"B", "KB", "MB", "GB", "TB"};
     double v = static_cast<double>(bytes);
@@ -229,21 +236,239 @@ ArchInfo sniff_arch(const GgufSnapshot& snap) {
     ai.n_layers = i(ap + ".block_count");
     ai.n_heads = i(ap + ".attention.head_count");
     ai.n_kv_heads = i(ap + ".attention.head_count_kv");
+    // The KV estimate needs layers, kv heads and head dim. Derive head_dim when
+    // the file only implies it, and record whether everything needed was present
+    // so the caller can refuse to print a confident-looking wrong number.
+    ai.head_dim = i(ap + ".attention.key_length");
+    if (ai.head_dim == 0 && i(ap + ".attention.value_length") > 0)
+        ai.head_dim = i(ap + ".attention.value_length");
+    if (ai.head_dim == 0 && ai.n_heads > 0 && ai.hidden_size > 0)
+        ai.head_dim = ai.hidden_size / ai.n_heads;
+    ai.context_length = i(ap + ".context_length");
+    if (ai.context_length == 0) ai.context_length = i(ap + ".max_context_length");
+    ai.vocab_size = i("tokenizer.ggml.tokens.length");
+    // Hybrid archs store a per-layer array; 0 means "no attention in this layer".
+    // Forge (parse_lfm2_config / the common parser) takes max(array) as
+    // num_kv_heads and then allocates KV uniformly for every layer, so the estimate
+    // mirrors that rather than the tighter "only the layers that need it" number.
+    if (auto it = snap.meta_int_array.find(ap + ".attention.head_count_kv");
+        it != snap.meta_int_array.end() && !it->second.empty()) {
+        ai.per_layer_kv = true;
+        for (int32_t h : it->second) {
+            if (h > 0) {
+                ++ai.n_attn_layers;
+                ai.n_kv_heads = std::max<int64_t>(ai.n_kv_heads, h);
+            }
+        }
+    }
+    if (ai.n_attn_layers == 0)
+        ai.n_attn_layers = ai.n_layers;  // uniform model
+    // Neither a scalar nor an array: MHA, where kv heads equal query heads. Resolve
+    // it once here so the summary, the estimate and kv_estimable cannot disagree.
+    if (ai.n_kv_heads == 0)
+        ai.n_kv_heads = ai.n_heads;
+    ai.n_expert = i(ap + ".expert_count");
+    ai.n_expert_used = i(ap + ".expert_used_count");
+    ai.sliding_window = i(ap + ".attention.sliding_window");
+    {
+        auto it = snap.meta_float.find(ap + ".rope.freq_base");
+        if (it != snap.meta_float.end())
+            ai.rope_theta = it->second;
+    }
+    ai.kv_estimable = ai.n_layers > 0 && ai.head_dim > 0 && ai.n_kv_heads > 0;
     ai.supported = arch_supported(ai.arch);
-    if (ai.arch == "llama" || ai.arch == "mistral" || ai.arch == "yi" || ai.arch == "qwen" ||
-        ai.arch == "qwen2" || ai.arch == "qwen3vl" || ai.arch == "phi3" || ai.arch == "falcon")
-        ai.family = "gqa";
-    else if (ai.arch == "gemma" || ai.arch == "gemma2")
-        ai.family = "gemma";
-    else if (ai.arch == "deepseek" || ai.arch == "deepseek_v2" || ai.arch == "deepseek_v3")
-        ai.family = "mla";
-    else if (ai.arch == "phimoe" || ai.arch == "gemma4")
-        ai.family = "moe";
-    else if (ai.arch == "qwen35")
-        ai.family = "hybrid";
-    else
-        ai.family = ai.arch;
+    // From the shared table rather than a second hand-written list, which is how
+    // the family string and the operator pipeline drifted apart before.
+    const char* fam = family_name(family_for_arch(ai.arch));
+    ai.family = (fam && *fam) ? fam : ai.arch;
     return ai;
+}
+
+
+// ---------------------------------------------------------------------------
+// KV / VRAM estimation
+// ---------------------------------------------------------------------------
+
+// Exact replica of KVCache::block_nbytes() for a row of `n` elements. Block
+// formats round UP to a whole block per row, so a flat bytes/element ratio is
+// not enough: for n=512, q8_0 is 17*34 = 578 B, not 512*1.0625 = 544 B, and
+// using the ratio understates a q8_0 cache by 6%.
+int64_t kv_row_bytes(const std::string& dtype, int64_t n) {
+    if (n <= 0) return 0;
+    if (dtype == "f16") return n * 2;
+    if (dtype == "fp32") return n * 4;
+    if (dtype == "q8_0") return ((n + 31) / 32) * 34;
+    if (dtype == "q4_0") return ((n + 31) / 32) * 18;
+    if (dtype == "q4_k") return ((n + 255) / 256) * 144;
+    if (dtype == "fp8_e4m3" || dtype == "fp8_e5m2") return n;  // 1 B/elem, no blocks
+    return -1;  // unknown
+}
+
+double kv_bytes_per_element(const std::string& dtype) {
+    // The engine has no BF16/Q5_K/Q6_K KV dtype, so neither do we: offering them
+    // would print a confident number the engine cannot actually produce.
+    switch (kv_row_bytes(dtype, 4096)) {
+    case -1: return -1.0;
+    default: return static_cast<double>(kv_row_bytes(dtype, 4096)) / 4096.0;
+    }
+}
+
+bool parse_kv_dtype(const std::string& in, std::string* out) {
+    static const char* kNames[] = {"f16",  "fp32",       "q8_0",  "q4_0",
+                                   "q4_k", "fp8_e4m3",   "fp8_e5m2"};
+    std::string v = in;
+    for (auto& c : v)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const char* n : kNames) {
+        if (v == n) {
+            *out = n;
+            return true;
+        }
+    }
+    // Accept the fp16/fp32 aliases too.
+    if (v == "fp16") { *out = "f16"; return true; }
+    if (v == "f32") { *out = "fp32"; return true; }
+    return false;
+}
+
+MemoryEstimate estimate_memory(const GgufSnapshot& snap, const ArchInfo& ai, int64_t ctx,
+                               const std::string& kv_dtype, int64_t vram_budget,
+                               double overhead_frac, int64_t overhead_floor_mb) {
+    MemoryEstimate me;
+    me.ctx = ctx > 0 ? ctx : (ai.context_length > 0 ? ai.context_length : 2048);
+    me.vram_budget = vram_budget;
+    me.kv_dtype = kv_dtype.empty() ? "f16" : kv_dtype;
+
+    if (!ai.kv_estimable) {
+        me.reason = "file does not state enough metadata to size the KV cache "
+                    "(need block_count and a head dim)";
+        return me;
+    }
+
+    // GQA: kv heads default to query heads when not stated (MHA).
+    const int64_t kv_heads = ai.n_kv_heads;
+
+    // Both K and V, every layer, using the engine's per-row block rounding so the
+    // total matches the KV Cache size Forge itself reports.
+    const int64_t row_elems = kv_heads * ai.head_dim;
+    const int64_t row = kv_row_bytes(me.kv_dtype, row_elems);
+    if (row < 0) {
+        me.reason = "unknown KV dtype '" + me.kv_dtype + "'";
+        return me;
+    }
+    me.kv_bytes_per_token = 2 * ai.n_layers * row;
+    // The true figure can exceed the flat ratio because each row rounds up to a
+    // whole block; report what is actually allocated, not the nominal rate.
+    me.bytes_per_elem = static_cast<double>(row) / static_cast<double>(row_elems);
+    me.kv_bytes_total = me.kv_bytes_per_token * me.ctx;
+
+    // Weight bytes as stored, from the tensors themselves rather than the file
+    // size, so the split is honest (the file also carries metadata and padding).
+    for (const auto& t : snap.tensors)
+        me.weight_bytes += t.data_size;
+
+    // No term for the recurrent/short-conv state that hybrid models carry: it is a
+    // fixed size (l_cache channels per layer), independent of the context length, and
+    // in the kilobytes against weights of gigabytes. Modelling it would add a
+    // guess without moving the total.
+
+    me.compute_reserve = std::max<int64_t>(
+        static_cast<int64_t>(static_cast<double>(me.weight_bytes) * overhead_frac),
+        overhead_floor_mb * 1024 * 1024);
+
+    me.total_bytes = me.weight_bytes + me.kv_bytes_total + me.compute_reserve;
+
+    if (vram_budget > 0) {
+        me.headroom_bytes = vram_budget - me.total_bytes;
+        me.fits = me.headroom_bytes >= 0;
+        if (!me.fits && ai.n_layers > 0 && me.weight_bytes > 0) {
+            // Assume weights are spread evenly across layers, which holds well
+            // except for MoE (where experts dominate) -- noted in the output.
+            const int64_t per_layer = me.weight_bytes / ai.n_layers;
+            const int64_t budget_for_weights =
+                vram_budget - me.kv_bytes_total - me.compute_reserve;
+            me.layers_resident = per_layer > 0 ? std::max<int64_t>(0, budget_for_weights / per_layer)
+                                               : 0;
+            if (me.layers_resident > ai.n_layers)
+                me.layers_resident = ai.n_layers;
+            me.layers_to_offload = ai.n_layers - me.layers_resident;
+        }
+    }
+    me.ok = true;
+    return me;
+}
+
+std::string render_memory(const GgufSnapshot& snap, const ArchInfo& ai, const MemoryEstimate& me) {
+    std::string out;
+    if (!me.ok) {
+        out += "  " + label("memory") + "      " + col::paint("cannot estimate: " + me.reason,
+                                                                   col::Style::Yellow) +
+               "\n";
+        return out;
+    }
+    out += "  " + label("kv dtype") + "    " + col::paint(me.kv_dtype, col::Style::Cyan) +
+           "  (" + fmt_fixed(me.bytes_per_elem) + " B/elem)\n";
+    out += "  " + label("context") + "     " +
+           col::paint(std::to_string(me.ctx) + " tokens", col::Style::Cyan) + "  (" +
+           std::to_string(ai.n_layers) + " layers x " + std::to_string(ai.n_kv_heads) +
+           " kv heads x " + std::to_string(ai.head_dim) + " head dim)\n";
+    if (ai.per_layer_kv && ai.n_attn_layers < ai.n_layers) {
+        out += "  " + label("") + "             " +
+               col::paint("only " + std::to_string(ai.n_attn_layers) + " of " +
+                              std::to_string(ai.n_layers) +
+                              " layers have attention; Forge allocates KV for all of them",
+                          col::Style::Dim) +
+               "\n";
+    }
+    out += "  " + label("kv / token") + "  " +
+           col::paint(human_bytes(me.kv_bytes_per_token), col::Style::Yellow) + "\n";
+    out += "  " + label("kv total") + "    " +
+           col::paint(human_bytes(me.kv_bytes_total), col::Style::Yellow) + "\n";
+    out += "  " + label("weights") + "    " +
+           col::paint(human_bytes(me.weight_bytes), col::Style::Yellow) + "\n";
+    out += "  " + label("compute") + "     " +
+           col::paint("~" + human_bytes(me.compute_reserve) + " (assumed overhead)",
+                      col::Style::Dim) +
+           "\n";
+    out += "  " + label("total") + "       " +
+           col::paint(human_bytes(me.total_bytes), col::Style::Bold) + "\n";
+    if (me.vram_budget > 0) {
+        if (me.fits) {
+            out += "  " + label("vram") + "        " +
+                   col::paint("fits " + human_bytes(me.vram_budget) + " with " +
+                                  human_bytes(me.headroom_bytes) + " to spare",
+                              col::Style::Green) +
+                   "\n";
+        } else {
+            out += "  " + label("vram") + "        " +
+                   col::paint("OVER by " + human_bytes(-me.headroom_bytes) + " against " +
+                                  human_bytes(me.vram_budget),
+                              col::Style::Red) +
+                   "\n";
+            if (me.layers_to_offload >= 0) {
+                out += "  " + label("offload") + "     " +
+                       col::paint(std::to_string(me.layers_to_offload) + " of " +
+                                      std::to_string(ai.n_layers) + " layers to CPU (est.)",
+                                  col::Style::Yellow) +
+                       "\n";
+                if (ai.n_expert > 0)
+                    out += "  " + label("") + "             " +
+                           col::paint("note: MoE weights are unevenly sized, so the per-layer "
+                                      "split is a rough estimate",
+                                      col::Style::Dim) +
+                           "\n";
+            }
+            // Shrinking the context is always available, and for long-context models
+            // it is by far the biggest lever on the cache.
+            out += "  " + label("") + "             " +
+                   col::paint("shrinking the context would free up to " +
+                                  human_bytes(me.kv_bytes_total),
+                              col::Style::Dim) +
+                   "\n";
+        }
+    }
+    (void)snap;
+    return out;
 }
 
 std::string render_header_line(const std::string& path, const GgufSnapshot& snap) {
@@ -578,6 +803,45 @@ std::string render_json(const LoadedModel& m, const RenderOptions& o) {
         out += IND + IND + "}";
     }
     out += st.layer_bytes.empty() || nlay == 0 ? "],\n" : "\n" + IND + "],\n";
+    // memory estimate (opt-in, before the trailing metadata section)
+    if (o.memory) {
+        const auto me = estimate_memory(s, ai, o.ctx, o.kv_dtype,
+                                        o.vram_mb > 0 ? o.vram_mb * 1024 * 1024 : -1);
+        out += IND + "\"memory\": {\n";
+        if (!me.ok) {
+            out += IND + IND + json_str("error") + ": " + json_str(me.reason) + "\n";
+        } else {
+            out += IND + IND + json_str("kv_dtype") + ": " + json_str(me.kv_dtype) + ",\n";
+            out += IND + IND + json_str("bytes_per_element") + ": " +
+                   fmt_fixed(me.bytes_per_elem, 4) + ",\n";
+            out += IND + IND + json_str("context") + ": " + std::to_string(me.ctx) + ",\n";
+            out += IND + IND + json_str("n_layers") + ": " + std::to_string(ai.n_layers) + ",\n";
+            out += IND + IND + json_str("n_attn_layers") + ": " +
+                   std::to_string(ai.n_attn_layers) + ",\n";
+            out += IND + IND + json_str("n_kv_heads") + ": " + std::to_string(ai.n_kv_heads) + ",\n";
+            out += IND + IND + json_str("head_dim") + ": " + std::to_string(ai.head_dim) + ",\n";
+            out += IND + IND + json_str("kv_bytes_per_token") + ": " +
+                   std::to_string(me.kv_bytes_per_token) + ",\n";
+            out += IND + IND + json_str("kv_bytes_total") + ": " +
+                   std::to_string(me.kv_bytes_total) + ",\n";
+            out += IND + IND + json_str("weight_bytes") + ": " +
+                   std::to_string(me.weight_bytes) + ",\n";
+            out += IND + IND + json_str("compute_reserve_bytes") + ": " +
+                   std::to_string(me.compute_reserve) + ",\n";
+            out += IND + IND + json_str("total_bytes") + ": " + std::to_string(me.total_bytes);
+            if (me.vram_budget > 0) {
+                out += ",\n" + IND + IND + json_str("vram_budget_bytes") + ": " +
+                       std::to_string(me.vram_budget) + ",\n";
+                out += IND + IND + json_str("fits") + ": " + (me.fits ? "true" : "false");
+                if (!me.fits && me.layers_to_offload >= 0) {
+                    out += ",\n" + IND + IND + json_str("layers_to_offload") + ": " +
+                           std::to_string(me.layers_to_offload);
+                }
+            }
+            out += "\n";
+        }
+        out += IND + "},\n";
+    }
     // metadata (last section, no trailing comma)
     out += IND + "\"metadata\": {\n";
     const auto groups = group_metadata(s, ai.arch);

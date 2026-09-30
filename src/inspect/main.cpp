@@ -1,6 +1,8 @@
 #include <chrono>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,8 +35,12 @@ struct Options {
     bool all = false;
     int tree_depth = 2;
     int tree_limit = 0;
-    int peaks = 0;        // --top N
+    int peaks = 0;         // --top N
     int top_layers = 0;    // --layers N
+    int64_t ctx = 0;       // --ctx N   (0 = use the model's trained length)
+    int64_t vram = 0;      // --vram MB  (0 = no budget to check against)
+    std::string kv_dtype;  // --kv-dtype NAME (empty = f16)
+    bool memory = false;   // -M, --memory
     int threads = 0;       // 0 = auto
     std::string out_file;
     forge::inspect::col::Mode color = forge::inspect::col::Mode::Auto;
@@ -59,6 +65,14 @@ void print_help(const char* prog) {
         "      --top N         list the N largest tensors\n"
         "      --layers N      per-layer byte table for the top N layers\n"
         "\n"
+        "Memory estimates:\n"
+        "  -M, --memory        KV cache + VRAM estimate for the model\n"
+        "      --ctx N         context length to assume (default: the model's own)\n"
+        "      --kv-dtype D    KV cache dtype for the estimate (default f16);\n"
+        "                      f16|fp32|q8_0|q4_0|q4_k|fp8_e4m3|fp8_e5m2\n"
+        "      --vram MB       VRAM budget to check against, and report how many\n"
+        "                      layers would have to stay on the CPU if it does not fit\n"
+        "\n"
         "Output format:\n"
         "  -f, --format NAME   text|table|json|yaml|markdown|csv|ini (default text)\n"
         "\n"
@@ -74,9 +88,22 @@ void print_help(const char* prog) {
         prog, prog);
 }
 
-int parse_int_arg(const char* s) {
-    long v = std::strtol(s, nullptr, 10);
-    return static_cast<int>(v);
+// Strict integer parse. strtol() stops at the first non-digit, so "--top 5x" was
+// silently accepted as 5 and "--layers 3oops" as 3. A typo in a count is a
+// number the user believes they set and did not, which is worse than an error.
+// Returns false on trailing garbage, empty input, or out-of-int range.
+bool parse_int_arg(const char* s, int* out) {
+    if (s == nullptr || *s == '\0')
+        return false;
+    char* end = nullptr;
+    errno = 0;
+    const long v = std::strtol(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0')
+        return false;
+    if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max())
+        return false;
+    *out = static_cast<int>(v);
+    return true;
 }
 
 bool is_positive_int(const std::string& s) {
@@ -116,28 +143,88 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (a == "-t" || a == "--tree") {
             opt.tree = true;
             if (i + 1 < args.size() && is_positive_int(args[i + 1])) {
-                opt.tree_depth = parse_int_arg(args[i + 1].c_str());
+                if (!parse_int_arg(args[i + 1].c_str(), &opt.tree_depth)) {
+                    std::fprintf(stderr, "forge-inspect: --tree expects an integer, got '%s'\n",
+                                 args[i + 1].c_str());
+                    return false;
+                }
                 ++i;
             }
         } else if (a.rfind("--tree=", 0) == 0) {
             opt.tree = true;
-            opt.tree_depth = parse_int_arg(a.c_str() + 7);
-        } else if (a == "--top" || a == "--layers" || a == "--tree-limit") {
+            if (!parse_int_arg(a.c_str() + 7, &opt.tree_depth)) {
+                std::fprintf(stderr, "forge-inspect: --tree expects an integer\n");
+                return false;
+            }
+        } else if (a == "--top" || a == "--layers" || a == "--tree-limit" || a == "--ctx" ||
+                   a == "--vram") {
             if (!take_value(a.c_str()))
                 return false;
-            int v = parse_int_arg(args[++i].c_str());
-            if (v <= 0)
+            int v = 0;
+            if (!parse_int_arg(args[++i].c_str(), &v) || v <= 0) {
+                std::fprintf(stderr, "forge-inspect: %s expects a positive integer, got '%s'\n",
+                             a.c_str(), args[i].c_str());
                 return false;
+            }
             if (a == "--top")
                 opt.peaks = v;
             else if (a == "--layers")
                 opt.top_layers = v;
+            else if (a == "--ctx")
+                opt.ctx = v;
+            else if (a == "--vram")
+                opt.vram = v;
             else
                 opt.tree_limit = v;
-        } else if (!a.empty() && a[0] == '-' && a.find("--top=") == 0) {
-            opt.peaks = parse_int_arg(a.c_str() + 6);
-        } else if (!a.empty() && a[0] == '-' && a.find("--layers=") == 0) {
-            opt.top_layers = parse_int_arg(a.c_str() + 9);
+        } else if (a.rfind("--top=", 0) == 0) {
+            int v = 0;
+            if (!parse_int_arg(a.c_str() + 6, &v) || v <= 0) {
+                std::fprintf(stderr, "forge-inspect: --top expects a positive integer\n");
+                return false;
+            }
+            opt.peaks = v;
+        } else if (a.rfind("--layers=", 0) == 0) {
+            int v = 0;
+            if (!parse_int_arg(a.c_str() + 9, &v) || v <= 0) {
+                std::fprintf(stderr, "forge-inspect: --layers expects a positive integer\n");
+                return false;
+            }
+            opt.top_layers = v;
+        } else if (a.rfind("--ctx=", 0) == 0) {
+            int v = 0;
+            if (!parse_int_arg(a.c_str() + 6, &v) || v <= 0) {
+                std::fprintf(stderr, "forge-inspect: --ctx expects a positive integer\n");
+                return false;
+            }
+            opt.ctx = v;
+        } else if (a.rfind("--vram=", 0) == 0) {
+            int v = 0;
+            if (!parse_int_arg(a.c_str() + 7, &v) || v <= 0) {
+                std::fprintf(stderr, "forge-inspect: --vram expects a positive integer\n");
+                return false;
+            }
+            opt.vram = v;
+        } else if (a == "-M" || a == "--memory") {
+            opt.memory = true;
+        } else if (a == "--kv-dtype" || a.rfind("--kv-dtype=", 0) == 0) {
+            std::string v;
+            if (a == "--kv-dtype") {
+                if (!take_value(a.c_str()))
+                    return false;
+                v = args[++i];
+            } else {
+                v = a.substr(11);
+            }
+            std::string canon;
+            if (!forge::inspect::parse_kv_dtype(v, &canon)) {
+                std::fprintf(stderr,
+                             "forge-inspect: unknown --kv-dtype '%s' (want "
+                             "f16|fp32|q8_0|q4_0|q4_k|fp8_e4m3|fp8_e5m2)\n",
+                             v.c_str());
+                return false;
+            }
+            opt.kv_dtype = canon;
+            opt.memory = true;
         } else if (a == "-f" || a == "--format") {
             if (!take_value(a.c_str()))
                 return false;
@@ -155,7 +242,12 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (a == "-j" || a == "--threads") {
             if (!take_value(a.c_str()))
                 return false;
-            opt.threads = parse_int_arg(args[++i].c_str());
+            if (!parse_int_arg(args[++i].c_str(), &opt.threads) || opt.threads <= 0) {
+                std::fprintf(stderr, "forge-inspect: --threads expects a positive integer, "
+                                     "got '%s'\n",
+                             args[i].c_str());
+                return false;
+            }
         } else if (a == "-o" || a == "--out") {
             if (!take_value(a.c_str()))
                 return false;
@@ -170,8 +262,14 @@ bool parse_args(int argc, char** argv, Options& opt) {
                 opt.color = Mode::Always;
             else if (v == "never")
                 opt.color = Mode::Never;
-            else
+            else {
+                // Silently exiting 2 with no message is indistinguishable from a
+                // crash or a bad file.
+                std::fprintf(stderr,
+                             "forge-inspect: unknown --color mode '%s' (want auto|always|never)\n",
+                             v.c_str());
                 return false;
+            }
         } else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "forge-inspect: unknown option '%s'\n", a.c_str());
             return false;
@@ -275,6 +373,10 @@ int main(int argc, char** argv) {
     if (is_plain(opt.format)) {
         forge::inspect::RenderOptions ro;
         ro.top_layers = opt.top_layers;
+        ro.memory = opt.memory;
+        ro.ctx = opt.ctx;
+        ro.vram_mb = opt.vram;
+        ro.kv_dtype = opt.kv_dtype;
         ro.peaks = opt.peaks;
         std::string out;
         switch (opt.format) {
@@ -351,6 +453,14 @@ int main(int argc, char** argv) {
     if (want_summary) {
         out += table ? forge::inspect::render_summary_table(m)
                      : forge::inspect::render_summary(m.snap, m.arch, m.stats);
+    }
+    if (opt.memory) {
+        // --vram is in MiB; the rest of the tool is byte-based.
+        const int64_t budget = opt.vram > 0 ? opt.vram * 1024 * 1024 : -1;
+        const auto me = forge::inspect::estimate_memory(m.snap, m.arch, opt.ctx, opt.kv_dtype,
+                                                        budget);
+        out += "\n  " + paint("memory estimate", Style::BoldCyan) + "\n";
+        out += forge::inspect::render_memory(m.snap, m.arch, me);
     }
     if (opt.top_layers) {
         out += "\n  " + paint("layer sizes (top " + std::to_string(opt.top_layers) + ")",
