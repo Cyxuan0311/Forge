@@ -40,7 +40,8 @@ struct Options {
     int64_t ctx = 0;       // --ctx N   (0 = use the model's trained length)
     int64_t vram = 0;      // --vram MB  (0 = no budget to check against)
     std::string kv_dtype;  // --kv-dtype NAME (empty = f16)
-    bool memory = false;   // -M, --memory
+    bool memory = false;
+    bool validate = false;   // -M, --memory
     int threads = 0;       // 0 = auto
     std::string out_file;
     forge::inspect::col::Mode color = forge::inspect::col::Mode::Auto;
@@ -66,6 +67,7 @@ void print_help(const char* prog) {
         "      --layers N      per-layer byte table for the top N layers\n"
         "\n"
         "Memory estimates:\n"
+        "  -V, --validate      cross-check the metadata against the tensors\n"
         "  -M, --memory        KV cache + VRAM estimate for the model\n"
         "      --ctx N         context length to assume (default: the model's own)\n"
         "      --kv-dtype D    KV cache dtype for the estimate (default f16);\n"
@@ -204,6 +206,8 @@ bool parse_args(int argc, char** argv, Options& opt) {
                 return false;
             }
             opt.vram = v;
+        } else if (a == "--validate" || a == "-V") {
+            opt.validate = true;
         } else if (a == "-M" || a == "--memory") {
             opt.memory = true;
         } else if (a == "--kv-dtype" || a.rfind("--kv-dtype=", 0) == 0) {
@@ -374,6 +378,7 @@ int main(int argc, char** argv) {
         forge::inspect::RenderOptions ro;
         ro.top_layers = opt.top_layers;
         ro.memory = opt.memory;
+        ro.validate = opt.validate;
         ro.ctx = opt.ctx;
         ro.vram_mb = opt.vram;
         ro.kv_dtype = opt.kv_dtype;
@@ -453,6 +458,20 @@ int main(int argc, char** argv) {
     if (want_summary) {
         out += table ? forge::inspect::render_summary_table(m)
                      : forge::inspect::render_summary(m.snap, m.arch, m.stats);
+    }
+    if (opt.validate) {
+        out += "\n  " + paint("validation", Style::BoldCyan) + "\n";
+        const auto findings = forge::inspect::validate_model(m.snap, m.arch);
+        out += forge::inspect::render_validation(findings);
+        // Exit non-zero on errors so this can gate a CI step. --validate is a
+        // question about the file, not a request to render, so a bad model is a
+        // failure even though the report itself succeeded.
+        for (const auto& f : findings) {
+            if (f.severity == forge::inspect::Severity::Error) {
+                write_output(out, opt.out_file);
+                return 2;
+            }
+        }
     }
     if (opt.memory) {
         // --vram is in MiB; the rest of the tool is byte-based.

@@ -120,6 +120,23 @@ struct DiffMetric {
 };
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+enum class Severity { Error, Warning, Info };
+
+struct Finding {
+    Severity severity = Severity::Info;
+    std::string code;     // stable identifier, e.g. "block_count_mismatch"
+    std::string message;  // one line, human readable
+};
+
+// Cross-checks the metadata against the tensors actually present, so a truncated
+// or mislabelled model is caught before an engine trips over it. Errors come
+// first; at most one finding per code, so the output stays short.
+std::vector<Finding> validate_model(const GgufSnapshot& snap, const ArchInfo& ai);
+std::string render_validation(const std::vector<Finding>& findings);
+
+// ---------------------------------------------------------------------------
 // Machine-readable formats. The CLI builds a single LoadedModel and passes it
 // here; these functions never emit ANSI color.
 // ---------------------------------------------------------------------------
@@ -152,6 +169,7 @@ struct RenderOptions {
     // Memory estimate, so the machine formats can carry it too (-M / --ctx /
     // --vram / --kv-dtype). ctx 0 = use the model's trained length;
     // vram_mb 0 = no budget to check against.
+    bool validate = false;
     bool memory = false;
     int64_t ctx = 0;
     int64_t vram_mb = 0;

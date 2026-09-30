@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <unordered_set>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -246,7 +248,16 @@ ArchInfo sniff_arch(const GgufSnapshot& snap) {
         ai.head_dim = ai.hidden_size / ai.n_heads;
     ai.context_length = i(ap + ".context_length");
     if (ai.context_length == 0) ai.context_length = i(ap + ".max_context_length");
-    ai.vocab_size = i("tokenizer.ggml.tokens.length");
+    // There is no GGUF key literally named "...tokens.length": the count only exists
+    // as the element count of the string array, which the scanner records. Falling back
+    // to the arch's own vocab_size keeps the value right for models that state it.
+    ai.vocab_size = i("tokenizer.ggml.vocab_size");
+    if (ai.vocab_size == 0) {
+        if (auto it = snap.meta_str_array_len.find("tokenizer.ggml.tokens");
+            it != snap.meta_str_array_len.end())
+            ai.vocab_size = static_cast<int64_t>(it->second);
+    }
+    if (ai.vocab_size == 0) ai.vocab_size = i(ap + ".vocab_size");
     // Hybrid archs store a per-layer array; 0 means "no attention in this layer".
     // Forge (parse_lfm2_config / the common parser) takes max(array) as
     // num_kv_heads and then allocates KV uniformly for every layer, so the estimate
@@ -608,6 +619,251 @@ std::string render_op_pipeline(const ArchInfo& ai) {
 }
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Layer index for the two naming conventions in the wild: llama.cpp's
+// "blk.N.attn_q.weight" and the HF-style "model.layers.N.self_attn.q_proj".
+// Returns -1 when the name is not per-layer.
+int layer_index_of(const std::string& name) {
+    static const char* kMarkers[] = {"blk.", "layers.", "layer.", "block_", "blocks."};
+    for (const char* m : kMarkers) {
+        const size_t p = name.find(m);
+        if (p == std::string::npos) continue;
+        const size_t s = p + std::strlen(m);
+        if (s >= name.size() || !std::isdigit(static_cast<unsigned char>(name[s]))) continue;
+        int64_t v = 0;
+        size_t i = s;
+        while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i])))
+            v = v * 10 + (name[i++] - '0');
+        return static_cast<int>(v);
+    }
+    return -1;
+}
+
+void add(std::vector<Finding>& out, Severity sev, const char* code, std::string msg) {
+    out.push_back({sev, code, std::move(msg)});
+}
+
+}  // namespace
+
+std::vector<Finding> validate_model(const GgufSnapshot& snap, const ArchInfo& ai) {
+    std::vector<Finding> out;
+    if (ai.arch.empty()) {
+        add(out, Severity::Error, "arch_missing",
+            "general.architecture is absent, so the file cannot be loaded by any engine");
+        // Without an arch almost nothing else can be cross-checked.
+        return out;
+    }
+    if (!ai.supported) {
+        add(out, Severity::Warning, "arch_unknown",
+            "architecture '" + ai.arch + "' is not one Forge supports; loading will fail");
+    }
+    if (ai.n_layers <= 0) {
+        add(out, Severity::Error, "block_count_missing",
+            ai.arch + ".block_count is missing or zero, so the layer count is unknown");
+    }
+
+    // Which layer indices do the tensors actually mention?
+    std::vector<int> seen;
+    {
+        std::unordered_set<int> uniq;
+        for (const auto& t : snap.tensors) {
+            const int li = layer_index_of(t.name);
+            if (li >= 0) uniq.insert(li);
+        }
+        seen.assign(uniq.begin(), uniq.end());
+        std::sort(seen.begin(), seen.end());
+    }
+
+    if (ai.n_layers > 0 && !seen.empty()) {
+        const int max_layer = seen.back();
+        if (max_layer + 1 != ai.n_layers) {
+            add(out, Severity::Error, "block_count_mismatch",
+                ai.arch + ".block_count is " + std::to_string(ai.n_layers) +
+                    " but the tensors cover layers 0.." + std::to_string(max_layer) +
+                    " (" + std::to_string(seen.size()) + " distinct); the file is truncated or "
+                    "the count is wrong");
+        }
+        // Layers declared but entirely absent from the tensor list.
+        if (static_cast<int>(seen.size()) < ai.n_layers) {
+            std::string missing;
+            int n_missing = 0;
+            for (int l = 0; l < ai.n_layers && n_missing < 4; ++l) {
+                if (!std::binary_search(seen.begin(), seen.end(), l)) {
+                    if (!missing.empty()) missing += ", ";
+                    missing += std::to_string(l);
+                    ++n_missing;
+                }
+            }
+            if (n_missing > 0) {
+                add(out, Severity::Error, "layers_absent",
+                    "layer(s) " + missing + " are in block_count but have no tensors at all" +
+                        (ai.n_layers - static_cast<int>(seen.size()) - n_missing > 0
+                             ? " (and others)"
+                             : ""));
+            }
+        }
+    } else if (ai.n_layers > 0 && seen.empty()) {
+        add(out, Severity::Info, "layers_unnamed",
+            "no per-layer tensors found (no blk.N / layers.N names), so the layer count "
+            "could not be cross-checked");
+    }
+
+    // Duplicate tensor names would silently drop weights on load.
+    {
+        std::unordered_set<std::string> seen_names;
+        std::string dup;
+        int n_dup = 0;
+        for (const auto& t : snap.tensors) {
+            if (!seen_names.insert(t.name).second) {
+                if (!dup.empty()) dup += ", ";
+                if (n_dup < 3) dup += t.name;
+                ++n_dup;
+            }
+        }
+        if (n_dup > 0)
+            add(out, Severity::Error, "tensor_duplicate",
+                std::to_string(n_dup) + " duplicate tensor name(s): " + dup +
+                    (n_dup > 3 ? ", ..." : "") + "; loaders keep only the last one");
+    }
+
+    // Geometry.
+    if (ai.n_heads > 0 && ai.hidden_size > 0) {
+        if (ai.hidden_size % ai.n_heads != 0)
+            add(out, Severity::Error, "hidden_not_divisible_by_heads",
+                "hidden_size " + std::to_string(ai.hidden_size) + " is not divisible by " +
+                    std::to_string(ai.n_heads) + " heads, so head_dim " +
+                    std::to_string(ai.head_dim) + " is a truncation and the model is malformed");
+    }
+    if (ai.n_kv_heads > 0 && ai.n_heads > 0 && ai.n_kv_heads > ai.n_heads)
+        add(out, Severity::Error, "kv_heads_exceed_heads",
+            ai.arch + ".attention.head_count_kv (" + std::to_string(ai.n_kv_heads) +
+                ") exceeds head_count (" + std::to_string(ai.n_heads) + ")");
+    if (ai.n_kv_heads > 0 && ai.n_heads > 0 && ai.n_kv_heads < ai.n_heads &&
+        ai.n_heads % ai.n_kv_heads != 0)
+        add(out, Severity::Warning, "heads_not_divisible_by_kv",
+            std::to_string(ai.n_heads) + " query heads is not a multiple of " +
+                std::to_string(ai.n_kv_heads) +
+                " KV heads; GQA implementations normally divide evenly");
+    if (ai.n_expert_used > 0 && ai.n_expert > 0 && ai.n_expert_used > ai.n_expert)
+        add(out, Severity::Error, "expert_used_exceeds_total",
+            ai.arch + ".expert_used_count (" + std::to_string(ai.n_expert_used) +
+                ") exceeds expert_count (" + std::to_string(ai.n_expert) + ")");
+
+    // The per-layer KV array must line up with the layer count, or every
+    // layer-indexed lookup into it is suspect.
+    if (auto it = snap.meta_int_array.find(ai.arch + ".attention.head_count_kv");
+        it != snap.meta_int_array.end() && ai.n_layers > 0 &&
+        static_cast<int64_t>(it->second.size()) != ai.n_layers) {
+        add(out, Severity::Error, "kv_array_length",
+            "attention.head_count_kv has " + std::to_string(it->second.size()) +
+                " entries but block_count is " + std::to_string(ai.n_layers) +
+                "; per-layer KV heads cannot be looked up");
+    }
+
+    // Vocabulary vs the embedding matrix.
+    if (ai.vocab_size > 0) {
+        for (const auto& t : snap.tensors) {
+            if (t.name.find("token_embd") == std::string::npos) continue;
+            // GGUF stores shape in ggml order, so the vocabulary may be either the
+            // first or the last dim depending on who wrote the file. Any dim matching
+            // the tokenizer count is fine; none matching is a real mismatch.
+            if (t.shape.size() >= 2 &&
+                std::find(t.shape.begin(), t.shape.end(), ai.vocab_size) == t.shape.end()) {
+                std::string dims;
+                for (size_t i = 0; i < t.shape.size(); ++i) {
+                    if (i) dims += "x";
+                    dims += std::to_string(t.shape[i]);
+                }
+                add(out, Severity::Error, "vocab_mismatch",
+                    "token_embd.weight is " + dims + " but the tokenizer lists " +
+                        std::to_string(ai.vocab_size) +
+                        " tokens; sampling will read out of bounds");
+            }
+            break;
+        }
+    } else {
+        add(out, Severity::Warning, "vocab_missing",
+            "tokenizer.ggml.tokens is absent, so the vocabulary size is unknown");
+    }
+
+    // Data extents. The scanner already rejects a bad index; this catches a file
+    // whose tensor table is consistent with itself but overruns the file.
+    {
+        uint64_t sum = 0;
+        uint64_t end = 0;
+        for (const auto& t : snap.tensors) {
+            sum += static_cast<uint64_t>(t.data_size);
+            const uint64_t stop = static_cast<uint64_t>(t.file_offset) +
+                                  static_cast<uint64_t>(t.data_size);
+            end = std::max(end, stop);
+        }
+        if (end > snap.file_size) {
+            add(out, Severity::Error, "tensor_data_past_eof",
+                "tensor data extends to byte " + std::to_string(end) +
+                    " but the file is only " + std::to_string(snap.file_size) +
+                    " bytes; the file is truncated");
+        }
+        // Metadata and alignment overhead: a big gap is normal, a huge one is not.
+        if (snap.file_size > 0 && end > 0 && sum > 0) {
+            const double covered = static_cast<double>(end) / static_cast<double>(snap.file_size);
+            if (covered <= 1.0 && covered < 0.80 && snap.tensor_count > 0) {
+                add(out, Severity::Info, "tensor_coverage",
+                    "tensor data covers only " +
+                        fmt_fixed(covered * 100.0, 1) + "% of the file; the rest is metadata, "
+                        "padding or data not described by the tensor table");
+            }
+        }
+    }
+
+    if (!ai.kv_estimable && ai.n_layers > 0)
+        add(out, Severity::Info, "kv_not_estimable",
+            "no head dim could be derived, so the KV cache size cannot be estimated");
+
+    std::stable_sort(out.begin(), out.end(), [](const Finding& a, const Finding& b) {
+        return static_cast<int>(a.severity) < static_cast<int>(b.severity);
+    });
+    return out;
+}
+
+std::string render_validation(const std::vector<Finding>& findings) {
+    std::string out;
+    if (findings.empty()) {
+        out += "  " + col::paint("no problems found", col::Style::Green) + "\n";
+        return out;
+    }
+    int n_err = 0, n_warn = 0;
+    for (const auto& f : findings) {
+        if (f.severity == Severity::Error) ++n_err;
+        else if (f.severity == Severity::Warning) ++n_warn;
+    }
+    if (n_err)
+        out += "  " + col::paint(std::to_string(n_err) + " error" + (n_err > 1 ? "s" : ""),
+                                 col::Style::Red) +
+               "\n";
+    if (n_warn)
+        out += "  " + col::paint(std::to_string(n_warn) + " warning" + (n_warn > 1 ? "s" : ""),
+                                 col::Style::Yellow) +
+               "\n";
+    for (const auto& f : findings) {
+        const char* tag = "info";
+        col::Style st = col::Style::Dim;
+        if (f.severity == Severity::Error) {
+            tag = "error";
+            st = col::Style::Red;
+        } else if (f.severity == Severity::Warning) {
+            tag = "warn ";
+            st = col::Style::Yellow;
+        }
+        out += "  " + col::paint(std::string(tag) + " ", st) + col::paint(f.code, col::Style::Bold) +
+               "  " + f.message + "\n";
+    }
+    return out;
+}
+
 // New sections: largest tensors + layer byte table.
 // ---------------------------------------------------------------------------
 
@@ -840,6 +1096,30 @@ std::string render_json(const LoadedModel& m, const RenderOptions& o) {
             }
             out += "\n";
         }
+        out += IND + "},\n";
+    }
+    // validation findings (opt-in)
+    if (o.validate) {
+        const auto fs = validate_model(s, ai);
+        out += IND + "\"validation\": {\n";
+        int n_err = 0;
+        for (const auto& f : fs)
+            if (f.severity == Severity::Error) ++n_err;
+        out += IND + IND + json_str("errors") + ": " + std::to_string(n_err) + ",\n";
+        out += IND + IND + json_str("ok") + ": " + std::string(n_err == 0 ? "true" : "false") +
+               ",\n";
+        out += IND + IND + "\"findings\": [";
+        for (size_t i = 0; i < fs.size(); ++i) {
+            const char* sev = fs[i].severity == Severity::Error
+                                  ? "error"
+                                  : (fs[i].severity == Severity::Warning ? "warning" : "info");
+            out += (i ? ",\n" : "\n");
+            out += IND + IND + IND + "{ " + json_str("severity") + ": " + json_str(sev) + ", " +
+                   json_str("code") + ": " + json_str(fs[i].code) + ", " + json_str("message") +
+                   ": " + json_str(fs[i].message) + " }";
+        }
+        out += (fs.empty() ? "" : "\n" + IND + IND);
+        out += "]\n";
         out += IND + "},\n";
     }
     // metadata (last section, no trailing comma)

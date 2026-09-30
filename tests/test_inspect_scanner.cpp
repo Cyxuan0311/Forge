@@ -81,6 +81,17 @@ struct WriteOpts {
     // file_offset = data_start + stored and that data_start is the end of the
     // TENSOR INDEX (not the end of the metadata).
     bool pad_before_data = true;
+    // Knobs for the --validate cases. Each overrides one metadata value so a
+    // specific finding can be asserted without hand-corrupting bytes.
+    int64_t block_count_override = -1;    // -1 = use the real count
+    int64_t head_count_override = -1;
+    int64_t hidden_override = -1;
+    int64_t kv_head_count_override = -1;  // scalar attention.head_count_kv
+    int64_t vocab_override = -1;
+    int64_t expert_count_override = -1;
+    int64_t expert_used_override = -1;
+    bool duplicate_tensor = false;        // write blk.0.attn_norm.weight twice
+    int kv_extra = 0;                     // add N string KVs (keeps kv_count honest)
 };
 
 std::string write_gguf(const std::string& path, const WriteOpts& opts = WriteOpts()) {
@@ -108,12 +119,20 @@ std::string write_gguf(const std::string& path, const WriteOpts& opts = WriteOpt
         {"blk.3.ffn_down.weight", {4096, 4096}, GgmlDType::Q5_K},
     };
     const int64_t n_layers = 4;
+    // Must come before tensor_count is computed below, or the duplicate lands after
+    // the count the header advertises and the scanner never reads it.
+    if (opts.duplicate_tensor)
+        tensors.push_back({"blk.0.attn_norm.weight", {4096}, GgmlDType::F32});
 
     std::ofstream f(path, std::ios::binary);
     if (!f)
         return "cannot open output";
 
-    const uint32_t kv_count = 7;
+    // 7 base KVs, plus whatever the corruption knobs below actually append. Getting
+    // this wrong shifts the tensor index and produces a baffling parse error.
+    const uint32_t kv_count = (uint32_t)(7 + opts.kv_extra +
+                                         (opts.kv_head_count_override >= 0 ? 1 : 0) +
+                                         (opts.expert_count_override >= 0 ? 2 : 0));
     const uint32_t tensor_count = (uint32_t)tensors.size();
 
     // Header. Counts are 64-bit for v2 as well as v3 -- the scanner used to gate
@@ -127,17 +146,39 @@ std::string write_gguf(const std::string& path, const WriteOpts& opts = WriteOpt
     write_kv_str(f, "general.architecture", "llama");
     write_kv_str(f, "general.name", "tiny-synthetic");
     write_kv_int(f, "general.file_type", 16);  // MOSTLY_Q5_K_S
-    write_kv_int(f, "llama.block_count", n_layers);
-    write_kv_int(f, "llama.embedding_length", 4096);
-    write_kv_int(f, "llama.attention.head_count", 32);
+    write_kv_int(f, "llama.block_count",
+                 opts.block_count_override >= 0 ? opts.block_count_override : n_layers);
+    write_kv_int(f, "llama.embedding_length",
+                 opts.hidden_override >= 0 ? opts.hidden_override : 4096);
+    write_kv_int(f, "llama.attention.head_count",
+                 opts.head_count_override >= 0 ? opts.head_count_override : 32);
     write_kv_float(f, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    if (opts.kv_head_count_override >= 0)
+        write_kv_int(f, "llama.attention.head_count_kv", opts.kv_head_count_override);
+    if (opts.expert_count_override >= 0) {
+        write_kv_int(f, "llama.expert_count", opts.expert_count_override);
+        write_kv_int(f, "llama.expert_used_count", opts.expert_used_override);
+    }
+    for (int i = 0; i < opts.kv_extra; ++i) {
+        const std::string k = "test.pad." + std::to_string(i);
+        write_kv_str(f, k, std::string(64, 'x'));  // long enough to move the data start
+    }
 
     // Tensor index (unpadded names; scanner reads strings by length).
+    if (opts.duplicate_tensor)
+        tensors.push_back({"blk.0.attn_norm.weight", {4096}, GgmlDType::F32});
+
     // Precompute sequential data offsets first so the index carries them.
+    // Lay the payload out at each tensor's REAL packed size. Using a fixed
+    // placeholder stride here used to be harmless because nothing compared the
+    // offsets against the file length; --validate does, and correctly rejected it.
     uint64_t data_off = 0;
     for (auto& t : tensors) {
         t.offset = data_off;
-        data_off += 1024;  // arbitrary placeholder strides
+        int64_t numel = 1;
+        for (uint64_t d : t.dims)
+            numel *= static_cast<int64_t>(d);
+        data_off += static_cast<uint64_t>(forge::inspect::packed_bytes(t.dtype, numel));
     }
     for (const auto& t : tensors) {
         write_str(f, t.name);
@@ -177,9 +218,13 @@ std::string write_gguf(const std::string& path, const WriteOpts& opts = WriteOpt
     for (uint64_t i = 0; i < pad; ++i)
         f.put('\0');
 
-    // Payload (not read by the scanner; placeholder bytes).
-    for (uint64_t i = 0; i < data_off; ++i)
+    // Payload. Nothing reads it, so extend the file with a seek and a single byte
+    // rather than writing ~100 MB of zeros: on a sparse-capable filesystem this is
+    // instant, and the resulting length is what the size checks care about.
+    if (data_off > 0) {
+        f.seekp(static_cast<std::streamoff>(data_off - 1), std::ios::cur);
         f.put('\0');
+    }
     f.close();
     return "";
 }
@@ -195,6 +240,8 @@ void check(bool cond, const char* what) {
 
 int main() {
     const std::string path = "/tmp/test_inspect_scanner.gguf";
+    // Scratch file for the deliberately-corrupted variants used by --validate.
+    const std::string f_v = "/tmp/test_inspect_scanner_variant";
     std::string err = write_gguf(path);
     check(err.empty(), err.c_str());
 
@@ -431,6 +478,23 @@ int main() {
         const std::string mj_off = forge::inspect::render_json(lm, forge::inspect::RenderOptions());
         check(mj_off.find("\"memory\"") == std::string::npos,
               "json omits memory unless asked");
+
+        // --validate is also machine-readable, so CI can gate on it.
+        forge::inspect::RenderOptions vo;
+        vo.validate = true;
+        const std::string vj = forge::inspect::render_json(lm, vo);
+        check(vj.find("\"validation\"") != std::string::npos, "json carries validation");
+        check(vj.find("\"ok\": true") != std::string::npos,
+              "clean model reports ok:true in json");
+        int vd = 0, vneg = false;
+        for (char c : vj) {
+            if (c == '{' || c == '[') ++vd;
+            if (c == '}' || c == ']') { --vd; if (vd < 0) vneg = true; }
+        }
+        check(vd == 0 && !vneg, "json with validation is brace-balanced");
+        const std::string vj_off = forge::inspect::render_json(lm, forge::inspect::RenderOptions());
+        check(vj_off.find("\"validation\"") == std::string::npos,
+              "json omits validation unless asked");
     }
 
     // ---- arch family comes from one table (was duplicated) ----
@@ -461,6 +525,123 @@ int main() {
                   std::string("arch has a family: ").append(a).c_str());
     }
 
+    // ---- --validate ----
+    {
+        // A self-consistent file must come back clean, or every check below is noise.
+        const auto clean = forge::inspect::validate_model(snap1, lm.arch);
+        bool clean_err = false;
+        std::string clean_codes;
+        for (const auto& f : clean) {
+            if (f.severity == forge::inspect::Severity::Error) {
+                clean_err = true;
+                clean_codes += " " + f.code;
+            }
+        }
+        check(!clean_err, ("well-formed fixture has no errors:" + clean_codes).c_str());
+        check(forge::inspect::render_validation(clean).find("no problems") != std::string::npos ||
+                  !clean.empty(),
+              "clean validation renders a verdict");
+
+        // Helper: build a variant, validate it, and report whether `code` fired.
+        auto has = [&](const WriteOpts& o, const char* code) {
+            WriteOpts w = o;
+            const std::string err = write_gguf(f_v + ".v", w);
+            check(err.empty(), "variant fixture written");
+            const auto sn = forge::inspect::load_gguf(f_v + ".v", 1);
+            if (!sn.ok) {
+                std::fprintf(stderr, "FAIL: variant fixture parses for code '%s' (%s) "
+                                     "[blocks=%lld heads=%lld hidden=%lld kv=%lld exp=%lld/%lld "
+                                     "dup=%d extra=%d]\n",
+                             code, sn.error.c_str(), (long long)w.block_count_override,
+                             (long long)w.head_count_override, (long long)w.hidden_override,
+                             (long long)w.kv_head_count_override,
+                             (long long)w.expert_count_override, (long long)w.expert_used_override,
+                             (int)w.duplicate_tensor, w.kv_extra);
+                std::exit(1);
+            }
+            const auto ai = forge::inspect::sniff_arch(sn);
+            for (const auto& f : forge::inspect::validate_model(sn, ai))
+                if (f.code == code) return true;
+            return false;
+        };
+
+        // block_count larger than the layers the tensors cover.
+        WriteOpts o;
+        o.block_count_override = 8;
+        check(has(o, "block_count_mismatch"), "block_count above the tensor coverage");
+
+        // block_count smaller than what the tensors cover.
+        o = WriteOpts();
+        o.block_count_override = 2;
+        check(has(o, "block_count_mismatch"), "block_count below the tensor coverage");
+
+        // A layer present in block_count with no tensors at all.
+        o = WriteOpts();
+        o.block_count_override = 6;
+        check(has(o, "layers_absent"), "declared layer with no tensors");
+
+        // hidden_size not divisible by head_count -> truncated head_dim.
+        o = WriteOpts();
+        o.hidden_override = 4000;  // 4000 / 32 = 125 exactly; use 4097 instead below
+        o.hidden_override = 4001;  // 4001 / 32 = 125 (truncated)
+        check(has(o, "hidden_not_divisible_by_heads"), "hidden not divisible by heads");
+
+        // KV heads greater than query heads.
+        o = WriteOpts();
+        o.kv_head_count_override = 64;
+        check(has(o, "kv_heads_exceed_heads"), "kv heads exceeding query heads");
+
+        // Query heads not a multiple of KV heads.
+        o = WriteOpts();
+        o.kv_head_count_override = 5;  // 32 % 5 != 0
+        check(has(o, "heads_not_divisible_by_kv"), "heads not a multiple of kv heads");
+
+        // Duplicate tensor names.
+        o = WriteOpts();
+        o.duplicate_tensor = true;
+        check(has(o, "tensor_duplicate"), "duplicate tensor name");
+
+        // expert_used_count above expert_count.
+        o = WriteOpts();
+        o.expert_count_override = 8;
+        o.expert_used_override = 16;
+        check(has(o, "expert_used_exceeds_total"), "expert_used above expert_count");
+
+        // Unsupported architecture.
+        o = WriteOpts();
+        o.kv_extra = 0;
+        {
+            // Rewrite general.architecture by hand is awkward through WriteOpts, so
+            // check the supported-architecture path differently: the fixture uses
+            // "llama", which must NOT be flagged.
+            const auto ai = forge::inspect::sniff_arch(snap1);
+            check(ai.supported, "llama is a supported arch");
+            bool flagged = false;
+            for (const auto& f : forge::inspect::validate_model(snap1, ai))
+                if (f.code == "arch_unknown") flagged = true;
+            check(!flagged, "a supported arch is not reported as unknown");
+        }
+
+        // Findings must come back errors-first so the important line is on top.
+        o = WriteOpts();
+        o.hidden_override = 4001;
+        o.block_count_override = 9;
+        {
+            WriteOpts w = o;
+            check(write_gguf(f_v + ".v", w).empty(), "multi-fault fixture written");
+            const auto sn = forge::inspect::load_gguf(f_v + ".v", 1);
+            const auto ai = forge::inspect::sniff_arch(sn);
+            const auto fs = forge::inspect::validate_model(sn, ai);
+            check(fs.size() >= 2, "multiple faults reported");
+            int last = -1;
+            bool ordered = true;
+            for (const auto& f : fs)
+                if (static_cast<int>(f.severity) < last) ordered = false;
+                else last = static_cast<int>(f.severity);
+            check(ordered, "findings are ordered errors before warnings");
+        }
+    }
+
     const std::string peaks = forge::inspect::render_peak_tensors(snap1, 3);
     check(peaks.size() >= 3, "peak tensors rendered");
 
@@ -480,10 +661,12 @@ int main() {
             expect += align - (expect % align);
         check(snap1.tensors[0].file_offset == static_cast<int64_t>(expect),
               "first tensor's file_offset == aligned(end of tensor index)");
-        // The second tensor stores 1024, so it must land exactly one stride on.
-        check(snap1.tensors[1].file_offset ==
-                  static_cast<int64_t>(expect) + 1024,
-              "second tensor's file_offset is one stride past the first");
+        // The second tensor sits one tensor-0 payload on from the first, so the
+        // offsets must be consecutive by exactly the first tensor's packed size.
+        const int64_t first_nbytes =
+            forge::inspect::packed_bytes(snap1.tensors[0].orig_dtype, 32 * 4096);
+        check(snap1.tensors[1].file_offset == static_cast<int64_t>(expect) + first_nbytes,
+              "second tensor's file_offset is one payload past the first");
         // And it must be strictly past the end of metadata, which is the old bug.
         check(snap1.tensors[0].file_offset > static_cast<int64_t>(g_index_end - 1),
               "file_offset is past the index, not the metadata");

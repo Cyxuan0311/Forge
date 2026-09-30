@@ -25,6 +25,11 @@ struct GgufSnapshot {
     std::unordered_map<std::string, int64_t> meta_int;
     std::unordered_map<std::string, double> meta_float;
     std::unordered_map<std::string, std::vector<int32_t>> meta_int_array;
+    // Element count of a STRING array, keyed by the array's own name. The strings
+    // themselves are skipped rather than stored: a 128k-entry vocabulary would cost
+    // megabytes and nothing here reads them, but the length is what tells you the
+    // vocabulary size and whether token_embd matches it.
+    std::unordered_map<std::string, uint64_t> meta_str_array_len;
 
     std::vector<GgufLoadedTensor> tensors;
 };
@@ -33,6 +38,11 @@ struct GgufSnapshot {
 // the tensor index are decoded in parallel across `threads` workers; threads
 // <= 1 runs serially. If `pool` is null, a process-wide cached pool is reused.
 GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool = nullptr);
+
+// Number of on-disk bytes for `numel` elements of a GGML type, block padding
+// included. Exposed so the tests build a file whose tensor offsets agree with
+// the sizes the scanner will derive, instead of inventing placeholder strides.
+int64_t packed_bytes(GgmlDType dt, int64_t numel);
 
 // Human-readable name for a GGML tensor type, e.g. "Q4_K".
 std::string dtype_name(GgmlDType dt);

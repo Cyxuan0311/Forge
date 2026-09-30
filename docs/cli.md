@@ -77,6 +77,9 @@ forge-inspect -M --ctx 4096 --kv-dtype q8_0 model.gguf
 
 # machine-readable, for scripting
 forge-inspect -M -f json model.gguf | jq .memory
+
+# will this file even load? non-zero exit on errors, so CI can gate on it
+forge-inspect -V model.gguf
 ```
 
 | Option | Description |
@@ -86,6 +89,7 @@ forge-inspect -M -f json model.gguf | jq .memory
 | `--kv-dtype D` | `f16`, `fp32`, `q8_0`, `q4_0`, `q4_k`, `fp8_e4m3`, `fp8_e5m2` |
 | `--vram MB` | Budget to check against; reports over/under and how many layers to offload |
 | `-f, --format` | `text`, `table`, `markdown`, `json`, `yaml`, `csv`, `ini` |
+| `-V, --validate` | Cross-check the metadata against the tensors; exit 2 on errors |
 | `--metadata` | Dump all metadata key/value pairs |
 | `-t, --tree [D]` | Tensor tree to depth `D` |
 
@@ -95,6 +99,11 @@ per-block scale and round each row up to a whole block, and the dtype list is
 exactly the set the engine can store — there is no BF16 or K-quant KV cache.
 Hybrid architectures (LFM2, Qwen3.5) also report how many layers actually hold
 attention, since that is often far fewer than the layer count.
+
+`--validate` cross-checks the header against the tensors: the layer count against
+the layers actually present, head geometry, duplicate tensor names, the vocabulary
+against the embedding matrix, and the tensor extents against the file length. It
+exits 2 if any of those is an error, so it can gate a download or a CI step.
 
 ## Examples
 

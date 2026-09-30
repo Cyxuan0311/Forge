@@ -95,7 +95,7 @@ BlockLayout ggml_layout(GgmlDType dt) {
 }
 
 // Number of on-disk bytes for `numel` elements of a given GGML type.
-int64_t packed_bytes(GgmlDType dt, int64_t numel) {
+int64_t packed_bytes_impl(GgmlDType dt, int64_t numel) {
     const BlockLayout l = ggml_layout(dt);
     if (l.block_size > 0) {
         const int64_t n_blocks = (numel + l.block_elements - 1) / l.block_elements;
@@ -184,6 +184,8 @@ size_t kv_skip(const uint8_t* data, size_t size, size_t off, uint32_t vtype) {
 }
 
 }  // namespace
+
+int64_t packed_bytes(GgmlDType dt, int64_t numel) { return packed_bytes_impl(dt, numel); }
 
 // Human-readable name for a GGML tensor type, e.g. "Q4_K".
 std::string dtype_name(GgmlDType dt) {
@@ -323,6 +325,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
         std::unordered_map<std::string, int64_t> meta_int;
         std::unordered_map<std::string, double> meta_float;
         std::unordered_map<std::string, std::vector<int32_t>> meta_int_array;
+        std::unordered_map<std::string, uint64_t> meta_str_array_len;
     };
     const size_t n_kv_parts =
         metadata_count == 0 ? 1 : std::min<size_t>(kv_threads, metadata_count);
@@ -378,6 +381,9 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
                     }
                     part.meta_int_array[key] = std::move(arr);
                 } else if (arr_type == 8) {
+                    // Record the length, skip the payload. Parsing 128k token strings
+                    // just to throw them away would dominate the parse time.
+                    part.meta_str_array_len[key] = arr_len;
                     for (uint64_t j = 0; j < arr_len; ++j)
                         read_gguf_string(data, size, off);
                 } else {
@@ -413,6 +419,8 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
             snap.meta_float[k] = v;
         for (const auto& [k, v] : part.meta_int_array)
             snap.meta_int_array[k] = v;
+        for (const auto& [k, v] : part.meta_str_array_len)
+            snap.meta_str_array_len[k] = v;
     }
 
     // ---- Tensor index section ----
@@ -541,7 +549,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
         int64_t numel = 1;
         for (int64_t d : t.shape)
             numel *= d;
-        t.data_size = packed_bytes(t.orig_dtype, numel);
+        t.data_size = packed_bytes_impl(t.orig_dtype, numel);
     };
 
     if (n_threads > 1 && tensor_count > 64) {
