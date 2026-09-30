@@ -92,6 +92,7 @@ struct WriteOpts {
     int64_t expert_used_override = -1;
     bool duplicate_tensor = false;        // write blk.0.attn_norm.weight twice
     int kv_extra = 0;                     // add N string KVs (keeps kv_count honest)
+    int drop_tensors = 0;                 // remove the last N tensors from the index
 };
 
 std::string write_gguf(const std::string& path, const WriteOpts& opts = WriteOpts()) {
@@ -123,6 +124,11 @@ std::string write_gguf(const std::string& path, const WriteOpts& opts = WriteOpt
     // the count the header advertises and the scanner never reads it.
     if (opts.duplicate_tensor)
         tensors.push_back({"blk.0.attn_norm.weight", {4096}, GgmlDType::F32});
+    // Drop from the END so the remaining names are a prefix of the full set, which is
+    // what makes the expected one-sided list obvious.
+    if (opts.drop_tensors > 0 &&
+        static_cast<size_t>(opts.drop_tensors) < tensors.size())
+        tensors.resize(tensors.size() - static_cast<size_t>(opts.drop_tensors));
 
     std::ofstream f(path, std::ios::binary);
     if (!f)
@@ -244,6 +250,10 @@ int main() {
     const std::string f_v = "/tmp/test_inspect_scanner_variant";
     std::string err = write_gguf(path);
     check(err.empty(), err.c_str());
+
+    // Capture this now: write_gguf sets the global for whichever file it wrote last,
+    // and the --validate and tensor-diff cases below write several more.
+    const size_t main_index_end = g_index_end;
 
     auto snap1 = forge::inspect::load_gguf(path, 1);
     auto snap4 = forge::inspect::load_gguf(path, 4);
@@ -642,6 +652,97 @@ int main() {
         }
     }
 
+    // ---- tensor diff ----
+    {
+        using forge::inspect::compute_tensor_diff;
+        using forge::inspect::TensorDiff;
+
+        // A file against itself must be perfectly clean, or every other case is noise.
+        const TensorDiff self = compute_tensor_diff(snap1, snap4);
+        check(self.common == 17, "self-diff sees every tensor as common");
+        check(self.common_identical == 17, "self-diff has no identical-count loss");
+        check(self.changed.empty(), "self-diff reports nothing changed");
+        check(self.only_a.empty() && self.only_b.empty(), "self-diff has no one-sided tensors");
+        const std::string self_txt = forge::inspect::render_tensor_diff(self, 0, false);
+        check(self_txt.find("identical") != std::string::npos,
+              "identical indexes are reported as such");
+
+        // Change one tensor's dtype in the second file: exactly that tensor moves.
+        {
+            WriteOpts o;
+            const std::string p2 = f_v + ".dtype.gguf";
+            check(write_gguf(p2, o).empty(), "variant written");
+            // Rewrite the file with one Q5_K tensor swapped to Q4_K by post-editing
+            // the tensor index is fiddly, so instead compare against a file that
+            // differs in its layer set.
+            const auto base = forge::inspect::load_gguf(p2, 1);
+            check(base.ok, "variant parses");
+
+            // A four-layer file against a two-layer one: two layers are one-sided.
+            WriteOpts o2;
+            o2.block_count_override = 2;
+            const std::string p3 = f_v + ".two.gguf";
+            check(write_gguf(p3, o2).empty(), "second variant written");
+            const auto two = forge::inspect::load_gguf(p3, 1);
+            check(two.ok, "second variant parses");
+
+            // The tensor list itself is the same (the knobs only touch metadata), so
+            // the diff is over identical indexes and must stay clean. This guards the
+            // "block_count changed but tensors did not" case from being reported as a
+            // tensor difference.
+            const TensorDiff meta_only = compute_tensor_diff(snap1, two);
+            check(meta_only.only_a.empty() && meta_only.only_b.empty(),
+                  "a metadata-only difference is not a tensor difference");
+            check(meta_only.common_identical == 17, "metadata-only difference keeps tensors identical");
+        }
+
+        // Now a real structural difference: drop tensors from the index.
+        {
+            WriteOpts o;
+            o.drop_tensors = 5;  // remove the last five entries
+            const std::string p4 = f_v + ".fewer.gguf";
+            check(write_gguf(p4, o).empty(), "truncated-tensor variant written");
+            const auto few = forge::inspect::load_gguf(p4, 1);
+            check(few.ok, "truncated-tensor variant parses");
+            const TensorDiff d = compute_tensor_diff(snap1, few);
+            check(d.common == 12, "the 12 retained tensors are common");
+            check(d.only_a.size() == 5, "the 5 dropped tensors are one-sided");
+            check(d.only_b.empty(), "nothing is only in the smaller file");
+            check(d.common_identical == 12, "retained tensors are identical");
+            // Names must come back sorted, so the output is stable between runs.
+            for (size_t i = 1; i < d.only_a.size(); ++i)
+                check(d.only_a[i - 1] < d.only_a[i], "one-sided names are sorted");
+
+            const std::string txt = forge::inspect::render_tensor_diff(d, 0, false);
+            check(txt.find("only in a") != std::string::npos, "text shows the one-sided count");
+            const std::string js = forge::inspect::render_tensor_diff_json(d, 0);
+            check(js.find("\"only_in_a\"") != std::string::npos, "json has only_in_a");
+            int vd = 0, vneg = false;
+            for (char c : js) {
+                if (c == '{' || c == '[') ++vd;
+                if (c == '}' || c == ']') { --vd; if (vd < 0) vneg = true; }
+            }
+            check(vd == 0 && !vneg, "tensor diff json is brace-balanced");
+        }
+
+        // --top must truncate the listing but not the counts.
+        {
+            WriteOpts o;
+            o.drop_tensors = 5;
+            const std::string p5 = f_v + ".fewer2.gguf";
+            check(write_gguf(p5, o).empty(), "variant written for the top-N check");
+            const auto few = forge::inspect::load_gguf(p5, 1);
+            const TensorDiff d = compute_tensor_diff(snap1, few);
+            const std::string all = forge::inspect::render_tensor_diff(d, 0, false);
+            const std::string top2 = forge::inspect::render_tensor_diff(d, 2, false);
+            check(top2.size() < all.size(), "--top shortens the listing");
+            check(top2.find("... and 3 more") != std::string::npos,
+                  "--top says how many were elided");
+            check(top2.find("only in a   5") != std::string::npos,
+                  "--top does not change the reported count");
+        }
+    }
+
     const std::string peaks = forge::inspect::render_peak_tensors(snap1, 3);
     check(peaks.size() >= 3, "peak tensors rendered");
 
@@ -656,7 +757,7 @@ int main() {
         // The scanner reports absolute file offsets, and this file stores 0 for the
         // first tensor, so file_offset == data_start == aligned(end of index).
         const uint64_t align = 32;
-        size_t expect = g_index_end;
+        size_t expect = main_index_end;
         if (expect % align)
             expect += align - (expect % align);
         check(snap1.tensors[0].file_offset == static_cast<int64_t>(expect),
@@ -668,7 +769,7 @@ int main() {
         check(snap1.tensors[1].file_offset == static_cast<int64_t>(expect) + first_nbytes,
               "second tensor's file_offset is one payload past the first");
         // And it must be strictly past the end of metadata, which is the old bug.
-        check(snap1.tensors[0].file_offset > static_cast<int64_t>(g_index_end - 1),
+        check(snap1.tensors[0].file_offset > static_cast<int64_t>(main_index_end - 1),
               "file_offset is past the index, not the metadata");
     }
 

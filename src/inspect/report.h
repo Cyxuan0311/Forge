@@ -153,6 +153,36 @@ struct LoadedModel {
 std::vector<DiffMetric> compute_diff(const LoadedModel& a, const LoadedModel& b);
 std::string render_diff_text(const LoadedModel& a, const LoadedModel& b);
 std::string render_diff_table(const LoadedModel& a, const LoadedModel& b);
+
+// A header-level tensor diff: which tensors exist in only one of the two models,
+// and which of the shared ones differ in dtype, shape or size.
+//
+// This compares the GGUF tensor index, not the weights. Nothing here reads tensor
+// data, so two models with identical indexes but different values are reported as
+// identical. That is the honest limit of a header diff and the reason it is
+// cheap enough to always run.
+struct TensorDelta {
+    std::string name;
+    std::string dtype_a, dtype_b;
+    std::string shape_a, shape_b;
+    int64_t bytes_a = 0, bytes_b = 0;
+    // What actually changed, for display: "dtype", "shape", "size", or a
+    // combination like "dtype+shape".
+    std::string changed;
+};
+
+struct TensorDiff {
+    std::vector<std::string> only_a;  // in the first model only
+    std::vector<std::string> only_b;  // in the second model only
+    std::vector<TensorDelta> changed;
+    int64_t common_identical = 0;
+    int64_t common = 0;
+};
+
+TensorDiff compute_tensor_diff(const GgufSnapshot& a, const GgufSnapshot& b);
+std::string render_tensor_diff(const TensorDiff& td, int top, bool table);
+std::string render_tensor_diff_json(const TensorDiff& td, int top);
+std::string render_diff_table(const LoadedModel& a, const LoadedModel& b);
 std::string render_summary_table(const LoadedModel& m);
 
 struct RenderOptions {

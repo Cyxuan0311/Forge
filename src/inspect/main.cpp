@@ -41,7 +41,8 @@ struct Options {
     int64_t vram = 0;      // --vram MB  (0 = no budget to check against)
     std::string kv_dtype;  // --kv-dtype NAME (empty = f16)
     bool memory = false;
-    bool validate = false;   // -M, --memory
+    bool validate = false;
+    bool tensor_diff = false;   // -d, --tensor-diff
     int threads = 0;       // 0 = auto
     std::string out_file;
     forge::inspect::col::Mode color = forge::inspect::col::Mode::Auto;
@@ -68,6 +69,8 @@ void print_help(const char* prog) {
         "\n"
         "Memory estimates:\n"
         "  -V, --validate      cross-check the metadata against the tensors\n"
+        "  -d, --tensor-diff   per-tensor diff against the second model (header level:\n"
+        "                      names, dtypes and shapes, not the weight values)\n"
         "  -M, --memory        KV cache + VRAM estimate for the model\n"
         "      --ctx N         context length to assume (default: the model's own)\n"
         "      --kv-dtype D    KV cache dtype for the estimate (default f16);\n"
@@ -206,6 +209,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
                 return false;
             }
             opt.vram = v;
+        } else if (a == "--tensor-diff" || a == "-d") {
+            // Needs a second file to be meaningful; the check happens once the
+            // models are loaded, where we know whether there is one.
+            opt.tensor_diff = true;
         } else if (a == "--validate" || a == "-V") {
             opt.validate = true;
         } else if (a == "-M" || a == "--memory") {
@@ -406,6 +413,12 @@ int main(int argc, char** argv) {
         return write_output(out, opt.out_file);
     }
 
+    if (opt.tensor_diff && opt.others.empty()) {
+        std::fprintf(stderr,
+                     "forge-inspect: --tensor-diff needs a second model to compare against\n");
+        return 1;
+    }
+
     // ------ human formats: text or table, optional diff ------
     std::vector<LoadedModel> models;
     models.reserve(opt.others.size() + 1);
@@ -513,6 +526,12 @@ int main(int argc, char** argv) {
         out += "\n  " + paint("diff vs " + o->path, Style::BoldYellow) + "\n";
         out += table ? forge::inspect::render_diff_table(m, *o)
                      : forge::inspect::render_diff_text(m, *o);
+        if (opt.tensor_diff) {
+            out += "  " + paint("tensors", Style::BoldYellow) + "\n";
+            out += forge::inspect::render_tensor_diff(
+                forge::inspect::compute_tensor_diff(m.snap, o->snap),
+                opt.top_layers > 0 ? opt.top_layers : 20, table);
+        }
     }
 
     return write_output(out, opt.out_file);

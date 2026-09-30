@@ -912,6 +912,162 @@ std::string render_layer_table(const TensorStats& stats, int top) {
 // Machine-readable formats. All plain: no ANSI, no terminal-drawing.
 // ---------------------------------------------------------------------------
 
+namespace {
+
+std::string shape_of(const std::vector<int64_t>& dims) {
+    if (dims.empty()) return "-";
+    std::string out;
+    for (size_t i = 0; i < dims.size(); ++i) {
+        if (i) out += "x";
+        out += std::to_string(dims[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+TensorDiff compute_tensor_diff(const GgufSnapshot& a, const GgufSnapshot& b) {
+    TensorDiff td;
+    std::unordered_map<std::string, const GgufLoadedTensor*> ia, ib;
+    ia.reserve(a.tensors.size() * 2);
+    ib.reserve(b.tensors.size() * 2);
+    for (const auto& t : a.tensors)
+        ia.emplace(t.name, &t);
+    for (const auto& t : b.tensors)
+        ib.emplace(t.name, &t);
+
+    for (const auto& [name, t] : ia) {
+        auto it = ib.find(name);
+        if (it == ib.end()) {
+            td.only_a.push_back(name);
+            continue;
+        }
+        ++td.common;
+        TensorDelta d;
+        d.name = name;
+        d.dtype_a = dtype_name(t->orig_dtype);
+        d.dtype_b = dtype_name(it->second->orig_dtype);
+        d.shape_a = shape_of(t->shape);
+        d.shape_b = shape_of(it->second->shape);
+        d.bytes_a = t->data_size;
+        d.bytes_b = it->second->data_size;
+        if (d.dtype_a != d.dtype_b) d.changed = "dtype";
+        if (d.shape_a != d.shape_b) {
+            d.changed = d.changed.empty() ? "shape" : d.changed + "+shape";
+        }
+        if (d.bytes_a != d.bytes_b) {
+            d.changed = d.changed.empty() ? "size" : d.changed + "+size";
+        }
+        if (d.changed.empty())
+            ++td.common_identical;
+        else
+            td.changed.push_back(std::move(d));
+    }
+    for (const auto& [name, t] : ib) {
+        (void)t;
+        if (ia.find(name) == ia.end()) td.only_b.push_back(name);
+    }
+    auto by_name = [](const std::string& x, const std::string& y) { return x < y; };
+    std::sort(td.only_a.begin(), td.only_a.end(), by_name);
+    std::sort(td.only_b.begin(), td.only_b.end(), by_name);
+    std::sort(td.changed.begin(), td.changed.end(),
+              [](const TensorDelta& x, const TensorDelta& y) { return x.name < y.name; });
+    return td;
+}
+
+namespace {
+
+// One line per category, with the count elided when zero so a clean diff is quiet.
+std::string td_line(const char* name, size_t n, col::Style st) {
+    return "  " + label(name) + "   " +
+           col::paint(std::to_string(n), n ? st : col::Style::Dim) + "\n";
+}
+
+void td_names(std::string& out, const char* label, const std::vector<std::string>& names, int top,
+              col::Style st) {
+    if (names.empty()) return;
+    out += "  " + std::string(label) + "  " +
+           col::paint(std::to_string(names.size()), st) + "\n";
+    const size_t n = top > 0 ? std::min<size_t>(static_cast<size_t>(top), names.size())
+                             : names.size();
+    for (size_t i = 0; i < n; ++i)
+        out += "      " + names[i] + "\n";
+    if (n < names.size())
+        out += "      ... and " + std::to_string(names.size() - n) + " more\n";
+}
+
+}  // namespace
+
+std::string render_tensor_diff(const TensorDiff& td, int top, bool table) {
+    (void)table;
+    std::string out;
+    out += "  " + label("common") + "    " + std::to_string(td.common) + "  (" +
+           std::to_string(td.common_identical) + " identical, " +
+           std::to_string(static_cast<int64_t>(td.changed.size())) + " changed)\n";
+    out += td_line("only in a", td.only_a.size(), col::Style::Yellow);
+    out += td_line("only in b", td.only_b.size(), col::Style::Yellow);
+    out += td_line("changed", td.changed.size(), col::Style::Cyan);
+    if (td.only_a.empty() && td.only_b.empty() && td.changed.empty()) {
+        out += "  " + col::paint("the two tensor indexes are identical", col::Style::Green) + "\n";
+        return out;
+    }
+    td_names(out, "only in a:", td.only_a, top, col::Style::Yellow);
+    td_names(out, "only in b:", td.only_b, top, col::Style::Yellow);
+    if (!td.changed.empty()) {
+        out += "  changed:\n";
+        const size_t n = top > 0 ? std::min<size_t>(static_cast<size_t>(top), td.changed.size())
+                                 : td.changed.size();
+        for (size_t i = 0; i < n; ++i) {
+            const auto& d = td.changed[i];
+            out += "      " + d.name + "  " + col::paint(d.changed, col::Style::Cyan);
+            if (d.changed.find("dtype") != std::string::npos)
+                out += "  " + d.dtype_a + " -> " + d.dtype_b;
+            if (d.changed.find("shape") != std::string::npos)
+                out += "  " + d.shape_a + " -> " + d.shape_b;
+            if (d.changed.find("size") != std::string::npos)
+                out += "  " + human_bytes(d.bytes_a) + " -> " + human_bytes(d.bytes_b);
+            out += "\n";
+        }
+        if (n < td.changed.size())
+            out += "      ... and " + std::to_string(td.changed.size() - n) + " more\n";
+    }
+    return out;
+}
+
+std::string render_tensor_diff_json(const TensorDiff& td, int top) {
+    const std::string IND = "  ";
+    const size_t limit = top > 0 ? static_cast<size_t>(top) : SIZE_MAX;
+    auto arr = [&](const char* key, const std::vector<std::string>& names) {
+        std::string o = std::string(IND) + IND + json_str(key) + ": [";
+        for (size_t i = 0; i < names.size() && i < limit; ++i)
+            o += (i ? ", " : "") + json_str(names[i]);
+        o += "]";
+        return o;
+    };
+    std::string out = "{\n";
+    out += IND + IND + json_str("common") + ": " + std::to_string(td.common) + ",\n";
+    out += IND + IND + json_str("identical") + ": " + std::to_string(td.common_identical) + ",\n";
+    out += IND + IND + json_str("changed_count") + ": " +
+           std::to_string(static_cast<int64_t>(td.changed.size())) + ",\n";
+    out += arr("only_in_a", td.only_a) + ",\n";
+    out += arr("only_in_b", td.only_b) + ",\n";
+    out += IND + IND + json_str("changed") + ": [";
+    for (size_t i = 0; i < td.changed.size() && i < limit; ++i) {
+        const auto& d = td.changed[i];
+        out += (i ? ",\n" : "\n");
+        out += IND + IND + IND + "{ " + json_str("name") + ": " + json_str(d.name) + ", " +
+               json_str("changed") + ": " + json_str(d.changed) + ", " + json_str("dtype_a") +
+               ": " + json_str(d.dtype_a) + ", " + json_str("dtype_b") + ": " + json_str(d.dtype_b) +
+               ", " + json_str("shape_a") + ": " + json_str(d.shape_a) + ", " + json_str("shape_b") +
+               ": " + json_str(d.shape_b) + ", " + json_str("bytes_a") + ": " +
+               std::to_string(d.bytes_a) + ", " + json_str("bytes_b") + ": " +
+               std::to_string(d.bytes_b) + " }";
+    }
+    out += (td.changed.empty() ? "" : "\n" + IND + IND);
+    out += "]\n}\n";
+    return out;
+}
+
 std::vector<DiffMetric> compute_diff(const LoadedModel& a, const LoadedModel& b) {
     std::vector<DiffMetric> out;
     auto add = [&](const char* m, std::function<std::string(const LoadedModel&)> f) {

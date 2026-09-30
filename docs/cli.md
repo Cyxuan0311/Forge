@@ -80,6 +80,9 @@ forge-inspect -M -f json model.gguf | jq .memory
 
 # will this file even load? non-zero exit on errors, so CI can gate on it
 forge-inspect -V model.gguf
+
+# what changed between an F16 and a BF16 conversion of the same model?
+forge-inspect -d model-f16.gguf model-bf16.gguf
 ```
 
 | Option | Description |
@@ -89,6 +92,7 @@ forge-inspect -V model.gguf
 | `--kv-dtype D` | `f16`, `fp32`, `q8_0`, `q4_0`, `q4_k`, `fp8_e4m3`, `fp8_e5m2` |
 | `--vram MB` | Budget to check against; reports over/under and how many layers to offload |
 | `-f, --format` | `text`, `table`, `markdown`, `json`, `yaml`, `csv`, `ini` |
+| `-d, --tensor-diff` | Per-tensor diff against a second model (needs two paths) |
 | `-V, --validate` | Cross-check the metadata against the tensors; exit 2 on errors |
 | `--metadata` | Dump all metadata key/value pairs |
 | `-t, --tree [D]` | Tensor tree to depth `D` |
@@ -99,6 +103,12 @@ per-block scale and round each row up to a whole block, and the dtype list is
 exactly the set the engine can store — there is no BF16 or K-quant KV cache.
 Hybrid architectures (LFM2, Qwen3.5) also report how many layers actually hold
 attention, since that is often far fewer than the layer count.
+
+`--tensor-diff` compares the two models' tensor indexes: which tensors exist in
+only one of them, and which shared tensors differ in dtype, shape or size. It
+reads the GGUF index, not the weights, so two models with identical indexes but
+different values are reported as identical. `--top N` bounds the listing (the
+counts are unaffected).
 
 `--validate` cross-checks the header against the tensors: the layer count against
 the layers actually present, head geometry, duplicate tensor names, the vocabulary

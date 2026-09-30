@@ -84,6 +84,7 @@ forge-inspect -M -f json model.gguf | jq .memory
 | `--kv-dtype D` | `f16`、`fp32`、`q8_0`、`q4_0`、`q4_k`、`fp8_e4m3`、`fp8_e5m2` |
 | `--vram MB` | 用于比对的预算；输出超出/剩余量以及需卸载的层数 |
 | `-f, --format` | `text`、`table`、`markdown`、`json`、`yaml`、`csv`、`ini` |
+| `-d, --tensor-diff` | 与第二个模型逐 tensor 对比（需要两个文件路径） |
 | `-V, --validate` | 用 tensor 实际内容交叉校验元数据；发现错误时退出码为 2 |
 | `--metadata` | 打印全部元数据键值 |
 | `-t, --tree [D]` | 深度为 `D` 的 tensor 树 |
@@ -92,6 +93,11 @@ forge-inspect -M -f json model.gguf | jq .memory
 量化 KV 的大小包含每块的 scale，且每行向上取整到整块；可选 dtype 列表与引擎
 实际可存储的类型完全一致（没有 BF16，也没有 K-quant 的 KV cache）。
 混合架构（LFM2、Qwen3.5）还会标注真正含注意力的层数——它通常远小于总层数。
+
+`--tensor-diff` 对比两个模型的 tensor 索引：哪些 tensor 只存在于其中一个、
+共有的 tensor 中哪些在 dtype、shape 或大小上不同。它只读 GGUF 索引、不读权重
+数据，因此索引相同但数值不同的模型会被判为相同。`--top N` 可限制列表长度
+（统计数字不受影响）。
 
 `--validate` 会用 tensor 实际内容交叉校验文件头：层数与实际存在的层是否一致、
 head 几何关系、tensor 重名、词表与 embedding 矩阵是否匹配、tensor 范围是否超出
