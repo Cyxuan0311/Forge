@@ -721,11 +721,27 @@ void KVCacheStorage::alloc(KVCacheDType dt, DeviceType dev, int rows, size_t rby
     }
 }
 
+void KVCacheStorage::adopt_device_buffer(KVCacheDType dt, void* base, size_t total_bytes,
+                                         size_t row_bytes_in) {
+    free();  // drop anything previously held
+    dtype = dt;
+    d_data = base;
+    d_bytes = total_bytes;
+    row_bytes = row_bytes_in;
+    max_rows = row_bytes_in ? static_cast<int>(total_bytes / row_bytes_in) : 0;
+    device = DeviceType::CUDA;
+    owns_buffer_ = false;
+}
+
 void KVCacheStorage::free() {
     if (device == DeviceType::CUDA) {
 #ifdef USE_CUDA
         if (d_data) {
-            cudaFree(d_data);
+            // Only free what we allocated. adopt_device_buffer() points into a
+            // caller-owned slab; freeing it there would corrupt every other page
+            // in the layer and double-free the slab at the end.
+            if (owns_buffer_)
+                cudaFree(d_data);
             d_data = nullptr;
         }
 #endif
@@ -738,6 +754,7 @@ void KVCacheStorage::free() {
     row_bytes = 0;
     dtype = KVCacheDType::FP32;
     device = DeviceType::CPU;
+    owns_buffer_ = true;
 }
 
 void KVCacheStorage::zero_fill() {

@@ -78,6 +78,9 @@ struct KVCacheStorage {
     std::vector<uint8_t> h_data;  // CPU-side quantized buffer
     void* d_data = nullptr;       // CUDA-side quantized buffer
     size_t d_bytes = 0;           // allocated size of d_data
+    // True when d_data points into a caller-owned slab (adopt_device_buffer),
+    // in which case free() must not cudaFree it.
+    bool owns_buffer_ = true;
 
     // --- Common ---
     int max_rows = 0;      // max_seq_len
@@ -96,6 +99,24 @@ struct KVCacheStorage {
     // For FP32: creates a Tensor(max_rows, row_bytes/4) on `device`.
     // For quantized: allocates h_data (CPU) or d_data (CUDA).
     void alloc(KVCacheDType dt, DeviceType dev, int max_rows, size_t row_bytes);
+
+    // Adopt an externally-owned device buffer instead of allocating one.
+    //
+    // The paged pool has one page per (page_size x row_bytes), and at
+    // budget-derived sizes that is ~880k pages across layers and K/V sides.
+    // Allocating each separately cost ~60 s of startup in cudaMalloc alone
+    // (~68 us x 881,664). One slab per (layer, side) brings that to 84 calls
+    // and the page pointers simply point into the slab, so the page-table
+    // indirection is unchanged.
+    //
+    // `base` must stay alive and unmoved for the lifetime of this storage; the
+    // caller owns it. `total_bytes` must be at least max_rows * row_bytes.
+    void adopt_device_buffer(KVCacheDType dt, void* base, size_t total_bytes,
+                             size_t row_bytes);
+
+    // True when this storage wraps a buffer owned by someone else, so free()
+    // must not cudaFree it.
+    bool owns_buffer() const { return owns_buffer_; }
 
     // Zero-fill all allocated storage
     void zero_fill();

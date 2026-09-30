@@ -481,6 +481,13 @@ private:
     // by KVCacheStorage::alloc (which places them on CUDA); these tables just
     // collect the per-page device base pointers for kernel access.
     // Host staging is [layer][page]; device array is one void** per layer.
+    // Slabs backing the per-page storage on CUDA: one per layer per side, owned
+    // here so they outlive the KVCacheStorage views that point into them. Pages
+    // do NOT cudaFree themselves (KVCacheStorage::owns_buffer() is false).
+    void free_layer_slabs_();
+    std::vector<void*> layer_slab_key_;
+    std::vector<void*> layer_slab_value_;
+
     std::vector<std::vector<void*>> d_key_page_ptrs_host_;
     std::vector<std::vector<void*>> d_value_page_ptrs_host_;
     std::vector<void**> d_key_page_ptrs_;

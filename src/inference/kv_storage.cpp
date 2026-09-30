@@ -162,6 +162,10 @@ PagedKVStorage::~PagedKVStorage() {
     }
     for (auto& kv : seq_tables_)
         free_page_table_mirrors(kv.second);
+    // The slabs own every page's bytes. The per-page KVCacheStorage views do not
+    // free them (owns_buffer() == false), so this is the only place they are
+    // released -- without it the pool leaks ~1.9 GB per process.
+    free_layer_slabs_();
 #endif
 }
 
@@ -332,7 +336,22 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     return true;
 }
 
+void PagedKVStorage::free_layer_slabs_() {
+#ifdef USE_CUDA
+    for (void* p : layer_slab_key_) cudaFree(p);
+    for (void* p : layer_slab_value_) cudaFree(p);
+#endif
+    layer_slab_key_.clear();
+    layer_slab_value_.clear();
+}
+
 bool PagedKVStorage::allocate_page_pools_locked() {
+    // Re-entrant: resize_to_budget() calls this again after warmup, when free
+    // VRAM is known. Release the previous slabs first, otherwise each resize
+    // strands a full pool's worth of device memory and the next budget query sees
+    // less free memory than it should.
+    free_layer_slabs_();
+
     // Allocate page pools per layer
     layer_pages_.resize(num_layers_);
     for (int l = 0; l < num_layers_; ++l) {
@@ -342,14 +361,61 @@ bool PagedKVStorage::allocate_page_pools_locked() {
 
         int lmax = layer_pools_[l].max_pages;
         layer_pages_[l].resize(lmax);
+
+        // One slab per (layer, side) instead of one allocation per page.
+        //
+        // The page count is budget-derived, not context-derived: at -c 4096 on a
+        // 6 GB card the q4_0 pool came out at 10,496 pages/layer, so 42 layers x
+        // 2 sides = 881,664 separate cudaMalloc calls. That cost ~60 s of startup
+        // (ctx=60865 ms) at roughly 68 us apiece -- the single largest source of
+        // paged startup latency, and it scales with free VRAM rather than with
+        // the work being done.
+        //
+        // The pages are already addressed indirectly through
+        // d_key_page_ptrs_/d_value_page_ptrs_, so a slab needs no change to the
+        // page-table indirection at all: each page just points at its slice.
+        // 881,664 calls become 2 per layer.
+        void* k_slab = nullptr;
+        void* v_slab = nullptr;
+        size_t k_slab_bytes = 0, v_slab_bytes = 0;
+        if (device_ == DeviceType::CUDA && lmax > 0) {
+#ifdef USE_CUDA
+            k_slab_bytes = static_cast<size_t>(lmax) * page_size_ * k_row_bytes;
+            v_slab_bytes = static_cast<size_t>(lmax) * page_size_ * v_row_bytes;
+            if (cudaMalloc(&k_slab, k_slab_bytes) != cudaSuccess) k_slab = nullptr;
+            if (cudaMalloc(&v_slab, v_slab_bytes) != cudaSuccess) v_slab = nullptr;
+            if (k_slab) cudaMemset(k_slab, 0, k_slab_bytes);
+            if (v_slab) cudaMemset(v_slab, 0, v_slab_bytes);
+#endif
+        }
+
         for (int p = 0; p < lmax; ++p) {
             auto& page = layer_pages_[l][p];
-            page.key.alloc(kv_config_.type_k, device_, page_size_, k_row_bytes);
-            page.value.alloc(kv_config_.type_v, device_, page_size_, v_row_bytes);
-            page.key.zero_fill();
-            page.value.zero_fill();
+            const size_t slice_k = static_cast<size_t>(page_size_) * k_row_bytes;
+            const size_t slice_v = static_cast<size_t>(page_size_) * v_row_bytes;
+            if (k_slab && v_slab) {
+                page.key.adopt_device_buffer(kv_config_.type_k,
+                                             static_cast<uint8_t*>(k_slab) +
+                                                 static_cast<size_t>(p) * slice_k,
+                                             slice_k, k_row_bytes);
+                page.value.adopt_device_buffer(kv_config_.type_v,
+                                               static_cast<uint8_t*>(v_slab) +
+                                                   static_cast<size_t>(p) * slice_v,
+                                               slice_v, v_row_bytes);
+            } else {
+                // CPU pools, or a CUDA slab that failed to allocate: fall back to
+                // per-page storage so behaviour degrades rather than breaks.
+                page.key.alloc(kv_config_.type_k, device_, page_size_, k_row_bytes);
+                page.value.alloc(kv_config_.type_v, device_, page_size_, v_row_bytes);
+                page.key.zero_fill();
+                page.value.zero_fill();
+            }
             page.filled = 0;
             page.ref_count = 0;
+        }
+        if (k_slab) {
+            layer_slab_key_.push_back(k_slab);
+            layer_slab_value_.push_back(v_slab);
         }
         // Init free list for this layer
         layer_pools_[l].free_page_ids.clear();
