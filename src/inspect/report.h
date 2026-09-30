@@ -109,7 +109,16 @@ std::string render_metadata(const GgufSnapshot& snap, const std::string& arch);
 std::string render_op_pipeline(const ArchInfo& ai);
 
 // New sections added for the size/peaks views.
-std::string render_peak_tensors(const GgufSnapshot& snap, int top);
+// `filter` is a case-insensitive substring of the tensor name; empty means all.
+// Returns the header line and the number of matches so the caller can say
+// "N of M match" rather than silently printing an empty section.
+std::string render_peak_tensors(const GgufSnapshot& snap, int top,
+                                const std::string& filter = std::string(),
+                                int* matched = nullptr);
+
+// Full detail for one tensor, by exact name. Empty when there is no such tensor;
+// `found` distinguishes "not found" from "found but empty".
+std::string render_tensor_detail(const GgufSnapshot& snap, const std::string& name, bool* found);
 std::string render_layer_table(const TensorStats& stats, int top);
 
 // Side-by-side comparison of two models (human + box table styles).
@@ -207,6 +216,20 @@ struct RenderOptions {
 };
 
 std::string render_json(const LoadedModel& m, const RenderOptions& o);
+
+// Machine-readable multi-model output: a "models" array holding one full report
+// per file, plus a "diff" array with the scalar and per-tensor differences
+// against the first model. Emitted instead of refusing when several paths are
+// given with -f json/-f yaml.
+std::string render_multi_json(const std::vector<LoadedModel>& models, const RenderOptions& o);
+std::string render_multi_yaml(const std::vector<LoadedModel>& models, const RenderOptions& o);
+
+// Machine-readable multi-model output: a "models" array holding one full report
+// per file, plus a "diff" array holding the scalar and per-tensor differences
+// against the first model. Emitted instead of refusing when several paths are
+// given with -f json/-f yaml.
+std::string render_multi_json(const std::vector<LoadedModel>& models, const RenderOptions& o);
+std::string render_multi_yaml(const std::vector<LoadedModel>& models, const RenderOptions& o);
 std::string render_yaml(const LoadedModel& m, const RenderOptions& o);
 std::string render_markdown(const LoadedModel& m, const RenderOptions& o);
 std::string render_csv(const LoadedModel& m, const RenderOptions& o);

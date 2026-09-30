@@ -86,6 +86,8 @@ forge-inspect -M -f json model.gguf | jq .memory
 | `-f, --format` | `text`、`table`、`markdown`、`json`、`yaml`、`csv`、`ini` |
 | `-d, --tensor-diff` | 与第二个模型逐 tensor 对比（需要两个文件路径） |
 | `-V, --validate` | 用 tensor 实际内容交叉校验元数据；发现错误时退出码为 2 |
+| `--filter SUBSTR` | 只显示名字包含 `SUBSTR` 的 tensor（不区分大小写） |
+| `--tensor NAME` | 按精确名字显示单个 tensor 的完整信息 |
 | `--metadata` | 打印全部元数据键值 |
 | `-t, --tree [D]` | 深度为 `D` 的 tensor 树 |
 

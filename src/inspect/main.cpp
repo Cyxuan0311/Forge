@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstdio>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -43,6 +44,8 @@ struct Options {
     bool memory = false;
     bool validate = false;
     bool tensor_diff = false;   // -d, --tensor-diff
+    std::string filter;         // --filter: substring of the tensor name
+    std::string tensor;         // --tensor: exact name
     int threads = 0;       // 0 = auto
     std::string out_file;
     forge::inspect::col::Mode color = forge::inspect::col::Mode::Auto;
@@ -69,6 +72,8 @@ void print_help(const char* prog) {
         "\n"
         "Memory estimates:\n"
         "  -V, --validate      cross-check the metadata against the tensors\n"
+        "      --filter SUBSTR only tensors whose name contains SUBSTR\n"
+        "      --tensor NAME  full detail for one tensor, by exact name\n"
         "  -d, --tensor-diff   per-tensor diff against the second model (header level:\n"
         "                      names, dtypes and shapes, not the weight values)\n"
         "  -M, --memory        KV cache + VRAM estimate for the model\n"
@@ -209,6 +214,26 @@ bool parse_args(int argc, char** argv, Options& opt) {
                 return false;
             }
             opt.vram = v;
+        } else if (a == "--filter") {
+            if (!take_value(a.c_str()))
+                return false;
+            opt.filter = args[++i];
+        } else if (a.rfind("--filter=", 0) == 0) {
+            opt.filter = a.substr(9);
+            if (opt.filter.empty()) {
+                std::fprintf(stderr, "forge-inspect: --filter needs a non-empty substring\n");
+                return false;
+            }
+        } else if (a == "--tensor") {
+            if (!take_value(a.c_str()))
+                return false;
+            opt.tensor = args[++i];
+        } else if (a.rfind("--tensor=", 0) == 0) {
+            opt.tensor = a.substr(9);
+            if (opt.tensor.empty()) {
+                std::fprintf(stderr, "forge-inspect: --tensor needs a tensor name\n");
+                return false;
+            }
         } else if (a == "--tensor-diff" || a == "-d") {
             // Needs a second file to be meaningful; the check happens once the
             // models are loaded, where we know whether there is one.
@@ -346,7 +371,12 @@ int main(int argc, char** argv) {
             forge::inspect::col::set_mode(Mode::Never);
     }
 
-    if (is_plain(opt.format) && !opt.others.empty()) {
+    // json and yaml can hold several models, so they are loaded and rendered
+    // together rather than rejected. The rest really are one-record formats.
+    const bool multi_ok = opt.format == forge::inspect::Format::Json ||
+                          opt.format == forge::inspect::Format::Yaml;
+    const bool multi_ok_with_others = multi_ok && !opt.others.empty();
+    if (is_plain(opt.format) && !opt.others.empty() && !multi_ok) {
         std::fprintf(stderr,
                      "forge-inspect: %s output supports a single model; use "
                      "format text/table to compare.\n",
@@ -381,7 +411,8 @@ int main(int argc, char** argv) {
                         parse_ms, stats_ms, threads};
 
     // ------ machine-readable single-model formats ------
-    if (is_plain(opt.format)) {
+    // json/yaml with several paths render everything together further down.
+    if (is_plain(opt.format) && !multi_ok_with_others) {
         forge::inspect::RenderOptions ro;
         ro.top_layers = opt.top_layers;
         ro.memory = opt.memory;
@@ -420,27 +451,91 @@ int main(int argc, char** argv) {
     }
 
     // ------ human formats: text or table, optional diff ------
+    // The extra models are parsed concurrently. They are independent files, and
+    // load_gguf already saturates `threads` on its own, so running them one at a
+    // time made the wall clock the sum of every parse.
     std::vector<LoadedModel> models;
     models.reserve(opt.others.size() + 1);
     models.push_back(std::move(primary));
-    for (const auto& p : opt.others) {
-        auto t = std::chrono::steady_clock::now();
-        GgufSnapshot s = forge::inspect::load_gguf(p, threads);
-        auto t1b = std::chrono::steady_clock::now();
-        if (!s.ok) {
-            std::fprintf(stderr, "forge-inspect: %s\n", s.error.c_str());
-            return 1;
+    {
+        const size_t n = opt.others.size();
+        std::vector<GgufSnapshot> snaps(n);
+        std::vector<TensorStats> stats(n);
+        std::vector<std::string> errors(n);
+        std::vector<double> parse_ms(n, 0.0), stats_ms(n, 0.0);
+        std::atomic<size_t> next{0};
+        const size_t workers = std::min<size_t>(n, static_cast<size_t>(std::max(1, threads)));
+        auto worker = [&]() {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= n) return;
+                const auto t0 = std::chrono::steady_clock::now();
+                snaps[i] = forge::inspect::load_gguf(opt.others[i], threads);
+                const auto t1 = std::chrono::steady_clock::now();
+                if (!snaps[i].ok) {
+                    errors[i] = snaps[i].error;
+                    continue;
+                }
+                stats[i] = forge::inspect::compute_stats(snaps[i], threads);
+                const auto t2 = std::chrono::steady_clock::now();
+                parse_ms[i] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                stats_ms[i] = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            }
+        };
+        if (workers <= 1) {
+            worker();
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(workers);
+            for (size_t k = 0; k < workers; ++k)
+                pool.emplace_back(worker);
+            for (auto& th : pool)
+                th.join();
         }
-        TensorStats st = forge::inspect::compute_stats(s, threads);
-        auto t2b = std::chrono::steady_clock::now();
-        models.push_back({p, std::move(s), std::move(st),
-                          forge::inspect::sniff_arch(models.back().snap),
-                          0.0, 0.0, threads});
-        models.back().parse_ms =
-            std::chrono::duration<double, std::milli>(t1b - t).count();
-        models.back().stats_ms =
-            std::chrono::duration<double, std::milli>(t2b - t1b).count();
+        for (size_t i = 0; i < n; ++i) {
+            if (!errors[i].empty()) {
+                std::fprintf(stderr, "forge-inspect: %s: %s\n", opt.others[i].c_str(),
+                             errors[i].c_str());
+                return 1;
+            }
+            LoadedModel lm;
+            lm.path = opt.others[i];
+            lm.arch = forge::inspect::sniff_arch(snaps[i]);
+            lm.snap = std::move(snaps[i]);
+            lm.stats = std::move(stats[i]);
+            lm.parse_ms = parse_ms[i];
+            lm.stats_ms = stats_ms[i];
+            lm.threads = threads;
+            models.push_back(std::move(lm));
+        }
     }
+    if (opt.format == forge::inspect::Format::Json || opt.format == forge::inspect::Format::Yaml) {
+        forge::inspect::RenderOptions mo;
+        mo.memory = opt.memory;
+        mo.ctx = opt.ctx;
+        mo.vram_mb = opt.vram;
+        mo.kv_dtype = opt.kv_dtype;
+        mo.validate = opt.validate;
+        mo.peaks = opt.peaks;
+        mo.top_layers = opt.top_layers;
+        const std::string mout =
+            opt.format == forge::inspect::Format::Json
+                ? forge::inspect::render_multi_json(models, mo)
+                : forge::inspect::render_multi_yaml(models, mo);
+        // --validate still gates the exit code, same as the human path.
+        if (opt.validate) {
+            for (const auto& lm : models) {
+                for (const auto& f : forge::inspect::validate_model(lm.snap, lm.arch)) {
+                    if (f.severity == forge::inspect::Severity::Error) {
+                        write_output(mout, opt.out_file);
+                        return 2;
+                    }
+                }
+            }
+        }
+        return write_output(mout, opt.out_file);
+    }
+
     std::vector<const LoadedModel*> others;
     for (size_t i = 1; i < models.size(); ++i)
         others.push_back(&models[i]);
@@ -472,6 +567,16 @@ int main(int argc, char** argv) {
         out += table ? forge::inspect::render_summary_table(m)
                      : forge::inspect::render_summary(m.snap, m.arch, m.stats);
     }
+    if (!opt.tensor.empty()) {
+        bool found = false;
+        const std::string detail = forge::inspect::render_tensor_detail(m.snap, opt.tensor, &found);
+        if (!found) {
+            std::fprintf(stderr, "forge-inspect: no tensor named '%s'\n", opt.tensor.c_str());
+            return 1;
+        }
+        write_output(detail, opt.out_file);
+        return 0;
+    }
     if (opt.validate) {
         out += "\n  " + paint("validation", Style::BoldCyan) + "\n";
         const auto findings = forge::inspect::validate_model(m.snap, m.arch);
@@ -499,10 +604,20 @@ int main(int argc, char** argv) {
                               Style::BoldCyan) + "\n";
         out += forge::inspect::render_layer_table(m.stats, opt.top_layers);
     }
-    if (opt.peaks) {
-        out += "\n  " + paint("largest tensors (top " + std::to_string(opt.peaks) + ")",
+    if (opt.peaks || !opt.filter.empty()) {
+        const int limit = opt.peaks > 0 ? opt.peaks : 20;
+        out += "\n  " + paint(opt.filter.empty()
+                                   ? "largest tensors (top " + std::to_string(limit) + ")"
+                                   : "tensors matching '" + opt.filter + "' (top " +
+                                         std::to_string(limit) + ")",
                               Style::BoldCyan) + "\n";
-        out += forge::inspect::render_peak_tensors(m.snap, opt.peaks);
+        int matched = 0;
+        out += forge::inspect::render_peak_tensors(m.snap, limit, opt.filter, &matched);
+        if (!opt.filter.empty())
+            out += "  " + paint(std::to_string(matched) + " of " +
+                                    std::to_string(m.snap.tensors.size()) + " tensors match",
+                                Style::Dim) +
+                   "\n";
     }
     if (opt.tree || opt.all) {
         out += "\n  " + paint("tensor tree (depth " + std::to_string(opt.tree_depth) + ")",

@@ -94,8 +94,15 @@ forge-inspect -d model-f16.gguf model-bf16.gguf
 | `-f, --format` | `text`, `table`, `markdown`, `json`, `yaml`, `csv`, `ini` |
 | `-d, --tensor-diff` | Per-tensor diff against a second model (needs two paths) |
 | `-V, --validate` | Cross-check the metadata against the tensors; exit 2 on errors |
+| `--filter SUBSTR` | Only tensors whose name contains `SUBSTR` (case-insensitive) |
+| `--tensor NAME` | Full detail for one tensor, by exact name |
 | `--metadata` | Dump all metadata key/value pairs |
 | `-t, --tree [D]` | Tensor tree to depth `D` |
+
+Several paths can be given at once. `text` and `table` render a side-by-side
+comparison; `json` and `yaml` emit a `models` array with one full report per file
+plus a `diff` array. `csv`, `markdown` and `ini` are single-record formats and
+say so if you pass more than one path. Extra models are parsed concurrently.
 
 The estimate follows the same accounting Forge itself uses, so the number
 matches the engine's own `KV Cache` report. Quantized sizes include the

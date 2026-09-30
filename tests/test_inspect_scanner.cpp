@@ -505,6 +505,39 @@ int main() {
         const std::string vj_off = forge::inspect::render_json(lm, forge::inspect::RenderOptions());
         check(vj_off.find("\"validation\"") == std::string::npos,
               "json omits validation unless asked");
+
+        // Multi-model json/yaml: an array of full reports plus a diff array. Each
+        // embedded report must nest without breaking the outer braces.
+        {
+            std::vector<forge::inspect::LoadedModel> two = {lm, lm};
+            two[1].path = "/tmp/second.gguf";
+            const std::string mj = forge::inspect::render_multi_json(two, mo);
+            check(mj.find("\"models\"") != std::string::npos, "multi json has a models array");
+            check(mj.find("\"diff\"") != std::string::npos, "multi json has a diff array");
+            check(mj.find("/tmp/second.gguf") != std::string::npos, "the second model is present");
+            int d1 = 0, neg1 = false;
+            for (char c : mj) {
+                if (c == '{' || c == '[') ++d1;
+                if (c == '}' || c == ']') { --d1; if (d1 < 0) neg1 = true; }
+            }
+            check(d1 == 0 && !neg1, "multi json is brace-balanced");
+            // Identical models must produce an empty diff rather than spurious deltas.
+            const std::string tdj = forge::inspect::render_tensor_diff_json(
+                forge::inspect::compute_tensor_diff(two[0].snap, two[1].snap), 0);
+            check(tdj.find("\"identical\": 17") != std::string::npos,
+                  "identical models report 17 identical tensors");
+
+            const std::string my = forge::inspect::render_multi_yaml(two, mo);
+            check(my.find("models:") != std::string::npos, "multi yaml has models");
+            check(my.find("diff:") != std::string::npos, "multi yaml has diff");
+            check(my.find("- file:") != std::string::npos, "multi yaml uses a list of mappings");
+
+            // A single model must still render as a bare object, not a one-element
+            // array: existing scripts parse the flat shape.
+            const std::string one = forge::inspect::render_json(lm, mo);
+            check(one.find("\"models\"") == std::string::npos,
+                  "single-model json stays a bare object");
+        }
     }
 
     // ---- arch family comes from one table (was duplicated) ----
@@ -741,6 +774,58 @@ int main() {
             check(top2.find("only in a   5") != std::string::npos,
                   "--top does not change the reported count");
         }
+    }
+
+    // ---- --filter / --tensor ----
+    {
+        int matched = -1;
+        const std::string all = forge::inspect::render_peak_tensors(snap1, 3, "", &matched);
+        check(matched == 17, "an empty filter matches every tensor");
+        check(all.find("and 14 more") != std::string::npos, "unfiltered list elides the rest");
+
+        // Substring on the name, case-insensitive.
+        matched = -1;
+        const std::string k = forge::inspect::render_peak_tensors(snap1, 50, "attn_k", &matched);
+        check(matched == 1, "filter 'attn_k' matches one tensor");
+        check(k.find("blk.0.attn_k.weight") != std::string::npos, "filter found the right tensor");
+        const std::string k_upper = forge::inspect::render_peak_tensors(snap1, 50, "ATTN_K", nullptr);
+        check(k_upper == k, "the filter is case-insensitive");
+
+        const std::string blk = forge::inspect::render_peak_tensors(snap1, 50, "blk.", nullptr);
+        check(blk.find("blk.0.") != std::string::npos, "filter 'blk.' matches layer tensors");
+        check(blk.find("token_embd") == std::string::npos, "and excludes the embedding");
+
+        // A filter that matches nothing must say so rather than print an empty section.
+        const std::string none = forge::inspect::render_peak_tensors(snap1, 5, "zzz", nullptr);
+        check(none.find("no tensor matches") != std::string::npos, "an empty match is reported");
+
+        // --top bounds the listing but not the count.
+        matched = -1;
+        const std::string two = forge::inspect::render_peak_tensors(snap1, 2, "blk.", &matched);
+        // The fixture is 16 "blk.N.*" tensors plus token_embd.
+        // 14 of the 17 are "blk.N.*"; the other three are token_embd, output_norm
+        // and output.
+        check(matched == 14, "filter 'blk.' matches 14 of the 17 tensors");
+        check(two.find("and 12 more") != std::string::npos, "--top elides the remainder");
+        check(two.find("9 of") == std::string::npos, "--top does not change the count");
+
+        // Single-tensor detail.
+        bool found = false;
+        const std::string d = forge::inspect::render_tensor_detail(snap1, "token_embd.weight", &found);
+        check(found, "render_tensor_detail finds an existing tensor");
+        check(d.find("shape") != std::string::npos, "detail has the shape");
+        check(d.find("F16") != std::string::npos || d.find("Q5_K") != std::string::npos,
+              "detail has the dtype");
+        check(d.find("offset") != std::string::npos, "detail has the file offset");
+        // token_embd is {32, 4096} Q5_K; the reported bytes must match packed_bytes.
+        check(d.find(std::to_string(forge::inspect::packed_bytes(GgmlDType::Q5_K, 32 * 4096))) !=
+                  std::string::npos,
+              "detail bytes agree with packed_bytes");
+
+        found = true;
+        const std::string miss = forge::inspect::render_tensor_detail(snap1, "nope", &found);
+        check(!found, "a missing tensor is reported as not found");
+        check(miss.empty(), "a missing tensor produces no output");
     }
 
     const std::string peaks = forge::inspect::render_peak_tensors(snap1, 3);

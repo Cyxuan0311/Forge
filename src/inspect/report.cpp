@@ -10,6 +10,7 @@
 
 #include "arch_ops.h"
 #include "color.h"
+#include "format.h"
 #include "meta_groups.h"
 
 namespace forge::inspect {
@@ -557,7 +558,15 @@ std::string render_chart(const TensorStats& stats) {
     if (stats.by_dtype.empty())
         return out;
     const int64_t max_bytes = stats.by_dtype.front().bytes > 0 ? stats.by_dtype.front().bytes : 1;
-    const int bar_max = 40;
+    // Size the bar to the terminal instead of a fixed 40, which ran off the edge of
+    // an 80-column terminal. The trailing "(N tensors)" differs per line, so allow
+    // for the widest one: 8 for the name, 2+2 around the bar, 6 for the percentage,
+    // 2 more, and the suffix.
+    size_t widest = 0;
+    for (const auto& d : stats.by_dtype)
+        widest = std::max(widest, std::string(" (" + std::to_string(d.count) + " tensors)").size());
+    const int fixed = 8 + 2 + 2 + 6 + 2 + static_cast<int>(widest);
+    const int bar_max = std::max(10, terminal_width(80) - fixed);
     for (const auto& d : stats.by_dtype) {
         int len = static_cast<int>((d.bytes * bar_max) / max_bytes);
         if (len < 1)
@@ -867,13 +876,32 @@ std::string render_validation(const std::vector<Finding>& findings) {
 // New sections: largest tensors + layer byte table.
 // ---------------------------------------------------------------------------
 
-std::string render_peak_tensors(const GgufSnapshot& snap, int top) {
+std::string render_peak_tensors(const GgufSnapshot& snap, int top, const std::string& filter,
+                                int* matched) {
     std::string out;
-    std::vector<size_t> order(snap.tensors.size());
-    for (size_t i = 0; i < order.size(); ++i)
-        order[i] = i;
+    std::string needle = filter;
+    for (auto& c : needle)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    std::vector<size_t> order;
+    order.reserve(snap.tensors.size());
+    for (size_t i = 0; i < snap.tensors.size(); ++i) {
+        if (needle.empty()) {
+            order.push_back(i);
+            continue;
+        }
+        std::string name = snap.tensors[i].name;
+        for (auto& c : name)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (name.find(needle) != std::string::npos) order.push_back(i);
+    }
+    if (matched)
+        *matched = static_cast<int>(order.size());
+    // Sort by size descending, but break ties by name so repeated runs agree.
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return snap.tensors[a].data_size > snap.tensors[b].data_size;
+        if (snap.tensors[a].data_size != snap.tensors[b].data_size)
+            return snap.tensors[a].data_size > snap.tensors[b].data_size;
+        return snap.tensors[a].name < snap.tensors[b].name;
     });
     const size_t n = std::min(static_cast<size_t>(top), order.size());
     for (size_t i = 0; i < n; ++i) {
@@ -888,7 +916,54 @@ std::string render_peak_tensors(const GgufSnapshot& snap, int top) {
                col::paint(human_bytes(t.data_size), col::Style::Cyan) + "  (" +
                col::paint(cnt, col::Style::Dim) + ")\n";
     }
+    if (n < order.size())
+        out += "  " + col::paint("... and " + std::to_string(order.size() - n) + " more",
+                                 col::Style::Dim) +
+               "\n";
+    if (order.empty() && !needle.empty())
+        out += "  " + col::paint("no tensor matches '" + filter + "'", col::Style::Yellow) + "\n";
     return out;
+}
+
+std::string render_tensor_detail(const GgufSnapshot& snap, const std::string& name, bool* found) {
+    if (found)
+        *found = false;
+    for (const auto& t : snap.tensors) {
+        if (t.name != name) continue;
+        if (found)
+            *found = true;
+        int64_t numel = 1;
+        for (int64_t d : t.shape)
+            numel *= d;
+        std::string dims;
+        for (size_t i = 0; i < t.shape.size(); ++i) {
+            if (i) dims += " x ";
+            dims += std::to_string(t.shape[i]);
+        }
+        std::string out;
+        auto row = [&](const char* k, const std::string& v) {
+            out += "  " + label(k) + "     " + v + "\n";
+        };
+        row("name", col::paint(t.name, col::Style::Bold));
+        row("dtype", col::paint(dtype_name(t.orig_dtype), col::Style::Yellow));
+        row("shape", dims.empty() ? std::string("scalar") : dims);
+        row("elements", std::to_string(numel));
+        row("bytes", col::paint(human_bytes(t.data_size), col::Style::Cyan) + " (" +
+                        std::to_string(t.data_size) + ")");
+        row("offset", std::to_string(t.file_offset));
+        // The packed size the scanner derived versus what a loader would compute from
+        // the dtype: a disagreement means the index and the dtype disagree.
+        const int64_t expect = packed_bytes(t.orig_dtype, numel);
+        if (expect != t.data_size) {
+            out += "  " + label("") + "       " +
+                   col::paint("packed size " + std::to_string(expect) + " != stored " +
+                                  std::to_string(t.data_size) + " B",
+                              col::Style::Yellow) +
+                   "\n";
+        }
+        return out;
+    }
+    return std::string();
 }
 
 std::string render_layer_table(const TensorStats& stats, int top) {
@@ -1080,6 +1155,92 @@ std::vector<DiffMetric> compute_diff(const LoadedModel& a, const LoadedModel& b)
     add("elements", [](const LoadedModel& x) { return std::to_string(x.stats.total_elements); });
     add("layers", [](const LoadedModel& x) { return std::to_string(x.arch.n_layers); });
     add("file_type", [](const LoadedModel& x) { return x.arch.file_type; });
+    return out;
+}
+
+// Re-indent a rendered "{...}" object by `pad` spaces so it nests cleanly. Used to
+// embed each single-model report as one element of the models array.
+std::string indent_block(const std::string& block, const std::string& pad) {
+    std::string out;
+    out.reserve(block.size() + pad.size() * 8);
+    for (size_t i = 0; i < block.size(); ++i) {
+        const char c = block[i];
+        if (c == '\n' && i + 1 < block.size() && block[i + 1] != '\n')
+            out += pad;
+        out += c;
+    }
+    if (!out.empty() && out.back() == '\n')
+        out.pop_back();
+    return out;
+}
+
+std::string render_multi_json(const std::vector<LoadedModel>& models, const RenderOptions& o) {
+    const std::string IND = "  ";
+    std::string out = "{\n";
+    out += IND + "\"models\": [\n";
+    for (size_t i = 0; i < models.size(); ++i) {
+        if (i) out += ",\n";
+        out += IND + IND + indent_block(render_json(models[i], o), IND + IND);
+    }
+    out += "\n" + IND + "],\n";
+
+    out += IND + "\"diff\": [\n";
+    for (size_t i = 1; i < models.size(); ++i) {
+        if (i > 1) out += ",\n";
+        out += IND + IND + "{ \"against\": " + json_str(models[i].path) + ",\n";
+        out += IND + IND + IND + "\"summary\": {";
+        const auto dm = compute_diff(models[0], models[i]);
+        for (size_t k = 0; k < dm.size(); ++k) {
+            if (k) out += ", ";
+            out += json_str(dm[k].metric) + ": { \"a\": " + json_str(dm[k].a) + ", \"b\": " +
+                   json_str(dm[k].b) + " }";
+        }
+        out += " },\n";
+        out += IND + IND + IND + "\"tensors\": ";
+        out += indent_block(render_tensor_diff_json(compute_tensor_diff(models[0].snap, models[i].snap),
+                                                    0),
+                            IND + IND + IND);
+        out += "\n" + IND + IND + "}";
+    }
+    out += "\n" + IND + "]\n}\n";
+    return out;
+}
+
+std::string render_multi_yaml(const std::vector<LoadedModel>& models, const RenderOptions& o) {
+    std::string out = "models:\n";
+    for (size_t i = 0; i < models.size(); ++i) {
+        out += "  - ";
+        std::string one = render_yaml(models[i], o);
+        // render_yaml emits a top-level mapping; indent it under the list item.
+        for (size_t k = 0; k < one.size(); ++k) {
+            const char c = one[k];
+            out += c;
+            if (c == '\n' && k + 1 < one.size())
+                out += "    ";
+        }
+        if (!one.empty() && one.back() != '\n')
+            out += "\n";
+    }
+    if (models.size() > 1) {
+        out += "diff:\n";
+        for (size_t i = 1; i < models.size(); ++i) {
+            out += "  - against: " + models[i].path + "\n";
+            out += "    summary:\n";
+            for (const auto& d : compute_diff(models[0], models[i]))
+                out += "      " + d.metric + ": {a: " + d.a + ", b: " + d.b + "}\n";
+            out += "    tensors:\n";
+            const auto td = compute_tensor_diff(models[0].snap, models[i].snap);
+            out += "      common: " + std::to_string(td.common) + "\n";
+            out += "      identical: " + std::to_string(td.common_identical) + "\n";
+            out += "      changed: " + std::to_string(static_cast<int64_t>(td.changed.size())) + "\n";
+            out += "      only_in_a:\n";
+            for (const auto& n : td.only_a)
+                out += "        - " + n + "\n";
+            out += "      only_in_b:\n";
+            for (const auto& n : td.only_b)
+                out += "        - " + n + "\n";
+        }
+    }
     return out;
 }
 
@@ -1519,6 +1680,50 @@ std::string render_ini(const LoadedModel& m, const RenderOptions& o) {
         out += "dtype_" + std::to_string(i + 1) + "_name = " + d.name + "\n";
         out += "dtype_" + std::to_string(i + 1) + "_bytes = " + std::to_string(d.bytes) + "\n";
         out += "dtype_" + std::to_string(i + 1) + "_count = " + std::to_string(d.count) + "\n";
+    }
+
+    // The -M / -V sections were silently absent from ini output before, so a script
+    // reading ini never saw them no matter what was asked for.
+    if (o.memory) {
+        const auto me = estimate_memory(s, ai, o.ctx, o.kv_dtype,
+                                        o.vram_mb > 0 ? o.vram_mb * 1024 * 1024 : -1);
+        out += "\n[memory]\n";
+        out += "ok = " + std::string(me.ok ? "yes" : "no") + "\n";
+        if (!me.ok) {
+            out += "reason = " + me.reason + "\n";
+        } else {
+            out += "kv_dtype = " + me.kv_dtype + "\n";
+            out += "bytes_per_element = " + fmt_fixed(me.bytes_per_elem) + "\n";
+            out += "context = " + std::to_string(me.ctx) + "\n";
+            out += "attn_layers = " + std::to_string(ai.n_attn_layers) + "\n";
+            out += "kv_bytes_per_token = " + std::to_string(me.kv_bytes_per_token) + "\n";
+            out += "kv_bytes_total = " + std::to_string(me.kv_bytes_total) + "\n";
+            out += "weight_bytes = " + std::to_string(me.weight_bytes) + "\n";
+            out += "compute_reserve_bytes = " + std::to_string(me.compute_reserve) + "\n";
+            out += "total_bytes = " + std::to_string(me.total_bytes) + "\n";
+            if (me.vram_budget > 0) {
+                out += "vram_budget_bytes = " + std::to_string(me.vram_budget) + "\n";
+                out += "fits = " + std::string(me.fits ? "yes" : "no") + "\n";
+                out += "layers_to_offload = " + std::to_string(me.layers_to_offload) + "\n";
+            }
+        }
+    }
+    if (o.validate) {
+        const auto fs = validate_model(s, ai);
+        int n_err = 0;
+        for (const auto& f : fs)
+            if (f.severity == Severity::Error) ++n_err;
+        out += "\n[validation]\n";
+        out += "ok = " + std::string(n_err == 0 ? "yes" : "no") + "\n";
+        out += "errors = " + std::to_string(n_err) + "\n";
+        out += "findings = " + std::to_string(static_cast<int64_t>(fs.size())) + "\n";
+        for (size_t i = 0; i < fs.size(); ++i) {
+            const char* sev = fs[i].severity == Severity::Error
+                                  ? "error"
+                                  : (fs[i].severity == Severity::Warning ? "warning" : "info");
+            out += "finding_" + std::to_string(i + 1) + " = " + sev + " " + fs[i].code + ": " +
+                   fs[i].message + "\n";
+        }
     }
     return out;
 }
