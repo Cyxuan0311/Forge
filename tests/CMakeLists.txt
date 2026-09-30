@@ -99,6 +99,14 @@ add_executable(forge-q4-0-encoding-test test_q4_0_encoding.cpp)
 forge_link_native(forge-q4-0-encoding-test)
 add_test(NAME q4-0-encoding COMMAND forge-q4-0-encoding-test)
 
+# Native FP16/BF16 weight GEMV on CPU. The F16/BF16 models used to be expanded
+# to FP32 at load, doubling per-token memory traffic; this pins the in-register
+# widening that replaces it, including the K tail and the bf16-is-a-shift rule.
+add_executable(forge-f16-gemv-test test_f16_gemv.cpp)
+forge_link_native(forge-f16-gemv-test)
+target_include_directories(forge-f16-gemv-test PRIVATE ${PROJECT_SOURCE_DIR})
+add_test(NAME f16-gemv COMMAND forge-f16-gemv-test)
+
 # Hadamard activation rotation (Phase 5): orthonormality, self-inverse,
 # dot-product preservation, and the full attention identity on CPU and CUDA.
 add_executable(forge-attn-rot-test test_attn_rot.cpp)

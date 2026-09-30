@@ -254,6 +254,137 @@ static void gemv_q4_0_transB_avx2(const float* a, const uint8_t* w, float* out, 
 // ---- FP32 GEMV (transB layout) ----
 
 #ifdef USE_AVX2
+// ---------------------------------------------------------------------------
+// Native FP16 / BF16 weight GEMV (transB layout), AVX2 + F16C.
+//
+// Why this exists. An F16 or BF16 GGUF used to be expanded to FP32 at load time
+// (gguf_model.cpp), which doubled both the resident footprint and the per-token
+// memory traffic. On a 2.6B model that is 5.4 GB of weights read as 10.8 GB per
+// generated token, and on a 15 GB host that expansion is close to fatal.
+//
+// The fix is the one llama.cpp uses (ggml/src/ggml-cpu/vec.h, simd-mappings.h:
+// GGML_F16_STEP 32 / GGML_F16_EPR 8 under AVX2+F16C): keep the weights at 2
+// bytes and widen them in registers, 8 elements at a time, accumulating in FP32.
+// The F16C conversion is one instruction per 8 elements and is not the
+// bottleneck -- this kernel is memory-bound, so halving the bytes is the whole
+// win.
+//
+//   FP16: _mm256_cvtph_ps  (vcvtph2ps, 8 x fp16 -> 8 x fp32)
+//   BF16: _mm256_cvtepu16_epi32 then <<16, because bf16 IS the top half of a
+//         float32, so the widening is a shift rather than a conversion. There is
+//         no bf16 F16C instruction, and the shift is exact.
+//
+// Accumulation is FP32 in both cases, matching the FP32 path this replaces, so
+// the only numerical difference from the old behaviour is the width of the
+// weights themselves -- which is the same difference the model already had.
+// ---------------------------------------------------------------------------
+
+#ifdef USE_AVX2
+
+// A 2-byte weight format, viewed as: how to widen 8 of them, and how to widen one
+// (the K tail, where a vector load would overrun). Both members are needed
+// because the tail is dtype-specific too -- widening a bf16 with the fp16 rule
+// would silently produce garbage in the last few elements of every row.
+struct WgtF16 {
+    static inline __m256 load8(const uint16_t* p) {
+        return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    }
+    static inline float scalar(uint16_t v) {
+        return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(v))));
+    }
+};
+
+struct WgtBF16 {
+    // No bf16 F16C instruction exists; bf16 is literally the top half of a
+    // float32, so widening is an exact zero-extend plus a 16-bit shift.
+    static inline __m256 load8(const uint16_t* p) {
+        const __m256i u16 =
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+        return _mm256_castsi256_ps(_mm256_slli_epi32(u16, 16));
+    }
+    static inline float scalar(uint16_t v) {
+        const uint32_t bits = static_cast<uint32_t>(v) << 16;
+        float f;
+        std::memcpy(&f, &bits, sizeof(f));
+        return f;
+    }
+};
+
+#endif  // USE_AVX2
+
+// Generic native-16-bit-weight GEMV (transB). W supplies the widening.
+template <typename W>
+static inline void gemv_f16like_transB_avx2_impl(const float* a, const uint16_t* b, float* out,
+                                                 int M, int K, int N) {
+    if (M == 1) {
+        // Same 4-row unroll and chunking as gemv_fp32_transB_avx2, so the two
+        // paths schedule identically and a dtype switch does not change
+        // threading behaviour.
+        constexpr int NR = 4;
+        const float* a_row = a;
+        cpu::parallel_for_chunks(N, NR, [&](int n0, int n1) {
+            for (int n = n0; n < n1; n += NR) {
+                const int rows = (n + NR <= N) ? NR : (N - n);
+                __m256 acc0 = _mm256_setzero_ps();
+                __m256 acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps();
+                __m256 acc3 = _mm256_setzero_ps();
+
+                const uint16_t* b_row0 = b + static_cast<size_t>(n + 0) * K;
+                const uint16_t* b_row1 = (rows > 1) ? b + static_cast<size_t>(n + 1) * K : nullptr;
+                const uint16_t* b_row2 = (rows > 2) ? b + static_cast<size_t>(n + 2) * K : nullptr;
+                const uint16_t* b_row3 = (rows > 3) ? b + static_cast<size_t>(n + 3) * K : nullptr;
+
+                for (int k = 0; k + 8 <= K; k += 8) {
+                    const __m256 av = _mm256_loadu_ps(a_row + k);
+                    acc0 = _mm256_fmadd_ps(av, W::load8(b_row0 + k), acc0);
+                    if (rows > 1) acc1 = _mm256_fmadd_ps(av, W::load8(b_row1 + k), acc1);
+                    if (rows > 2) acc2 = _mm256_fmadd_ps(av, W::load8(b_row2 + k), acc2);
+                    if (rows > 3) acc3 = _mm256_fmadd_ps(av, W::load8(b_row3 + k), acc3);
+                }
+
+                const int ktail = (K / 8) * 8;
+                const auto finalize = [&](const uint16_t* b_r, __m256 acc_val) -> float {
+                    float sum = hsum_avx2(acc_val);
+                    for (int k = ktail; k < K; ++k)
+                        sum += a_row[k] * W::scalar(b_r[k]);
+                    return sum;
+                };
+                out[n + 0] = finalize(b_row0, acc0);
+                if (rows > 1) out[n + 1] = finalize(b_row1, acc1);
+                if (rows > 2) out[n + 2] = finalize(b_row2, acc2);
+                if (rows > 3) out[n + 3] = finalize(b_row3, acc3);
+            }
+        });
+    } else {
+        cpu::parallel_for(M, [&](int m) {
+            const float* a_row = a + static_cast<size_t>(m) * K;
+            float* o_row = out + static_cast<size_t>(m) * N;
+            for (int n = 0; n < N; ++n) {
+                const uint16_t* b_row = b + static_cast<size_t>(n) * K;
+                __m256 acc = _mm256_setzero_ps();
+                int k = 0;
+                for (; k + 8 <= K; k += 8)
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a_row + k), W::load8(b_row + k), acc);
+                float sum = hsum_avx2(acc);
+                for (; k < K; ++k)
+                    sum += a_row[k] * W::scalar(b_row[k]);
+                o_row[n] = sum;
+            }
+        });
+    }
+}
+
+static inline void gemv_fp16_transB_avx2(const float* a, const uint16_t* b, float* out, int M,
+                                        int K, int N) {
+    gemv_f16like_transB_avx2_impl<WgtF16>(a, b, out, M, K, N);
+}
+
+static inline void gemv_bf16_transB_avx2(const float* a, const uint16_t* b, float* out, int M,
+                                         int K, int N) {
+    gemv_f16like_transB_avx2_impl<WgtBF16>(a, b, out, M, K, N);
+}
+
 static void gemv_fp32_transB_avx2(const float* a, const float* b, float* out, int M, int K, int N) {
     if (M == 1) {
         constexpr int NR = 4;

@@ -1046,6 +1046,56 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
 #    endif
 #endif
             }
+        } else if (b->dtype() == DataType::FP16 || b->dtype() == DataType::BF16) {
+            // Native 2-byte weights: widen in registers instead of carrying an
+            // FP32 copy of the whole tensor in RAM. The old behaviour (expand at
+            // load) doubled per-token memory traffic -- 5.4 GB of F16 weights read
+            // as 10.8 GB per token -- and on a 15 GB host that expansion was
+            // close to fatal. See gemv_f16like_transB_avx2_impl for the maths;
+            // forge-f16-gemv-test pins it against a scalar reference.
+            //
+            // The activation stays FP32 and accumulation stays FP32, so this is
+            // the same arithmetic the FP32 path performed, over the same weight
+            // values -- only the resident width changed.
+#if FORGE_USE_OPENBLAS
+            // No BLAS path for 2-byte weights; the AVX2 kernel is the whole point
+            // and OpenBLAS would only reintroduce an FP32 temporary.
+            PERF_SCOPE("matmul_transB/f16_gemv_avx2");
+            if (b->dtype() == DataType::FP16)
+                cpu::gemv_fp16_transB_avx2(a_data, static_cast<const uint16_t*>(b->data()), o_data,
+                                           M, K, N);
+            else
+                cpu::gemv_bf16_transB_avx2(a_data, static_cast<const uint16_t*>(b->data()), o_data,
+                                            M, K, N);
+#elif defined(USE_AVX2)
+            PERF_SCOPE("matmul_transB/f16_gemv_avx2");
+            if (b->dtype() == DataType::FP16)
+                cpu::gemv_fp16_transB_avx2(a_data, static_cast<const uint16_t*>(b->data()), o_data,
+                                           M, K, N);
+            else
+                cpu::gemv_bf16_transB_avx2(a_data, static_cast<const uint16_t*>(b->data()), o_data,
+                                            M, K, N);
+#else
+            // Scalar reference, same widening, so the path still works without AVX2.
+            PERF_SCOPE("matmul_transB/f16_gemv_scalar");
+            cpu::parallel_for(M, [&](int m) {
+                const float* a_row = a_data + static_cast<size_t>(m) * K;
+                float* o_row = o_data + static_cast<size_t>(m) * N;
+                for (int n = 0; n < N; ++n) {
+                    const uint16_t* b_row = static_cast<const uint16_t*>(b->data()) +
+                                            static_cast<size_t>(n) * K;
+                    double acc = 0;
+                    for (int k = 0; k < K; ++k) {
+                        // Same widening the vector path uses, so the two agree.
+                        const float wv = (b->dtype() == DataType::FP16)
+                                             ? cpu::WgtF16::scalar(b_row[k])
+                                             : cpu::WgtBF16::scalar(b_row[k]);
+                        acc += static_cast<double>(a_row[k]) * wv;
+                    }
+                    o_row[n] = static_cast<float>(acc);
+                }
+            });
+#endif
         } else {
 #if FORGE_USE_OPENBLAS
             PERF_SCOPE("matmul_transB/fp32_gemm_openblas");

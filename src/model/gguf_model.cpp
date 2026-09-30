@@ -509,9 +509,68 @@ TensorPtr GgufModel::get_tensor(const std::string& name, DeviceType device) cons
     // FORGE_BF16_EXPAND=1 restores the old expand-on-CUDA behaviour. Escape hatch
     // only, since this branch is shared by every BF16 GGUF, not just DSpark
     // drafters: set it if a BF16 model ever regresses.
+    // Phase 1: keep 2-byte weights native on CPU instead of expanding to FP32.
+    //
+    // Scoped deliberately. Only the tensors that feed ops::matmul_transB may stay
+    // 2-byte, because those are the only ones with a widening GEMV. Everything
+    // else is read through a float* by a consumer that has no 2-byte path, and
+    // those reads are silent -- a native FP16 tensor reinterpreted as float just
+    // yields plausible garbage, which is exactly what an unrestricted
+    // FORGE_CPU_KEEP_2BYTE=1 produced (the model answered "NumbeNumbe...").
+    //
+    // Kept 2-byte (the ones that matter): 2D matmul weights, i.e. attn_q/k/v,
+    // attn_output, ffn_gate/up/down, the expert weights, shortconv_*_proj, and
+    // output.weight. These are the bulk of the model and are read in full on
+    // every generated token, so this is where halving the bytes buys anything.
+    //
+    // Expanded (kept FP32): anything 1D, anything with "_norm" in the name, the
+    // LFM2 shortconv kernel (read directly as float by conv1d_cpu), and
+    // token_embd. The last one is worth being explicit about: the token
+    // embedding is ONE row per token, not the whole table, so holding it in FP32
+    // costs ~1 GB of RAM but essentially zero per-token traffic, while the
+    // matmul weights are the part that is re-read every token.
+    // Phase 1: keep 2-byte weights native on CPU instead of expanding to FP32.
+    //
+    // Scoped deliberately. Only tensors that feed ops::matmul_transB may stay
+    // 2-byte, because those are the only ones with a widening GEMV. Every other
+    // consumer reads through a float* with no 2-byte path, and that read is
+    // silent: a native FP16 tensor reinterpreted as float just yields plausible
+    // garbage. An unrestricted FORGE_CPU_KEEP_2BYTE=1 produced exactly that --
+    // the model answered "NumbeNumbe..." because blk.0.attn_norm.weight
+    // (shape [2048]) and blk.0.shortconv.conv.weight (read directly as float by
+    // conv1d_cpu) had been left 2-byte.
+    //
+    // Kept 2-byte: 2D matmul weights -- attn_q/k/v, attn_output, ffn_gate/up/down,
+    // expert weights, shortconv_{in,out}_proj, output.weight. These are the bulk
+    // of the model AND are re-read in full on every generated token, so this is
+    // where halving the bytes actually buys anything.
+    //
+    // Expanded to FP32: anything not 2D, anything with "_norm" in the name, the
+    // LFM2 shortconv conv kernel, and token_embd. The token embedding is worth
+    // spelling out: it is ONE row per token, not the whole table, so holding it
+    // in FP32 costs ~1 GB of resident RAM but essentially zero per-token
+    // traffic, unlike the matmul weights.
+    // Default ON. FORGE_CPU_KEEP_2BYTE=0 restores the old expand-everything
+    // behaviour, which is the escape hatch for any model whose 2D weights turn
+    // out to be read as float somewhere this rule did not anticipate.
+    //
+    // The scope above is what makes the default safe: only 2D matmul weights stay
+    // 2-byte, and that is the only shape with a widening GEMV behind it. Anything
+    // outside it is still expanded, so the float* consumers (norms, the LFM2
+    // shortconv kernel, the token embedding, 1D biases) are unaffected.
+    const char* flag = std::getenv("FORGE_CPU_KEEP_2BYTE");
+    const bool cpu_keep_2byte = (flag == nullptr) || (flag[0] != '0');
+    bool keep_2byte = false;
+    if (device == DeviceType::CPU && cpu_keep_2byte && lt.shape.size() == 2 &&
+        lt.name.find("_norm") == std::string::npos &&
+        lt.name.find("token_embd") == std::string::npos &&
+        lt.name.find("shortconv.conv") == std::string::npos) {
+        keep_2byte = true;
+    }
+
     if (lt.dtype == DataType::BF16 &&
-        (device == DeviceType::CPU || (std::getenv("FORGE_BF16_EXPAND") &&
-                                       std::getenv("FORGE_BF16_EXPAND")[0] == '1'))) {
+        ((device == DeviceType::CPU && !keep_2byte) ||
+         (std::getenv("FORGE_BF16_EXPAND") && std::getenv("FORGE_BF16_EXPAND")[0] == '1'))) {
         int64_t numel = 1;
         for (auto d : lt.shape) numel *= d;
         auto tensor = std::make_shared<Tensor>(DataType::FP32, lt.shape, DeviceType::CPU);
@@ -529,7 +588,7 @@ TensorPtr GgufModel::get_tensor(const std::string& name, DeviceType device) cons
     // kernels and the embedding row lookups read weights as float, and a
     // zero-copy native-FP16 tensor would be silently misread there. CUDA keeps
     // the native form (embedding/matmul have FP16-aware kernels).
-    if (lt.dtype == DataType::FP16 && device == DeviceType::CPU) {
+    if (lt.dtype == DataType::FP16 && device == DeviceType::CPU && !keep_2byte) {
         int64_t numel = 1;
         for (auto d : lt.shape) numel *= d;
         auto tensor = std::make_shared<Tensor>(DataType::FP32, lt.shape, DeviceType::CPU);
