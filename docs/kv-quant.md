@@ -237,3 +237,40 @@ Use instead:
   identity, the full attention identity, CPU-vs-CUDA agreement.
 - A repeated-sample quality score, as in the `-rkq` table above. Sample it
   several times; a single run is noise.
+
+## Paged KV (`--paged-kv`)
+
+Paged storage resolves rows through a page table instead of a contiguous base
+pointer, which is what lets many sequences share one pool. Two things about it
+are worth knowing.
+
+**Asymmetric K/V works, but only over a limited matrix.** `-ctk`/`-ctv` with
+different dtypes needs both sides templated independently, because the formats
+have different block geometries (q8_0 is 32 elems / 34 B, q4_0 is 32 / 18, f16
+is 8 / 16) and therefore different row strides *and* different per-head byte
+offsets. Covered: `head_dim ∈ {64, 96, 128}` and `{q8_0, q4_0, f16}` on both
+sides. Anything else is refused by the attention selector with both dtype names
+and both remedies, rather than falling through to a path that cannot work.
+
+**Startup is budget-bound, not context-bound.** The page pool is sized from free
+VRAM, not from `--ctx-size`: at `-c 4096` on a 6 GB card the q4_0 pool sized
+itself to 10,496 pages/layer. If those pages are allocated individually that is
+881,664 `cudaMalloc` calls, which cost ~60 s of startup — scaling with free VRAM
+rather than with the work being done, so a 5-token prompt paid for a 167,936-token
+pool. Forge allocates one slab per (layer, side) and points the page table into
+it, which is 84 calls instead:
+
+```
+paged q4_0, -c 4096
+  ctx        60865 ms  ->    412 ms   (148x)
+  startup    68556 ms  ->   5548 ms
+```
+
+Verifying anything here needs a numeric test, not a text diff. Greedy decoding
+on this GPU path is not bit-reproducible, and `forge-paged-kv-numerics-test`
+exists because the obvious check is worthless: contiguous and paged `q8_0/q8_0`,
+a pair that has always been correct, diverged at 7% of characters purely from
+run-to-run nondeterminism. The test drives the real scatter and both paged
+attention kernels against a CPU reference built from the *CPU* writer's output,
+so a CPU/CUDA convention split cannot hide — which is exactly how the first q4_0
+regression got shipped.
