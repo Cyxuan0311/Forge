@@ -562,4 +562,10 @@ if(FORGE_BUILD_BENCHMARKS)
       target_link_libraries(forge-bench-${bench} PRIVATE OpenMP::OpenMP_CXX)
     endif()
   endforeach()
+
+  # gpu_bandwidth: Phase 0 gate for the FP16/BF16 optimisation. Measures the
+  # achievable HBM read roof so "is decode already memory-bound?" stops being a
+  # guess. A .cu because it needs its own streaming kernels; no OpenMP.
+  add_executable(forge-bench-gpu_bandwidth bench_gpu_bandwidth.cu)
+  forge_link_native(forge-bench-gpu_bandwidth)
 endif()
