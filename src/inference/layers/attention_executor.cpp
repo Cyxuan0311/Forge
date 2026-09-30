@@ -404,6 +404,30 @@ AttentionExecutor::QKVResult AttentionExecutor::project_qkv(const TensorPtr& x,
 #endif
 
 #ifdef USE_CUDA
+// Asymmetric K/V: the two sides have different block geometries, so both the row
+// strides and the per-head byte offsets differ. Passing one row size here (as the
+// monomorphic macro does) is what made this configuration unservable.
+#define FORGE_PAGED_MIXED_PREFILL_CASE(ENUM_PATH, DK, DV, LAUNCH_FN)                           \
+    case ENUM_PATH: {                                                                          \
+        attn_out = std::make_shared<Tensor>(                                                    \
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim},               \
+            DeviceType::CUDA);                                                                 \
+        {                                                                                      \
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);                       \
+            const size_t k_row_size =                                                          \
+                KVCache::block_nbytes(DK, num_kv_heads * head_dim);                            \
+            const size_t v_row_size =                                                          \
+                KVCache::block_nbytes(DV, num_kv_heads * head_dim);                            \
+            cuda::LAUNCH_FN(                                                                  \
+                static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),      \
+                storage_->d_value_page_ptrs(layer_idx), d_page_ids,                            \
+                static_cast<float*>(attn_out->data()), seq_len, total_len, num_heads,           \
+                num_kv_heads, head_dim, storage_->page_size(), k_row_size, v_row_size,          \
+                mask_data, causal, nullptr, nullptr, 0);                                       \
+        }                                                                                      \
+        break;                                                                                 \
+    }
+
 #define FORGE_PAGED_PREFILL_CASE(ENUM_PATH, DTYPE, LAUNCH_FN)                                  \
     case ENUM_PATH: {                                                                          \
         attn_out = std::make_shared<Tensor>(                                                    \
@@ -692,6 +716,45 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                              launch_paged_flash_attention_gqa_prefill_fp32)
     FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_Q4_0_PREFILL, KVCacheDType::Q4_0,
                              launch_paged_flash_attention_gqa_prefill_q4_0)
+    // Asymmetric K/V prefill. One case, dispatching on the dtype pair inside:
+    // six FORGE_PAGED_MIXED_PREFILL_CASE invocations would be six `case` labels
+    // on the same enumerator, which does not compile.
+    case AttentionPath::CUDA_PAGED_MIXED_PREFILL: {
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        {
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
+            // storage_, not kv_cache_: see the decode case above.
+            const KVCacheDType tk = storage_->kv_type_k();
+            const KVCacheDType tv = storage_->kv_type_v();
+            const size_t k_row_size = KVCache::block_nbytes(tk, num_kv_heads * head_dim);
+            const size_t v_row_size = KVCache::block_nbytes(tv, num_kv_heads * head_dim);
+            const auto run = [&](auto fn) {
+                fn(static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),
+                   storage_->d_value_page_ptrs(layer_idx), d_page_ids,
+                   static_cast<float*>(attn_out->data()), seq_len, total_len, num_heads,
+                   num_kv_heads, head_dim, storage_->page_size(), k_row_size, v_row_size,
+                   mask_data, causal, nullptr, nullptr, 0);
+            };
+            if (tk == KVCacheDType::Q8_0 && tv == KVCacheDType::Q4_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q8_0_q4_0);
+            else if (tk == KVCacheDType::Q4_0 && tv == KVCacheDType::Q8_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q4_0_q8_0);
+            else if (tk == KVCacheDType::Q8_0 && tv == KVCacheDType::F16)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q8_0_f16);
+            else if (tk == KVCacheDType::F16 && tv == KVCacheDType::Q8_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_f16_q8_0);
+            else if (tk == KVCacheDType::Q4_0 && tv == KVCacheDType::F16)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q4_0_f16);
+            else if (tk == KVCacheDType::F16 && tv == KVCacheDType::Q4_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_f16_q4_0);
+            else
+                throw std::runtime_error(
+                    std::string("paged mixed prefill: unsupported KV dtype pair (K=") +
+                    kv_cache_dtype_name(tk) + ", V=" + kv_cache_dtype_name(tv) + ")");
+        }
+        break;
+    }
     FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_F16_PREFILL, KVCacheDType::F16,
                              launch_paged_flash_attention_gqa_prefill_f16)
     FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_Q8_0_PREFILL, KVCacheDType::Q8_0,
@@ -1084,6 +1147,50 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
 
     // ---- Paged CUDA decode (Phase 4) ----
     // KV rows are resolved through the per-sequence page table; no materialize.
+    // ---- Paged MIXED decode (asymmetric K/V) ----
+    // Rows are resolved through the page table; K and V are templated
+    // independently, so each side carries its own row stride and per-head byte
+    // offset. Passing the page-pointer table to a contiguous kernel here is what
+    // segfaulted this configuration before the paged mixed kernel existed.
+    case AttentionPath::CUDA_PAGED_MIXED_DECODE:
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        {
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
+            // storage_, not kv_cache_: in paged mode the rows live in the
+            // storage and kv_cache_ stays FP32, so asking kv_cache_ reports
+            // (fp32, fp32) and the launcher refuses.
+            const KVCacheDType tk = storage_->kv_type_k();
+            const KVCacheDType tv = storage_->kv_type_v();
+            const size_t k_row_size = KVCache::block_nbytes(tk, num_kv_heads * head_dim);
+            const size_t v_row_size = KVCache::block_nbytes(tv, num_kv_heads * head_dim);
+            const auto fmt = [](KVCacheDType d) {
+                switch (d) {
+                case KVCacheDType::Q8_0: return 0;
+                case KVCacheDType::Q4_0: return 1;
+                case KVCacheDType::F16:  return 2;
+                default: return -1;
+                }
+            };
+            const bool ok = cuda::launch_paged_flash_attention_gqa_decode_mixed(
+                static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),
+                storage_->d_value_page_ptrs(layer_idx), d_page_ids,
+                static_cast<float*>(attn_out->data()), total_len, num_heads, num_kv_heads,
+                head_dim, storage_->page_size(), k_row_size, v_row_size, fmt(tk), fmt(tv),
+                mask_row, 0);
+            // The selector gated on coverage, so false here means the two
+            // disagree. Fail loudly rather than emit an uninitialised output.
+            if (!ok) {
+                throw std::runtime_error(
+                    std::string("paged mixed-dtype attention: launcher refused (K=") +
+                    kv_cache_dtype_name(tk) + ", V=" + kv_cache_dtype_name(tv) +
+                    ", head_dim=" + std::to_string(head_dim) + ")");
+            }
+        }
+#endif
+        break;
+
     case AttentionPath::CUDA_PAGED_Q4_0_DECODE:
 #ifdef USE_CUDA
         attn_out = std::make_shared<Tensor>(

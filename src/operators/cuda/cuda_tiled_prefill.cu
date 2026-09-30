@@ -181,7 +181,7 @@ struct DqFp8 : StageHalf {
 // Mirrors paged_kv_row() in cuda_paged_kv.cu.
 // =========================================================================
 
-template <typename Dequant, bool PAGED, int HEAD_DIM>
+template <typename Dequant, bool PAGED, int HEAD_DIM, typename DequantV = Dequant>
 struct KvView {
     const uint8_t* k_base;
     const uint8_t* v_base;
@@ -189,8 +189,17 @@ struct KvView {
     void* const* v_pages;
     const int32_t* page_ids;
     int page_size;
-    size_t row_bytes;
-    size_t head_off;
+    // K and V can have different cache dtypes (-ctk/-ctv), which means different
+    // block geometries: q8_0 is 32 elems / 34 B, q4_0 is 32 / 18, f16 is 8 / 16.
+    // So the row stride AND the per-head byte offset differ per side. This used to
+    // be one row_bytes and one head_off for both, which is why an asymmetric pair
+    // had no path here. DequantV defaults to Dequant so every existing
+    // instantiation -- the tuned f16 / q8_0 prefill -- compiles to exactly what it
+    // did before.
+    size_t row_bytes;   // K's row stride
+    size_t v_row_bytes;
+    size_t head_off;    // K's per-head offset
+    size_t v_head_off;
     int kv_h;
     int num_kv_heads;
     const float* k_scales;
@@ -215,11 +224,11 @@ struct KvView {
             const int page_idx = j / page_size;
             const int off = j - page_idx * page_size;
             base = static_cast<const uint8_t*>(v_pages[page_ids[page_idx]]) +
-                   (size_t)off * row_bytes;
+                   (size_t)off * v_row_bytes;
         } else {
-            base = v_base + (size_t)j * row_bytes;
+            base = v_base + (size_t)j * v_row_bytes;
         }
-        return base + head_off;
+        return base + v_head_off;
     }
 
     __device__ __forceinline__ float kd(const uint8_t* row, int d, int j) const {
@@ -234,13 +243,16 @@ struct KvView {
 // The tiled prefill kernel.
 // =========================================================================
 
-template <typename Dequant, bool PAGED, int HEAD_DIM, int BLOCK_SIZE>
+// DequantV (defaulting to Dequant) is the V-side dequantiser and v_row_bytes the
+// V-side row stride; both only matter when K and V dtypes differ. Defaulting
+// keeps every existing instantiation byte-identical in behaviour.
+template <typename Dequant, bool PAGED, int HEAD_DIM, int BLOCK_SIZE, typename DequantV = Dequant>
 __global__ void fused_attn_tiled_prefill_kernel(
     const float* __restrict__ Q, const uint8_t* __restrict__ K, const uint8_t* __restrict__ V,
     float* __restrict__ O, int q_len, int kv_len, int num_heads, int num_kv_heads,
     size_t row_bytes, const float* __restrict__ mask, bool causal, void* const* k_pages,
     void* const* v_pages, const int32_t* page_ids, int page_size, const float* k_scales,
-    const float* v_scales) {
+    const float* v_scales, size_t v_row_bytes = 0) {
     const int h = blockIdx.y;
     const int qi = blockIdx.x;
     if (h >= num_heads || qi >= q_len) return;
@@ -260,9 +272,13 @@ __global__ void fused_attn_tiled_prefill_kernel(
     // Output elements owned by this thread — the whole point of the tiling.
     constexpr int DPT = (HEAD_DIM + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    const KvView<Dequant, PAGED, HEAD_DIM> kv{
-        K, V, k_pages, v_pages, page_ids, page_size, row_bytes,
-        Dequant::template head_offset<HEAD_DIM>(kv_h), kv_h, num_kv_heads, k_scales, v_scales};
+    // Callers that predate asymmetric support pass 0 for v_row_bytes; treat that
+    // as "same as K" so every existing instantiation is unchanged.
+    const size_t v_row_stride = v_row_bytes ? v_row_bytes : row_bytes;
+    const KvView<Dequant, PAGED, HEAD_DIM, DequantV> kv{
+        K, V, k_pages, v_pages, page_ids, page_size, row_bytes, v_row_stride,
+        Dequant::template head_offset<HEAD_DIM>(kv_h),
+        DequantV::template head_offset<HEAD_DIM>(kv_h), kv_h, num_kv_heads, k_scales, v_scales};
 
     __shared__ float s_q[HEAD_DIM];
     for (int d = tid; d < HEAD_DIM; d += BLOCK_SIZE) s_q[d] = q_row[d];
@@ -367,13 +383,16 @@ __global__ void fused_attn_tiled_prefill_kernel(
 // explicit (non-causal) masks are both supported.
 // =========================================================================
 
-template <typename Dequant, bool PAGED, int HEAD_DIM, int BLOCK_M, int BLOCK_N>
+// DequantV (defaulting to Dequant) is the V-side dequantiser, and v_row_bytes
+// the V-side row stride; both are only meaningful when K and V dtypes differ.
+template <typename Dequant, bool PAGED, int HEAD_DIM, int BLOCK_M, int BLOCK_N,
+          typename DequantV = Dequant>
 __global__ void fused_attn_qtiled_v2_kernel(
     const float* __restrict__ Q, const uint8_t* __restrict__ K, const uint8_t* __restrict__ V,
     float* __restrict__ O, int q_len, int kv_len, int num_heads, int num_kv_heads,
     size_t row_bytes, const float* __restrict__ mask, bool causal,
     void* const* k_pages, void* const* v_pages, const int32_t* page_ids, int page_size,
-    const float* k_scales, const float* v_scales) {
+    const float* k_scales, const float* v_scales, size_t v_row_bytes = 0) {
     const int h = blockIdx.y;
     if (h >= num_heads) return;
     const int kv_groups = num_heads / num_kv_heads;
@@ -393,7 +412,9 @@ __global__ void fused_attn_qtiled_v2_kernel(
     const int base_d = lane * DPT;
 
     __shared__ typename Dequant::StageT s_k[BLOCK_N * HEAD_DIM];
-    __shared__ typename Dequant::StageT s_v[BLOCK_N * HEAD_DIM];
+    // V may stage as a different width than K when the two dtypes differ
+    // (e.g. FP32 K needs float tiles, V can be __half).
+    __shared__ typename DequantV::StageT s_v[BLOCK_N * HEAD_DIM];
     __shared__ float s_q[BLOCK_M * HEAD_DIM];
 
     // Cooperative Q load for this block's query tile.
@@ -413,9 +434,13 @@ __global__ void fused_attn_qtiled_v2_kernel(
     float m_g = -1e30f;
     float l_g = 0.0f;
 
-    const KvView<Dequant, PAGED, HEAD_DIM> kv{
-        K, V, k_pages, v_pages, page_ids, page_size, row_bytes,
-        Dequant::template head_offset<HEAD_DIM>(kv_h), kv_h, num_kv_heads, k_scales, v_scales};
+    // v_row_bytes == 0 means "same as K", so callers that predate asymmetric
+    // support need no change.
+    const size_t v_row_stride = v_row_bytes ? v_row_bytes : row_bytes;
+    const KvView<Dequant, PAGED, HEAD_DIM, DequantV> kv{
+        K, V, k_pages, v_pages, page_ids, page_size, row_bytes, v_row_stride,
+        Dequant::template head_offset<HEAD_DIM>(kv_h),
+        DequantV::template head_offset<HEAD_DIM>(kv_h), kv_h, num_kv_heads, k_scales, v_scales};
 
     for (int t0 = 0; t0 < kv_len; t0 += BLOCK_N) {
         const int tile_end = (t0 + BLOCK_N <= kv_len) ? BLOCK_N : (kv_len - t0);
@@ -429,7 +454,7 @@ __global__ void fused_attn_qtiled_v2_kernel(
                 const uint8_t* krow = kv.krow(j);
                 const uint8_t* vrow = kv.vrow(j);
                 s_k[jj * HEAD_DIM + d] = Dequant::stage(Dequant::deq<HEAD_DIM>(krow, d, j, kv_h, num_kv_heads, k_scales));
-                s_v[jj * HEAD_DIM + d] = Dequant::stage(Dequant::deq<HEAD_DIM>(vrow, d, j, kv_h, num_kv_heads, v_scales));
+                s_v[jj * HEAD_DIM + d] = DequantV::stage(DequantV::deq<HEAD_DIM>(vrow, d, j, kv_h, num_kv_heads, v_scales));
             }
         }
         __syncthreads();
@@ -478,9 +503,9 @@ __global__ void fused_attn_qtiled_v2_kernel(
         for (int j = 0; j < tile_end; ++j) {
             const float wj = rt * __shfl_sync(0xffffffff, w_self, j);
             if (wj > 0.0f) {
-                const typename Dequant::StageT* vrow = &s_v[j * HEAD_DIM];
+                const typename DequantV::StageT* vrow = &s_v[j * HEAD_DIM];
 #pragma unroll
-                for (int i = 0; i < DPT; ++i) acc[i] += wj * Dequant::load(vrow[base_d + i]);
+                for (int i = 0; i < DPT; ++i) acc[i] += wj * DequantV::load(vrow[base_d + i]);
             }
         }
 
@@ -499,7 +524,7 @@ __global__ void fused_attn_qtiled_v2_kernel(
 // instantiations (e.g. FP32-staged HD=256/512, over the 48KB static shared
 // limit) from compiling the kernel at all; the launcher's runtime guard never
 // reaches those cases.
-template <typename DEQ, bool PAGED, int HD, int BM, int BN,
+template <typename DEQ, bool PAGED, int HD, int BM, int BN, typename DEQV = DEQ,
           typename std::enable_if<(HD <= DEQ::kMaxQtiledHD), int>::type = 0>
 static inline void qtiled_v2_case(const float* Q, const uint8_t* K, const uint8_t* V, float* O,
                                   int q_len, int kv_len, int num_heads, int num_kv_heads,
@@ -507,10 +532,10 @@ static inline void qtiled_v2_case(const float* Q, const uint8_t* K, const uint8_
                                   void* const* k_pages, void* const* v_pages,
                                   const int32_t* page_ids, int page_size,
                                   const float* k_scales, const float* v_scales, dim3 grid,
-                                  dim3 block, cudaStream_t stream) {
-    fused_attn_qtiled_v2_kernel<DEQ, PAGED, HD, BM, BN><<<grid, block, 0, stream>>>(
+                                  dim3 block, cudaStream_t stream, size_t v_row_bytes = 0) {
+    fused_attn_qtiled_v2_kernel<DEQ, PAGED, HD, BM, BN, DEQV><<<grid, block, 0, stream>>>(
         Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, row_bytes, mask, causal, k_pages,
-        v_pages, page_ids, page_size, k_scales, v_scales);
+        v_pages, page_ids, page_size, k_scales, v_scales, v_row_bytes);
 }
 
 template <typename DEQ, bool PAGED, int HD, int BM, int BN,
@@ -842,6 +867,86 @@ DEFINE_QUANT_PREFILL_QTILED(launch_fused_flash_attention_gqa_prefill_fp8_e5m2, D
 
 // Paged FP32: previously the only paged KV layout that materialized; the tiled
 // kernel reads FP32 pages directly through the page table.
+// ---- Paged MIXED prefill (asymmetric K/V) ----
+//
+// -ctk/-ctv can give K and V different dtypes, which means different block
+// geometries and therefore different row strides AND different per-head byte
+// offsets. Every prefill kernel above is monomorphic (one Dequant, one
+// row_bytes), which is why asymmetric paged KV had no path at all and had to be
+// refused outright rather than served.
+//
+// Same Dequant policy types as the monomorphic kernels, so K/V dequantisation is
+// literally the same code; only the row/offset arithmetic differs per side.
+template <typename DEQK, typename DEQV>
+static inline void launch_qtiled_paged_mixed(const float* Q, void* const* k_pages,
+                                             void* const* v_pages, const int32_t* page_ids,
+                                             float* O, int q_len, int kv_len, int num_heads,
+                                             int num_kv_heads, int head_dim, int page_size,
+                                             size_t k_row_bytes, size_t v_row_bytes,
+                                             const float* mask, bool causal, const float* k_scales,
+                                             const float* v_scales, cudaStream_t stream,
+                                             const char* tag) {
+    if (head_dim % 32 != 0 || head_dim > DEQK::kMaxQtiledHD ||
+        head_dim > DEQV::kMaxQtiledHD) {
+        fprintf(stderr,
+                "[ERROR] tiled_paged_mixed_prefill %s: unsupported head_dim=%d (need %%32==0 and "
+                "<=%d)\n",
+                tag, head_dim, DEQK::kMaxQtiledHD);
+        return;
+    }
+    const uint8_t* K = nullptr;  // unused when PAGED; KvView resolves via the page table
+    const uint8_t* V = nullptr;
+    int bm, bn;
+    if (head_dim <= 128) {
+        bm = 8;
+        bn = 32;
+    } else if (head_dim <= 256) {
+        bm = 4;
+        bn = 32;
+    } else {
+        bm = 2;
+        bn = 16;
+    }
+    dim3 grid((q_len + bm - 1) / bm, num_heads);
+    dim3 block(bm * 32);
+
+#define PAGED_MIXED_CASE(HD, BM, BN)                                                          \
+    qtiled_v2_case<DEQK, true, HD, BM, BN, DEQV>(                                            \
+        Q, K, V, O, q_len, kv_len, num_heads, num_kv_heads, k_row_bytes, mask, causal,         \
+        k_pages, v_pages, page_ids, page_size, k_scales, v_scales, grid, block, stream,         \
+        v_row_bytes)
+    switch (head_dim) {
+    case 32:  PAGED_MIXED_CASE(32,  8, 32); break;
+    case 64:  PAGED_MIXED_CASE(64,  8, 32); break;
+    case 96:  PAGED_MIXED_CASE(96,  8, 32); break;
+    case 128: PAGED_MIXED_CASE(128, 8, 32); break;
+    case 256: PAGED_MIXED_CASE(256, 4, 32); break;
+    case 512: PAGED_MIXED_CASE(512, 2, 16); break;
+    default: break;
+    }
+#undef PAGED_MIXED_CASE
+}
+
+#define PAGED_MIXED_ENTRY(NAME, K, V)                                                           \
+    void NAME(const float* Q, void* const* k_pages, void* const* v_pages,                      \
+              const int32_t* page_ids, float* O, int q_len, int kv_len, int num_heads,          \
+              int num_kv_heads, int head_dim, int page_size, size_t k_row_bytes,                \
+              size_t v_row_bytes, const float* mask, bool causal, const float* k_scales,        \
+              const float* v_scales, cudaStream_t stream) {                                     \
+        launch_qtiled_paged_mixed<K, V>(Q, k_pages, v_pages, page_ids, O, q_len, kv_len,        \
+                                        num_heads, num_kv_heads, head_dim, page_size,           \
+                                        k_row_bytes, v_row_bytes, mask, causal, k_scales,        \
+                                        v_scales, stream, "mixed");                             \
+    }
+
+PAGED_MIXED_ENTRY(launch_paged_flash_attention_gqa_prefill_q8_0_q4_0, DqQ8_0, DqQ4_0)
+PAGED_MIXED_ENTRY(launch_paged_flash_attention_gqa_prefill_q4_0_q8_0, DqQ4_0, DqQ8_0)
+PAGED_MIXED_ENTRY(launch_paged_flash_attention_gqa_prefill_q8_0_f16, DqQ8_0, DqF16)
+PAGED_MIXED_ENTRY(launch_paged_flash_attention_gqa_prefill_f16_q8_0, DqF16, DqQ8_0)
+PAGED_MIXED_ENTRY(launch_paged_flash_attention_gqa_prefill_q4_0_f16, DqQ4_0, DqF16)
+PAGED_MIXED_ENTRY(launch_paged_flash_attention_gqa_prefill_f16_q4_0, DqF16, DqQ4_0)
+#undef PAGED_MIXED_ENTRY
+
 DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp32, DqFp32, "fp32")
 DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_q4_0, DqQ4_0, "q4_0")
 DEFINE_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_f16, DqF16, "f16")

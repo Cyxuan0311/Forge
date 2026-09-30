@@ -137,13 +137,37 @@ struct FmtF16 {
 // Mixed-dtype fused GQA decode (HEAD_DIM <= 128, one online-softmax pass)
 // =========================================================================
 
-template <int HEAD_DIM, int NUM_WARPS, typename KFmt, typename VFmt>
+// Page-table row resolution. Duplicated here as it already is in
+// cuda_paged_kv.cu and cuda_tiled_prefill.cu; when PAGED is false no paged
+// instantiation exists and this is never reached.
+__device__ __forceinline__ const uint8_t* paged_kv_row(const uint8_t* base,
+                                                       const int32_t* __restrict__ page_ids,
+                                                       void* const* __restrict__ page_ptrs,
+                                                       int page_size, size_t row_bytes, int j) {
+    if (page_ids == nullptr) return base + (size_t)j * row_bytes;
+    const int page_idx = j / page_size;
+    const int offset = j - page_idx * page_size;
+    const uint8_t* page_base = static_cast<const uint8_t*>(page_ptrs[page_ids[page_idx]]);
+    return page_base + (size_t)offset * row_bytes;
+}
+
+// PAGED resolves KV rows through the page table rather than a contiguous base
+// pointer. It is a template parameter, not a runtime flag, so the contiguous
+// instantiations (the well-tuned f16 / q8_0 paths) remain exactly the code they
+// were, and so a paged launch cannot be handed a page-pointer table where the
+// kernel expects KV data -- which is precisely what segfaulted asymmetric paged
+// KV before the selector learned to refuse it.
+template <int HEAD_DIM, int NUM_WARPS, typename KFmt, typename VFmt, bool PAGED = false>
 __global__ void fused_attn_mixed_decode_kernel(const float* __restrict__ Q,
                                                const uint8_t* __restrict__ q_K,
                                                const uint8_t* __restrict__ q_V,
                                                float* __restrict__ O, int kv_len, int num_heads,
                                                int num_kv_heads, size_t k_row_size,
-                                               size_t v_row_size, const float* __restrict__ mask_row) {
+                                               size_t v_row_size, const float* __restrict__ mask_row,
+                                               void* const* k_pages = nullptr,
+                                               void* const* v_pages = nullptr,
+                                               const int32_t* page_ids = nullptr,
+                                               int page_size = 0) {
     const int h = blockIdx.x;
     if (h >= num_heads)
         return;
@@ -179,8 +203,12 @@ __global__ void fused_attn_mixed_decode_kernel(const float* __restrict__ Q,
     for (int j = tid; j < kv_len; j += block_size) {
         if (mask_row != nullptr && mask_row[j] < -1e20f) continue;
 
-        const uint8_t* k_row = q_K + (size_t)j * k_row_size + k_head_off;
-        const uint8_t* v_row = q_V + (size_t)j * v_row_size + v_head_off;
+        const uint8_t* k_row =
+            PAGED ? paged_kv_row(nullptr, page_ids, k_pages, page_size, k_row_size, j) + k_head_off
+                  : q_K + (size_t)j * k_row_size + k_head_off;
+        const uint8_t* v_row =
+            PAGED ? paged_kv_row(nullptr, page_ids, v_pages, page_size, v_row_size, j) + v_head_off
+                  : q_V + (size_t)j * v_row_size + v_head_off;
 
         float dot = 0.0f;
 #pragma unroll
@@ -222,6 +250,63 @@ __global__ void fused_attn_mixed_decode_kernel(const float* __restrict__ Q,
     __syncthreads();
 
     cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+}
+
+// Paged mixed-dtype decode. Dispatch table is spelled out rather than shared
+// with the contiguous launcher through macros: two ~20-line tables beat a macro
+// layer that has to select between them at compile time, and the asymmetry is
+// the whole point of this entry point.
+//
+// fmt codes: 0 = q8_0, 1 = q4_0, 2 = f16 (same codes as the contiguous launcher).
+bool launch_paged_flash_attention_gqa_decode_mixed(const float* Q, void* const* k_pages,
+                                                   void* const* v_pages, const int32_t* page_ids,
+                                                   float* O, int kv_len, int num_heads,
+                                                   int num_kv_heads, int head_dim, int page_size,
+                                                   size_t k_row_size, size_t v_row_size, int k_fmt,
+                                                   int v_fmt, const float* mask_row,
+                                                   cudaStream_t stream) {
+    const int blocks = num_heads;
+
+#define LAUNCH_PAGED(HD, KF, VF)                                                              \
+    fused_attn_mixed_decode_kernel<HD, 4, KF, VF, true><<<blocks, 128, 0, stream>>>(           \
+        Q, nullptr, nullptr, O, kv_len, num_heads, num_kv_heads, k_row_size, v_row_size,       \
+        mask_row, k_pages, v_pages, page_ids, page_size)
+
+#define LAUNCH_PAGED_HD(KF, VF)                     \
+    do {                                            \
+        switch (head_dim) {                         \
+        case 64:  LAUNCH_PAGED(64, KF, VF); break;  \
+        case 96:  LAUNCH_PAGED(96, KF, VF); break;  \
+        case 128: LAUNCH_PAGED(128, KF, VF); break; \
+        default: return false;                      \
+        }                                           \
+    } while (0)
+
+    if (k_fmt == 0 && v_fmt == 0) {
+        LAUNCH_PAGED_HD(FmtQ8_0, FmtQ8_0);
+    } else if (k_fmt == 0 && v_fmt == 1) {
+        LAUNCH_PAGED_HD(FmtQ8_0, FmtQ4_0);
+    } else if (k_fmt == 1 && v_fmt == 0) {
+        LAUNCH_PAGED_HD(FmtQ4_0, FmtQ8_0);
+    } else if (k_fmt == 1 && v_fmt == 1) {
+        LAUNCH_PAGED_HD(FmtQ4_0, FmtQ4_0);
+    } else if (k_fmt == 0 && v_fmt == 2) {
+        LAUNCH_PAGED_HD(FmtQ8_0, FmtF16);
+    } else if (k_fmt == 1 && v_fmt == 2) {
+        LAUNCH_PAGED_HD(FmtQ4_0, FmtF16);
+    } else if (k_fmt == 2 && v_fmt == 0) {
+        LAUNCH_PAGED_HD(FmtF16, FmtQ8_0);
+    } else if (k_fmt == 2 && v_fmt == 1) {
+        LAUNCH_PAGED_HD(FmtF16, FmtQ4_0);
+    } else if (k_fmt == 2 && v_fmt == 2) {
+        LAUNCH_PAGED_HD(FmtF16, FmtF16);
+    } else {
+        return false;
+    }
+    return true;
+
+#undef LAUNCH_PAGED
+#undef LAUNCH_PAGED_HD
 }
 
 }  // namespace cuda

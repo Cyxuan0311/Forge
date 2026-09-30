@@ -71,6 +71,11 @@ enum class AttentionPath {
     // CUDA paged paths (Phase 4): KV held in fixed-size pages; the decode kernel
     // traverses the per-sequence page table directly. No materialization.
     // FP32 paged KV falls back to CUDA_FP32_DECODE (materialize then attend).
+    // Asymmetric K/V served from paged storage: K and V are templated
+    // independently through the page table, each with its own row stride and
+    // per-head byte offset.
+    CUDA_PAGED_MIXED_DECODE,      // paged GQA decode, K and V may differ
+    CUDA_PAGED_MIXED_PREFILL,     // paged GQA prefill, K and V may differ
     CUDA_PAGED_Q4_0_DECODE,      // CUDA paged GQA decode with Q4_0 KV
     CUDA_PAGED_F16_DECODE,       // CUDA paged GQA decode with F16 KV
     CUDA_PAGED_Q8_0_DECODE,      // CUDA paged GQA decode with Q8_0 KV

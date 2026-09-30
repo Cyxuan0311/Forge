@@ -75,23 +75,29 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
         // their existing dedicated paths so a refactor here cannot perturb the
         // well-tuned f16 / q8_0 / q4_0 decode throughput.
         if (p.paged && p.has_quantized_kv && p.kv_type_k != p.kv_type_v) {
-            // Asymmetric K/V is not implemented for paged storage. There is no
-            // paged mixed kernel and, more fundamentally, the contiguous fallback
-            // is not available either: CUDA-backed paged storage cannot
-            // materialise rows (read_key*/read_value* return null by design), so
-            // the contiguous mixed kernel would be handed the per-layer page
-            // POINTER TABLE where it expects KV data and dereference it as
-            // floats. That segfaulted on --paged-kv -ctk q8_0 -ctv q4_0, 3 of 3.
-            //
-            // Refuse explicitly instead. Silently producing a path that cannot
-            // work is the failure mode this whole selection layer exists to
-            // prevent.
+            // Asymmetric K/V on paged storage. The contiguous mixed kernel must
+            // NOT be used here: it would be handed the per-layer page POINTER
+            // TABLE where it expects KV data, which is what segfaulted this
+            // configuration 3 times out of 3 before the paged mixed kernel
+            // existed. The paged mixed kernel resolves rows through the page
+            // table and templates K and V independently.
+            const bool hd_ok = p.head_dim == 64 || p.head_dim == 96 || p.head_dim == 128;
+            const auto fmt = [](KVCacheDType d) {
+                switch (d) {
+                case KVCacheDType::Q8_0: return 0;
+                case KVCacheDType::Q4_0: return 1;
+                case KVCacheDType::F16:  return 2;
+                default: return -1;
+                }
+            };
+            if (hd_ok && fmt(p.kv_type_k) >= 0 && fmt(p.kv_type_v) >= 0)
+                return AttentionPath::CUDA_PAGED_MIXED_DECODE;
             throw std::runtime_error(
                 std::string("asymmetric KV cache (K=") + kv_cache_dtype_name(p.kv_type_k) +
                 ", V=" + kv_cache_dtype_name(p.kv_type_v) +
-                ") is not supported with --paged-kv: there is no paged mixed-dtype "
-                "kernel, and paged storage cannot be materialised to FP32 as a "
-                "fallback. Use the same dtype for K and V, or drop --paged-kv.");
+                ") with --paged-kv needs a paged mixed-dtype kernel, which covers "
+                "head_dim 64/96/128 over {q8_0, q4_0, f16}; this is head_dim " +
+                std::to_string(p.head_dim) + ".");
         }
         if (p.has_quantized_kv && p.kv_type_k != p.kv_type_v) {
             const auto fmt = [](KVCacheDType d) {
@@ -154,19 +160,20 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
     // GQA prefill (seq_len > 1): prefer the fused quantized prefill kernel when
     // the KV cache holds a symmetric quantized type we have a policy for.
     // Paged KV resolves rows through the page table (no materialization).
+    // Asymmetric K/V on paged storage, prefill. This must sit OUTSIDE the
+    // symmetric guard below, which by construction cannot match when the two
+    // dtypes differ.
+    if (p.paged && p.has_quantized_kv && p.kv_type_k != p.kv_type_v) {
+        if (p.head_dim == 64 || p.head_dim == 96 || p.head_dim == 128)
+            return AttentionPath::CUDA_PAGED_MIXED_PREFILL;
+        throw std::runtime_error(
+            std::string("asymmetric KV cache (K=") + kv_cache_dtype_name(p.kv_type_k) +
+            ", V=" + kv_cache_dtype_name(p.kv_type_v) +
+            ") with --paged-kv (prefill) needs a paged mixed-dtype kernel covering "
+            "head_dim 64/96/128; this is head_dim " + std::to_string(p.head_dim) + ".");
+    }
     if (p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
         if (p.paged) {
-            // Same gap on the prefill side: the paged prefill kernels are
-            // monomorphic, so an asymmetric pair would be read with the wrong
-            // layout for one side. Refuse rather than misread (the decode
-            // branch above throws first, so this is belt-and-braces for callers
-            // that reach prefill selection directly).
-            if (p.has_quantized_kv && p.kv_type_k != p.kv_type_v) {
-                throw std::runtime_error(
-                    std::string("asymmetric KV cache (K=") + kv_cache_dtype_name(p.kv_type_k) +
-                    ", V=" + kv_cache_dtype_name(p.kv_type_v) +
-                    ") is not supported with --paged-kv (prefill).");
-            }
             switch (p.kv_type_k) {
             case KVCacheDType::FP32:
                 return AttentionPath::CUDA_PAGED_FP32_PREFILL;

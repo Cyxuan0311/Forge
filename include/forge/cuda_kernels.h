@@ -731,6 +731,18 @@ bool launch_fused_flash_attention_gqa_decode_mixed(const float* Q, const void* q
                                                    const float* mask_row = nullptr,
                                                    cudaStream_t stream = 0);
 
+// Paged mixed-dtype decode: same dtype coverage and same head_dim limits as the
+// contiguous launcher above, but KV rows are resolved through the page table, so
+// an asymmetric K/V pair can be served from paged storage. k_fmt/v_fmt use the
+// same codes (0 = q8_0, 1 = q4_0, 2 = f16).
+bool launch_paged_flash_attention_gqa_decode_mixed(const float* Q, void* const* k_pages,
+                                                   void* const* v_pages, const int32_t* page_ids,
+                                                   float* O, int kv_len, int num_heads,
+                                                   int num_kv_heads, int head_dim, int page_size,
+                                                   size_t k_row_size, size_t v_row_size, int k_fmt,
+                                                   int v_fmt, const float* mask_row = nullptr,
+                                                   cudaStream_t stream = 0);
+
 // FP8 fused GQA decode (online dequant). q_K/q_V point at the quantized cache.
 void launch_fused_flash_attention_gqa_decode_fp8_e4m3(
     const float* Q, const void* q_K, const void* q_V, float* O, int kv_len, int num_heads,
@@ -942,6 +954,27 @@ void launch_ssm_gated_norm(float* delta_out, const float* z, const float* norm_w
 // bx = b⊙x and gate = c in one pass.
 void launch_lfm2_bcx_split(const float* bcx, float* bx, float* gate, int seq_len, int hidden,
                            cudaStream_t stream = 0);
+
+
+// ---- Paged MIXED prefill (asymmetric K/V) ----
+//
+// -ctk/-ctv can give K and V different dtypes, so the row strides AND the
+// per-head byte offsets differ per side. Each entry point names its pair; there
+// is no monomorphic entry because there is no single row size to pass.
+#define FORGE_DECLARE_PAGED_MIXED_PREFILL(name)                                                \
+    void name(const float* Q, void* const* k_pages, void* const* v_pages,                      \
+              const int32_t* page_ids, float* O, int q_len, int kv_len, int num_heads,          \
+              int num_kv_heads, int head_dim, int page_size, size_t k_row_bytes,                \
+              size_t v_row_bytes, const float* mask, bool causal, const float* k_scales,        \
+              const float* v_scales, cudaStream_t stream = 0);
+
+FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_q8_0_q4_0)
+FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_q4_0_q8_0)
+FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_q8_0_f16)
+FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_f16_q8_0)
+FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_q4_0_f16)
+FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_f16_q4_0)
+#undef FORGE_DECLARE_PAGED_MIXED_PREFILL
 
 }  // namespace cuda
 }  // namespace forge

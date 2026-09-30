@@ -35,6 +35,7 @@
 
 #include "forge/cuda_kernels.h"
 #include "forge/kv_cache.h"
+#include "forge/kv_cache_dtype.h"
 #include "forge/tensor.h"
 
 using namespace forge;
@@ -189,10 +190,16 @@ static PagedPool make_pool(int page_size, int n_pages, size_t row_bytes) {
 }
 
 static void run_dtype(KVCacheDType dt, const char* name, int head_dim, int num_kv_heads,
-                      int num_heads, int kv_len, int page_size) {
+                      int num_heads, int kv_len, int page_size, KVCacheDType dt_v = KVCacheDType::FP32,
+                      bool paged = false) {
     char buf[200];
     const int kv_dim = num_kv_heads * head_dim;
-    const size_t row_bytes = KVCache::block_nbytes(dt, kv_dim);
+    // row_bytes is per side: K and V may have different block geometries.
+    KVCacheDType tv = dt_v == KVCacheDType::FP32 ? dt : dt_v;
+    const size_t k_row_bytes = KVCache::block_nbytes(dt, kv_dim);
+    const size_t v_row_bytes = KVCache::block_nbytes(tv, kv_dim);
+    const size_t row_bytes = k_row_bytes;
+    const bool mixed = tv != dt;
     const int n_pages = (kv_len + page_size - 1) / page_size;
 
     Rng rng(0xC0FFEEu ^ static_cast<uint32_t>(dt));
@@ -203,14 +210,14 @@ static void run_dtype(KVCacheDType dt, const char* name, int head_dim, int num_k
     for (auto& x : q) x = rng.next();
 
     // ---- 1. the device writer ----
-    PagedPool pool = make_pool(page_size, n_pages, row_bytes);
+    PagedPool pool = make_pool(page_size, n_pages, std::max(k_row_bytes, v_row_bytes));
     float *d_k = nullptr, *d_v = nullptr;
     cudaMalloc(&d_k, kf.size() * sizeof(float));
     cudaMalloc(&d_v, vf.size() * sizeof(float));
     cudaMemcpy(d_k, kf.data(), kf.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_v, vf.data(), vf.size() * sizeof(float), cudaMemcpyHostToDevice);
     cuda::launch_kv_scatter(d_k, d_v, pool.d_k_ptrs, pool.d_v_ptrs, pool.d_page_ids, kv_len, 0,
-                            page_size, kv_dim, row_bytes, row_bytes, dt, dt, 0);
+                            page_size, kv_dim, k_row_bytes, v_row_bytes, dt, tv, 0);
     cudaDeviceSynchronize();
 
     // Read the raw bytes back and dequantize on the CPU with the CPU reader.
@@ -218,20 +225,20 @@ static void run_dtype(KVCacheDType dt, const char* name, int head_dim, int num_k
     std::vector<std::vector<float>> k_rows(kv_len), v_rows(kv_len);
     for (int kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
         for (int j = 0; j < kv_len; ++j) {
-            std::vector<uint8_t> row(row_bytes);
+            std::vector<uint8_t> row(k_row_bytes);
             const int page = j / page_size, off = j % page_size;
             const uint8_t* base = static_cast<const uint8_t*>(pool.k_pages[static_cast<size_t>(page)]);
-            cudaMemcpy(row.data(), base + static_cast<size_t>(off) * row_bytes, row_bytes,
+            cudaMemcpy(row.data(), base + static_cast<size_t>(off) * k_row_bytes, k_row_bytes,
                        cudaMemcpyDeviceToHost);
             k_rows[j].resize(kv_dim);
             KVCache::dequantize_row(dt, row.data(), k_rows[j].data(), kv_dim);
-            std::vector<uint8_t> vrow(row_bytes);
+            std::vector<uint8_t> vrow(v_row_bytes);
             cudaMemcpy(vrow.data(),
                        static_cast<const uint8_t*>(pool.v_pages[static_cast<size_t>(page)]) +
-                           static_cast<size_t>(off) * row_bytes,
-                       row_bytes, cudaMemcpyDeviceToHost);
+                           static_cast<size_t>(off) * v_row_bytes,
+                       v_row_bytes, cudaMemcpyDeviceToHost);
             v_rows[j].resize(kv_dim);
-            KVCache::dequantize_row(dt, vrow.data(), v_rows[j].data(), kv_dim);
+            KVCache::dequantize_row(tv, vrow.data(), v_rows[j].data(), kv_dim);
         }
     }
 
@@ -272,6 +279,32 @@ static void run_dtype(KVCacheDType dt, const char* name, int head_dim, int num_k
     cudaMemset(d_o, 0, q.size() * sizeof(float));
 
     bool launched = true;
+    if (mixed) {
+        const auto fmt = [](KVCacheDType d) {
+            return d == KVCacheDType::Q8_0 ? 0 : (d == KVCacheDType::Q4_0 ? 1 : 2);
+        };
+        const bool ok = cuda::launch_paged_flash_attention_gqa_decode_mixed(
+            d_q, pool.d_k_ptrs, pool.d_v_ptrs, pool.d_page_ids, d_o, kv_len, num_heads,
+            num_kv_heads, head_dim, page_size, k_row_bytes, v_row_bytes, fmt(dt), fmt(tv),
+            nullptr, 0);
+        cudaDeviceSynchronize();
+        std::snprintf(buf, sizeof(buf), "%s/%s paged MIXED decode launched", name,
+                      kv_cache_dtype_name(tv));
+        check(ok && cudaGetLastError() == cudaSuccess, buf);
+        if (!ok) return;
+        std::vector<float> gotm(q.size());
+        cudaMemcpy(gotm.data(), d_o, gotm.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        const std::vector<float> refm = ref_attend(q, k_rows, v_rows, num_kv_heads, head_dim);
+        double me = 0, ms = 0;
+        for (size_t i = 0; i < gotm.size(); ++i) {
+            me = std::max<double>(me, std::fabs(gotm[i] - refm[i]));
+            ms = std::max<double>(ms, std::fabs(refm[i]));
+        }
+        std::snprintf(buf, sizeof(buf),
+                      "%s/%s paged MIXED decode matches CPU reference (max err %.2e, |out| %.3f)",
+                      name, kv_cache_dtype_name(tv), me, ms);
+        check(me < 5e-2 * std::max(1e-3, ms), buf);
+    } else {
     switch (dt) {
     case KVCacheDType::Q4_0:
         cuda::launch_paged_flash_attention_gqa_decode_q4_0(
@@ -314,6 +347,7 @@ static void run_dtype(KVCacheDType dt, const char* name, int head_dim, int num_k
     // would be, because here the writer and reader are the same pair.
     const double tol = (dt == KVCacheDType::Q4_0) ? 5e-2 : 2e-2;
     check(max_err < tol * std::max(1e-3, scale), buf);
+    }  // end else: symmetric decode. The mixed case above falls through to prefill.
 
     // ---- 3. the paged *prefill* kernel ----
     // The decode check above cannot see a prefill bug: decode is only ever given
@@ -335,6 +369,52 @@ static void run_dtype(KVCacheDType dt, const char* name, int head_dim, int num_k
         cudaMemset(d_op, 0, qp.size() * sizeof(float));
 
         bool ok = true;
+        if (mixed) {
+            const auto run = [&](auto fn) {
+                fn(d_qp, pool.d_k_ptrs, pool.d_v_ptrs, pool.d_page_ids, d_op, q_len, kv_len,
+                   num_heads, num_kv_heads, head_dim, page_size, k_row_bytes, v_row_bytes, nullptr,
+                   true, nullptr, nullptr, 0);
+            };
+            if (dt == KVCacheDType::Q8_0 && tv == KVCacheDType::Q4_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q8_0_q4_0);
+            else if (dt == KVCacheDType::Q4_0 && tv == KVCacheDType::Q8_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q4_0_q8_0);
+            else if (dt == KVCacheDType::Q8_0 && tv == KVCacheDType::F16)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q8_0_f16);
+            else if (dt == KVCacheDType::F16 && tv == KVCacheDType::Q8_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_f16_q8_0);
+            else if (dt == KVCacheDType::Q4_0 && tv == KVCacheDType::F16)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_q4_0_f16);
+            else if (dt == KVCacheDType::F16 && tv == KVCacheDType::Q4_0)
+                run(cuda::launch_paged_flash_attention_gqa_prefill_f16_q4_0);
+            else
+                ok = false;
+            cudaDeviceSynchronize();
+            std::snprintf(buf, sizeof(buf), "%s/%s paged MIXED prefill launched cleanly", name,
+                          kv_cache_dtype_name(tv));
+            check(ok && cudaGetLastError() == cudaSuccess, buf);
+            if (!ok) {
+                cudaFree(d_qp);
+                cudaFree(d_op);
+                return;
+            }
+            std::vector<float> gotm(qp.size());
+            cudaMemcpy(gotm.data(), d_op, gotm.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            const std::vector<float> refm = ref_attend_causal(qp, k_rows, v_rows, num_kv_heads,
+                                                              head_dim);
+            double me = 0, ms = 0;
+            for (size_t i = 0; i < gotm.size(); ++i) {
+                me = std::max<double>(me, std::fabs(gotm[i] - refm[i]));
+                ms = std::max<double>(ms, std::fabs(refm[i]));
+            }
+            std::snprintf(buf, sizeof(buf),
+                          "%s/%s paged MIXED prefill matches CPU reference (max err %.2e, |out| %.3f)",
+                          name, kv_cache_dtype_name(tv), me, ms);
+            check(me < 5e-2 * std::max(1e-3, ms), buf);
+            cudaFree(d_qp);
+            cudaFree(d_op);
+            return;
+        }
         switch (dt) {
         case KVCacheDType::Q4_0:
             cuda::launch_paged_flash_attention_gqa_prefill_q4_0(
@@ -407,6 +487,18 @@ int main() {
                 run_dtype(KVCacheDType::Q4_0, "q4_0", hd, nkv, nh, kv_len, page_size);
                 run_dtype(KVCacheDType::Q8_0, "q8_0", hd, nkv, nh, kv_len, page_size);
                 run_dtype(KVCacheDType::F16, "f16  ", hd, nkv, nh, kv_len, page_size);
+                // Asymmetric K/V: the whole point of the paged mixed kernel. K and
+                // V have different block geometries, so both the row strides and
+                // the per-head byte offsets differ -- one row_bytes cannot serve
+                // both sides, which is why this combination had no path at all.
+                run_dtype(KVCacheDType::Q8_0, "q8_0", hd, nkv, nh, kv_len, page_size,
+                          KVCacheDType::Q4_0);
+                run_dtype(KVCacheDType::Q4_0, "q4_0", hd, nkv, nh, kv_len, page_size,
+                          KVCacheDType::Q8_0);
+                run_dtype(KVCacheDType::Q8_0, "q8_0", hd, nkv, nh, kv_len, page_size,
+                          KVCacheDType::F16);
+                run_dtype(KVCacheDType::F16, "f16  ", hd, nkv, nh, kv_len, page_size,
+                          KVCacheDType::Q4_0);
             }
         }
     }
