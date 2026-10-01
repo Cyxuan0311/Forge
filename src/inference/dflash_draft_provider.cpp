@@ -1,5 +1,9 @@
 #include "forge/dflash_draft_provider.h"
 
+#ifdef USE_CUDA
+#    include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -76,14 +80,28 @@ float top_probability(const float* logits, int vocab_size) {
 // A Tensor::view() would inherit the parent's nbytes() (a reshape, not a slice),
 // which makes the downstream device transfer over-read, so materialize instead.
 // The block is a handful of rows, so the copy is negligible.
+// First `rows` rows of `t`, as a new tensor on t's own device.
+//
+// The device has to be branched on, not just assumed. This used to be a host
+// memcpy, which was correct while the stash was staged to the host -- and became a
+// host memcpy of device pointers (a segfault) once take_layer_hiddens stopped
+// staging it. Leading rows of a row-major tensor are one contiguous range, so the
+// device copy is a single transfer rather than a per-row loop.
 std::shared_ptr<Tensor> leading_rows(const TensorPtr& t, int64_t rows) {
     const int64_t cols = t->shape()[1];
     auto out = std::make_shared<Tensor>(t->dtype(), std::vector<int64_t>{rows, cols}, t->device());
     const size_t row_bytes = static_cast<size_t>(cols) * dtype_size(t->dtype());
+    const size_t total = row_bytes * static_cast<size_t>(rows);
+#ifdef USE_CUDA
+    if (t->device() == DeviceType::CUDA) {
+        cudaMemcpyAsync(out->data(), t->data(), total, cudaMemcpyDeviceToDevice,
+                        /*stream=*/0);
+        return out;
+    }
+#endif
     const auto* src = static_cast<const uint8_t*>(t->data());
     auto* dst = static_cast<uint8_t*>(out->data());
-    for (int64_t r = 0; r < rows; ++r)
-        std::memcpy(dst + r * row_bytes, src + r * row_bytes, row_bytes);
+    std::memcpy(dst, src, total);
     return out;
 }
 

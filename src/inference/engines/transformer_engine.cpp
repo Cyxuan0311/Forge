@@ -121,9 +121,20 @@ TensorPtr TransformerEngine::take_layer_hiddens(const std::vector<int>& layers) 
     if (layer_hiddens_.empty()) {
         return nullptr;
     }
-    // Gather the requested layers, copying each to CPU so we can concatenate
-    // them row-wise on the host. copy_from() is a synchronous d2h copy for
-    // CUDA->CPU, so the source tensors are left untouched.
+    // Gather the requested layers and concatenate them along the hidden dimension.
+    //
+    // On CUDA this is done on the device. It used to copy every layer to the host,
+    // concatenate there, and let the drafter copy the result straight back: a round
+    // trip whose only lasting effect was the two synchronous pageable copies in it.
+    // A synchronous pageable cudaMemcpy drains the stream first, so the cost was not
+    // the bytes (tens of KB) but the wait for every kernel already queued -- which
+    // is why this showed up as ~7 ms of host time per draft round on MiniCPM5-2.6B-
+    // DSpark, in a function whose own GPU work measures ~0.2 ms. Copying each layer
+    // into its column block with cudaMemcpy2DAsync keeps it on the device and turns
+    // the wait back into ordinary queueing.
+    //
+    // Layers are assumed to share a device, which they do whenever the target runs
+    // on one; a mixed set falls back to the host path rather than trying a peer copy.
     //
     // Indices follow the vLLM aux-hidden-state convention: 0 is the embedding and
     // k is the output of layer k, so the vector holds num_layers + 1 entries and a
@@ -136,25 +147,72 @@ TensorPtr TransformerEngine::take_layer_hiddens(const std::vector<int>& layers) 
                      std::to_string(layer_hiddens_.size()) + " captured)");
             continue;
         }
-        const TensorPtr& t = layer_hiddens_[li];
-        auto cpu = std::make_shared<Tensor>(t->dtype(), t->shape(), DeviceType::CPU);
-        cpu->copy_from(*t);
-        selected.push_back(std::move(cpu));
+        selected.push_back(layer_hiddens_[li]);
     }
     if (selected.empty()) {
         return nullptr;
     }
     const int64_t seq = selected[0]->shape()[0];
     int64_t total_hidden = 0;
+    bool one_device = true;
     for (auto& t : selected) {
         total_hidden += t->shape()[1];
+        if (t->device() != selected[0]->device())
+            one_device = false;
     }
-    auto out = std::make_shared<Tensor>(selected[0]->dtype(),
+
+#ifdef USE_CUDA
+    if (one_device && selected[0]->device() == DeviceType::CUDA) {
+        auto out = std::make_shared<Tensor>(selected[0]->dtype(),
+                                            std::vector<int64_t>{seq, total_hidden},
+                                            DeviceType::CUDA);
+        const size_t elem = out->nbytes() / out->numel();  // bytes per element
+        auto* dst = static_cast<uint8_t*>(out->data());
+        int64_t col = 0;
+        bool ok = true;
+        for (auto& t : selected) {
+            const int64_t H = t->shape()[1];
+            // Column block: H elements per row into a destination whose rows are
+            // total_hidden wide, so dpitch is the full row and spitch the source row.
+            const cudaError_t err = cudaMemcpy2DAsync(
+                dst + static_cast<size_t>(col) * elem,
+                static_cast<size_t>(total_hidden) * elem,
+                static_cast<const void*>(t->data()),
+                static_cast<size_t>(H) * elem,
+                static_cast<size_t>(H) * elem, static_cast<size_t>(seq),
+                cudaMemcpyDeviceToDevice, /*stream=*/0);
+            if (err != cudaSuccess) {
+                LOG_WARN("take_layer_hiddens: cudaMemcpy2DAsync failed (" +
+                         std::string(cudaGetErrorString(err)) +
+                         "), falling back to the host path");
+                ok = false;
+                break;
+            }
+            col += H;
+        }
+        if (ok)
+            return out;
+    }
+#endif
+
+    // Host path: normalize every layer to the CPU and concatenate there.
+    std::vector<TensorPtr> on_host;
+    on_host.reserve(selected.size());
+    for (auto& t : selected) {
+        if (t->device() == DeviceType::CPU) {
+            on_host.push_back(t);
+            continue;
+        }
+        auto cpu = std::make_shared<Tensor>(t->dtype(), t->shape(), DeviceType::CPU);
+        cpu->copy_from(*t);
+        on_host.push_back(std::move(cpu));
+    }
+    auto out = std::make_shared<Tensor>(on_host[0]->dtype(),
                                         std::vector<int64_t>{seq, total_hidden}, DeviceType::CPU);
     const size_t elem = out->nbytes() / out->numel();  // bytes per element
     uint8_t* dst = static_cast<uint8_t*>(out->data());
     int64_t col = 0;
-    for (auto& t : selected) {
+    for (auto& t : on_host) {
         const uint8_t* src = static_cast<const uint8_t*>(t->data());
         const int64_t H = t->shape()[1];
         const size_t row_bytes = static_cast<size_t>(H) * elem;
