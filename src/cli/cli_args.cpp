@@ -81,11 +81,13 @@ static void print_usage(const char* prog) {
             "       --spec-draft-target-layers LIST  Target layer indices feeding the draft encoder, e.g. \"2,5,8\"\n"
             "       --spec-draft-mask-id N MASK token id for the DFlash query block (default: from GGUF)\n"
             "       --spec-draft-n N       Speculative tokens proposed per round (default: 5)\n"
-            "       --spec-dspark-topk N  DSpark: apply markov bias only to top-N base-logit candidates (0 = full vocab)\n"
+            "       --spec-dspark-topk N  DSpark: apply markov bias only to top-N base-logit\n"
+            "                           candidates (default 64; 0 = full vocab)\n"
             "       --spec-dspark-conf F   DSpark: drop drafted positions whose confidence < F (default: 0.5)\n"
             "       --spec-min-acc F       Disable drafting (fall back to plain decode) while acceptance EWMA < F\n"
-            "       --no-adaptive-draft     Always draft the full --spec-draft budget instead of sizing it to the\n"
-            "                             recent accepted length (adaptive sizing is on by default)\n"
+            "       --adaptive-draft       Size each round's draft length to the recent accepted length\n"
+            "                             (off by default: llama.cpp uses a fixed length, and the\n"
+            "                             controller walks itself down to 1 on a weak drafter)\n"
             "                           (default: 0 = always speculate; useful when the drafter is larger\n"
             "                           than the target, e.g. MiniCPM5-2.6B-DSpark over a 2B target)\n"
             "       --perf                Print per-phase performance breakdown after generation\n"
@@ -558,6 +560,9 @@ CliArgs parse_args(int argc, char** argv) {
         } else if (arg == "--no-adaptive-draft") {
             args.spec.enabled = true;
             args.spec.adaptive_draft = false;
+        } else if (arg == "--adaptive-draft") {
+            args.spec.enabled = true;
+            args.spec.adaptive_draft = true;
         } else if (arg == "--spec-ngram-mod-n") {
             if (++i >= argc) {
                 std::cerr << "Error: " << arg << " requires an argument\n";

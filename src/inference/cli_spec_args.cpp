@@ -8,6 +8,7 @@ namespace forge {
 
 bool is_spec_arg(const std::string& arg) {
     static const char* kSpecFlags[] = {
+        "--adaptive-draft",
         "--no-adaptive-draft",
         "--no-ngram",
         "--spec",
@@ -219,6 +220,12 @@ SpecParseResult parse_spec_arg(const std::string& arg, int argc, char** argv, in
     if (arg == "--no-adaptive-draft") {
         spec.enabled = true;
         spec.adaptive_draft = false;
+        return SpecParseResult::Ok;
+    }
+
+    if (arg == "--adaptive-draft") {
+        spec.enabled = true;
+        spec.adaptive_draft = true;
         return SpecParseResult::Ok;
     }
 

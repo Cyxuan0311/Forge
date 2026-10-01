@@ -141,7 +141,7 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "      --spec-dspark-topk N     DSpark markov top-k (0 = full vocab)\n"
                 << "      --spec-dspark-conf F     DSpark confidence truncation (0 = off)\n"
                 << "      --spec-min-acc F   Disable drafting while acceptance EWMA < F\n"
-                << "      --no-adaptive-draft      Always draft the full --spec-draft budget\n"
+                << "      --adaptive-draft        Size each round's draft to the recent accepted length (off)\n"
                 << "      --spec-n-min N, --spec-p-min F, --spec-ngram-n N,\n"
                 << "      --spec-ngram-min N, --spec-ngram-mod[-n|-min|-max],\n"
                 << "      --no-ngram, --spec-mtp, --spec-stats   See forge-cli --help\n"

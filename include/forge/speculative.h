@@ -102,10 +102,24 @@ struct SpeculativeConfig {
     float p_min = 0.0f;         // draft confidence early-stop threshold (Phase 3 model draft)
     bool print_stats = false;   // CLI: print SpeculativeStats after generation (--spec-stats)
 
-    // Size n_draft per round to track the recent accepted length (on by default).
-    // --no-adaptive-draft pins it to n_draft instead. See SpeculativeExecutor::step
-    // for why the acceptance rate is the wrong control signal.
-    bool adaptive_draft = true;
+    // Size n_draft per round to track the recent accepted length. OFF by default,
+    // matching llama.cpp, which uses a static draft length every round
+    // (common/speculative.cpp:1202, `const int32_t n_draft = params.n_max;`)
+    // and only clamps it once to the drafter's trained block size (line 1001).
+    //
+    // It used to be on by default, and it was a trap. The controller shrinks the
+    // draft when acceptance is low, but a shorter draft raises the acceptance rate
+    // at constant drafter quality, so the controller rewards its own mistake and
+    // walks the length down to 1. At 1 token per round the payoff is capped at
+    // ~1.4 tokens/step, and since the drafter forward still runs the full trained
+    // block width, the discarded tokens are work already paid for and thrown away.
+    //
+    // Measured on MiniCPM5-2.6B-DSpark over a 2B target: adaptive sizing collapsed
+    // to 1 token within a few rounds and held there for the rest of the generation,
+    // hiding the real per-position acceptance data (34% / 15% / 3%) behind a single
+    // average. Turn it on with --adaptive-draft; --no-adaptive-draft is kept as an
+    // accepted no-op so existing scripts keep working.
+    bool adaptive_draft = false;
 
     // Standalone small draft model (Phase 3); takes priority over n-gram when set
     std::string draft_model_path;

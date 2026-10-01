@@ -210,16 +210,21 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
         return out;
     }
 
-    // Adaptive draft sizing.
+    // Adaptive draft sizing (opt-in via --adaptive-draft).
     //
-    // This used to scale n_draft by (0.5 + acceptance_rate), which is a one-way
-    // ratchet: any rate below 0.5 gives a multiplier < 1, so the draft shrank
-    // every round and could never grow back. At the measured 41.7% acceptance it
-    // walked 7 -> 1 within six rounds and then stayed at 1 for the rest of the
-    // generation, which is why "draft tokens" came out ~= "spec steps" no matter
-    // what --spec-draft or --spec-draft-n were set to. It was also
-    // self-reinforcing: once n_draft reached 1 a round could only accept 0 or 1,
-    // so the measured rate kept decaying and pinned it there for good.
+    // The DEFAULT here is a fixed draft length, which is what llama.cpp does: it
+    // reads params.n_max every round with no feedback
+    // (common/speculative.cpp:1202) and clamps it once to the drafter's trained
+    // block size (line 1001). There is no length controller to misbehave.
+    //
+    // The controller that used to run by default was a trap. It scaled n_draft by
+    // (0.5 + acceptance_rate), which is a one-way ratchet: any rate below 0.5 gives
+    // a multiplier < 1, so the draft shrank every round and could never grow back.
+    // At the measured 41.7% acceptance it walked 7 -> 1 within six rounds and then
+    // stayed at 1, which is why "draft tokens" came out ~= "spec steps" no matter
+    // what --spec-draft was set to. It was also self-reinforcing: once n_draft
+    // reached 1 a round could only accept 0 or 1, so the measured rate kept decaying
+    // and pinned it there for good.
     //
     // Acceptance *rate* is the wrong signal on two counts:
     //   - it is confounded with the draft length. Shrinking the draft raises the
@@ -230,9 +235,10 @@ SpeculativeExecutor::StepOutput SpeculativeExecutor::step(const StepInput& in) {
     //     the tokens it hands back. A discarded draft token is already paid for,
     //     so dropping it wastes work that was done.
     //
-    // Size on accepted LENGTH instead -- that is the actual payoff -- and let it
-    // move in both directions under a slew limit so it tracks without
-    // oscillating. --no-adaptive-draft pins n_draft to the configured value.
+    // The accepted-length controller below still sizes on the payoff rather than the
+    // rate, and slews in both directions, so it is safe to opt into. It is just not
+    // the default: a weak drafter benefits from seeing its true per-position
+    // acceptance rather than from having its own measurements bent by the controller.
     if (!cfg_.adaptive_draft) {
         adaptive_draft_ = cfg_.n_draft;
     } else {

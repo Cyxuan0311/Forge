@@ -41,6 +41,20 @@ namespace forge {
 
 namespace {
 
+// Size of a file in bytes, or 0 if it cannot be determined. Used to reserve VRAM
+// for a draft model before the GGUF is parsed: the file size is an upper bound on
+// its weight bytes (it also covers the metadata and padding), which is the safe
+// direction for a reservation.
+size_t file_size_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+        return 0;
+    const std::streamoff end = f.tellg();
+    if (end <= 0)
+        return 0;
+    return static_cast<size_t>(end);
+}
+
 // Available host RAM in bytes (Linux: /proc/meminfo "MemAvailable").
 // Returns 0 when it cannot be determined, so callers fall back rather than
 // guess -- a wrong guess means either a needlessly short context or an OOM
@@ -945,7 +959,66 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
             (size_t)n_ubatch *
             ((size_t)cfg.hidden_dim + (size_t)cfg.num_heads * (size_t)cfg.head_dim) *
             sizeof(float) * 4;
-        const size_t headroom = 256ull * 1024 * 1024 + activation_bytes;
+        size_t headroom = 256ull * 1024 * 1024 + activation_bytes;
+
+        // Reserve for the draft model before sizing the KV cache.
+        //
+        // Speculative decoding builds the target context -- and therefore allocates
+        // the KV cache -- before the drafter is loaded, so without a reservation the
+        // cache is sized as if nothing else were coming and swallows all remaining
+        // VRAM. Reserving the draft's footprint (weights plus its share of the
+        // TensorCore dequant workspace) keeps the card from being fully committed by
+        // one structure, which is the same reason the KV cache is capped rather than
+        // sized to the model's full trained length.
+        //
+        // Effect, measured on MiniCPM5-2.6B-DSpark over MiniCPM5-2.6B Q4_K_M on a
+        // 6 GiB card: with a draft model configured and no explicit -c, the KV cache
+        // drops from 73728 to 46080 tokens, holding ~1.4 GB back.
+        //
+        // NOTE: this did NOT recover throughput on its own. Speculative decoding is
+        // still much slower with a large KV cache than a small one (15.7 vs 30.9
+        // tok/s at ctx 32768 vs 2048, 120 tokens, identical 25.7% acceptance), and
+        // that gap is NOT explained by any of:
+        //   - the drafter's weights being stranded in host memory (checked: 2 tensors,
+        //     0 MB, which is just the scalar norm-epsilons),
+        //   - matmul path selection (the planner's decision line is byte-identical at
+        //     both sizes: "q3k path=mmq source=vram:not_tc_eligible", and that is a
+        //     Q3_K capability probe, not this model's Q4_K_M path),
+        //   - the KV range attended (filled() returns logical_filled, the real write
+        //     cursor, not the allocation size).
+        // The slowdown lands on the drafter's GEMV-shaped ops (ffn/*, qkv_proj,
+        // attn_proj: 3-13x) while elementwise ops and output_proj are unaffected,
+        // and scales linearly with the configured context. That mechanism is still
+        // open; this reservation stands on its own merits as a budgeting fix.
+        size_t draft_reserve_bytes = 0;
+        {
+            const auto& spec = ctx_.params().speculative_config;
+            if (spec.enabled && !spec.draft_model_path.empty()) {
+                draft_reserve_bytes = file_size_bytes(spec.draft_model_path);
+                // Also reserve the TensorCore dequant workspace: the planner's
+                // mandatory_workspace_bytes, the same number it logs as "scratch=".
+                // The drafter loads after this sizing decision, so its share of the
+                // workspace has to be held back here rather than discovered later.
+                size_t workspace = 0;
+#ifdef USE_CUDA
+                workspace = estimate_dequant_scratch_peak_bytes();
+#endif
+                draft_reserve_bytes += workspace;
+
+                // A reserve larger than the KV budget itself would starve the target
+                // down to the minimum-context floor, so bound it there. Half is a
+                // reasonable split: the drafter is meant to be small, and if it is not,
+                // speculation was the wrong choice anyway.
+                const size_t kv_budget = static_cast<size_t>(kv_max_seq) * per_token_bytes;
+                if (draft_reserve_bytes > kv_budget / 2)
+                    draft_reserve_bytes = kv_budget / 2;
+                headroom += draft_reserve_bytes;
+                LOG_INFO("KV cache sizing reserves " +
+                         std::to_string(draft_reserve_bytes / (1024 * 1024)) +
+                         " MB of headroom for the draft model and its TensorCore workspace "
+                         "(--spec-model)");
+            }
+        }
 
         size_t usable_mem = 0;
         if (kv_dev == DeviceType::CUDA) {

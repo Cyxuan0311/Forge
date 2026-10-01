@@ -642,6 +642,13 @@ int main(int argc, char** argv) {
 
     ctx.params_mut().offload_kqv = args.common.offload_kqv;
     ctx.params_mut().offload_embedding = model.offload_embedding();
+    // Publish the speculative config BEFORE init_kv_cache(). The KV cache is sized
+    // here, and TransformerEngine::init_kv_cache reserves headroom for the draft
+    // model when it sees one configured -- otherwise the cache swallows the VRAM
+    // the drafter needs and the matmul planner silently drops to MMQ. The config
+    // used to be applied later, in generate_streaming, which is too late.
+    if (args.spec.enabled)
+        ctx.params_mut().speculative_config = args.spec;
     ctx.init_kv_cache();
     if (tfm_eng) {
         // In paged mode the contiguous KVCache is intentionally left
