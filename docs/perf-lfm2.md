@@ -1,5 +1,35 @@
 # LFM2.5-2.6B inference performance
 
+## Read this before trusting any number on this machine
+
+The RTX 4050 Laptop **bistables between roughly 1755 MHz and 2400 MHz** under software
+power capping -- `nvidia-smi -q -d PERFORMANCE` reports `SW Power Cap: Active` and
+`SW Thermal Slowdown: Active` (a laptop dGPU power policy, visible here because the box
+runs under WSL2). Decode is clock-bound, and throughput tracks the clock ratio exactly:
+
+| SM clock during run | tok/s |
+|---------------------|-------|
+| 1755-1770 MHz       | 35.7 - 36.4 |
+| 2265 MHz            | 49.1 |
+| 2415 MHz            | 49.3 |
+
+2400 / 1755 = 1.37, and 49.1 / 35.8 = 1.37. A single run can therefore read up to 1.7x
+faster than its neighbour for reasons that have nothing to do with the code.
+
+Practical rules:
+
+- Compare **ratios**, not absolute tok/s. Absolute figures do not reproduce here.
+- Interleave the two arms of an A/B within the same loop and report the median of
+  several reps. A one-shot measurement of DSpark speculative decoding made it look 24%
+  slower than plain decode; the controlled median is 0.97x, i.e. parity.
+- Sanity-check with `nvidia-smi -q -d CLOCK,PERFORMANCE` (sampled mid-run) before
+  believing a surprising result. Note `nvidia-smi --query-gpu=clocks.sm,...` is **not**
+  supported by this driver; use `-q -d`.
+
+Effects that survive interleaving and tight error bars (e.g. the speculative path being
+1.9x slower with a 32768-token KV cache than a 2048-token one, with non-overlapping
+ranges) are real and worth chasing. Effects that move run to run are the clock.
+
 Measured on the reference box: **i5-13500H** (8C/16T, AVX2 + F16C, **no** AVX-512/AMX),
 15 GB RAM, **RTX 4050 Laptop** 6 GB (sm_89, measured HBM read roof 164 GB/s), model on an
 external NTFS volume sustaining ~138 MB/s. Model is `arch=lfm2`, 30 layers
