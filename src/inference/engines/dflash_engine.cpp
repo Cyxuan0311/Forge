@@ -769,6 +769,24 @@ static inline float dot_markov(const float* a, const float* b, int n) {
     return s;
 }
 
+// Sequential Markov sampling for DSpark, on the host.
+//
+// WHY THIS IS STILL ON THE CPU. llama.cpp runs the whole chain inside the compute
+// graph (src/models/dflash.cpp:292-392): ggml_get_rows(w1, prev) -> build_lora_mm
+// (w2, w1_prev) -> ggml_add -> ggml_argmax, with no host round trip and no top-k.
+// Porting that here looked worthwhile and stopped being worthwhile once the top-k
+// default was fixed. Measured on MiniCPM5-2.6B-DSpark, this function costs
+//   63.27 ms per draft round over the full vocabulary (top_k == 0), and
+//    0.54 ms per draft round at the default top_k of 64,
+// against a ~90 ms round. At the default it is 0.6% of the round, so a GPU port
+// could win at most that. It would also need the markov head resident on the GPU
+// as FP32 -- 2 x 130560 x 256 x 4 B = 254 MB -- which on a 6 GiB card comes
+// straight out of the KV cache. Net: negative. Revisit only if top_k is forced to
+// 0, or if the drafter's acceptance improves enough that the remaining per-round
+// cost is dominated by this.
+//
+// The full-vocabulary path is still supported (--spec-dspark-topk 0) and is the
+// reference implementation for the top-k path: the two agree token for token.
 std::vector<int32_t> dspark_sequential_sample(
     const std::vector<const float*>& rows, int vocab,
     const std::vector<const float*>& hidden_rows, int hidden_dim,
