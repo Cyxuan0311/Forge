@@ -976,9 +976,13 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         // drops from 73728 to 46080 tokens, holding ~1.4 GB back.
         //
         // NOTE: this did NOT recover throughput on its own. Speculative decoding is
-        // still much slower with a large KV cache than a small one (15.7 vs 30.9
-        // tok/s at ctx 32768 vs 2048, 120 tokens, identical 25.7% acceptance), and
-        // that gap is NOT explained by any of:
+        // still much slower with a large KV cache than a small one, and unlike the
+        // reference box's clock bistability this one reproduces: 3 interleaved reps
+        // give 31.4/31.6/31.5 tok/s at ctx 2048 against 17.5/15.3/17.4 at ctx 32768,
+        // with non-overlapping ranges, while plain decode is unaffected by -c (37.4 at
+        // both). It is therefore specific to the speculative path.
+        //
+        // The gap is NOT explained by any of:
         //   - the drafter's weights being stranded in host memory (checked: 2 tensors,
         //     0 MB, which is just the scalar norm-epsilons),
         //   - matmul path selection (the planner's decision line is byte-identical at
