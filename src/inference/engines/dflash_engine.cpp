@@ -289,7 +289,8 @@ void DflashEngine::write_context_kv(const TensorPtr& prefix_embd, int64_t start_
     // KV cache 采用首次 forward 惰性分配, 但增量追加路径 (append_context_kv)
     // 先于任何 decode 执行, 必须在此确保已分配 (幂等: 已初始化则立即返回),
     // 否则 kv_cache_ 是空壳, update() 报 invalid layer / max_seq_len=0。
-    init_kv_cache(cfg);
+    { PERF_SCOPE("dflash/ctx_init_kv");
+      init_kv_cache(cfg); }
     // 输入是"已编码 context feature" (append: encode() 的 fc 输出; precompute:
     // raw prefix)。按 vLLM dflash _project_context_kv 语义统一在此应用 encoder
     // 输出 norm (hidden_norm), 再逐层投影。权重缺失时原样透传。
@@ -302,8 +303,9 @@ void DflashEngine::write_context_kv(const TensorPtr& prefix_embd, int64_t start_
             tmp->copy_from(*enc_norm);
             enc_norm = tmp;
         }
-        feature = NormExecutor::apply(feature, enc_norm, nullptr, NormType::RMSNorm,
-                                      cfg.rms_norm_eps);
+        { PERF_SCOPE("dflash/ctx_enc_norm");
+          feature = NormExecutor::apply(feature, enc_norm, nullptr, NormType::RMSNorm,
+                                        cfg.rms_norm_eps); }
         dev = feature->device();
     }
     const int prefix_len = static_cast<int>(feature->shape()[0]);
@@ -317,7 +319,9 @@ void DflashEngine::write_context_kv(const TensorPtr& prefix_embd, int64_t start_
         // 设备再投影 —— ops::matmul_transB 的两个分支都假定两侧同设备, 混置时会
         // 在主机端解引用对侧指针导致段错误 (drafter --spec-draft-ngl 1/5 时崩溃)。
         const DeviceType ldev = lw.wk() ? lw.wk()->device() : layer_device(layer);
-        TensorPtr feat_l = transfer_hidden(feature, ldev);
+        TensorPtr feat_l;
+        { PERF_SCOPE("dflash/ctx_xfer");
+          feat_l = transfer_hidden(feature, ldev); }
         TensorPtr K, V;
         {
             PERF_SCOPE("dflash/ctx_proj");
@@ -336,7 +340,9 @@ void DflashEngine::write_context_kv(const TensorPtr& prefix_embd, int64_t start_
         // allocated once and reused across layers: the ROPE result is read from
         // k_rope only, so a zeroed buffer of the right shape is sufficient and
         // saves a per-layer allocation + memset.
-        TensorPtr q_dummy = dummy_q(prefix_len, num_heads * head_dim, K->dtype(), ldev);
+        TensorPtr q_dummy;
+        { PERF_SCOPE("dflash/ctx_dummy_q");
+          q_dummy = dummy_q(prefix_len, num_heads * head_dim, K->dtype(), ldev); }
         TensorPtr k_rope;
         {
             PERF_SCOPE("dflash/ctx_rope");
@@ -439,6 +445,32 @@ void DflashEngine::append_context_kv_from_hiddens(const TensorPtr& hiddens, int6
 void DflashEngine::encode_and_write_context_kv(const TensorPtr& hiddens, int64_t start_pos) {
     write_context_kv(encode(hiddens), start_pos);
 }
+
+// Cost of append_context_kv, and why the obvious optimization does not exist here.
+//
+// Measured on MiniCPM5-2.6B-DSpark: ~17 ms per round, for 1-4 tokens pushed
+// through five layers (~11 matmuls, 50 MB of weight traffic). The GEMV-shaped
+// matmuls are NOT the reason, which is worth writing down because the profile
+// strongly suggests they are:
+//
+//   - prefix_len is 1-4 (verified by instrumenting this function), so the FLOPs
+//     are negligible and the traffic is ~0.3 ms at the 164 GB/s read roof.
+//   - The matmuls here are fp32 activations x bf16 weights, which
+//     matmul_transB sends to cuBLAS (BF16 has no GEMV dispatch entry; it reads
+//     nullptr in both tables). That looks like a missing fast path.
+//   - It is not. Benchmarked on the drafter's own shape (M=2, K=2048, N=10240),
+//     cuBLAS runs at 180 GB/s -- above this box's 164 GB/s read roof, the excess
+//     being L2 reuse across the timing loop's repeated calls. A hand-written
+//     bf16 GEMV written to test the hypothesis was SLOWER: 113 GB/s, 0.370 ms
+//     against cuBLAS's 0.232 ms. It was reverted.
+//   - tests/test_bf16_gemv_cuda.cu now pins the finding so the nullptr entry
+//     does not get "optimized" again.
+//
+// So the 17 ms is host-side, not device-side: encode_fc's profiled 1.09 ms is
+// about 4x the 0.232 ms its kernel actually takes, and that gap is launch and
+// dispatch latency in the ~11 ops of this path with nothing to overlap them.
+// Capturing this path in a CUDA graph is the untried lever; the decoder already
+// has one (--cuda-graph) but it does not cover the drafter's context-KV writes.
 
 void DflashEngine::precompute_context_kv(const std::vector<int32_t>& prefix_ids,
                                          int64_t start_pos) {

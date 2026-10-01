@@ -461,6 +461,15 @@ if(CUDAToolkit_FOUND)
   # production CUDA GEMV kernels (launch_gemv_q3_k_smem / launch_gemv_q2_k_q8_1)
   # against a CPU dequant golden. Used to measure the effect of bandwidth tuning
   # (e.g. the __ldg change in cuda_gemv_common.cuh). Skips without an Ada GPU.
+    # BF16 matmul bandwidth guard. BF16 has no GEMV dispatch entry, so a drafter's
+  # BF16 matmuls go through cuBLAS, and profiling made that look like an
+  # opportunity (a hand-written GEMV turned out 1.4x SLOWER -- cuBLAS already runs
+  # at ~96% of the read roof). This pins that finding so the next person who spots
+  # the nullptr entry does not spend a day rediscovering it.
+  add_executable(forge-bf16-gemv-test test_bf16_gemv_cuda.cu)
+  forge_link_native(forge-bf16-gemv-test)
+  add_test(NAME bf16-matmul-bandwidth COMMAND forge-bf16-gemv-test)
+
   add_executable(forge-q3k-gemv-bench test_q3k_gemv_cuda.cu)
   forge_link_native(forge-q3k-gemv-bench)
   add_test(NAME q3k-gemv-bench COMMAND forge-q3k-gemv-bench)
