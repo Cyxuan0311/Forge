@@ -469,8 +469,39 @@ void DflashEngine::encode_and_write_context_kv(const TensorPtr& hiddens, int64_t
 // So the 17 ms is host-side, not device-side: encode_fc's profiled 1.09 ms is
 // about 4x the 0.232 ms its kernel actually takes, and that gap is launch and
 // dispatch latency in the ~11 ops of this path with nothing to overlap them.
-// Capturing this path in a CUDA graph is the untried lever; the decoder already
-// has one (--cuda-graph) but it does not cover the drafter's context-KV writes.
+//
+// ---- The related d2h_hidden / dspark/d2h stalls are NOT recoverable either ----
+//
+// After the encoder-input round trip was taken off the host (commit 700001b), the
+// remaining per-round profile lines are dflash/d2h_hidden ~9.9 ms and
+// dspark/d2h ~0.4 ms. Both are synchronous pageable cudaMemcpys of tens of KB, and a
+// synchronous pageable copy drains the stream first -- so the numbers are how long the
+// queued GPU work took, not how long the copy took. It is tempting to read them as
+// removable transfer overhead. They are not, and the way to find that out was to
+// build the thing that supposedly removes them.
+//
+// The whole DSpark chain was moved to the device: markov_embed[prev] gather, a
+// [vocab, d] bias GEMV, add, argmax and the confidence head, structured in-graph the
+// way llama.cpp does it (src/models/dflash.cpp:292-392), with only the n finished
+// tokens and 2n confidence floats crossing back. It was differentially tested against
+// dspark_sequential_sample and produced bit-identical tokens and confidences, so the
+// port was correct. It was also slower:
+//
+//   host    d2h_hidden 9.87 + markov_sample 0.52 + d2h 0.41  = 10.8 ms per round
+//   device  dspark/device_chain                                 = 14.0 ms per round
+//
+// The single cudaMemcpyDeviceToHost still needed to get the tokens back drains the
+// stream exactly like the copies it replaced, so the same wait reappears there. There
+// is no way to avoid a synchronous read of the result: the host has to know the sampled
+// token before it can decide what to run next. That is the shape of the speculative
+// loop, not a fixable cost. The device version additionally spent 134 MB of VRAM on
+// the head ([130560, 256]) and computed the bias over the whole vocabulary where the
+// host path at the default top-k of 64 computes 64 dot products.
+//
+// So the honest reading: those profile lines are not overhead, they are the GPU being
+// busy. verify_forward is ~31 ms per round on its own, the drafter forward ~7 ms, this
+// path ~4 ms, and a round takes ~46 ms. The time attributed to the copy-back is the
+// CPU waiting for that work, and it would be spent waiting somewhere either way.
 
 void DflashEngine::precompute_context_kv(const std::vector<int32_t>& prefix_ids,
                                          int64_t start_pos) {
