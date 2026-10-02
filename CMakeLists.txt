@@ -243,9 +243,8 @@ target_link_libraries(forge_tokenizer PUBLIC forge_core)
 # Pluggable tool-call dialects + <think> reasoning separation for the server.
 # Pure host logic (nlohmann/json + std); no engine or tokenizer dependency.
 add_library(
-  forge_agent STATIC
-  src/agent/tool_dialect.cpp src/agent/reasoning_filter.cpp
-  src/agent/agent_pipeline.cpp)
+  forge_agent STATIC src/agent/tool_dialect.cpp src/agent/reasoning_filter.cpp
+                     src/agent/agent_pipeline.cpp)
 target_include_directories(
   forge_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
@@ -368,18 +367,16 @@ if(CUDAToolkit_FOUND)
 endif()
 
 # ---- forge-server (OpenAI-compatible HTTP API server) ----
-add_library(
-  forge_httplib STATIC
-  third_party/cpp-httplib/httplib.cpp third_party/cpp-httplib/httplib.h)
+add_library(forge_httplib STATIC third_party/cpp-httplib/httplib.cpp
+                                 third_party/cpp-httplib/httplib.h)
 target_include_directories(
   forge_httplib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib)
 find_package(Threads REQUIRED)
 target_link_libraries(forge_httplib PUBLIC Threads::Threads)
 
 add_executable(
-  forge-server
-  src/server/server_main.cpp src/server/server_state.cpp
-  src/server/server_routes.cpp)
+  forge-server src/server/server_main.cpp src/server/server_state.cpp
+               src/server/server_routes.cpp)
 target_include_directories(
   forge-server
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -400,8 +397,8 @@ target_link_libraries(
           forge_httplib
           $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
 if(CUDAToolkit_FOUND)
-  target_link_libraries(forge-server PRIVATE CUDA::cudart
-                                             $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
+  target_link_libraries(
+    forge-server PRIVATE CUDA::cudart $<$<BOOL:${USE_CUBLAS}>:CUDA::cublas>)
   set_target_properties(
     forge-server
     PROPERTIES CUDA_SEPARABLE_COMPILATION ON

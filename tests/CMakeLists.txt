@@ -52,9 +52,8 @@ function(forge_link_native target)
     set(group_close "-Wl,--end-group")
   endif()
   target_link_libraries(
-    ${target}
-    PRIVATE ${group_open} ${FORGE_TEST_LIBS} ${group_close}
-            $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
+    ${target} PRIVATE ${group_open} ${FORGE_TEST_LIBS} ${group_close}
+                      $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
   if(CUDAToolkit_FOUND)
     target_compile_definitions(${target} PRIVATE USE_CUDA)
     target_link_libraries(
@@ -160,8 +159,8 @@ add_test(NAME qwen35-recurrent COMMAND forge-qwen35-recurrent-test)
 add_executable(forge-gdn-reference-test test_gdn_reference.cpp)
 forge_link_native(forge-gdn-reference-test)
 target_include_directories(
-  forge-gdn-reference-test
-  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+  forge-gdn-reference-test PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                   ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME gdn-reference COMMAND forge-gdn-reference-test)
 
 # Depthwise causal conv1d reference cross-check (sliding-window tap order + the
@@ -170,8 +169,8 @@ add_test(NAME gdn-reference COMMAND forge-gdn-reference-test)
 add_executable(forge-conv1d-reference-test test_conv1d_reference.cpp)
 forge_link_native(forge-conv1d-reference-test)
 target_include_directories(
-  forge-conv1d-reference-test
-  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+  forge-conv1d-reference-test PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                      ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME conv1d-reference COMMAND forge-conv1d-reference-test)
 
 # IQ-family dequant row functions vs llama.cpp scalar reference: pins the
@@ -180,8 +179,8 @@ add_test(NAME conv1d-reference COMMAND forge-conv1d-reference-test)
 add_executable(forge-dequant-reference-test test_dequant_reference.cpp)
 forge_link_native(forge-dequant-reference-test)
 target_include_directories(
-  forge-dequant-reference-test
-  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+  forge-dequant-reference-test PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                       ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME dequant-reference COMMAND forge-dequant-reference-test)
 
 # Roadmap 2.5: prefill whole-segment quantized write (requires CUDA).
@@ -203,8 +202,8 @@ else()
   set(group_close "-Wl,--end-group")
 endif()
 target_link_libraries(
-  forge-inspect-scanner-test
-  PRIVATE ${group_open} forge_inspect ${FORGE_TEST_LIBS} ${group_close})
+  forge-inspect-scanner-test PRIVATE ${group_open} forge_inspect
+                                     ${FORGE_TEST_LIBS} ${group_close})
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge-inspect-scanner-test PRIVATE USE_CUDA)
   target_link_libraries(forge-inspect-scanner-test PRIVATE CUDA::cudart)
@@ -240,13 +239,12 @@ add_test(NAME dtype-contract COMMAND forge-dtype-contract-test)
 # build (same pattern as dtype-contract above).
 add_executable(
   forge-tool-dialects-test
-  test_tool_dialects.cpp
-  ${PROJECT_SOURCE_DIR}/src/agent/tool_dialect.cpp
+  test_tool_dialects.cpp ${PROJECT_SOURCE_DIR}/src/agent/tool_dialect.cpp
   ${PROJECT_SOURCE_DIR}/src/agent/reasoning_filter.cpp
   ${PROJECT_SOURCE_DIR}/src/agent/agent_pipeline.cpp)
 target_include_directories(
-  forge-tool-dialects-test
-  PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
+  forge-tool-dialects-test PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                   ${PROJECT_SOURCE_DIR}/third_party)
 add_test(NAME tool-dialects COMMAND forge-tool-dialects-test)
 
 # Q3_K MMQ decode bisect -- a host-only mechanical debugging tool (not a
@@ -461,7 +459,7 @@ if(CUDAToolkit_FOUND)
   # production CUDA GEMV kernels (launch_gemv_q3_k_smem / launch_gemv_q2_k_q8_1)
   # against a CPU dequant golden. Used to measure the effect of bandwidth tuning
   # (e.g. the __ldg change in cuda_gemv_common.cuh). Skips without an Ada GPU.
-    # BF16 matmul bandwidth guard. BF16 has no GEMV dispatch entry, so a drafter's
+  # BF16 matmul bandwidth guard. BF16 has no GEMV dispatch entry, so a drafter's
   # BF16 matmuls go through cuBLAS, and profiling made that look like an
   # opportunity (a hand-written GEMV turned out 1.4x SLOWER -- cuBLAS already runs
   # at ~96% of the read roof). This pins that finding so the next person who spots
@@ -565,8 +563,15 @@ if(FORGE_BUILD_BENCHMARKS)
   # OpenMP (omp_set_num_threads / omp_get_wtime), so the OpenMP runtime must be
   # linked in -- it is not part of the ordinary test link interface.
   find_package(OpenMP)
-  foreach(bench IN ITEMS ffn_q2k moe_multigemv moe_real output_proj_q6k
-                         prefill_gemm cpu_decode dspark_gemm)
+  foreach(
+    bench IN
+    ITEMS ffn_q2k
+          moe_multigemv
+          moe_real
+          output_proj_q6k
+          prefill_gemm
+          cpu_decode
+          dspark_gemm)
     add_executable(forge-bench-${bench} bench_${bench}.cpp)
     # bench_cpu_decode.cpp includes arch headers by repo-relative path
     # ("src/operators/cpu/arch/x86/fused.h"); give it the source root.
