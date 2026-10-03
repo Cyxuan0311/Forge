@@ -693,6 +693,30 @@ bool PagedKVStorage::write_kv_seq(int layer, int seq_id, int64_t pos, int seq_le
 
     auto& table = seq_tables_[seq_id][layer];
 
+    // seq_window_archive_page releases a page's buffers and keeps the
+    // slot->page mapping intact, so a write that lands on an archived slot (a
+    // KVMem clip re-forwards the sink and tail over exactly those slots) must
+    // bring the page's storage back first -- writing through the mapping would
+    // otherwise dereference released memory. The restored bytes are immediately
+    // overwritten; this only re-arms the allocation the row writes go through.
+    {
+        const int64_t first_page = pos / page_size_;
+        const int64_t last_page = (pos + seq_len - 1) / page_size_;
+        for (int64_t p = first_page; p <= last_page; ++p) {
+            if (p >= static_cast<int64_t>(table.page_ids.size()))
+                break;
+            const int page_id = table.page_ids[p];
+            if (page_id >= 0 && layer_pages_[layer][page_id].evicted &&
+                !bring_back_unlocked(layer, page_id)) {
+                LOG_ERROR("PagedKVStorage::write_kv_seq: failed to bring back "
+                          "archived page " + std::to_string(page_id) +
+                          " for seq=" + std::to_string(seq_id) +
+                          " layer=" + std::to_string(layer));
+                return false;
+            }
+        }
+    }
+
     // ---- CUDA scatter path (Phase 4) ----
     // k_data/v_data are device FP32 pointers; the kernel writes directly into
     // pages and quantizes in-place. No host staging.
@@ -813,11 +837,17 @@ TensorPtr PagedKVStorage::read_key(int layer) const {
         if (layer >= (int)tables.size())
             continue;
         const auto& table = tables[layer];
-        for (int p = 0; p < (int)table.page_ids.size(); ++p) {
+        // Bound the walk by logical_len: page_ids can cover more pages than the
+        // visible length (a KVMem clip shrinks logical_len while archived pages
+        // stay in the slot map), and materialising rows past the end would
+        // overrun the output tensor -- heap corruption, not just stale data.
+        int64_t remaining = table.logical_len;
+        for (int p = 0; p < (int)table.page_ids.size() && remaining > 0; ++p) {
             int page_id = table.page_ids[p];
             const auto& page = layer_pages_[layer][page_id];
-            int rows_in_page =
-                (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
+            const int rows_in_page =
+                static_cast<int>(std::min<int64_t>(page_size_, remaining));
+            remaining -= rows_in_page;
             for (int r = 0; r < rows_in_page; ++r) {
                 if (kv_config_.type_k == KVCacheDType::FP32) {
                     const float* src = page.key.fp32_row(r);
@@ -867,11 +897,17 @@ TensorPtr PagedKVStorage::read_value(int layer) const {
         if (layer >= (int)tables.size())
             continue;
         const auto& table = tables[layer];
-        for (int p = 0; p < (int)table.page_ids.size(); ++p) {
+        // Bound the walk by logical_len: page_ids can cover more pages than the
+        // visible length (a KVMem clip shrinks logical_len while archived pages
+        // stay in the slot map), and materialising rows past the end would
+        // overrun the output tensor -- heap corruption, not just stale data.
+        int64_t remaining = table.logical_len;
+        for (int p = 0; p < (int)table.page_ids.size() && remaining > 0; ++p) {
             int page_id = table.page_ids[p];
             const auto& page = layer_pages_[layer][page_id];
-            int rows_in_page =
-                (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
+            const int rows_in_page =
+                static_cast<int>(std::min<int64_t>(page_size_, remaining));
+            remaining -= rows_in_page;
             for (int r = 0; r < rows_in_page; ++r) {
                 if (kv_config_.type_v == KVCacheDType::FP32) {
                     const float* src = page.value.fp32_row(r);
@@ -937,11 +973,17 @@ TensorPtr PagedKVStorage::read_key_seq(int layer, int seq_id) const {
     float* dst = static_cast<float*>(out->data());
 
     int row = 0;
-    for (int p = 0; p < (int)table.page_ids.size(); ++p) {
+    // Bound the walk by logical_len: page_ids can cover more pages than the
+    // visible length (a KVMem clip shrinks logical_len while archived pages
+    // stay in the slot map), and materialising rows past the end would
+    // overrun the output tensor -- heap corruption, not just stale data.
+    int64_t remaining = table.logical_len;
+    for (int p = 0; p < (int)table.page_ids.size() && remaining > 0; ++p) {
         int page_id = table.page_ids[p];
         const auto& page = layer_pages_[layer][page_id];
-        int rows_in_page =
-            (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
+        const int rows_in_page =
+            static_cast<int>(std::min<int64_t>(page_size_, remaining));
+        remaining -= rows_in_page;
         for (int r = 0; r < rows_in_page; ++r) {
             if (kv_config_.type_k == KVCacheDType::FP32) {
                 const float* src = page.key.fp32_row(r);
@@ -988,11 +1030,17 @@ TensorPtr PagedKVStorage::read_value_seq(int layer, int seq_id) const {
     float* dst = static_cast<float*>(out->data());
 
     int row = 0;
-    for (int p = 0; p < (int)table.page_ids.size(); ++p) {
+    // Bound the walk by logical_len: page_ids can cover more pages than the
+    // visible length (a KVMem clip shrinks logical_len while archived pages
+    // stay in the slot map), and materialising rows past the end would
+    // overrun the output tensor -- heap corruption, not just stale data.
+    int64_t remaining = table.logical_len;
+    for (int p = 0; p < (int)table.page_ids.size() && remaining > 0; ++p) {
         int page_id = table.page_ids[p];
         const auto& page = layer_pages_[layer][page_id];
-        int rows_in_page =
-            (p == (int)table.page_ids.size() - 1) ? table.filled_in_last : page_size_;
+        const int rows_in_page =
+            static_cast<int>(std::min<int64_t>(page_size_, remaining));
+        remaining -= rows_in_page;
         for (int r = 0; r < rows_in_page; ++r) {
             if (kv_config_.type_v == KVCacheDType::FP32) {
                 const float* src = page.value.fp32_row(r);

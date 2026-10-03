@@ -131,8 +131,10 @@ struct KVemTurnPlan {
     //   sink_reuse    sink slots still resident from the previous turn (no forward)
     //   sink_forward  sink slots to (re)forward into slots [sink_reuse, ...) from
     //                 prompt[0, sink_reuse+sink_forward)
-    //   new_to_compute the tail, written at slot sink_reuse + sink_forward
-    //   tail_base     logical position of the first tail slot
+    //   new_to_compute the tail tokens, written at slots [tail_slot_start, ...)
+    //   tail_base     logical position of the first forwarded tail token; the
+    //                 resident (reused) tail keeps the logical positions it was
+    //                 written with
     //
     // With both sink counters at 0 the window is one contiguous run and the layout
     // is exactly the un-sunk one, so prompts that fit are unaffected.
@@ -148,7 +150,7 @@ struct KVemTurnPlan {
     // the turn that builds it; carried over unchanged on later turns). Needed by
     // the caller to turn a window slot into a logical position:
     //   slot <  sink_slots -> logical = slot
-    //   slot >= sink_slots -> logical = tail_base + (slot - sink_slots)
+    //   slot >= sink_slots -> logical = tail_base + (slot - tail_slot_start)
     int64_t sink_slots = 0;
     // rope_pos_offset to use for a forward that writes *tail* slots. RoPE must
     // see the logical position, not the slot, so that the distance between the

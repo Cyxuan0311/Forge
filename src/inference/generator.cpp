@@ -179,29 +179,33 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     // point. Tiered mode has no contiguous KVCache to roll back, and the working
     // set only reports its own planned length -- which does not by itself shrink
     // the storage's. Hence the explicit seq_set_logical_len below.
-    if (prefix_len > 0) {
-        if (!tiered) {
+    if (!tiered) {
+        if (prefix_len > 0) {
             if (auto* kv = engine->kv_cache()) {
                 kv->rollback(prefix_len);
             }
-        } else if (auto* kv_mem = engine->kv_memory()) {
-            // Tiered: KVCache::rollback is contiguous-only, and write_kv_seq only
-            // ever grows logical_len, so without an explicit shrink the rows this
-            // turn is about to overwrite stay visible to seq_filled() -- and decode
-            // attends to everything below total_len with no mask. Pull the length
-            // back to the resident prefix so the prefill re-grows it to exactly
-            // new_window_len. Shrinking never drops pages, so a subsequent
-            // head-clip that needs the room can still grow again.
-            const bool shrank = kv_mem->storage().seq_set_logical_len(0, prefix_len);
-            if (!shrank) {
-                LOG_WARN("KVMem: could not shrink seq 0 logical length to " +
-                         std::to_string(prefix_len) +
-                         " -- stale KV rows from the previous turn stay visible to "
-                         "decode until this prefill overwrites them");
-            }
+        } else if (config.reset_kv_cache) {
+            ctx_.reset_kv_cache();
         }
-    } else if (!tiered && config.reset_kv_cache) {
-        ctx_.reset_kv_cache();
+    } else if (auto* kv_mem = engine->kv_memory()) {
+        // Tiered: KVCache::rollback is contiguous-only, and write_kv_seq only
+        // ever grows logical_len, so without an explicit shrink the rows this
+        // turn is about to overwrite stay visible to seq_filled() -- and decode
+        // attends to everything below total_len with no mask. Pull the length
+        // back to the resident prefix so the prefill re-grows it to exactly
+        // new_window_len. This must also run when prefix_len == 0: a clipped
+        // turn archives the whole resident window off-device while the storage
+        // keeps the old length, so attention would read released buffers.
+        // Shrinking never drops pages, so a subsequent head-clip that needs the
+        // room can still grow again.
+        const int64_t cur = kv_mem->storage().seq_window_len(0, 0);
+        if (cur > prefix_len &&
+            !kv_mem->storage().seq_set_logical_len(0, prefix_len)) {
+            LOG_WARN("KVMem: could not shrink seq 0 logical length to " +
+                     std::to_string(prefix_len) +
+                     " -- stale KV rows from the previous turn stay visible to "
+                     "decode until this prefill overwrites them");
+        }
     }
 
     // ---- Prefill phase ----

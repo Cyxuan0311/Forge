@@ -110,7 +110,13 @@ KVemTurnPlan KVWorkingSetManager::on_prompt(const std::vector<int32_t>& prompt, 
         const int64_t lp = logical_at(prev_slots - 1);
         return lp < 0 ? tail_base : lp + 1;
     };
-    int64_t tail_src = (tail_keep > 0) ? next_logical(match) : tail_base;
+    // Divergence inside the pinned sink: the sink re-forward covers prompt
+    // [sink_reuse, sink_slots), so the tail's prompt-side start is the sink's
+    // end. tail_base would point at the OLD tail's logical start and silently
+    // skip every prompt token in [sink_slots, tail_base) -- the model would
+    // answer from a window that never saw most of the new turn.
+    int64_t tail_src = (tail_keep > 0) ? next_logical(match)
+                     : (sink_forward > 0 ? sink_reuse + sink_forward : tail_base);
     if (tail_src < 0)
         tail_src = 0;
     if (tail_src > prompt_len)
@@ -304,16 +310,21 @@ KVemTurnPlan KVWorkingSetManager::on_prompt(const std::vector<int32_t>& prompt, 
     segs_ = std::move(next);
 
     plan.sink_slots = plan.sink_forward;
-    plan.tail_base = tail_base;
+    // The fresh tail's logical base is tail_src, not the resident tail's base:
+    // on an unclipped multi-turn turn the resident tail still starts at logical
+    // 0 while the divergence -- and the fresh tail -- sit at the match point.
+    // The two only coincide on a clipped turn. plan.tail_base therefore carries
+    // the *forwarded* tail's base, which is what the rope offset derives from.
+    plan.tail_base = tail_src;
     // A forward writing tail slots needs this shift so RoPE lands on the logical
     // position: slot + tail_rope_offset == logical_of_slot(slot).
     int64_t sink_slots_final = 0;
     for (const auto& s : segs_)
         if (s.kind == WindowSeg::Kind::Sink)
             sink_slots_final = s.slot_len;
-    plan.tail_rope_offset = tail_base - plan.tail_slot_start;
+    plan.tail_rope_offset = tail_src - plan.tail_slot_start;
     plan.new_window_len = cursor;
-    plan.new_rope_off = tail_base;
+    plan.new_rope_off = tail_src;
     plan.max_generate = std::max<int64_t>(0, budget_ - plan.new_window_len);
 
     if (plan.new_window_len > budget_) {
@@ -363,7 +374,7 @@ KVemTurnPlan KVWorkingSetManager::on_prompt(const std::vector<int32_t>& prompt, 
              " sink=" + std::to_string(plan.sink_slots) + "(reuse " +
              std::to_string(plan.sink_reuse) + ", fwd " + std::to_string(plan.sink_forward) +
              ") recalled=" + std::to_string(stats_.recalled_pages) + " tail_base=" +
-             std::to_string(tail_base) + " tail_slot=" + std::to_string(plan.tail_slot_start) +
+             std::to_string(plan.tail_base) + " tail_slot=" + std::to_string(plan.tail_slot_start) +
              " keep_window=" + std::to_string(plan.kept_window_len) + " compute=" +
              std::to_string(plan.new_to_compute.size()) + " window=" +
              std::to_string(plan.new_window_len) + "/" + std::to_string(budget_) +

@@ -140,6 +140,18 @@ void test_prefix_reuse_across_turns() {
     p3.push_back(4242);
     const KVemTurnPlan c = mgr.on_prompt(p3, 32);
     check(c.kept_window_len == 101, "turn 3 reuses 101 slots");
+
+    // Regression: with no dropped head the fresh tail's logical base is the
+    // match point, so slot + tail_rope_offset must land on the token's true
+    // position in the prompt. Deriving the offset from the *resident* tail's
+    // base (0 here) instead duplicated positions [0, tail_len) over the reused
+    // prefix and garbled every turn after the first.
+    check(b.tail_rope_offset == 0, "turn 2 rope offset is 0 without a dropped head");
+    check(c.tail_rope_offset == 0, "turn 3 rope offset is 0 without a dropped head");
+    check(b.tail_slot_start + b.tail_rope_offset == 100,
+          "turn 2 tail forward starts at logical 100");
+    check(c.tail_slot_start + c.tail_rope_offset == 101,
+          "turn 3 tail forward starts at logical 101");
 }
 
 void test_divergence_inside_sink_refills_sink() {
@@ -338,6 +350,11 @@ void test_generated_tokens_folded_into_history() {
     // The whole point: only the new question needs a forward.
     check(static_cast<int64_t>(t2.new_to_compute.size()) == 20,
           "turn 2 forwards only the new question, not the reply");
+    // The forwarded tail must start at the prompt's logical position 48 (40
+    // prompt + 8 reply), not at the resident tail's base -- otherwise the new
+    // question's RoPE positions overlap the reused prefix.
+    check(t2.tail_slot_start + t2.tail_rope_offset == 48,
+          "turn 2 tail forward starts at logical 48");
     (void)before;
 }
 
