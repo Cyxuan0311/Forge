@@ -77,6 +77,13 @@ add_executable(forge-args-test test_args.cpp)
 forge_link_native(forge-args-test)
 add_test(NAME args COMMAND forge-args-test)
 
+# Server-side per-session state: seq allocation, per-session token mirrors and
+# LRU eviction, so two conversations cannot clobber each other's KV prefix.
+# Host-only.
+add_executable(forge-server-session-test test_server_session_state.cpp)
+forge_link_native(forge-server-session-test)
+add_test(NAME server-session COMMAND forge-server-session-test)
+
 # Mixed-dtype fused attention (-ctk/-ctv): every (K,V) format pair the selector
 # can route to the mixed kernel, checked against a CPU FP32 reference computed
 # from the dequantized rows. Guards the per-head byte offsets (the two sides

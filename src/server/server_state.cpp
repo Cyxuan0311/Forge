@@ -711,8 +711,24 @@ ChatCompletionResult ServerState::chat_completion(
     //    This mirrors vLLM's free(request) + per-block ref_count eviction.
     int prefix_len = 0;
     const bool paged_mode = (ctx_->params().kv_storage_mode == KVStorageMode::Paged);
+    // Per-session state: which seq_id this conversation's working set lives in,
+    // and the token mirror the contiguous backend compares against. A request
+    // without session_id lands on the default session, which is seq 0 -- exactly
+    // what every request used before sessions existed, so old clients behave
+    // identically.
+    SessionState& sess = acquire_session(req.session_id);
+    const int sess_seq = sess.seq_id;
+    // The contiguous mirror is per session, so a second conversation cannot
+    // shorten the prefix the first one is about to match against.
+    std::vector<int32_t>& cached_kv_tokens = sess.kv_tokens;
     if (paged_mode && tiered) {
         // ---- KVMem turn boundary ----
+        // The working set is a single-conversation policy object bound to seq 0,
+        // so try_acquire_slot() caps admission at one request while it is
+        // attached: only the default session can make progress here, and a second
+        // conversation would interleave prompts through one on_prompt() state.
+        // Per-session KVMem needs one manager per session -- follow-up work.
+        //
         // seq 0's resident window IS the conversation state, tracked by the
         // working-set manager across turns. Releasing it, or sharing its pages
         // into radix cache seq_ids, would invalidate the window layout that
@@ -732,9 +748,9 @@ ChatCompletionResult ServerState::chat_completion(
             // a request finishes; the server path must do it here — otherwise
             // the matched node keeps ref_count >= 1 forever and its pages can
             // never be evicted.
-            prefix_cache_.release_prefix(0, km->storage());
-            km->storage().release(0);
-            prefix_len = prefix_cache_.try_lookup(prompt_ids, 0, km->storage());
+            prefix_cache_.release_prefix(sess_seq, km->storage());
+            km->storage().release(sess_seq);
+            prefix_len = prefix_cache_.try_lookup(prompt_ids, sess_seq, km->storage());
             // vLLM-style on-demand eviction before prefill. Cached prefixes
             // hold pages after register_prefix(); a new sequence needs
             // ceil((prompt_tail + gen_budget) / page_size) fresh pages in every
@@ -778,10 +794,10 @@ ChatCompletionResult ServerState::chat_completion(
         gen_cfg.reset_kv_cache = false;
     } else {
         // Contiguous single-entry mirror (behavior unchanged).
-        if (!cached_kv_tokens_.empty()) {
-            const size_t lim = std::min(cached_kv_tokens_.size(), prompt_ids.size());
+        if (!cached_kv_tokens.empty()) {
+            const size_t lim = std::min(cached_kv_tokens.size(), prompt_ids.size());
             size_t m = 0;
-            while (m < lim && cached_kv_tokens_[m] == prompt_ids[m]) {
+            while (m < lim && cached_kv_tokens[m] == prompt_ids[m]) {
                 ++m;
             }
             prefix_len = static_cast<int>(m);
@@ -791,7 +807,7 @@ ChatCompletionResult ServerState::chat_completion(
         if (prefix_len == 0) {
             // generate() resets the KV cache on this path; keep the mirror honest
             // so a later request cannot reuse rows that no longer exist.
-            cached_kv_tokens_.clear();
+            cached_kv_tokens.clear();
         }
     }
     if (opt_.log_prompt_prefix) {
@@ -832,10 +848,10 @@ ChatCompletionResult ServerState::chat_completion(
         // request for the next turn's plan to match against.
         if (paged_mode && !tiered) {
             if (auto* km = ctx_->engine()->kv_memory()) {
-                km->storage().release(0);
+                km->storage().release(sess_seq);
             }
         }
-        cached_kv_tokens_.clear();
+        cached_kv_tokens.clear();
         throw;
     }
 
@@ -860,17 +876,17 @@ ChatCompletionResult ServerState::chat_completion(
                 std::vector<int32_t> resident(prompt_ids);
                 resident.insert(resident.end(), result.token_ids.begin(),
                                 result.token_ids.end());
-                prefix_cache_.register_prefix(resident, 0, km->storage());
+                prefix_cache_.register_prefix(resident, sess_seq, km->storage());
                 prefix_cache_.evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
             }
         }
     } else {
         // Contiguous single-entry mirror.
-        cached_kv_tokens_ = prompt_ids;
-        cached_kv_tokens_.insert(cached_kv_tokens_.end(), result.token_ids.begin(),
+        cached_kv_tokens = prompt_ids;
+        cached_kv_tokens.insert(cached_kv_tokens.end(), result.token_ids.begin(),
                                  result.token_ids.end());
-        if (static_cast<int>(cached_kv_tokens_.size()) + gen_budget > kv_capacity) {
-            cached_kv_tokens_.clear();
+        if (static_cast<int>(cached_kv_tokens.size()) + gen_budget > kv_capacity) {
+            cached_kv_tokens.clear();
         }
     }
 
@@ -1018,6 +1034,70 @@ ChatCompletionResult ServerState::chat_completion(
 // ============================================================================
 // Admission control
 // ============================================================================
+
+// ============================================================================
+// Session state
+// ============================================================================
+namespace {
+// Session working-set seq ids start well above PrefixCache::CACHE_SEQ_ID_BASE
+// (1e6) and its successors, so the two allocators can never hand out the same id.
+constexpr int kSessionSeqBase = 1;
+}  // namespace
+
+ServerState::SessionState& ServerState::acquire_session(const std::string& session_id) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+
+    auto it = sessions_.find(session_id);
+    if (it != sessions_.end()) {
+        it->second.last_active_ms = now;
+        ++it->second.use_count;
+        return it->second;
+    }
+
+    // Full: retire the least-recently-used session. Without this, a client that
+    // sends a fresh id per request (or an attacker) would pin every page in the
+    // pool, since each session's working set holds pages until it is released.
+    if (static_cast<int>(sessions_.size()) >= kMaxSessions) {
+        std::string victim;
+        int64_t oldest = now;
+        bool have = false;
+        for (const auto& kv : sessions_) {
+            if (!have || kv.second.last_active_ms < oldest) {
+                oldest = kv.second.last_active_ms;
+                victim = kv.first;
+                have = true;
+            }
+        }
+        if (have) {
+            drop_session(victim, /*release_kv=*/true);
+        }
+    }
+
+    SessionState st;
+    // seq 0 is reserved for the default session so that a request without a
+    // session_id keeps hitting exactly the pages it did before sessions existed.
+    st.seq_id = session_id.empty() ? 0
+                                   : kSessionSeqBase + static_cast<int>(next_session_seq_++);
+    st.last_active_ms = now;
+    st.use_count = 1;
+    auto res = sessions_.emplace(session_id, std::move(st));
+    return res.first->second;
+}
+
+void ServerState::drop_session(const std::string& session_id, bool release_kv) {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end())
+        return;
+    if (release_kv) {
+        if (auto* eng = ctx_ ? ctx_->engine() : nullptr) {
+            if (auto* mem = eng->kv_memory())
+                mem->release(it->second.seq_id);
+        }
+    }
+    sessions_.erase(it);
+}
 
 bool ServerState::tiered_kv_active() const {
     const InferenceContext* ctx = ctx_.get();

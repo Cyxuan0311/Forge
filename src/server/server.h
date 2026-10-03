@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "forge/agent/agent_pipeline.h"
@@ -93,6 +94,10 @@ struct ServerOptions {
 
 struct ChatCompletionRequest {
     std::vector<ChatTemplateMessage> messages;
+    // Optional conversation key. Requests sharing a session reuse each other's KV
+    // prefix and token mirror, so a multi-turn chat only prefills its tail.
+    // Absent/empty means the single default session -- the historical behaviour.
+    std::string session_id;
     // Defaults are anti-degeneration engineering choices (repeat penalty etc.),
     // not OpenAI's bare defaults - small models (e.g. 1.1B) loop indefinitely
     // without them. Explicit request fields still override these.
@@ -152,10 +157,52 @@ public:
 /// Returns false when max_inflight requests are already queued.
 bool try_acquire_slot();
 
+// ---- Per-session state ----
+// The KV cache is a single shared resource, so before sessions every request
+// addressed seq 0 and reused one token mirror: two interleaved conversations
+// overwrote each other's prefix and the next turn re-prefilled from scratch.
+// A session owns a seq_id plus its own mirror, so conversations stop stepping on
+// each other.
+//
+// session_id is optional in the request. Absent (or empty) means the default
+// session, which is exactly the old single-slot behaviour -- existing clients are
+// unaffected.
+struct SessionState {
+    // Working-set seq. Allocated from a range above the radix cache's cache
+    // seq_ids so the two allocators cannot collide.
+    int seq_id = 0;
+    // Tokens this session has resident: prompt + generated. The prefix-reuse
+    // mirror for the contiguous backend.
+    std::vector<int32_t> kv_tokens;
+    // Tokens fed into the working set's logical history (KVMem path), kept in
+    // step with kv_tokens so a session can be restored or inspected.
+    int64_t last_active_ms = 0;
+    uint64_t use_count = 0;
+};
+
+// Maximum retained sessions. Beyond this the least-recently-used one has its seq
+// released, so a long tail of distinct ids cannot pin the whole page pool.
+static constexpr int kMaxSessions = 32;
+
+/// Resolve (creating on first use) the state for `session_id`, evicting the
+/// least-recently-used session if the table is full. Empty `session_id` maps to
+/// the default session, preserving the pre-session single-slot behaviour.
+SessionState& acquire_session(const std::string& session_id);
+
+/// Drop a session and release its KV working set. Called on eviction and on
+/// request failure.
+void drop_session(const std::string& session_id, bool release_kv);
+
+/// Number of live sessions (diagnostics/tests).
+int session_count() const { return static_cast<int>(sessions_.size()); }
+
 /// True when the KVMem tiered working set is active. It owns seq 0's slot layout
 /// with process-wide state (logical_hist_, archived_chunks_), so it serves one
 /// conversation at a time regardless of max_inflight -- see try_acquire_slot().
 bool tiered_kv_active() const;
+
+/// Default session id used when a request does not carry one.
+static const char* default_session_id() { return ""; }
     void release_slot();
 
 private:
@@ -169,13 +216,16 @@ private:
     std::string model_id_;
     std::atomic<int> active_requests_{0};
 
-    // ---- Session prefix reuse ----
-    // Token ids currently resident in the KV cache: the previous request's
-    // prompt plus the tokens it generated. Chat front-ends (opencode, ...)
-    // resend the whole conversation every turn, so the next prompt usually
-    // starts with exactly these ids and only the tail has to be prefilled.
+
+
+// Session token mirrors live in SessionState::kv_tokens (see acquire_session()).
+
+    // Live sessions, keyed by the request's session_id ("" = default session).
     // Guarded by inference_mutex_.
-    std::vector<int32_t> cached_kv_tokens_;
+    std::unordered_map<std::string, SessionState> sessions_;
+    int next_session_seq_ = 0;
+
+
 
     // ---- Paged-mode radix prefix cache ----
     // Mirrors the RequestScheduler's page-level prefix sharing. Each request's

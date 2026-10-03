@@ -147,6 +147,10 @@ bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRe
         out.messages.push_back(std::move(msg));
     }
 
+    // Optional conversation key. Absent -> the default session, i.e. exactly the
+    // pre-session single-slot behaviour, so existing clients are unaffected.
+    if (body.contains("session_id") && body["session_id"].is_string())
+        out.session_id = body["session_id"].get<std::string>();
     if (body.contains("temperature") && body["temperature"].is_number())
         out.temperature = body["temperature"].get<float>();
     if (body.contains("top_p") && body["top_p"].is_number())
@@ -514,6 +518,10 @@ bool parse_responses_request(const httplib::Request& http_req,
         return false;
     }
 
+    // Optional conversation key. Absent -> the default session, i.e. exactly the
+    // pre-session single-slot behaviour, so existing clients are unaffected.
+    if (body.contains("session_id") && body["session_id"].is_string())
+        out.session_id = body["session_id"].get<std::string>();
     if (body.contains("temperature") && body["temperature"].is_number())
         out.temperature = body["temperature"].get<float>();
     if (body.contains("top_p") && body["top_p"].is_number())
