@@ -12,6 +12,7 @@
  *   forge-cli -m model.gguf --info             # Model info
  */
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -452,7 +453,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    Logger::instance().set_level(static_cast<LogLevel>(args.verbose));
+    // LogLevel is NONE=0, LOG_ERROR=1, WARN=2, INFO=3, ... so casting the raw -v
+    // count shifted everything by one: no -v meant NONE (everything silenced,
+    // including WARN) and -v only reached LOG_ERROR. Offset by one so -v 0 is
+    // ERROR, -v 1 is WARN, and so on. WARN is where the operational warnings
+    // live (KV truncation, dtype fallbacks), and they must be reachable.
+    Logger::instance().set_level(
+        static_cast<LogLevel>(std::min<int>(args.verbose + 1,
+                                           static_cast<int>(LogLevel::TRACE))));
 
     ensure_engines_registered();
     ensure_loaders_registered();
@@ -714,6 +722,9 @@ int main(int argc, char** argv) {
                       << "  logical ctx=" << kv_mem->max_seq_len()
                       << " tokens, gpu pool=" << pool_tokens
                       << " tokens, page=" << page_size << "\n";
+            // Hand the manager its storage so clipped pages can be offloaded to the
+            // host pool and (with FORGE_KVMEM_RECALL) pulled back by relevance.
+            ws->attach_storage(&kv_mem->storage(), kv_mem->storage().num_layers(), 0);
             kv_mem->set_working_set(std::move(ws));
         }
     }
