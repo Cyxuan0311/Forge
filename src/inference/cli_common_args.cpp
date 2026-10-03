@@ -242,10 +242,19 @@ ParseResult parse_common_arg(const std::string& arg, int argc, char** argv, int&
         b = &out.paged_kv;
     else if (arg == "--cuda-graph")
         b = &out.cuda_graph;
-    else if (arg == "--kvmem")
-        b = &out.kvmem;
-    else if (arg == "-rkq" || arg == "--rope-k-quant" || arg == "-nrkq" ||
-             arg == "--no-rope-k-quant")
+    else if (arg == "--kvmem") {
+        // --kvmem implies --paged-kv: the tiered working set caps the page pool
+        // and lets the logical context exceed it, so it is meaningless (and was
+        // silently reduced to a no-op) on contiguous storage. This has to happen
+        // at parse time, not in apply_common_args, because the storage object is
+        // already constructed by the time args are applied -- KVMemory::is_paged()
+        // reads the live storage, not params. forge-cli set this in its own
+        // parser; forge-server only comes through here, hence the fix.
+        out.paged_kv = true;
+        return parse_bool_flag(arg, out.kvmem) == ParseResult::Ok ? ParseResult::Ok
+                                                                 : ParseResult::Error;
+    } else if (arg == "-rkq" || arg == "--rope-k-quant" || arg == "-nrkq" ||
+               arg == "--no-rope-k-quant")
         b = &out.rope_k_quant;
     else if (arg == "--offload-embedding" || arg == "--no-offload-embedding")
         b = &out.offload_embedding;
@@ -285,7 +294,14 @@ bool apply_common_args(const CommonArgs& a, Model* model, InferenceContext& ctx,
 
     params.offload_kqv = a.offload_kqv;
     params.offload_embedding = a.offload_embedding;
-    params.kv_storage_mode = a.paged_kv ? KVStorageMode::Paged : KVStorageMode::Contiguous;
+    // --kvmem implies --paged-kv, exactly as the help text states: the tiered
+    // working set caps the page pool and lets the logical context exceed it.
+    // forge-cli set this in its own parser, but forge-server only comes through
+    // this shared parser -- without it --kvmem silently degraded to a no-op with
+    // "tiered KV disabled". Decided here, at the single consumption point, so
+    // neither entry point can be missed.
+    const bool paged = a.paged_kv || a.kvmem;
+    params.kv_storage_mode = paged ? KVStorageMode::Paged : KVStorageMode::Contiguous;
 
     if (!engine) return true;
 
