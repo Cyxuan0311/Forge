@@ -1019,9 +1019,28 @@ ChatCompletionResult ServerState::chat_completion(
 // Admission control
 // ============================================================================
 
+bool ServerState::tiered_kv_active() const {
+    const InferenceContext* ctx = ctx_.get();
+    if (!ctx)
+        return false;
+    const InferenceEngine* eng = ctx->engine();
+    if (!eng)
+        return false;
+    const KVMemory* mem = eng->kv_memory();
+    return mem != nullptr && mem->working_set() != nullptr;
+}
+
 bool ServerState::try_acquire_slot() {
     int cur = active_requests_.load(std::memory_order_relaxed);
-    const int cap = opt_.max_inflight > 0 ? opt_.max_inflight : 1;
+    int cap = opt_.max_inflight > 0 ? opt_.max_inflight : 1;
+    // KVMem's working set is a single-conversation policy object: logical_hist_,
+    // the segment table and archived_chunks_ are per-instance, not per-seq, and
+    // the class documents itself as "not thread-safe: one conversation at a time".
+    // The whole engine is already serialised by inference_mutex_, but queueing two
+    // requests would still interleave their prompts through one on_prompt() state
+    // and silently corrupt the window layout. Admit exactly one.
+    if (tiered_kv_active())
+        cap = 1;
     while (cur < cap) {
         if (active_requests_.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
             return true;

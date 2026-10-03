@@ -149,8 +149,13 @@ public:
     const std::string& model_id() const { return model_id_; }
 
     // ---- Admission control (queue-full -> 429) ----
-    /// Returns false when max_inflight requests are already queued.
-    bool try_acquire_slot();
+/// Returns false when max_inflight requests are already queued.
+bool try_acquire_slot();
+
+/// True when the KVMem tiered working set is active. It owns seq 0's slot layout
+/// with process-wide state (logical_hist_, archived_chunks_), so it serves one
+/// conversation at a time regardless of max_inflight -- see try_acquire_slot().
+bool tiered_kv_active() const;
     void release_slot();
 
 private:

@@ -258,8 +258,20 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
 
     // Admission control: reject when the inference queue is full.
     if (!state.try_acquire_slot()) {
-        send_error(res, 429, "Server is busy: inference queue is full, retry later.",
-                   "server_error", "429");
+        // Under KVMem the queue is capped at one by construction (the working set
+        // is a single-conversation policy object), so a rejection there is a
+        // configuration property, not transient load -- say so, and do not invite
+        // a blind retry that will keep failing.
+        if (state.tiered_kv_active()) {
+            send_error(res, 429,
+                       "Server runs with --kvmem, whose tiered KV working set serves one "
+                       "conversation at a time. Retry once the current request finishes, or "
+                       "start the server without --kvmem to allow concurrent requests.",
+                       "server_error", "429");
+        } else {
+            send_error(res, 429, "Server is busy: inference queue is full, retry later.",
+                       "server_error", "429");
+        }
         return;
     }
 
@@ -617,8 +629,20 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
     }
 
     if (!state.try_acquire_slot()) {
-        send_error(res, 429, "Server is busy: inference queue is full, retry later.",
-                   "server_error", "429");
+        // Under KVMem the queue is capped at one by construction (the working set
+        // is a single-conversation policy object), so a rejection there is a
+        // configuration property, not transient load -- say so, and do not invite
+        // a blind retry that will keep failing.
+        if (state.tiered_kv_active()) {
+            send_error(res, 429,
+                       "Server runs with --kvmem, whose tiered KV working set serves one "
+                       "conversation at a time. Retry once the current request finishes, or "
+                       "start the server without --kvmem to allow concurrent requests.",
+                       "server_error", "429");
+        } else {
+            send_error(res, 429, "Server is busy: inference queue is full, retry later.",
+                       "server_error", "429");
+        }
         return;
     }
 
