@@ -1491,6 +1491,21 @@ std::mutex g_dequant_cache_mu;
 //  0  = caching disabled (callers fall back to transient scratch).
 //  >0 = explicit budget in MB.
 static std::atomic<long> g_dequant_cache_mb_override(-1);
+// Set when a user-facing surface (CLI/server option) pinned the budget, so the
+// VRAM-aware resolver leaves that choice alone.
+static std::atomic<bool> g_dequant_cache_budget_explicit{false};
+
+void set_dequant_cache_budget_mb_explicit(long mb) {
+    g_dequant_cache_budget_explicit.store(true, std::memory_order_relaxed);
+    set_dequant_cache_budget_mb(mb);
+}
+
+bool dequant_cache_budget_is_explicit() {
+    if (g_dequant_cache_budget_explicit.load(std::memory_order_relaxed))
+        return true;
+    const char* e = std::getenv("FORGE_DEQUANT_CACHE_MB");
+    return e != nullptr;
+}
 
 void set_dequant_cache_budget_mb(long mb) {
     g_dequant_cache_mb_override.store(mb, std::memory_order_relaxed);
@@ -1536,6 +1551,39 @@ size_t dequant_required_bytes() {
                                   ? g_dequant_total_fp16
                                   : dequant_cache_budget_bytes();
     return cache_part + g_dequant_scratch_peak;
+}
+
+// Resolve the dequant cache budget from *measured* free VRAM, once the weights
+// and the KV cache are both resident.
+//
+// The cache is deliberately all-or-nothing. A partial budget is the worst of
+// both worlds: it pays the full VRAM cost of caching while still evicting and
+// re-dequantizing, because the working set cannot fit. Measured on an RTX 4050
+// (6 GB, LFM2.5-2.6B Q8_0, ~5.2 GB FP16 working set), prefill of a 3368-token
+// prompt cost 2993 ms with no cache, 3480 ms at a 256 MB budget, and 14419 ms
+// at the 1024 MB default -- and because the budget never tracked the allocated
+// KV cache, that cost scaled with the configured context rather than the
+// filled one (4.9x slower at -c 32768 than -c 8192 for the same prompt).
+//
+// So: cache the whole working set when free VRAM can hold it, otherwise leave
+// the cache off and let each call dequantize into transient scratch. Measured
+// on the same box the per-call dequant is within noise of the cached path
+// (3062 ms vs 2931 ms), so giving up the cache costs almost nothing while
+// keeping the memory is worth several times more.
+size_t resolve_dequant_cache_budget_from_vram(size_t safety_margin_bytes) {
+    if (dequant_cache_budget_is_explicit()) {
+        return dequant_cache_budget_bytes();  // user pinned it; do not second-guess
+    }
+    size_t free_mem = 0, total_mem = 0;
+    if (cudaMemGetInfo(&free_mem, &total_mem) != cudaSuccess)
+        return dequant_cache_budget_bytes();
+    const size_t working_set = g_dequant_total_fp16;
+    const size_t usable =
+        free_mem > safety_margin_bytes ? free_mem - safety_margin_bytes : size_t(0);
+    const size_t budget = (working_set > 0 && working_set <= usable) ? working_set : size_t(0);
+    if (budget != dequant_cache_budget_bytes())
+        set_dequant_cache_budget_mb(static_cast<long>(budget / (1024 * 1024)));
+    return budget;
 }
 
 void dequant_cache_free(void* ptr, cudaStream_t stream) {
@@ -1607,11 +1655,20 @@ void* dequant_cache_acquire(DataType dt, const void* key, int N, int K, cudaStre
         return it->second.ptr;
     }
 
-    if (dequant_cache_budget_bytes() == 0)
+    const size_t budget = dequant_cache_budget_bytes();
+    if (budget == 0)
         return nullptr;  // caching disabled
 
-    while (!g_dequant_cache.empty() &&
-           g_dequant_cache_bytes + need > dequant_cache_budget_bytes()) {
+    // A weight that can never fit the budget on its own must not disturb the
+    // entries that can. Evicting here would empty the whole cache, fail anyway,
+    // and leave every weight -- including the ones that did fit -- on the
+    // per-call dequant path for the rest of the run. Measured on RTX 4050:
+    // that cascade is what made prefill cost scale with the *allocated* KV
+    // capacity rather than the filled sequence length.
+    if (need > budget)
+        return nullptr;
+
+    while (!g_dequant_cache.empty() && g_dequant_cache_bytes + need > budget) {
         auto lru = g_dequant_cache.begin();
         for (auto i = g_dequant_cache.begin(); i != g_dequant_cache.end(); ++i) {
             if (i->second.last_used < lru->second.last_used)
@@ -1622,8 +1679,8 @@ void* dequant_cache_acquire(DataType dt, const void* key, int N, int K, cudaStre
         g_dequant_cache.erase(lru);
     }
 
-    if (g_dequant_cache_bytes + need > dequant_cache_budget_bytes())
-        return nullptr;  // still no room: let caller use transient scratch
+    if (g_dequant_cache_bytes + need > budget)
+        return nullptr;  // no room even after eviction: transient scratch
 
     void* ptr = nullptr;
     if (cudaMalloc(&ptr, need) != cudaSuccess)

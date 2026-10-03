@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
     // very first launch_cublas_gemm_quant_fp16 call honors --dequant-cache-mb
     // (or falls back to FORGE_DEQUANT_CACHE_MB env / 1024 MB default).
     if (opt.dequant_cache_mb >= 0) {
-        forge::cuda::set_dequant_cache_budget_mb(opt.dequant_cache_mb);
+        forge::cuda::set_dequant_cache_budget_mb_explicit(opt.dequant_cache_mb);
     }
 #endif
 

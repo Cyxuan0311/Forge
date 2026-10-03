@@ -46,6 +46,8 @@
 #include <string>
 #include <vector>
 
+#include "forge/kv_storage.h"
+
 namespace forge {
 
 class KVMemory;  // forward: the manager is attached to KVMemory, not built on it
@@ -118,6 +120,42 @@ struct KVemTurnPlan {
     int64_t kept_logical_len = 0;
     int64_t kept_window_len = 0;
     int64_t kept_rope_off = 0;
+
+    // ---- Attention-sink prefix (StreamingLLM-style) ----
+    // The window is two contiguous slot segments: slots
+    // [0, sink_reuse + sink_forward) hold logical [0, sink_reuse+sink_forward) --
+    // the conversation's first tokens, which attention needs as a stable sink --
+    // and the slots after them hold the most recent tail. The logical gap
+    // between the two ranges is the history that was dropped, deliberately.
+    //
+    //   sink_reuse    sink slots still resident from the previous turn (no forward)
+    //   sink_forward  sink slots to (re)forward into slots [sink_reuse, ...) from
+    //                 prompt[0, sink_reuse+sink_forward)
+    //   new_to_compute the tail, written at slot sink_reuse + sink_forward
+    //   tail_base     logical position of the first tail slot
+    //
+    // With both sink counters at 0 the window is one contiguous run and the layout
+    // is exactly the un-sunk one, so prompts that fit are unaffected.
+    int64_t sink_reuse = 0;
+    int64_t sink_forward = 0;
+    int64_t tail_base = 0;
+    // Window slot at which the tail segment starts. Normally sink_reuse +
+    // sink_forward, but recalled archived pages sit between them, so the tail
+    // forward must start after those too. The generator uses this as the tail
+    // forward's start_pos.
+    int64_t tail_slot_start = 0;
+    // Total size of the sink segment after this turn (sink_reuse+sink_forward on
+    // the turn that builds it; carried over unchanged on later turns). Needed by
+    // the caller to turn a window slot into a logical position:
+    //   slot <  sink_slots -> logical = slot
+    //   slot >= sink_slots -> logical = tail_base + (slot - sink_slots)
+    int64_t sink_slots = 0;
+    // rope_pos_offset to use for a forward that writes *tail* slots. RoPE must
+    // see the logical position, not the slot, so that the distance between the
+    // sink and the recent tail is the true one rather than compressed by the
+    // dropped middle. A forward that writes *sink* slots must use offset 0.
+    int64_t tail_rope_offset = 0;
+
     std::vector<int32_t> new_to_compute;
     int64_t new_window_len = 0;
     int64_t new_rope_off = 0;
@@ -172,10 +210,49 @@ public:
         int64_t recalled_tokens = 0;
         int64_t dropped_tokens = 0;
         int64_t window_overflow = 0;
+        int64_t archived_pages = 0;
+        int64_t recalled_pages = 0;
     };
     const Stats& stats() const { return stats_; }
 
+    // Give the manager the storage it must move pages between, and arm the
+    // per-sequence window ops. Until this is called the manager is pure policy:
+    // it plans a window but never archives or recalls anything.
+    //
+    // The manager owns the slot layout while attached, so it must be detached
+    // (or the sequence released) before anything else touches that sequence's
+    // page table.
+    void attach_storage(KVStorage* storage, int num_layers, int seq_id);
+
+    // Keyword ("recent"-style) recall settings. `recall_pages` caps how many
+    // archived pages one turn may pull back; `recall_min_score` is the minimum
+    // per-page relevance below which a page is not worth a slot.
+    void set_recall_policy(int max_pages, double min_score) {
+        recall_max_pages_ = max_pages;
+        recall_min_score_ = min_score;
+    }
+
+// Fold the tokens produced by decode back into the logical history.
+    //
+    // Decode writes them into seq 0 starting at the window slot just past
+    // new_window_len, i.e. contiguous with the Tail segment, and the next turn's
+    // prompt begins with exactly this sequence. Without folding them in the
+    // manager's match can never reach them, so every turn re-prefilled the whole
+    // previous assistant message -- pure waste, since the KV was already resident
+    // and already carried the right logical RoPE positions.
+    //
+    // Returns the number of tokens adopted (0 when there is no manager, the tail
+    // is absent, or the window has no room left).
+    int64_t append_generated(const std::vector<int32_t>& tokens, int64_t start_slot);
+
 private:
+    // Archive the window pages at slots [0, from_slot) to the host pool, skipping
+    // the pinned sink. Returns the number of tokens moved.
+    int64_t archive_pages(int64_t from_slot);
+    // Pull up to recall_max_pages_ archived pages back into the window, choosing by
+    // lexical relevance to `prompt`. Appends a WindowSeg per restored page. Returns
+    // the tokens restored.
+    int64_t recall_pages(const std::vector<int32_t>& prompt, int64_t sink_slots);
     KVemConfig cfg_;
     int page_size_ = 16;
     int budget_ = 0;
@@ -187,15 +264,76 @@ private:
     int64_t last_win_len_ = 0;
     int64_t last_rope_off_ = 0;
 
-    // Logical position p corresponds to prompt index p + head_shift_.
-    // > 0 only after a single prompt exceeded the whole budget and its head
-    // was clipped (the last-resort path); the shift keeps the logical history
-    // aligned with the *next* prompt so the common-prefix match survives.
+    // Logical position of the *tail* segment's first slot. 0 unless a prompt
+    // exceeded the whole budget and its head was clipped; then it is the first
+    // logical position still covered by the tail, so the common-prefix match and
+    // the recall source ranges stay aligned with the next prompt. Mirrors the
+    // Tail segment's logical_start.
     int64_t head_shift_ = 0;
+
+    // ---- Window layout: explicit segment table ----
+    // The window is a contiguous run of slots [0, window_len) tiled by segs_ in
+    // slot order, with NO holes. That single invariant is what makes everything
+    // else safe:
+    //   * seq_filled() (= the storage's logical_len, advanced as max(old, pos+n)
+    //     over slot writes) equals sum(slot_len), so attention sees exactly the
+    //     resident window;
+    //   * the paged kernels derive a query's slot as kv_len - q_len + qi, which
+    //     with a hole-free range is exactly the slot the token was written to, so
+    //     the causal mask never mis-binds;
+    //   * a recalled page can be *inserted* at any slot index without the
+    //     kernels caring about order, because attention is order-independent over
+    //     keys and each K already carries its logical RoPE position.
+    //
+    // Slots:  [ Sink ][ Recalled ][ Recalled ][ Tail ]
+    // Logical:[0,S)  [A1,A1+n1)  [A2,A2+n2)   [base, ...)
+    // The gaps between the logical ranges are history that was dropped on
+    // purpose; they are what the archive holds.
+    struct WindowSeg {
+        int64_t slot_start = 0;
+        int64_t slot_len = 0;
+        int64_t logical_start = 0;
+        enum class Kind { Sink, Recalled, Tail };
+        Kind kind = Kind::Tail;
+    };
+    std::vector<WindowSeg> segs_;
+
+    // Logical position of a window slot, or -1 when the slot is past the window.
+    int64_t logical_of_slot(int64_t slot) const;
+    // Sum of segment slot lengths; must always equal last_win_len_.
+    int64_t window_slots() const;
+    // Drop segments that no longer hold a slot range (after archiving), keeping
+    // slot_start/slot_len consistent for the survivors.
+    void compact_segments();
+
+    // ---- Host archive + keyword recall ----
+    // Storage handle, armed by attach_storage(). Null => the planner is pure
+    // policy and never moves pages.
+    KVStorage* storage_ = nullptr;
+    int num_layers_ = 0;
+    int seq_id_ = 0;
+
+    // One archived window page: its token ids plus the logical range it covers,
+    // so a recalled segment can be described exactly (and its tokens rebuilt into
+    // logical_hist_ without re-reading the prompt).
+    struct ArchivedChunk {
+        int64_t logical_start = 0;
+        int64_t slot_len = 0;
+        std::vector<int32_t> tokens;
+    };
+    // Archived pages, in archive order. Kept in step with the storage's own
+    // archived_pages list so a page can be scored without touching its KV.
+    std::vector<ArchivedChunk> archived_chunks_;
+    int recall_max_pages_ = 0;  // 0 = recall disabled (the default)
+    double recall_min_score_ = 1.0;
 
     // Current turn's window state.
     int64_t window_len_ = 0;
     int64_t rope_off_ = 0;
+    // head_shift_ value at which the truncation warning was last emitted, so the
+    // steady-state loss is reported when it appears and when it grows materially
+    // rather than once per turn.
+    int64_t last_warned_head_shift_ = 0;
 
     Stats stats_;
 };

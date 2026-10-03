@@ -1700,24 +1700,20 @@ int64_t PagedKVStorage::seq_window_archive_page(int seq_id, int layer, int idx) 
     auto& page = layer_pages_[layer][page_id];
     int64_t tokens = page.filled;
 
-    // Copy the page's data to the host swap pool before dropping it from the
-    // window table. offload_to_host_unlocked is idempotent for already-evicted
-    // pages and releases the device buffers.
+    // Copy the page's data to the host swap pool before it is overwritten.
+    // offload_to_host_unlocked is idempotent for already-evicted pages and releases
+    // the device buffers.
     if (!offload_to_host_unlocked(layer, page_id))
         return -1;
 
-    table.page_ids.erase(table.page_ids.begin() + idx);
+    // Deliberately NOT erased from page_ids. write_kv_seq resolves a slot to its
+    // page as page_ids[pos / page_size], so page_ids is the *slot -> page* map and
+    // must stay hole-free; compacting it here would shift every later slot onto the
+    // wrong page and exhaust the pool on the next write. An archived page stays
+    // referenced (ref_count > 0, not in the free list) with its data off-device,
+    // and is reclaimed by seq_window_restore_page when it is recalled.
     table.archived_pages.push_back({page_id, (int32_t)tokens});
-    table.d_dirty = true;  // window table shifted — full re-upload
-
-    // The archived page stays reserved (ref_count > 0, not in the free list);
-    // only the window token accounting shrinks.
-    table.logical_len -= tokens;
-    if (table.logical_len < 0)
-        table.logical_len = 0;
-    // filled_in_last describes the last window page; the archived page was not
-    // the last one (the manager never archives the final partial page), so the
-    // value survives the erase unchanged.
+    table.d_dirty = true;
     return tokens;
 }
 
@@ -1741,11 +1737,11 @@ int64_t PagedKVStorage::seq_window_drop_page(int seq_id, int layer, int idx) {
             free_page(layer, page_id);
     }
 
-    table.page_ids.erase(table.page_ids.begin() + idx);
+    // page_ids stays hole-free for the same reason as in seq_window_archive_page:
+    // it is the slot -> page map that write_kv_seq indexes by pos / page_size.
+    // Zero the page id so the slot has no device backing until it is rewritten.
+    table.page_ids[idx] = -1;
     table.d_dirty = true;
-    table.logical_len -= tokens;
-    if (table.logical_len < 0)
-        table.logical_len = 0;
     return tokens;
 }
 
@@ -1768,13 +1764,37 @@ int64_t PagedKVStorage::seq_window_restore_page(int seq_id, int layer, int archi
         return -1;
 
     table.archived_pages.erase(table.archived_pages.begin() + archive_idx);
-    table.page_ids.insert(table.page_ids.begin() + insert_idx, ap.page_id);
-    table.d_dirty = true;
 
-    // The restored page is a full page (the manager only archives completed
-    // pages), so window tokens grow by its fill; the last window page stays
-    // last, keeping filled_in_last valid.
-    table.logical_len += ap.tokens;
+    // page_ids is the slot -> page map indexed by pos / page_size, so it must stay
+    // hole-free and the same length; inserting here would shift every later slot
+    // onto the wrong page. Restore in place when the slot still exists and is empty
+    // (the archive/restore pairing the manager uses), otherwise fall back to
+    // appending so a mismatch can never silently corrupt the mapping.
+    int placed = -1;
+    if (insert_idx >= 0 && insert_idx < (int)table.page_ids.size() &&
+        table.page_ids[insert_idx] < 0) {
+        table.page_ids[insert_idx] = ap.page_id;
+        placed = insert_idx;
+    } else {
+        int free_slot = -1;
+        for (int i = 0; i < (int)table.page_ids.size(); ++i) {
+            if (table.page_ids[i] < 0) {
+                free_slot = i;
+                break;
+            }
+        }
+        if (free_slot < 0)
+            table.page_ids.push_back(ap.page_id);
+        else
+            table.page_ids[free_slot] = ap.page_id;
+        placed = free_slot >= 0 ? free_slot : (int)table.page_ids.size() - 1;
+    }
+    table.d_dirty = true;
+    // The page keeps its own slot, so the window length is unchanged; only the
+    // data came back. (An archived page was always a full window page.)
+    (void)placed;
+    table.logical_len = std::max<int64_t>(table.logical_len,
+                                          static_cast<int64_t>(placed + 1) * page_size_);
     return ap.tokens;
 }
 

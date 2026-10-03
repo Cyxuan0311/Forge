@@ -141,7 +141,9 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             // Only the non-resident tail needs a forward; the resident prefix is
             // already in window slots [0, kept_window_len).
             prompt_len = static_cast<int>(ws_plan.new_to_compute.size());
-            rope_pos_offset = ws_plan.new_rope_off - ws_plan.kept_window_len;
+            // Decode and the tail prefill both write slots >= sink_slots, so both
+            // need the tail's logical shift. A sink prefill (below) uses 0.
+            rope_pos_offset = ws_plan.tail_rope_offset;
         }
     }
 
@@ -158,6 +160,11 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     } else if (config.prefix_len > 0 && prompt_len > 1) {
         prefix_len = std::min(config.prefix_len, prompt_len - 1);
     }
+    // Where the tail forward writes. Equals prefix_len normally; when a pinned sink
+    // was just (re)forwarded it sits after the sink segment, and with recalled
+    // archived pages in between the tail starts after those too -- so take the
+    // planner's word for it rather than deriving it.
+    int64_t fwd_start_slot = tiered ? ws_plan.tail_slot_start : prefix_len;
     // Tiered: the resident prefix is already in window slots [0, kept_window_len)
     // and must NOT be re-forwarded, so the tail to compute is the whole
     // new_to_compute vector (length = kept_window_len + new_window_len tail),
@@ -168,16 +175,29 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
 
     // The KV write cursor is monotonic, so a previous request can leave rows
     // beyond prefix_len. Prefill masks them out (causal: j > q_pos), but decode
-    // attends to everything below total_len, so rewind to the reuse point.
-    // In tiered mode the window slot count after the previous turn is already
-    // tracked by the working set, so recomputing the window is the caller's
-    // side of the contract: the stale slots beyond kept_window_len are masked
-    // by the causal prefill, and the window length the next turn reports comes
-    // from the plan, not from the KV cursor.
+    // attends to everything below total_len with no mask, so rewind to the reuse
+    // point. Tiered mode has no contiguous KVCache to roll back, and the working
+    // set only reports its own planned length -- which does not by itself shrink
+    // the storage's. Hence the explicit seq_set_logical_len below.
     if (prefix_len > 0) {
         if (!tiered) {
             if (auto* kv = engine->kv_cache()) {
                 kv->rollback(prefix_len);
+            }
+        } else if (auto* kv_mem = engine->kv_memory()) {
+            // Tiered: KVCache::rollback is contiguous-only, and write_kv_seq only
+            // ever grows logical_len, so without an explicit shrink the rows this
+            // turn is about to overwrite stay visible to seq_filled() -- and decode
+            // attends to everything below total_len with no mask. Pull the length
+            // back to the resident prefix so the prefill re-grows it to exactly
+            // new_window_len. Shrinking never drops pages, so a subsequent
+            // head-clip that needs the room can still grow again.
+            const bool shrank = kv_mem->storage().seq_set_logical_len(0, prefix_len);
+            if (!shrank) {
+                LOG_WARN("KVMem: could not shrink seq 0 logical length to " +
+                         std::to_string(prefix_len) +
+                         " -- stale KV rows from the previous turn stay visible to "
+                         "decode until this prefill overwrites them");
             }
         }
     } else if (!tiered && config.reset_kv_cache) {
@@ -205,6 +225,36 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
                 dump_prefill_profile(result.prefill_ms, fwd_len);
             }
         };
+        // Tiered with a pinned attention sink: forward the sink segment into
+        // slots [sink_reuse, sink_reuse+sink_forward) BEFORE the tail, so the
+        // window becomes [sink | tail]. The two ranges are separate forwards
+        // because the paged store's write cursor only moves forward; the sink is
+        // always logical [0, sink) and the tail always starts at its own (much
+        // larger) logical base, so a single contiguous range cannot express both.
+        if (tiered && ws_plan.sink_forward > 0) {
+            const int sink_len = static_cast<int>(ws_plan.sink_forward);
+            const int64_t sink_from = static_cast<int64_t>(ws_plan.sink_reuse);
+            auto sink_ids = std::make_shared<Tensor>(DataType::INT32,
+                                                     std::vector<int64_t>{sink_len},
+                                                     DeviceType::CPU);
+            std::memcpy(sink_ids->data(),
+                        prompt_tokens.data() + sink_from,
+                        static_cast<size_t>(sink_len) * sizeof(int32_t));
+            if (dev == DeviceType::CUDA)
+                sink_ids->to_device(DeviceType::CUDA);
+            auto sink_req = ForwardRequest::from_ids(
+                sink_ids, static_cast<int64_t>(ws_plan.sink_reuse));
+            // RoPE must use the *logical* position here, which for a
+            // sink slot is exactly the slot index, so the offset is 0. The tail
+            // forward below uses ws_plan.tail_rope_offset instead.
+            sink_req.rope_pos_offset = 0;
+            engine->forward_request(sink_req);
+            // tail_slot_start already accounts for the sink segment (and any
+            // recalled pages between), so the tail forward must NOT be advanced
+            // again here -- doing so would write past the planned window and
+            // exhaust the page pool.
+        }
+
         auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{fwd_len},
                                                   DeviceType::CPU);
         // Tiered: forward ws_plan.new_to_compute (the non-resident tail), not
@@ -222,7 +272,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         // logical position rope_pos_offset, which keeps archived KV at its true
         // relative distance. Untiered, rope_pos_offset stays 0 and this is a
         // no-op.
-        auto prefill_req = ForwardRequest::from_ids(input_ids, prefix_len);
+        auto prefill_req = ForwardRequest::from_ids(input_ids, fwd_start_slot);
         prefill_req.rope_pos_offset = rope_pos_offset;
         auto logits = engine->forward_request(prefill_req);
 
@@ -448,6 +498,17 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     }
 
 decode_done:
+    // Tiered: fold what decode produced back into the working set's logical
+    // history. Those tokens are already resident (decode wrote them starting at
+    // new_window_len) and already carry the right logical RoPE positions, but
+    // without this the manager's match can never reach them, so the next turn
+    // re-prefills the whole previous assistant message.
+    if (tiered && !result.token_ids.empty()) {
+        if (auto* kv_mem = engine->kv_memory()) {
+            if (auto* ws = kv_mem->working_set())
+                ws->append_generated(result.token_ids, ws_plan.new_window_len);
+        }
+    }
     if (!result.finished) {
         result.finished = true;
         result.finish_reason = aborted(config) ? "aborted" : "length";

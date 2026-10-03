@@ -286,6 +286,7 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
                       << "  logical ctx=" << kv_mem->max_seq_len()
                       << " tokens, gpu pool=" << pool_tokens
                       << " tokens, page=" << page_size << "\n";
+            ws->attach_storage(&kv_mem->storage(), kv_mem->storage().num_layers(), 0);
             kv_mem->set_working_set(std::move(ws));
         }
     }
@@ -849,7 +850,17 @@ ChatCompletionResult ServerState::chat_completion(
         // tier's resident state for the next turn.
         if (!tiered) {
             if (auto* km = ctx_->engine()->kv_memory()) {
-                prefix_cache_.register_prefix(prompt_ids, 0, km->storage());
+                // Register the prompt AND the reply, not just the prompt. Decode
+                // writes result.token_ids into seq 0 starting at prompt_ids.size(),
+                // so that whole span is resident; the next turn's prompt starts with
+                // exactly that sequence. Registering only the prompt left the reply's
+                // KV unreferenced, and the release(0) at the top of the next request
+                // threw it away -- so every turn re-prefilled the entire previous
+                // assistant message. The contiguous branch below already did this.
+                std::vector<int32_t> resident(prompt_ids);
+                resident.insert(resident.end(), result.token_ids.begin(),
+                                result.token_ids.end());
+                prefix_cache_.register_prefix(resident, 0, km->storage());
                 prefix_cache_.evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
             }
         }

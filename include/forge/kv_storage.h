@@ -70,6 +70,17 @@ public:
 
     // ---- Sequence operations ----
     virtual int seq_filled(int layer, int seq_id) const = 0;
+    // Force the sequence's logical length to `len` (shrinking only).
+    //
+    // write_kv_seq advances logical_len with max(), so it never shrinks on its
+    // own. KVMem needs the opposite: its planner may decide this turn's window
+    // is shorter than last turn's, and without a shrink the extra rows stay
+    // visible to seq_filled() -- i.e. decode attends to stale, position-misaligned
+    // KV left over from the previous turn's generation. KVMem cannot use
+    // KVCache::rollback (contiguous-only), so it calls this instead.
+    // Returns false if the sequence/layer is unknown or `len` exceeds the
+    // current length (never grows).
+    virtual bool seq_set_logical_len(int seq_id, int64_t len) { return false; }
     virtual bool seq_remove(int seq_id, int64_t p0, int64_t p1) = 0;
     virtual bool seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1) = 0;
     virtual bool seq_keep(int seq_id) = 0;
@@ -139,6 +150,12 @@ public:
     }
     // Per-sequence window ops used by KVWorkingSetManager. Token counts are
     // the page's filled rows; -1 signals an invalid op.
+    //
+    // Every op below no-ops until windowing is armed for the sequence, because
+    // they erase/insert in the middle of page_ids and would corrupt an ordinary
+    // paged request. attach_working_set() is the only thing that arms it, and
+    // only a manager that owns the slot layout should call it.
+    virtual void attach_working_set(int seq_id, bool active) { (void)seq_id; (void)active; }
     virtual int64_t seq_window_archive_page(int seq_id, int layer, int idx) {
         (void)seq_id;
         (void)layer;
@@ -341,6 +358,7 @@ public:
     TensorPtr read_value_seq(int layer, int seq_id) const override;
 
     int seq_filled(int layer, int seq_id) const override;
+    bool seq_set_logical_len(int seq_id, int64_t len) override;
     bool seq_remove(int seq_id, int64_t p0, int64_t p1) override;
     bool seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1) override;
     bool seq_keep(int seq_id) override;
@@ -373,6 +391,7 @@ public:
     bool kvmem_supported() const override;
     void set_pool_token_cap(int tokens) override { pool_cap_tokens_ = tokens; }
     int64_t seq_window_len(int seq_id, int layer) const override;
+    void attach_working_set(int seq_id, bool active) override;
     int64_t seq_window_archive_page(int seq_id, int layer, int idx) override;
     int64_t seq_window_drop_page(int seq_id, int layer, int idx) override;
     int64_t seq_window_restore_page(int seq_id, int layer, int archive_idx,

@@ -561,6 +561,17 @@ bool launch_cublas_gemm_quant_fp16(DataType dt, const float* A, const void* B_q,
 // unset, resolved from the FORGE_DEQUANT_CACHE_MB env var (default 1024). 0
 // disables the cache (callers fall back to transient scratch).
 void set_dequant_cache_budget_mb(long mb);
+// Same, but records the value as a deliberate user choice so the VRAM-aware
+// resolver will not override it. Use this from CLI/server option plumbing.
+void set_dequant_cache_budget_mb_explicit(long mb);
+// True when the budget was pinned by a user-facing surface or FORGE_DEQUANT_CACHE_MB.
+bool dequant_cache_budget_is_explicit();
+// Re-derive the cache budget from measured free VRAM and the loaded model's FP16
+// working set. All-or-nothing: caches the whole working set if free VRAM (minus
+// safety_margin_bytes) can hold it, otherwise disables the cache. Call this once
+// the weights and the KV cache are both resident. No-op when the budget is
+// explicit. Returns the budget in bytes actually adopted.
+size_t resolve_dequant_cache_budget_from_vram(size_t safety_margin_bytes);
 long dequant_cache_budget_mb();
 // Resolved byte budget for the per-weight FP16 dequant cache (0 disables it).
 // Lazily derived from the MB budget above (CLI > FORGE_DEQUANT_CACHE_MB env >

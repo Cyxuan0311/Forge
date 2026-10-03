@@ -1250,6 +1250,32 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
             // Push this model's dequant footprint to the allocator before probing,
             // so dequant_required_bytes() reflects the loaded model, not a stale one.
             estimate_dequant_scratch_peak_bytes();
+            // Size the FP16 dequant cache from measured free VRAM now that both
+            // the weights and the KV cache are resident. Without this the budget
+            // stayed at a fixed 1024 MB default and never tracked the allocated
+            // context, which made prefill cost scale with -c.
+            const size_t dequant_budget =
+                cuda::resolve_dequant_cache_budget_from_vram(/*safety_margin_bytes=*/256ULL * 1024 * 1024);
+            {
+                const size_t mib = 1024 * 1024;
+                const std::string msg =
+                    "FP16 dequant cache: budget=" + std::to_string(dequant_budget / mib) + "MB" +
+                    " working_set=" + std::to_string(cuda::dequant_total_fp16_bytes() / mib) + "MB" +
+                    " scratch_peak=" + std::to_string(cuda::dequant_scratch_peak_bytes() / mib) +
+                    "MB source=" +
+                    (cuda::dequant_cache_budget_is_explicit() ? "explicit" : "vram") +
+                    (dequant_budget == 0
+                         ? (cuda::dequant_total_fp16_bytes() > 0
+                                ? " (disabled: working set does not fit free VRAM)"
+                                : " (disabled: working set unknown)")
+                         : "");
+                // A disabled cache is a deliberate VRAM trade, not an error, but it
+                // changes prefill throughput so it must be visible without -v.
+                if (dequant_budget == 0)
+                    LOG_WARN(msg);
+                else
+                    LOG_INFO(msg);
+            }
             resolve_quant_policy_vram_aware(DataType::Q3_K, /*safety_margin_bytes=*/256ULL * 1024 * 1024);
         }
     }
