@@ -183,25 +183,30 @@ void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
         std::cout.flush();
 
         GenerationStats stats;
+        // The reply text is needed to build the next turn's prompt. Storing an
+        // empty assistant turn (as this used to) meant the model could not see its
+        // own previous answers at all, and the KV of every reply became
+        // unreachable -- so each turn re-prefilled the whole previous message.
+        std::string reply_text;
 
         if (args.no_stream) {
             stats = generate_batch(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
                                    !args.no_sample, args.seed, tokenizer.eos_token_id(),
-                                   args.spec, &prefix_cache);
+                                   args.spec, &prefix_cache, &reply_text);
         } else {
             stats =
                 generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
                                    !args.no_sample, args.seed, tokenizer.eos_token_id(),
-                                   args.spec, &prefix_cache);
+                                   args.spec, &prefix_cache, &reply_text);
         }
 
         std::cout << "\n";
 
         forge_print_stats_line(stats);
 
-        conversation.push_back({"assistant", ""});
+        conversation.push_back({"assistant", reply_text});
 
         std::cout << "\n";
 

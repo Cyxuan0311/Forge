@@ -30,7 +30,8 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
                                    float temperature, int top_k, float top_p, float repeat_penalty,
                                    int repeat_last_n, bool do_sample, uint64_t seed,
                                    int eos_token_id, const SpeculativeConfig& spec_cfg,
-                                   forge::PrefixCache* prefix_cache) {
+                                   forge::PrefixCache* prefix_cache,
+                                   std::string* out_text) {
     // Apply speculative config to context before generation
     if (spec_cfg.enabled) {
         ctx.params_mut().speculative_config = spec_cfg;
@@ -63,7 +64,14 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     // KV cache (that would wipe the radix cache's seq_ids); release(0) clears only the
     // previous request's working set. See PrefixCache / RequestScheduler for details.
     const bool paged = (ctx.params().kv_storage_mode == KVStorageMode::Paged);
-    if (paged && prefix_cache) {
+    // KVMem: seq 0's resident window IS the conversation state, tracked across turns
+    // by the working-set manager. Releasing it, or sharing its pages into radix cache
+    // seq_ids, invalidates the window layout on_prompt() plans against -- the next
+    // turn would then skip prefilling a prefix that no longer exists. Mirrors
+    // forge-server's tiered branch (server_state.cpp).
+    const bool tiered = paged && ctx.engine()->kv_memory() &&
+                        ctx.engine()->kv_memory()->working_set() != nullptr;
+    if (paged && prefix_cache && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             km->storage().release(0);
             gen_cfg.prefix_len = prefix_cache->try_lookup(prompt_tokens, 0, km->storage());
@@ -108,16 +116,33 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
         std::fprintf(stderr, "\n");
     }
 
-    if (paged && prefix_cache) {
+    // Decode the reply once, from the token ids, rather than reassembling the
+    // streamed chunks: streaming decodes in 4-token groups, so the chunk
+    // boundaries can split a multi-byte character.
+    if (out_text && !result.token_ids.empty())
+        *out_text = tokenizer.decode(result.token_ids, true, false);
+
+    if (paged && prefix_cache && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
-            prefix_cache->register_prefix(prompt_tokens, 0, km->storage());
+            // Register prompt AND reply: decode wrote result.token_ids into seq 0
+            // right after the prompt, and the next turn's prompt begins with
+            // exactly that sequence. Registering only the prompt left the reply's
+            // KV unreferenced, and the next turn's release(0) discarded it -- so
+            // every turn re-prefilled the whole previous assistant message.
+            std::vector<int32_t> resident(prompt_tokens);
+            resident.insert(resident.end(), result.token_ids.begin(),
+                            result.token_ids.end());
+            prefix_cache->register_prefix(resident, 0, km->storage());
             prefix_cache->evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
         }
     }
 
     if (!token_buffer.empty()) {
-        std::cout << tokenizer.decode(token_buffer, true, false);
+        const std::string tail_text = tokenizer.decode(token_buffer, true, false);
+        std::cout << tail_text;
         std::cout.flush();
+        if (out_text)
+            *out_text += tail_text;
     }
 
     GenerationStats stats;
@@ -138,7 +163,8 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
                                const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                float temperature, int top_k, float top_p, float repeat_penalty,
                                int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
-                               const SpeculativeConfig& spec_cfg, forge::PrefixCache* prefix_cache) {
+                               const SpeculativeConfig& spec_cfg, forge::PrefixCache* prefix_cache,
+                               std::string* out_text) {
     // Apply speculative config to context before generation
     if (spec_cfg.enabled) {
         ctx.params_mut().speculative_config = spec_cfg;
@@ -167,7 +193,10 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     // Paged-mode prefix reuse (radix PrefixCache): share cached prefix on hit,
     // register this request's prefix afterwards. Never reset the whole cache.
     const bool paged = (ctx.params().kv_storage_mode == KVStorageMode::Paged);
-    if (paged && prefix_cache) {
+    // See the streaming path above: under KVMem the tier owns seq 0's window.
+    const bool tiered = paged && ctx.engine()->kv_memory() &&
+                        ctx.engine()->kv_memory()->working_set() != nullptr;
+    if (paged && prefix_cache && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             km->storage().release(0);
             gen_cfg.prefix_len = prefix_cache->try_lookup(prompt_tokens, 0, km->storage());
@@ -198,14 +227,19 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
         std::fprintf(stderr, "\n");
     }
 
-    if (paged && prefix_cache) {
+    if (paged && prefix_cache && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
-            prefix_cache->register_prefix(prompt_tokens, 0, km->storage());
+            std::vector<int32_t> resident(prompt_tokens);
+            resident.insert(resident.end(), result.token_ids.begin(),
+                            result.token_ids.end());
+            prefix_cache->register_prefix(resident, 0, km->storage());
             prefix_cache->evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
         }
     }
 
     auto text = tokenizer.decode(result.token_ids, true, false);
+    if (out_text)
+        *out_text = text;
     std::cout << text;
     std::cout.flush();
 
