@@ -98,6 +98,20 @@ struct ChatCompletionRequest {
     // prefix and token mirror, so a multi-turn chat only prefills its tail.
     // Absent/empty means the single default session -- the historical behaviour.
     std::string session_id;
+    // Incremental history. When non-empty these messages are APPENDED to the
+    // session's stored history instead of replacing it, so a client stops
+    // resending the whole conversation every turn. The rendered prompt is still
+    // produced from the complete history, so prefix reuse is unaffected.
+    //
+    // Requires session_id: without one there is no history to append to. Sending
+    // both messages and delta_messages is an error rather than a silent merge --
+    // the intent would be ambiguous.
+    std::vector<ChatTemplateMessage> delta_messages;
+    // Discard the session's stored history and KV working set before handling this
+    // request (the equivalent of a client's "/clear"). Lets a delta client start
+    // over without the server accumulating an ever-growing conversation it can no
+    // longer correct.
+    bool reset_session = false;
     // Defaults are anti-degeneration engineering choices (repeat penalty etc.),
     // not OpenAI's bare defaults - small models (e.g. 1.1B) loop indefinitely
     // without them. Explicit request fields still override these.
@@ -174,6 +188,15 @@ struct SessionState {
     // Tokens this session has resident: prompt + generated. The prefix-reuse
     // mirror for the contiguous backend.
     std::vector<int32_t> kv_tokens;
+    // Conversation history as sent by the client, accumulated across turns so a
+    // delta request can be rendered in full context. Empty for sessions that
+    // only ever send the complete history.
+    std::vector<ChatTemplateMessage> messages;
+    // The reply we produced last turn. A delta client does not know it, so the
+    // assistant turn is re-inserted from here to keep the conversation
+    // alternating (and so tool_calls replies survive, which a client cannot
+    // reproduce byte-for-byte).
+    std::string last_reply;
     // Tokens fed into the working set's logical history (KVMem path), kept in
     // step with kv_tokens so a session can be restored or inspected.
     int64_t last_active_ms = 0;

@@ -81,21 +81,14 @@ json build_assistant_message(const fsrv::ChatCompletionResult& r) {
 
 // ---- Request parsing -------------------------------------------------------
 
-bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRequest& out,
-                        std::string& err) {
-    json body = json::parse(http_req.body, nullptr, false);
-    if (body.is_discarded()) {
-        err = "Invalid JSON in request body";
-        return false;
-    }
-
-    if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty()) {
-        err = "'messages' must be a non-empty array";
-        return false;
-    }
-    for (const auto& m : body["messages"]) {
+// Parse one OpenAI `messages`-shaped array into `out`. Shared by `messages` and
+// `delta_messages` so both accept exactly the same message form.
+static bool parse_message_array(const nlohmann::json& arr,
+                                std::vector<fsrv::ChatTemplateMessage>& out,
+                                const char* field, std::string* err) {
+    for (const auto& m : arr) {
         if (!m.is_object() || !m.contains("role")) {
-            err = "Each message must be an object with 'role'";
+            *err = "Each message must be an object with 'role'";
             return false;
         }
         fsrv::ChatTemplateMessage msg;
@@ -126,8 +119,8 @@ bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRe
         }
         if (!m.contains("content") || m["content"].is_null()) {
             if (msg.role != "assistant" || msg.tool_calls.empty()) {
-                err = "'content' must be a string, an array of parts, or null "
-                      "for an assistant tool_calls message";
+                *err = "'content' must be a string, an array of parts, or null "
+                       "for an assistant tool_calls message";
                 return false;
             }
         } else if (m["content"].is_string()) {
@@ -141,16 +134,66 @@ bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRe
                 }
             }
         } else {
-            err = "'content' must be a string or an array of parts";
+            *err = "'content' must be a string or an array of parts";
             return false;
         }
-        out.messages.push_back(std::move(msg));
+        out.push_back(std::move(msg));
+    }
+    (void)field;
+    return true;
+}
+
+bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRequest& out,
+                        std::string& err) {
+    json body = json::parse(http_req.body, nullptr, false);
+    if (body.is_discarded()) {
+        err = "Invalid JSON in request body";
+        return false;
     }
 
     // Optional conversation key. Absent -> the default session, i.e. exactly the
     // pre-session single-slot behaviour, so existing clients are unaffected.
     if (body.contains("session_id") && body["session_id"].is_string())
         out.session_id = body["session_id"].get<std::string>();
+    const bool has_messages =
+        body.contains("messages") && body["messages"].is_array() && !body["messages"].empty();
+    const bool has_delta = body.contains("delta_messages") &&
+                           body["delta_messages"].is_array() &&
+                           !body["delta_messages"].empty();
+    if (body.contains("messages") && !body["messages"].is_array())
+        err = "'messages' must be an array";
+    if (body.contains("delta_messages") && !body["delta_messages"].is_array())
+        err = "'delta_messages' must be an array";
+    if (!err.empty())
+        return false;
+    if (!has_messages && !has_delta) {
+        err = "'messages' must be a non-empty array (or send 'delta_messages' with a "
+               "session_id to append to an existing conversation)";
+        return false;
+    }
+    // Sending both is ambiguous: does `messages` replace the history or extend it?
+    // Refuse rather than guess.
+    if (has_messages && has_delta) {
+        err = "Send either 'messages' (full history) or 'delta_messages' (append), not both";
+        return false;
+    }
+    if (has_messages) {
+        if (!parse_message_array(body["messages"], out.messages, "messages", &err))
+            return false;
+    }
+    if (has_delta) {
+        if (out.session_id.empty()) {
+            err = "'delta_messages' requires a non-empty 'session_id': there is no stored "
+                   "history to append to";
+            return false;
+        }
+        if (!parse_message_array(body["delta_messages"], out.delta_messages, "delta_messages",
+                                 &err))
+            return false;
+    }
+
+    if (body.contains("reset_session") && body["reset_session"].is_boolean())
+        out.reset_session = body["reset_session"].get<bool>();
     if (body.contains("temperature") && body["temperature"].is_number())
         out.temperature = body["temperature"].get<float>();
     if (body.contains("top_p") && body["top_p"].is_number())
@@ -522,6 +565,8 @@ bool parse_responses_request(const httplib::Request& http_req,
     // pre-session single-slot behaviour, so existing clients are unaffected.
     if (body.contains("session_id") && body["session_id"].is_string())
         out.session_id = body["session_id"].get<std::string>();
+    if (body.contains("reset_session") && body["reset_session"].is_boolean())
+        out.reset_session = body["reset_session"].get<bool>();
     if (body.contains("temperature") && body["temperature"].is_number())
         out.temperature = body["temperature"].get<float>();
     if (body.contains("top_p") && body["top_p"].is_number())

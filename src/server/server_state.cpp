@@ -403,9 +403,60 @@ ChatCompletionResult ServerState::chat_completion(
         tools_json = arr.dump();
         tools_active = true;
     }
+    // ---- Conversation assembly ----
+    // `messages` is the complete history; `delta_messages` appends to the session's
+    // stored history. Either way the template sees the full conversation, so
+    // prefix reuse and the rendered prompt are identical -- only what the client
+    // had to send differs.
+    //
+    // Reached before the session is acquired below, so this uses a lookup that
+    // does not create: a delta against a session that was never created (or was
+    // evicted) would otherwise silently render a truncated conversation and answer
+    // from a fraction of the real history.
+    std::vector<ChatTemplateMessage> history;
+    if (req.reset_session) {
+        // Release the working set and forget the history; the request below then
+        // rebuilds from whatever it carries.
+        if (ctx_) {
+            if (auto* eng = ctx_->engine()) {
+                if (auto* mem = eng->kv_memory())
+                    mem->release(acquire_session(req.session_id).seq_id);
+            }
+        }
+        sessions_[req.session_id].messages.clear();
+        sessions_[req.session_id].last_reply.clear();
+        sessions_[req.session_id].kv_tokens.clear();
+    }
+    if (!req.delta_messages.empty()) {
+        auto it = sessions_.find(req.session_id);
+        if (it == sessions_.end()) {
+            throw ContextLengthExceededError(
+                "Unknown or expired session_id '" + req.session_id +
+                "': this server holds no stored history for it. Send the full "
+                "'messages' array for the first turn of a conversation.");
+        }
+        history = it->second.messages;
+        // The assistant turn the client omitted (it does not know our reply) is
+        // re-inserted from the tokens we actually generated, so the conversation
+        // stays alternating. A client that does send its own assistant message
+        // overrides nothing -- we only add one when the last stored turn is not
+        // already an assistant turn.
+        if (!history.empty() && history.back().role != "assistant") {
+            ChatTemplateMessage reply;
+            reply.role = "assistant";
+            reply.content = it->second.last_reply;
+            if (!reply.content.empty())
+                history.push_back(std::move(reply));
+        }
+        history.insert(history.end(), req.delta_messages.begin(), req.delta_messages.end());
+        it->second.messages = history;
+    } else {
+        history = req.messages;
+    }
+
     std::vector<ChatTemplateMessage> tooled_messages = tools_json.empty()
-        ? pipeline.inject_tools(req.messages, req.tools, req.tool_choice, &tools_active)
-        : req.messages;
+        ? pipeline.inject_tools(history, req.tools, req.tool_choice, &tools_active)
+        : history;
 
     ChatTemplateInput input;
     input.messages = tooled_messages;
@@ -854,6 +905,12 @@ ChatCompletionResult ServerState::chat_completion(
         cached_kv_tokens.clear();
         throw;
     }
+
+    // Remember the conversation and our reply so the next delta request can be
+    // assembled without the client resending them. For a full-history request the
+    // client is authoritative, so only the reply is recorded.
+    sess.messages = history;
+    sess.last_reply = result.text;
 
     // Record what the KV cache now holds, per backend.
     if (paged_mode) {

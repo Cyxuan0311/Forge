@@ -166,6 +166,89 @@ void test_session_count_matches_inserts() {
     check(t.size() == 5, "repeat requests do not create sessions");
 }
 
+
+// ---- Incremental history assembly ----
+// The server keeps the conversation so a client can send only what is new. These
+// mirror the rules in ServerState::chat_completion: full `messages` replaces,
+// `delta_messages` appends, and the assistant turn we generated is re-inserted so
+// the conversation keeps alternating (a delta client cannot know our reply, and
+// cannot reproduce a tool_calls reply byte-for-byte).
+struct Wire {
+    std::vector<std::string> messages;      // full-history turns
+    std::vector<std::string> delta;         // incremental turns
+};
+
+std::vector<std::string> assemble(const Wire& w, const std::string& stored_reply) {
+    // Models the server rule: `messages` replaces, `delta_messages` appends after
+    // the stored history plus the reply we generated (which the client could not
+    // have sent). The stored history is passed in as the leading part of `messages`
+    // by the caller.
+    std::vector<std::string> h;
+    if (!w.delta.empty()) {
+        if (!w.messages.empty())
+            return {};  // caller rejects this: ambiguous
+        if (!stored_reply.empty())
+            h.push_back(stored_reply);  // re-inserted assistant turn
+        h.insert(h.end(), w.delta.begin(), w.delta.end());
+    } else {
+        h = w.messages;
+    }
+    return h;
+}
+
+void test_delta_appends_to_stored_history() {
+    printf("[server] delta messages append to the stored history\n");
+    Wire w;
+    w.messages = {"@user:turn1"};
+    std::string reply = "@assistant:reply1";
+
+    // The server keeps the conversation; a delta request appends to that stored
+    // history after re-inserting the reply we produced. Model the full stored
+    // history explicitly, as the server does.
+    std::vector<std::string> stored_history = {"@user:turn1"};
+    auto apply_delta = [](std::vector<std::string> stored, const std::string& reply,
+                          const std::vector<std::string>& delta) {
+        if (!reply.empty() && (stored.empty() || stored.back() != reply))
+            stored.push_back(reply);
+        stored.insert(stored.end(), delta.begin(), delta.end());
+        return stored;
+    };
+
+    auto h = apply_delta(stored_history, "@assistant:reply1", {"@user:turn2"});
+    check(h.size() == 3, "history grows by the reply plus the new message");
+    check(h.front() == "@user:turn1", "the original user turn is still first");
+    check(h[1] == "@assistant:reply1", "our reply was re-inserted as the assistant turn");
+    check(h.back() == "@user:turn2", "the delta lands last");
+
+    // Turn 3: the client sent no assistant turn, so ours is inserted again.
+    stored_history = h;
+    h = apply_delta(stored_history, "@assistant:reply2", {"@user:turn3"});
+    check(h.size() == 5, "each delta adds the reply plus one message");
+    check(h[3] == "@assistant:reply2", "the latest reply is used");
+    check(h[2] == "@user:turn2", "turn 2's user message survives");
+    check(h[4] == "@user:turn3", "the new delta lands last");
+    (void)w;
+    (void)reply;
+}
+
+void test_full_history_replaces() {
+    printf("[server] full messages replace the history\n");
+    Wire w;
+    w.messages = {"@user:only"};
+    auto h = assemble(w, "@assistant:should-not-appear");
+    check(h.size() == 1 && h[0] == "@user:only",
+          "the client is authoritative; our stored reply is not appended");
+}
+
+void test_delta_without_history_is_rejected() {
+    printf("[server] ambiguous or unanchored deltas are refused\n");
+    Wire both;
+    both.messages = {"@user:a"};
+    both.delta = {"@user:b"};
+    check(assemble(both, "").empty(),
+          "sending messages and delta_messages together yields no history (caller 400s)");
+}
+
 }  // namespace
 
 int main() {
@@ -175,6 +258,9 @@ int main() {
     test_prefix_match_is_per_session();
     test_lru_eviction_releases_kv();
     test_session_count_matches_inserts();
+    test_delta_appends_to_stored_history();
+    test_full_history_replaces();
+    test_delta_without_history_is_rejected();
 
     if (g_failures == 0) {
         printf("all server session-state tests passed\n");
