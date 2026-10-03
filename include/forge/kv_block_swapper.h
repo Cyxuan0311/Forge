@@ -32,12 +32,21 @@ public:
     // Save the raw key/value bytes of page (layer, page_id). The slot is created
     // on first use and never shrinks. `k_bytes`/`v_bytes` are fixed per page so
     // mismatched sizes on a later call are rejected.
+    //
+    // `kind` says where the source/destination memory lives. It is NOT optional:
+    // a paged GPU page's bytes live in device memory, and std::memcpy cannot read
+    // them (it faults or silently returns garbage). PagedKVStorage knows which
+    // side is device, so it says so.
+    enum class CopyKind : int {
+        Host,  // plain std::memcpy (CPU backend, or a pinned staging copy)
+        Device,  // cudaMemcpy; the buffers are device pointers
+    };
     bool offload(int layer, int page_id, const void* k_src, size_t k_bytes, const void* v_src,
-                 size_t v_bytes);
+                 size_t v_bytes, CopyKind kind = CopyKind::Host);
 
     // Restore the previously saved bytes into the given destinations.
     bool bring_back(int layer, int page_id, void* k_dst, size_t k_bytes, void* v_dst,
-                    size_t v_bytes) const;
+                    size_t v_bytes, CopyKind kind = CopyKind::Host) const;
 
     bool has(int layer, int page_id) const;
     bool size(int layer, int page_id, size_t* k_bytes, size_t* v_bytes) const;

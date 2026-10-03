@@ -300,8 +300,12 @@ bool RequestScheduler::step() {
             continue;
 
         // Bring any previously-evicted pages of this sequence back onto the
-        // device before the forward pass reads them.
-        if (memory && memory->is_paged())
+        // device before the forward pass reads them. Skipped under KVMem: the
+        // pages the manager archived are marked evicted in the same pool, and
+        // pulling them back here would silently un-archive them behind the
+        // manager's back (its token index would still list them as archived, so a
+        // later recall would double-restore).
+        if (memory && memory->is_paged() && !memory->working_set())
             memory->storage().bring_back_seq(rid);
 
         InferenceBatchItem item;
@@ -621,6 +625,15 @@ std::vector<int> RequestScheduler::try_swap_out() {
         return suspended;
     KVMemory* memory = engine->kv_memory();
     if (!memory || !memory->is_paged())
+        return suspended;
+    // KVMem owns seq 0's window: the working-set manager plans against that exact
+    // slot layout and keeps its own token index, and its archive uses the *same*
+    // KVBlockSwapper pool keyed by (layer, page_id). Swapping a tiered sequence
+    // out would both invalidate the manager's view and collide in that pool. The
+    // scheduler is not tier-aware, so refuse rather than corrupt. (Making the
+    // scheduler tier-aware, or keying the archive pool separately, is the real
+    // fix; this gate is the safe interim.)
+    if (memory->working_set())
         return suspended;
     auto& storage = memory->storage();
 

@@ -69,8 +69,48 @@ KVBlockSwapper::~KVBlockSwapper() {
     total_bytes_ = 0;
 }
 
+// Raw-byte copies that respect where the memory actually lives. A paged GPU
+// page's bytes are device memory; std::memcpy on a device pointer faults (or,
+// worse, reads whatever happens to be mapped there). This is the whole reason
+// CopyKind exists.
+namespace {
+
+// Destination is the page's own (device) buffer: host blob -> device.
+bool copy_host_to_dst(void* dst, const void* src, size_t bytes,
+                      KVBlockSwapper::CopyKind dst_kind) {
+#ifdef USE_CUDA
+    if (dst_kind == KVBlockSwapper::CopyKind::Device)
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+#else
+    (void)dst;
+    (void)src;
+    (void)bytes;
+    (void)dst_kind;
+#endif
+    std::memcpy(dst, src, bytes);
+    return true;
+}
+
+// Destination is the pinned host blob: device -> host.
+bool copy_src_to_host(void* host_dst, const void* src, size_t bytes,
+                      KVBlockSwapper::CopyKind src_kind) {
+#ifdef USE_CUDA
+    if (src_kind == KVBlockSwapper::CopyKind::Device)
+        return cudaMemcpy(host_dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+#else
+    (void)host_dst;
+    (void)src;
+    (void)bytes;
+    (void)src_kind;
+#endif
+    std::memcpy(host_dst, src, bytes);
+    return true;
+}
+
+}  // namespace
+
 bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k_bytes,
-                             const void* v_src, size_t v_bytes) {
+                             const void* v_src, size_t v_bytes, CopyKind kind) {
     if ((!k_src && k_bytes) || (!v_src && v_bytes)) {
         LOG_ERROR("KVBlockSwapper::offload: null source with non-zero size");
         return false;
@@ -84,10 +124,10 @@ bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k
                       std::to_string(layer) + "," + std::to_string(page_id) + ")");
             return false;
         }
-        if (k_bytes)
-            std::memcpy(it->second.k, k_src, k_bytes);
-        if (v_bytes)
-            std::memcpy(it->second.v, v_src, v_bytes);
+        if (!copy_src_to_host(it->second.k, k_src, k_bytes, kind))
+            return false;
+        if (!copy_src_to_host(it->second.v, v_src, v_bytes, kind))
+            return false;
         return true;
     }
 
@@ -99,7 +139,10 @@ bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k
                       " bytes)");
             return false;
         }
-        std::memcpy(blob.k, k_src, k_bytes);
+        if (!copy_src_to_host(blob.k, k_src, k_bytes, kind)) {
+            free_host(blob.k);
+            return false;
+        }
         blob.k_size = k_bytes;
     }
     if (v_bytes) {
@@ -110,7 +153,11 @@ bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k
                       " bytes)");
             return false;
         }
-        std::memcpy(blob.v, v_src, v_bytes);
+        if (!copy_src_to_host(blob.v, v_src, v_bytes, kind)) {
+            free_host(blob.v);
+            free_host(blob.k);
+            return false;
+        }
         blob.v_size = v_bytes;
     }
     pool_.emplace(key, blob);
@@ -119,7 +166,7 @@ bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k
 }
 
 bool KVBlockSwapper::bring_back(int layer, int page_id, void* k_dst, size_t k_bytes, void* v_dst,
-                                size_t v_bytes) const {
+                                size_t v_bytes, CopyKind kind) const {
     auto it = pool_.find(PageKey{layer, page_id});
     if (it == pool_.end())
         return false;
@@ -130,10 +177,10 @@ bool KVBlockSwapper::bring_back(int layer, int page_id, void* k_dst, size_t k_by
         return false;
     if (v_bytes && (!v_dst || !blob.v))
         return false;
-    if (k_bytes)
-        std::memcpy(k_dst, blob.k, k_bytes);
-    if (v_bytes)
-        std::memcpy(v_dst, blob.v, v_bytes);
+    if (!copy_host_to_dst(k_dst, blob.k, k_bytes, kind))
+        return false;
+    if (!copy_host_to_dst(v_dst, blob.v, v_bytes, kind))
+        return false;
     return true;
 }
 

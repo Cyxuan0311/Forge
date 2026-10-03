@@ -1019,6 +1019,37 @@ int PagedKVStorage::seq_filled(int layer, int seq_id) const {
     return (int)it->second[layer].logical_len;
 }
 
+bool PagedKVStorage::seq_set_logical_len(int seq_id, int64_t len) {
+    if (len < 0)
+        return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end())
+        return false;
+
+    bool any = false;
+    for (int l = 0; l < (int)it->second.size(); ++l) {
+        auto& table = it->second[l];
+        if (len > table.logical_len)
+            return false;  // never grows
+        if (table.logical_len == len)
+            continue;
+        table.logical_len = len;
+        // Keep filled_in_last consistent with the new length: it is how much of
+        // the final page is valid, and a stale value would make the last-page
+        // bound wrong for the next write.
+        if (len == 0) {
+            table.filled_in_last = 0;
+        } else {
+            const int last_page_idx = (int)((len - 1) / page_size_);
+            table.filled_in_last = (int)(len - (int64_t)last_page_idx * page_size_);
+        }
+        any = true;
+    }
+    return any;
+}
+
 bool PagedKVStorage::seq_remove(int seq_id, int64_t p0, int64_t p1) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -1471,7 +1502,12 @@ bool PagedKVStorage::offload_to_host_unlocked(int layer, int page_id) {
     if (k_bytes == 0 && v_bytes == 0)
         return false;
 
-    if (!swapper_.offload(layer, page_id, k_src, k_bytes, v_src, v_bytes))
+    // Device or FP32 storage's bytes live in device memory; std::memcpy cannot
+    // read them, so the swapper must be told which side is which.
+    const KVBlockSwapper::CopyKind kind =
+        (device_ == DeviceType::CUDA) ? KVBlockSwapper::CopyKind::Device
+                                       : KVBlockSwapper::CopyKind::Host;
+    if (!swapper_.offload(layer, page_id, k_src, k_bytes, v_src, v_bytes, kind))
         return false;
 
     storage_release_data(page.key);
@@ -1587,6 +1623,16 @@ bool PagedKVStorage::kvmem_supported() const {
         if (pool.policy != KVLayerPolicy::Full)
             return false;
     return !layer_pools_.empty();
+}
+
+void PagedKVStorage::attach_working_set(int seq_id, bool active) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // The table is created lazily on the first write, so arming a sequence that
+    // has no pages yet must create an empty one rather than silently do nothing.
+    auto& table = seq_tables_[seq_id];
+    table.resize((size_t)std::max(0, num_layers_));
+    for (auto& t : table)
+        t.window_active = active;
 }
 
 int64_t PagedKVStorage::seq_window_len(int seq_id, int layer) const {

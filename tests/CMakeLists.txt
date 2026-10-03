@@ -128,6 +128,12 @@ add_executable(forge-dflash-test test_dflash.cpp)
 forge_link_native(forge-dflash-test)
 add_test(NAME dflash COMMAND forge-dflash-test)
 
+# KVMem tiered working set: window-planning policy, including the pinned
+# attention sink that survives budget pressure. Host-only (pure policy).
+add_executable(forge-kvmem-working-set-test test_kvmem_working_set.cpp)
+forge_link_native(forge-kvmem-working-set-test)
+add_test(NAME kvmem-working-set COMMAND forge-kvmem-working-set-test)
+
 # KV auto-capacity sizing (roadmap 1.2): per-sequence footprint arithmetic and
 # the max_num_seqs derivation from a device memory budget. Host-only.
 add_executable(forge-kv-sizing-test test_kv_sizing.cpp)
@@ -471,6 +477,14 @@ if(CUDAToolkit_FOUND)
   add_executable(forge-q3k-gemv-bench test_q3k_gemv_cuda.cu)
   forge_link_native(forge-q3k-gemv-bench)
   add_test(NAME q3k-gemv-bench COMMAND forge-q3k-gemv-bench)
+
+  # KVBlockSwapper device round-trip. offload() used to std::memcpy unconditionally
+  # while its only callers hand it *device* pointers, so eviction faulted (or read
+  # garbage). tests/test_kv_offload.cpp is host-only, so nothing covered the CUDA
+  # path; this does. Skips gracefully without a CUDA device.
+  add_executable(forge-kv-block-swapper-test test_kv_block_swapper_cuda.cu)
+  forge_link_native(forge-kv-block-swapper-test)
+  add_test(NAME kv-block-swapper COMMAND forge-kv-block-swapper-test)
 
   # Phase 5-D: Q3_K FP16 whole-matrix dequant (launch_dequant_q3_k_matrix_fp16)
   # + the Q3_K -> FP16 -> cuBLAS TensorCore prefill route it unlocks. Parity
