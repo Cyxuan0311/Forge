@@ -630,6 +630,13 @@ std::vector<int> PagedKVStorage::layer_pool_max_pages() const {
 void PagedKVStorage::init_seq(int seq_id) {
     if (seq_tables_.find(seq_id) == seq_tables_.end()) {
         seq_tables_[seq_id].resize(num_layers_);
+        // Sticky arming: the working set is still attached to this sequence, so
+        // a table re-created after reset()/release() must come back
+        // window-active or the per-turn shrink in the generator silently skips.
+        if (ws_armed_seqs_.count(seq_id)) {
+            for (auto& t : seq_tables_[seq_id])
+                t.window_active = true;
+        }
     }
 }
 
@@ -1675,6 +1682,13 @@ bool PagedKVStorage::kvmem_supported() const {
 
 void PagedKVStorage::attach_working_set(int seq_id, bool active) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Record the arming so init_seq() can re-arm tables re-created after
+    // reset()/release() for as long as the manager stays attached.
+    if (active) {
+        ws_armed_seqs_.insert(seq_id);
+    } else {
+        ws_armed_seqs_.erase(seq_id);
+    }
     // The table is created lazily on the first write, so arming a sequence that
     // has no pages yet must create an empty one rather than silently do nothing.
     auto& table = seq_tables_[seq_id];

@@ -495,6 +495,17 @@ private:
     // Per-sequence page tables: seq_tables_[seq_id][layer] -> SequencePageTable
     std::unordered_map<int, std::vector<SequencePageTable>> seq_tables_;
 
+    // Sequences whose window tracking is armed (a KVWorkingSetManager is
+    // attached). Arming is sticky across reset()/release(): those clear table
+    // content, but the manager stays attached and re-plans every turn, so a
+    // table lazily re-created by the next write must come back window-active --
+    // otherwise seq_window_len() reports -1 and the generator's per-turn
+    // logical-length shrink silently skips, leaving stale decode rows visible
+    // to unmasked decode attention (observed as garbled multi-turn output on
+    // CUDA, where warmup's reset_kv_cache() wipes the armed table after
+    // server startup attached the working set).
+    std::unordered_set<int> ws_armed_seqs_;
+
     // ---- CUDA page pointer tables (Phase 4) ----
     // Built once in init() when device_==CUDA. Pages themselves are allocated
     // by KVCacheStorage::alloc (which places them on CUDA); these tables just
