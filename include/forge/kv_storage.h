@@ -220,6 +220,37 @@ public:
     // Uploads the host page_ids for (layer, seq_id) to a device staging buffer
     // and returns the device pointer. Returns nullptr if not applicable.
     virtual const int32_t* upload_seq_page_table(int layer, int seq_id) { return nullptr; }
+    // Device-side row mirror read (Phase 4-B): returns FP32 K/V views covering
+    // rows [0, logical_len) of (layer, seq_id) directly on the CUDA device,
+    // serving CPU-backed paged storage that feeds CUDA attention. Avoids the
+    // per-call host materialization + full-window H2D copy in the caller.
+    // Returns false when unsupported; callers fall back to read_key_seq /
+    // read_value_seq plus an explicit device copy.
+    virtual bool read_window_cuda(int /*layer*/, int /*seq_id*/, TensorPtr* /*k_out*/,
+                                  TensorPtr* /*v_out*/) {
+        return false;
+    }
+    // Phase 4-C: deferred device row writes for CPU-backed paged pools serving
+    // CUDA decode. enqueue stashes one single-row K/V write: it advances the
+    // sequence's logical_len (so attention sees the row this step, exactly as
+    // the synchronous path would), records the device row as pending, and
+    // kicks off an async D2H into pinned staging — the page write itself
+    // happens at flush time. Until then read_window_cuda serves the row from
+    // the pending device tensors, never from the unflushed page cell. Returns
+    // false when unsupported (caller falls back to the synchronous write path).
+    virtual bool enqueue_device_row_write(int /*layer*/, int /*seq_id*/, int64_t /*pos*/,
+                                          const TensorPtr& /*k*/, const TensorPtr& /*v*/) {
+        return false;
+    }
+    // Flush all pending device row writes into their pages (one device sync
+    // for the whole step). Engines that enqueue MUST call this at the end of
+    // every forward pass; sequence-structure ops (seq_remove/seq_share/
+    // seq_keep/release/reset) are only legal once the queue is empty, which
+    // the end-of-forward flush guarantees.
+    virtual void flush_pending_writes() {}
+    // Opt-in gate: only engines that guarantee a flush after every forward may
+    // enable deferral (a queue that never drains silently loses rows).
+    virtual void set_defer_device_writes(bool /*on*/) {}
     virtual KVCacheDType kv_type_k() const { return KVCacheDType::FP32; }
     virtual KVCacheDType kv_type_v() const { return KVCacheDType::FP32; }
 
@@ -322,6 +353,31 @@ struct SequencePageTable {
     int d_cap = 0;                // allocated capacity (in int32 elements)
     int d_synced = 0;             // number of elements already on the device
     bool d_dirty = true;          // true => next upload must rewrite [0, n)
+
+    // Phase 4-B: persistent per-(seq, layer) device mirror of the sequence's
+    // K/V rows (FP32 tensors on CUDA). Only populated for CPU-backed pools
+    // serving CUDA attention (read_window_cuda). Holds rows
+    // [0, cuda_mirror_synced); every write at position p truncates
+    // cuda_mirror_synced to p, so a mirror read only ever uploads the appended
+    // tail instead of materializing the whole window on the host. Purely an
+    // accelerator: presence or absence never changes what attention computes.
+    TensorPtr cuda_key_mirror = nullptr;  // [cuda_mirror_rows, kv_dim] FP32 CUDA
+    TensorPtr cuda_value_mirror = nullptr;
+    int64_t cuda_mirror_rows = 0;    // allocated rows (grow-only, amortized 2x)
+    int64_t cuda_mirror_synced = 0;  // rows [0, synced) are valid on the device
+
+    // Phase 4-C: the deferred decode row that is visible via logical_len but
+    // has not landed in its page yet (page write happens at flush time).
+    // read_window_cuda serves it from these kept-alive device tensors (D2D
+    // into the mirror) — a page re-upload would read the unflushed cell. The
+    // flush clears this once the row is in its page.
+    int64_t pending_pos = -1;
+    TensorPtr pending_k_dev = nullptr;
+    TensorPtr pending_v_dev = nullptr;
+
+    // Phase 4-B: host staging for dequantizing one page span of quantized rows
+    // before its H2D upload (FP32 pages memcpy straight from the page buffer).
+    std::vector<float> mirror_stage_;
 };
 
 // Phase 6: per-layer page pool metadata.
@@ -453,6 +509,11 @@ public:
     void* const* d_key_page_ptrs(int layer) const override;
     void* const* d_value_page_ptrs(int layer) const override;
     const int32_t* upload_seq_page_table(int layer, int seq_id) override;
+    bool read_window_cuda(int layer, int seq_id, TensorPtr* k_out, TensorPtr* v_out) override;
+    bool enqueue_device_row_write(int layer, int seq_id, int64_t pos, const TensorPtr& k,
+                                  const TensorPtr& v) override;
+    void flush_pending_writes() override;
+    void set_defer_device_writes(bool on) override { defer_device_writes_ = on; }
 
 private:
     int alloc_page(int layer);
@@ -526,6 +587,29 @@ private:
     // device through SequencePageTable::{d_mirror,d_cap,d_synced,d_dirty} (one
     // mirror per (seq, layer)). No shared cross-sequence staging buffer exists
     // anymore, so concurrent sequences cannot overwrite each other.
+
+    // ---- Phase 4-C: deferred device row writes ----
+    // Decode rows computed on the GPU for a CPU-backed pool: the D2H is kicked
+    // off asynchronously at enqueue time and the page write happens once per
+    // step in flush_pending_writes() (after a single stream sync), instead of
+    // one pipeline-draining synchronous D2H per layer.
+    struct PendingRowWrite {
+        int layer = 0;
+        int seq_id = 0;
+        int64_t pos = 0;
+        float* k_host = nullptr;  // pinned staging (page-write source)
+        float* v_host = nullptr;
+    };
+    bool defer_device_writes_ = false;
+    std::vector<PendingRowWrite> pending_row_writes_;
+    // Grow-only pinned staging pool; flush resets the bump offset so decode
+    // reuses the same block(s) step after step. Single-threaded per forward:
+    // enqueue and flush never interleave.
+    std::vector<void*> pinned_blocks_;
+    size_t pinned_block_cap_ = 0;  // capacity of pinned_blocks_.back()
+    size_t pinned_off_ = 0;        // bump offset within the current block
+    float* pinned_alloc_unlocked(size_t bytes);
+    void free_pinned_blocks_();
 
     mutable std::mutex mutex_;
 };

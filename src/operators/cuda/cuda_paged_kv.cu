@@ -671,6 +671,137 @@ __global__ void paged_attn_q8_0_decode_kernel(const float* __restrict__ Q,
     cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
 }
 
+// ---- FP32 paged decode ----
+// Dedicated seq_len==1 kernel for FP32 paged KV. Before this existed, the
+// selector routed FP32 paged decode to the tiled prefill kernel — decode-shaped
+// work at the wrong operand layout, ~2x slower than the contiguous FP32 decode
+// kernel at long context. Structurally identical to paged_attn_f16_decode_
+// kernel, plus a shared-memory stage of the resolved per-page K/V base
+// pointers: without it, every KV row pays two DEPENDENT global loads
+// (page_ids -> page_ptrs) before its data can even be fetched, a serial
+// latency chain that dominates when each thread walks thousands of rows.
+template <int HEAD_DIM, int NUM_WARPS>
+__global__ void paged_attn_fp32_decode_kernel(const float* __restrict__ Q,
+                                              void* const* __restrict__ k_page_ptrs,
+                                              void* const* __restrict__ v_page_ptrs,
+                                              const int32_t* __restrict__ page_ids,
+                                              float* __restrict__ O, int kv_len, int num_heads,
+                                              int num_kv_heads, int page_size, size_t q_row_size,
+                                              const float* __restrict__ mask_row) {
+    int h = blockIdx.x;
+    if (h >= num_heads)
+        return;
+
+    int kv_groups = num_heads / num_kv_heads;
+    int kv_h = h / kv_groups;
+
+    int lane = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    const size_t head_byte_offset = (size_t)kv_h * HEAD_DIM * sizeof(float);
+
+    __shared__ float s_q[HEAD_DIM];
+    for (int d = tid; d < HEAD_DIM; d += block_size) {
+        s_q[d] = Q[h * HEAD_DIM + d];
+    }
+
+    // Stage the resolved page base pointers once per block: one coalesced pass
+    // over the page table replaces a two-hop dependent global load chain per
+    // KV row in the main loop. Tables larger than the 48KB default dynamic
+    // shared budget skip the stage (kernel and launcher compute the same
+    // predicate; smem is then passed as 0) and resolve rows per iteration.
+    const int npages = (kv_len + page_size - 1) / page_size;
+    const bool staged = (2 * (size_t)npages * sizeof(void*)) <= (48 * 1024);
+    uint8_t** s_kbase = nullptr;
+    uint8_t** s_vbase = nullptr;
+    if (staged) {
+        extern __shared__ char s_pages_raw[];
+        s_kbase = reinterpret_cast<uint8_t**>(s_pages_raw);
+        s_vbase = s_kbase + npages;
+        for (int p = tid; p < npages; p += block_size) {
+            const int pid = page_ids[p];
+            s_kbase[p] = static_cast<uint8_t*>(k_page_ptrs[pid]);
+            s_vbase[p] = static_cast<uint8_t*>(v_page_ptrs[pid]);
+        }
+    }
+    __syncthreads();
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+
+    float local_max = -1e30f;
+    float local_sum = 0.0f;
+    float local_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d)
+        local_acc[d] = 0.0f;
+
+    for (int j = tid; j < kv_len; j += block_size) {
+        if (mask_row != nullptr && mask_row[j] < -1e20f)
+            continue;
+
+        const int page_idx = j / page_size;
+        const int offset = j - page_idx * page_size;
+        const uint8_t* k_base =
+            staged ? s_kbase[page_idx]
+                   : reinterpret_cast<const uint8_t*>(k_page_ptrs[page_ids[page_idx]]);
+        const uint8_t* v_base =
+            staged ? s_vbase[page_idx]
+                   : reinterpret_cast<const uint8_t*>(v_page_ptrs[page_ids[page_idx]]);
+        const float* k_row =
+            reinterpret_cast<const float*>(k_base + (size_t)offset * q_row_size + head_byte_offset);
+        const float* v_row =
+            reinterpret_cast<const float*>(v_base + (size_t)offset * q_row_size + head_byte_offset);
+
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            dot += s_q[d] * k_row[d];
+        }
+        dot *= scale;
+        if (mask_row != nullptr)
+            dot += mask_row[j];
+
+        float new_max = fmaxf(local_max, dot);
+        float correction = expf(local_max - new_max);
+        float weight = expf(dot - new_max);
+        local_sum = local_sum * correction + weight;
+
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            local_acc[d] = local_acc[d] * correction + weight * v_row[d];
+        }
+        local_max = new_max;
+    }
+
+    float warp_max = warp_reduce_max(local_max);
+    float rescale = expf(local_max - warp_max);
+    float warp_sum = warp_reduce_sum(local_sum * rescale);
+    float warp_acc[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = local_acc[d] * rescale;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d)
+        warp_acc[d] = warp_reduce_sum(warp_acc[d]);
+
+    __shared__ float s_warp_max[NUM_WARPS];
+    __shared__ float s_warp_sum[NUM_WARPS];
+    __shared__ float s_warp_acc[NUM_WARPS * HEAD_DIM];
+
+    if (lane == 0) {
+        s_warp_max[warp_id] = warp_max;
+        s_warp_sum[warp_id] = warp_sum;
+    }
+    for (int d = lane; d < HEAD_DIM; d += 32) {
+        s_warp_acc[warp_id * HEAD_DIM + d] = warp_acc[d];
+    }
+    __syncthreads();
+
+    cross_warp_merge_and_write<HEAD_DIM, NUM_WARPS>(s_warp_max, s_warp_sum, s_warp_acc, O, h, lane);
+}
+
 // =========================================================================
 // Launch functions for paged decode kernels
 // =========================================================================
@@ -778,6 +909,50 @@ void launch_paged_flash_attention_gqa_decode_q8_0(const float* Q, void* const* k
         break;
     default:
         fprintf(stderr, "[ERROR] paged_attn_q8_0_decode: unsupported head_dim=%d\n", head_dim);
+        break;
+    }
+#undef LAUNCH
+}
+
+void launch_paged_flash_attention_gqa_decode_fp32(const float* Q, void* const* k_page_ptrs,
+                                                  void* const* v_page_ptrs, const int32_t* page_ids,
+                                                  float* O, int kv_len, int num_heads,
+                                                  int num_kv_heads, int head_dim, int page_size,
+                                                  size_t q_row_size, const float* mask_row,
+                                                  cudaStream_t stream) {
+    int blocks = num_heads;
+    // Shared-memory stage of the resolved page bases inside the kernel. Must
+    // match the kernel-side predicate: when the table would overflow the 48KB
+    // default dynamic shared budget, pass 0 and the kernel resolves rows
+    // per-iteration instead.
+    const int npages = (kv_len + page_size - 1) / page_size;
+    const size_t smem = 2 * (size_t)npages * sizeof(void*);
+    const int smem_arg = (smem <= 48 * 1024) ? (int)smem : 0;
+
+#define LAUNCH(HD)                                                                                    \
+    paged_attn_fp32_decode_kernel<HD, 4>                                                              \
+        <<<blocks, 128, smem_arg, stream>>>(Q, k_page_ptrs, v_page_ptrs, page_ids, O, kv_len,         \
+                                            num_heads, num_kv_heads, page_size, q_row_size,           \
+                                            mask_row)
+
+    switch (head_dim) {
+    case 64:
+        LAUNCH(64);
+        break;
+    case 96:
+        LAUNCH(96);
+        break;
+    case 128:
+        LAUNCH(128);
+        break;
+    case 256:
+        LAUNCH(256);
+        break;
+    case 512:
+        LAUNCH(512);
+        break;
+    default:
+        fprintf(stderr, "[ERROR] paged_attn_fp32_decode: unsupported head_dim=%d\n", head_dim);
         break;
     }
 #undef LAUNCH

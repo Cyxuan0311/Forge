@@ -57,6 +57,13 @@ TensorPtr GenericEngine::forward_request(const ForwardRequest& req) {
 
     init_kv_cache(cfg);
 
+    // Phase 4-C: this engine flushes deferred paged row writes at the end of
+    // every forward, so decode K/V rows may hop to the host asynchronously
+    // (one stream sync per step) instead of one pipeline-draining D2H per
+    // layer. Other engines keep the synchronous write path by default.
+    if (kv_memory_)
+        kv_memory_->storage().set_defer_device_writes(true);
+
     DeviceType first_dev = layer_device(0);
     auto ids_on_dev = transfer_hidden(req.input_ids, first_dev);
 
@@ -92,6 +99,12 @@ TensorPtr GenericEngine::forward_request(const ForwardRequest& req) {
     }
 
     auto logits = forward_layers(hidden, req);
+
+    // Phase 4-C: land deferred decode K/V rows in their pages before anything
+    // reads the logical length — one cudaStreamSynchronize per step instead of
+    // one pipeline-draining D2H per layer.
+    if (kv_memory_)
+        kv_memory_->storage().flush_pending_writes();
 
     // Logit softcapping (Gemma2/Gemma4)
     if (cfg.f_final_logit_softcapping > 0.0f && logits) {
@@ -223,6 +236,19 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
             // CUDA-backed paged storage takes device pointers directly (no D2H);
             // CPU-backed paged storage needs the data on CPU.
             DeviceType storage_dev = kv_memory_->storage().device();
+            // Phase 4-C: a single decode row computed on the GPU for a CPU-backed
+            // pool goes through the deferred write queue (async D2H into pinned
+            // staging; pages updated by flush_pending_writes at end of forward;
+            // attention sees the row via the storage's device row mirror). The
+            // synchronous staging below stalls the host until this layer's GPU
+            // pipeline drains (~2-3 ms per layer at long context, 16x per decode
+            // step with partial offload).
+            if (storage_dev == DeviceType::CPU && seq_len == 1 &&
+                k_rope->device() == DeviceType::CUDA && v->device() == DeviceType::CUDA &&
+                kv_memory_->storage().enqueue_device_row_write(layer_idx, lctx.seq_id(),
+                                                               start_pos, k_rope, v)) {
+                // Deferred: logical_len already advanced, pages land at flush.
+            } else {
             const float* k_data;
             const float* v_data;
             TensorPtr k_cpu, v_cpu;  // keep alive for CPU path
@@ -252,6 +278,7 @@ TensorPtr GenericEngine::forward_layer(const TensorPtr& hidden,
                     "Paged KV write failed at layer " + std::to_string(layer_idx) +
                     ": pos=" + std::to_string(start_pos) + " seq_len=" + std::to_string(seq_len) +
                     " (page pool exhausted — reduce --ctx-size or free VRAM)");
+            }
             }
         } else {
             // Contiguous mode: write to KVCache directly

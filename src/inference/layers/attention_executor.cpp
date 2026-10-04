@@ -496,8 +496,20 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
             // Per-sequence read: avoids duplicating shared-page data.
             // Falls back to all-sequence read if seq_id is invalid.
             if (seq_id >= 0) {
-                k_out = storage_->read_key_seq(layer_idx, seq_id);
-                v_out = storage_->read_value_seq(layer_idx, seq_id);
+                // Phase 4-B: a CPU-backed paged pool serving CUDA compute hands out its
+                // persistent device row mirror, skipping the per-call host
+                // materialization + full-window H2D copy (the dominant decode
+                // cost at long context with partial weight offload). On a miss
+                // the legacy per-sequence materialization path runs unchanged.
+                if (dev == DeviceType::CUDA && storage_->device() == DeviceType::CPU) {
+                    TensorPtr mk, mv;
+                    if (storage_->read_window_cuda(layer_idx, seq_id, &mk, &mv)) {
+                        k_out = mk;
+                        v_out = mv;
+                    }
+                }
+                if (!k_out) k_out = storage_->read_key_seq(layer_idx, seq_id);
+                if (!k_out || !v_out) v_out = storage_->read_value_seq(layer_idx, seq_id);
             }
             if (!k_out || !v_out) {
                 k_out = storage_->read_key(layer_idx);
@@ -1245,6 +1257,29 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
             const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
             size_t q_row_size = KVCache::block_nbytes(KVCacheDType::Q8_0, num_kv_heads * head_dim);
             cuda::launch_paged_flash_attention_gqa_decode_q8_0(
+                static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),
+                storage_->d_value_page_ptrs(layer_idx), d_page_ids,
+                static_cast<float*>(attn_out->data()), total_len, num_heads, num_kv_heads, head_dim,
+                storage_->page_size(), q_row_size, mask_row, 0);
+        }
+#else
+    {
+        TensorPtr k_, v_;
+        get_kv_on_device(k_, v_);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, k_, v_, seq_len, total_len, num_heads, num_kv_heads, head_dim, mask, true);
+    }
+#endif
+        break;
+
+    case AttentionPath::CUDA_PAGED_FP32_DECODE:
+#ifdef USE_CUDA
+        attn_out = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
+        {
+            const int32_t* d_page_ids = paged_tables(layer_idx, seq_id);
+            size_t q_row_size = KVCache::block_nbytes(KVCacheDType::FP32, num_kv_heads * head_dim);
+            cuda::launch_paged_flash_attention_gqa_decode_fp32(
                 static_cast<const float*>(q->data()), storage_->d_key_page_ptrs(layer_idx),
                 storage_->d_value_page_ptrs(layer_idx), d_page_ids,
                 static_cast<float*>(attn_out->data()), total_len, num_heads, num_kv_heads, head_dim,

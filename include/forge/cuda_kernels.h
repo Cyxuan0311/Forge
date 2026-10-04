@@ -857,6 +857,11 @@ void launch_paged_flash_attention_gqa_decode_q8_0(
     float* O, int kv_len, int num_heads, int num_kv_heads, int head_dim, int page_size,
     size_t q_row_size, const float* mask_row = nullptr, cudaStream_t stream = 0);
 
+void launch_paged_flash_attention_gqa_decode_fp32(
+    const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs, const int32_t* page_ids,
+    float* O, int kv_len, int num_heads, int num_kv_heads, int head_dim, int page_size,
+    size_t q_row_size, const float* mask_row = nullptr, cudaStream_t stream = 0);
+
 void launch_paged_flash_attention_gqa_decode_fp8_e4m3(
     const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs, const int32_t* page_ids,
     float* O, int kv_len, int num_heads, int num_kv_heads, int head_dim, int page_size,

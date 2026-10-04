@@ -45,13 +45,11 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
     // GQA decode (seq_len == 1): prefer fused quantized KV if available
     if (p.seq_len == 1) {
         // Paged KV cache (Phase 4): traverse the page table directly.
-        // Quantized paged KV has a dedicated decode kernel. FP32 paged has no
-        // dedicated decode kernel AND the CUDA paged storage cannot materialize
-        // rows (read_key* return null by design) — so route it to the paged
-        // prefill kernel, which handles seq_len==1 + causal correctly (the
-        // single query attends to all kv_len rows). Previously FP32 paged fell
-        // through to CUDA_FP32_DECODE, which materializes from the contiguous
-        // cache and crashed (null K/V) with a paged CUDA storage.
+        // Quantized paged KV has a dedicated decode kernel. FP32 paged also has
+        // a dedicated decode kernel now (materialization is not an option: the
+        // CUDA paged storage cannot materialize rows — read_key* return null by
+        // design — and routing to the paged prefill kernel ran decode-shaped
+        // work through a q_len-tiled kernel, ~2x slower at long context).
         if (p.paged && p.has_quantized_kv && p.kv_type_k == p.kv_type_v) {
             switch (p.kv_type_k) {
             case KVCacheDType::Q4_0:
@@ -65,7 +63,7 @@ AttentionPath choose_attention_path(const AttentionProblem& p) {
             case KVCacheDType::FP8_E5M2:
                 return AttentionPath::CUDA_PAGED_FP8_E5M2_DECODE;
             case KVCacheDType::FP32:
-                return AttentionPath::CUDA_PAGED_FP32_PREFILL;
+                return AttentionPath::CUDA_PAGED_FP32_DECODE;
             default:
                 break;  // Unsupported symmetric type → FP32 fallback
             }
@@ -281,6 +279,8 @@ const char* attention_path_name(AttentionPath path) {
         return "CUDA_PAGED_F16_DECODE";
     case AttentionPath::CUDA_PAGED_Q8_0_DECODE:
         return "CUDA_PAGED_Q8_0_DECODE";
+    case AttentionPath::CUDA_PAGED_FP32_DECODE:
+        return "CUDA_PAGED_FP32_DECODE";
     case AttentionPath::CUDA_PAGED_FP8_E4M3_DECODE:
         return "CUDA_PAGED_FP8_E4M3_DECODE";
     case AttentionPath::CUDA_PAGED_FP8_E5M2_DECODE:

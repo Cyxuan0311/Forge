@@ -153,6 +153,7 @@ int ContiguousKVStorage::num_free_slots() const {
 PagedKVStorage::PagedKVStorage() = default;
 
 PagedKVStorage::~PagedKVStorage() {
+    free_pinned_blocks_();
 #ifdef USE_CUDA
     for (int l = 0; l < num_layers_; ++l) {
         if (l < (int)d_key_page_ptrs_.size() && d_key_page_ptrs_[l])
@@ -700,6 +701,13 @@ bool PagedKVStorage::write_kv_seq(int layer, int seq_id, int64_t pos, int seq_le
 
     auto& table = seq_tables_[seq_id][layer];
 
+    // Phase 4-B: rows at/above pos may be rewritten by this call, so the device
+    // row mirror must re-upload them before its next read. Rows below pos are
+    // untouched; in particular an appending write (pos == logical_len) leaves
+    // an up-to-date mirror alone, so decode only ever uploads its one new row.
+    if (table.cuda_mirror_synced > pos)
+        table.cuda_mirror_synced = pos;
+
     // seq_window_archive_page releases a page's buffers and keeps the
     // slot->page mapping intact, so a write that lands on an archived slot (a
     // KVMem clip re-forwards the sink and tail over exactly those slots) must
@@ -1143,6 +1151,10 @@ bool PagedKVStorage::seq_remove(int seq_id, int64_t p0, int64_t p1) {
         }
 
         table.page_ids = remaining_pages;
+        // Phase 4-B: pages after the removed range compact to earlier slots, so
+        // mirrored rows at/above p0 now live at different logical positions.
+        if (table.cuda_mirror_synced > p0)
+            table.cuda_mirror_synced = p0;
         table.d_dirty = true;  // Phase 2-D: indexes shifted — full re-upload.
         // Recalculate logical_len
         if (table.page_ids.empty()) {
@@ -1185,6 +1197,9 @@ bool PagedKVStorage::seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1)
         const auto& src_table = src_it->second[l];
         auto& dst_table = seq_tables_[dst_seq][l];
         dst_table.d_dirty = true;  // Phase 2-D: table mutated — full re-upload.
+        // Phase 4-B: dst's tail rows now alias src pages; force the dst row
+        // mirror to re-upload everything on its next read (rare operation).
+        dst_table.cuda_mirror_synced = 0;
 
         for (int p = first_page; p <= last_page && p < (int)src_table.page_ids.size(); ++p) {
             int page_id = src_table.page_ids[p];
@@ -1220,6 +1235,15 @@ bool PagedKVStorage::seq_keep(int seq_id) {
 
 void PagedKVStorage::release(int seq_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Defensive: drop any deferred row writes for this sequence (the queue is
+    // normally empty between forwards; this guards an aborted forward).
+    pending_row_writes_.erase(std::remove_if(pending_row_writes_.begin(),
+                                             pending_row_writes_.end(),
+                                             [seq_id](const PendingRowWrite& r) {
+                                                 return r.seq_id == seq_id;
+                                             }),
+                              pending_row_writes_.end());
 
     auto it = seq_tables_.find(seq_id);
     if (it == seq_tables_.end())
@@ -1322,6 +1346,9 @@ int PagedKVStorage::free_pages_full() const {
 
 void PagedKVStorage::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Defensive: drop deferred row writes (reset discards all sequence state).
+    pending_row_writes_.clear();
 
     // Free the persistent device mirrors before dropping the host tables.
 #ifdef USE_CUDA
@@ -1665,6 +1692,311 @@ const int32_t* PagedKVStorage::upload_seq_page_table_unlocked(int layer, int seq
     return table.d_mirror;
 #else
     return nullptr;
+#endif
+}
+
+// =========================================================================
+// Phase 4-B: device row mirror for CPU-backed pools serving CUDA attention.
+//
+// Without this, a partial-offload deployment (-ngl < num_layers) pays, on
+// every attention call, for a host materialization of the whole window
+// (read_key_seq/read_value_seq) plus a full H2D copy of both tensors —
+// O(context) PCIe traffic per layer per decode step, which is what made
+// paged decode ~2x slower than the contiguous KV cache at long context.
+// The mirror keeps rows [0, synced) of each (seq, layer) resident on the
+// device; writes only ever append (decode) or truncate (new turn), so the
+// steady-state cost is one row uploaded per generated token. Invalidation
+// lives entirely on the write side (write_kv_seq / seq_remove / seq_share);
+// every other mutation either preserves rows [0, p) or erases the table
+// (release/reset free the mirrors with it).
+// =========================================================================
+bool PagedKVStorage::read_window_cuda(int layer, int seq_id, TensorPtr* k_out,
+                                      TensorPtr* v_out) {
+#ifdef USE_CUDA
+    // Mirror serves CPU-backed pools only: a CUDA-backed pool already answers
+    // from its device pages. The mirror itself always stores FP32 rows -- the
+    // materialized attention paths consume FP32 regardless of the storage
+    // dtype -- so quantized pages are dequantized row-by-row on upload.
+    if (device_ != DeviceType::CPU)
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return false;
+    SequencePageTable& table = it->second[layer];
+    const int64_t n = table.logical_len;
+    if (n <= 0)
+        return false;
+
+    const int kv_dim = (layer < (int)kv_dims_.size()) ? kv_dims_[layer] : kv_dims_[0];
+    const size_t row_bytes = (size_t)kv_dim * sizeof(float);
+
+    // (Re)allocate the mirror when missing or too small. Capacity doubles so
+    // decode's one-row appends amortize to O(1) H2D traffic; a realloc
+    // re-uploads everything once.
+    if (!table.cuda_key_mirror || table.cuda_mirror_rows < n) {
+        const int64_t new_rows =
+            table.cuda_mirror_rows > 0
+                ? std::max<int64_t>(table.cuda_mirror_rows * 2, n)
+                : std::max<int64_t>(n, 256);
+        table.cuda_key_mirror = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{new_rows, kv_dim}, DeviceType::CUDA);
+        table.cuda_value_mirror = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{new_rows, kv_dim}, DeviceType::CUDA);
+        table.cuda_mirror_rows = new_rows;
+        table.cuda_mirror_synced = 0;
+    }
+
+    // Upload rows [cuda_mirror_synced, n). Same page walk as read_key_seq:
+    // pages fill sequentially, the last bounded by logical_len (page_ids may
+    // cover more pages than there are visible rows after a KVMem clip).
+    // Rows at/above pending_pos are visible via logical_len (the deferred-write
+    // enqueue advanced it) but their page cells have not been written yet — the
+    // page upload must stop short of them; the pending row itself is filled
+    // from its device tensors after the loop below.
+    const int64_t page_cap =
+        (table.pending_pos >= 0 && table.pending_pos < n) ? table.pending_pos : n;
+    int64_t row_base = 0;
+    for (int p = 0; p < (int)table.page_ids.size() && row_base < n; ++p) {
+        const int64_t rows_in_page = std::min<int64_t>(page_size_, n - row_base);
+        const int64_t span_lo = std::max(row_base, table.cuda_mirror_synced);
+        const int64_t span_hi = std::min(row_base + rows_in_page, page_cap);  // exclusive
+        if (span_lo < span_hi) {
+            const int page_id = table.page_ids[p];
+            const auto& page = layer_pages_[layer][page_id];
+            const int r0 = static_cast<int>(span_lo - row_base);
+            const int cnt = static_cast<int>(span_hi - span_lo);
+            const size_t span_bytes = static_cast<size_t>(cnt) * row_bytes;
+            const size_t span_rows = static_cast<size_t>(cnt) * kv_dim;
+            float* k_dst =
+                static_cast<float*>(table.cuda_key_mirror->data()) +
+                static_cast<size_t>(span_lo) * kv_dim;
+            float* v_dst =
+                static_cast<float*>(table.cuda_value_mirror->data()) +
+                static_cast<size_t>(span_lo) * kv_dim;
+            const bool k_fp32 = kv_config_.type_k == KVCacheDType::FP32;
+            const bool v_fp32 = kv_config_.type_v == KVCacheDType::FP32;
+            // Host staging for dequantized spans (K first half, V second half so
+            // one upload's source is never overwritten while another is queued).
+            float* stage = nullptr;
+            if (!k_fp32 || !v_fp32) {
+                table.mirror_stage_.resize(span_rows * ((k_fp32 != v_fp32) ? 1 : 2));
+                stage = table.mirror_stage_.data();
+            }
+            // Uploads are asynchronous on the default stream: the attention
+            // kernel that consumes these rows is launched on the same stream,
+            // so stream order alone guarantees visibility -- a synchronous
+            // cudaMemcpy here would stall the host until the whole queued GPU
+            // pipeline drains (observed as ~3x slower decode).
+            if (k_fp32) {
+                // Fast path: FP32 pages are contiguous -- copy the span as-is.
+                cudaMemcpyAsync(k_dst, page.key.fp32_row(r0), span_bytes,
+                                cudaMemcpyHostToDevice);
+            } else {
+                // Quantized pages: dequantize the span into host staging, then
+                // upload it as one block. Decode appends a single row per step,
+                // so the steady-state cost is one row dequant + 2 KB H2D.
+                for (int r = 0; r < cnt; ++r) {
+                    KVCache::dequantize_row(kv_config_.type_k, page.key.q_row(r0 + r),
+                                            stage + static_cast<size_t>(r) * kv_dim, kv_dim);
+                }
+                cudaMemcpyAsync(k_dst, stage, span_bytes, cudaMemcpyHostToDevice);
+            }
+            if (v_fp32) {
+                cudaMemcpyAsync(v_dst, page.value.fp32_row(r0), span_bytes,
+                                cudaMemcpyHostToDevice);
+            } else {
+                float* v_stage = k_fp32 ? stage : stage + span_rows;
+                for (int r = 0; r < cnt; ++r) {
+                    KVCache::dequantize_row(kv_config_.type_v, page.value.q_row(r0 + r),
+                                            v_stage + static_cast<size_t>(r) * kv_dim, kv_dim);
+                }
+                cudaMemcpyAsync(v_dst, v_stage, span_bytes, cudaMemcpyHostToDevice);
+            }
+        }
+        row_base += rows_in_page;
+    }
+
+    // Serve the pending (not yet flushed) decode row straight from its device
+    // tensors. This also covers a mirror realloc above: the page upload stops
+    // at page_cap, so without this the newest row would be missing entirely.
+    if (table.pending_pos >= 0 && table.pending_pos >= table.cuda_mirror_synced &&
+        table.pending_pos < n && table.pending_pos < table.cuda_mirror_rows &&
+        table.pending_k_dev && table.pending_v_dev) {
+        float* k_dst = static_cast<float*>(table.cuda_key_mirror->data()) +
+                       (size_t)table.pending_pos * kv_dim;
+        float* v_dst = static_cast<float*>(table.cuda_value_mirror->data()) +
+                       (size_t)table.pending_pos * kv_dim;
+        cudaMemcpyAsync(k_dst, table.pending_k_dev->data(), row_bytes,
+                        cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(v_dst, table.pending_v_dev->data(), row_bytes,
+                        cudaMemcpyDeviceToDevice);
+    }
+    table.cuda_mirror_synced = n;
+
+    // Contiguous [n, kv_dim] views into the mirror storage: no copy, and the
+    // next read re-uploads only rows appended after this call.
+    *k_out = std::make_shared<Tensor>(table.cuda_key_mirror->slice(0, 0, n));
+    *v_out = std::make_shared<Tensor>(table.cuda_value_mirror->slice(0, 0, n));
+    return true;
+#else
+    (void)layer;
+    (void)seq_id;
+    (void)k_out;
+    (void)v_out;
+    return false;
+#endif
+}
+
+// =========================================================================
+// Phase 4-C: deferred device row writes.
+//
+// The read-side mirror (read_window_cuda) removed the per-step full-window
+// materialization, but the WRITE side still stalled the host once per CUDA
+// layer: staging the freshly computed row into a CPU-backed pool went through
+// a synchronous D2H, which waits for this layer's GPU pipeline to drain
+// (~2-3 ms per layer at long context, 16x per decode step with partial
+// offload). Here the row hops to the host asynchronously (pinned staging) and
+// the page write is deferred to flush_pending_writes(), which pays ONE stream
+// sync per decode step. The row is also absorbed into the device row mirror
+// (device-to-device) so the next attention sees it without waiting for the
+// page write; until the flush lands, logical_len excludes the row — engines
+// that enqueue must therefore flush at the end of every forward pass.
+// =========================================================================
+bool PagedKVStorage::enqueue_device_row_write(int layer, int seq_id, int64_t pos,
+                                              const TensorPtr& k, const TensorPtr& v) {
+#ifdef USE_CUDA
+    if (!defer_device_writes_ || device_ != DeviceType::CPU)
+        return false;
+    if (!k || !v || k->device() != DeviceType::CUDA || v->device() != DeviceType::CUDA)
+        return false;
+    if (k->dtype() != DataType::FP32 || v->dtype() != DataType::FP32)
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return false;
+    SequencePageTable& table = it->second[layer];
+    const int kv_dim = (layer < (int)kv_dims_.size()) ? kv_dims_[layer] : kv_dims_[0];
+    if (k->numel() != kv_dim || v->numel() != kv_dim)
+        return false;  // not a single full row — use the synchronous path
+    const size_t row_bytes = (size_t)kv_dim * sizeof(float);
+
+    // Advance the logical length NOW: the synchronous path's write_kv_seq
+    // makes the row visible to seq_filled() before attention runs, and this
+    // path must behave identically — deferring that visibility to flush time
+    // made decode attention skip the current token's own row (corrupted
+    // output). The page write itself still lands at flush; until then
+    // read_window_cuda serves this row from the device tensors recorded below,
+    // never from the unflushed page cell.
+    table.pending_pos = pos;
+    table.pending_k_dev = k;
+    table.pending_v_dev = v;
+    table.logical_len = std::max(table.logical_len, pos + 1);
+
+    // Stage the row into pinned memory for the page write at flush time.
+    float* k_host = pinned_alloc_unlocked(row_bytes);
+    float* v_host = pinned_alloc_unlocked(row_bytes);
+    if (!k_host || !v_host) {
+        table.pending_pos = -1;
+        table.pending_k_dev.reset();
+        table.pending_v_dev.reset();
+        return false;
+    }
+    cudaMemcpyAsync(k_host, k->data(), row_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(v_host, v->data(), row_bytes, cudaMemcpyDeviceToHost);
+
+    PendingRowWrite entry;
+    entry.layer = layer;
+    entry.seq_id = seq_id;
+    entry.pos = pos;
+    entry.k_host = k_host;
+    entry.v_host = v_host;
+    pending_row_writes_.push_back(std::move(entry));
+    return true;
+#else
+    (void)layer;
+    (void)seq_id;
+    (void)pos;
+    (void)k;
+    (void)v;
+    return false;
+#endif
+}
+
+void PagedKVStorage::flush_pending_writes() {
+    std::vector<PendingRowWrite> rows;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        rows.swap(pending_row_writes_);
+    }
+    if (rows.empty())
+        return;
+#ifdef USE_CUDA
+    // One sync per decode step: every enqueued D2H lands here, so the host
+    // never stalls per layer waiting on the GPU pipeline.
+    cudaStreamSynchronize(0);
+    for (const auto& r : rows) {
+        if (!write_kv_seq(r.layer, r.seq_id, r.pos, 1, r.k_host, r.v_host)) {
+            pinned_off_ = 0;
+            throw std::runtime_error(
+                "Paged KV deferred write failed at layer " + std::to_string(r.layer) +
+                ": pos=" + std::to_string(r.pos) +
+                " (page pool exhausted — reduce --ctx-size or free VRAM)");
+        }
+    }
+    pinned_off_ = 0;  // reuse the pinned pool from the start next step
+    // The rows are in their pages now — drop the pending device tensors so
+    // read_window_cuda goes back to serving these rows from the pages.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& r : rows) {
+            auto it = seq_tables_.find(r.seq_id);
+            if (it == seq_tables_.end() || r.layer < 0 || r.layer >= (int)it->second.size())
+                continue;
+            auto& t = it->second[r.layer];
+            if (t.pending_pos == r.pos) {
+                t.pending_pos = -1;
+                t.pending_k_dev.reset();
+                t.pending_v_dev.reset();
+            }
+        }
+    }
+#endif
+}
+
+float* PagedKVStorage::pinned_alloc_unlocked(size_t bytes) {
+#ifdef USE_CUDA
+    if (pinned_blocks_.empty() || pinned_block_cap_ - pinned_off_ < bytes) {
+        const size_t block = std::max<size_t>(bytes, 1 << 20);
+        void* p = nullptr;
+        if (cudaHostAlloc(&p, block, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        pinned_blocks_.push_back(p);
+        pinned_block_cap_ = block;
+        pinned_off_ = 0;
+    }
+    float* out =
+        reinterpret_cast<float*>(static_cast<char*>(pinned_blocks_.back()) + pinned_off_);
+    pinned_off_ += bytes;
+    return out;
+#else
+    (void)bytes;
+    return nullptr;
+#endif
+}
+
+void PagedKVStorage::free_pinned_blocks_() {
+#ifdef USE_CUDA
+    for (void* p : pinned_blocks_)
+        cudaFreeHost(p);
+    pinned_blocks_.clear();
+    pinned_block_cap_ = 0;
+    pinned_off_ = 0;
 #endif
 }
 
