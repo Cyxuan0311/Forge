@@ -701,12 +701,15 @@ bool PagedKVStorage::write_kv_seq(int layer, int seq_id, int64_t pos, int seq_le
 
     auto& table = seq_tables_[seq_id][layer];
 
-    // Phase 4-B: rows at/above pos may be rewritten by this call, so the device
-    // row mirror must re-upload them before its next read. Rows below pos are
-    // untouched; in particular an appending write (pos == logical_len) leaves
-    // an up-to-date mirror alone, so decode only ever uploads its one new row.
+    // Phase 4-B/4-D: rows at/above pos may be rewritten by this call, so both
+    // row mirrors must re-upload them before their next read. Rows below pos
+    // are untouched; in particular an appending write (pos == logical_len)
+    // leaves an up-to-date mirror alone, so decode only ever uploads its one
+    // new row (on the device) or dequantizes it (on the host).
     if (table.cuda_mirror_synced > pos)
         table.cuda_mirror_synced = pos;
+    if (table.host_mirror_synced > pos)
+        table.host_mirror_synced = pos;
 
     // seq_window_archive_page releases a page's buffers and keeps the
     // slot->page mapping intact, so a write that lands on an archived slot (a
@@ -1151,10 +1154,13 @@ bool PagedKVStorage::seq_remove(int seq_id, int64_t p0, int64_t p1) {
         }
 
         table.page_ids = remaining_pages;
-        // Phase 4-B: pages after the removed range compact to earlier slots, so
-        // mirrored rows at/above p0 now live at different logical positions.
+        // Phase 4-B/4-D: pages after the removed range compact to earlier
+        // slots, so mirrored rows at/above p0 now live at different logical
+        // positions. Both the device and the host mirror must re-upload them.
         if (table.cuda_mirror_synced > p0)
             table.cuda_mirror_synced = p0;
+        if (table.host_mirror_synced > p0)
+            table.host_mirror_synced = p0;
         table.d_dirty = true;  // Phase 2-D: indexes shifted — full re-upload.
         // Recalculate logical_len
         if (table.page_ids.empty()) {
@@ -1197,9 +1203,10 @@ bool PagedKVStorage::seq_share(int src_seq, int dst_seq, int64_t p0, int64_t p1)
         const auto& src_table = src_it->second[l];
         auto& dst_table = seq_tables_[dst_seq][l];
         dst_table.d_dirty = true;  // Phase 2-D: table mutated — full re-upload.
-        // Phase 4-B: dst's tail rows now alias src pages; force the dst row
-        // mirror to re-upload everything on its next read (rare operation).
+        // Phase 4-B/4-D: dst's tail rows now alias src pages; force the dst row
+        // mirrors to re-upload everything on their next read (rare operation).
         dst_table.cuda_mirror_synced = 0;
+        dst_table.host_mirror_synced = 0;
 
         for (int p = first_page; p <= last_page && p < (int)src_table.page_ids.size(); ++p) {
             int page_id = src_table.page_ids[p];
@@ -1276,10 +1283,20 @@ void PagedKVStorage::release(int seq_id) {
         table.window_active = false;
     }
 
-    // Release the persistent device mirrors, then drop the host tables.
+    // Release the persistent mirrors, then drop the host tables.
 #ifdef USE_CUDA
     free_page_table_mirrors(it->second);
 #endif
+    // Phase 4-D: the FP32 host row mirrors are the largest of the per-sequence
+    // allocations; drop them explicitly instead of waiting for the table's
+    // destructor, so a released sequence's working set is reclaimable even if
+    // some caller still holds a slice view of the storage.
+    for (auto& t : it->second) {
+        t.host_key_mirror.reset();
+        t.host_value_mirror.reset();
+        t.host_mirror_rows = 0;
+        t.host_mirror_synced = 0;
+    }
     seq_tables_.erase(it);
 }
 
@@ -1350,11 +1367,18 @@ void PagedKVStorage::reset() {
     // Defensive: drop deferred row writes (reset discards all sequence state).
     pending_row_writes_.clear();
 
-    // Free the persistent device mirrors before dropping the host tables.
+    // Free the persistent mirrors before dropping the host tables.
 #ifdef USE_CUDA
     for (auto& kv : seq_tables_)
         free_page_table_mirrors(kv.second);
 #endif
+    for (auto& kv : seq_tables_)
+        for (auto& t : kv.second) {
+            t.host_key_mirror.reset();
+            t.host_value_mirror.reset();
+            t.host_mirror_rows = 0;
+            t.host_mirror_synced = 0;
+        }
     // Clear all sequence tables
     seq_tables_.clear();
 
@@ -1847,6 +1871,115 @@ bool PagedKVStorage::read_window_cuda(int layer, int seq_id, TensorPtr* k_out,
     (void)v_out;
     return false;
 #endif
+}
+
+// =========================================================================
+// Phase 4-D: host row mirror for CPU-backed pools serving CPU attention.
+//
+// read_window_cuda fixed the CUDA side of long-context paged decode, but the
+// layers whose attention runs on the host (partial offload: -ngl < num_layers)
+// still went through read_key_seq/read_value_seq, which materialize the WHOLE
+// window into two freshly allocated FP32 tensors on every call — O(context)
+// host dequant + copy per layer per decode step, and the fresh allocations
+// also throw away the cache locality a persistent buffer would have. Measured
+// on Qwen2.5-7B Q4_0 / RTX 4050 at 5.1k context with -ngl 16: the 12
+// non-offloaded layers cost ~22 ms/step, i.e. essentially the whole remaining
+// gap to the contiguous cache (which hands out a zero-copy view into a
+// persistent per-layer KV buffer).
+// This provides that view: rows [0, synced) stay resident on the host, decode
+// appends one row per step, and every write at position p truncates the
+// watermark to p so rewritten rows are re-uploaded. Invalidation is handled
+// entirely by the same write-side hooks as the CUDA mirror (write_kv_seq,
+// seq_remove, seq_share); release/reset drop the tables that own the tensors.
+// =========================================================================
+bool PagedKVStorage::read_window_host(int layer, int seq_id, TensorPtr* k_out,
+                                      TensorPtr* v_out) {
+    // Only a CPU-backed pool can be materialized on the host: page buffers are
+    // host pointers, and dequantize_row() below is a host function. A CUDA
+    // pool must use its paged kernels instead (read_key* return null there).
+    if (device_ != DeviceType::CPU)
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end() || layer < 0 || layer >= (int)it->second.size())
+        return false;
+    SequencePageTable& table = it->second[layer];
+    const int64_t n = table.logical_len;
+    if (n <= 0)
+        return false;
+    // A deferred (device-only) row inside the visible window cannot be served
+    // here: its page cell still holds the previous contents and its data lives
+    // on the device, so the upload below would read a stale row. Unreachable
+    // in practice — deferral only applies to layers whose attention runs on
+    // CUDA, and those read through read_window_cuda — so fall back instead of
+    // silently serving stale KV.
+    if (table.pending_pos >= 0 && table.pending_pos < n)
+        return false;
+
+    const int kv_dim = (layer < (int)kv_dims_.size()) ? kv_dims_[layer] : kv_dims_[0];
+
+    // (Re)allocate when missing or too small; capacity doubles so decode's
+    // one-row appends amortize to O(1) host work. A realloc re-uploads once.
+    if (!table.host_key_mirror || table.host_mirror_rows < n) {
+        const int64_t new_rows =
+            table.host_mirror_rows > 0
+                ? std::max<int64_t>(table.host_mirror_rows * 2, n)
+                : std::max<int64_t>(n, 256);
+        table.host_key_mirror = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{new_rows, kv_dim}, DeviceType::CPU);
+        table.host_value_mirror = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{new_rows, kv_dim}, DeviceType::CPU);
+        table.host_mirror_rows = new_rows;
+        table.host_mirror_synced = 0;
+    }
+
+    float* k_base = static_cast<float*>(table.host_key_mirror->data());
+    float* v_base = static_cast<float*>(table.host_value_mirror->data());
+    const bool k_fp32 = kv_config_.type_k == KVCacheDType::FP32;
+    const bool v_fp32 = kv_config_.type_v == KVCacheDType::FP32;
+    const size_t row_bytes = static_cast<size_t>(kv_dim) * sizeof(float);
+
+    // Upload rows [host_mirror_synced, n). Same page walk as read_key_seq:
+    // pages fill sequentially, the last bounded by logical_len (page_ids may
+    // cover more pages than there are visible rows after a KVMem clip).
+    int64_t row_base = 0;
+    for (int p = 0; p < (int)table.page_ids.size() && row_base < n; ++p) {
+        const int64_t rows_in_page = std::min<int64_t>(page_size_, n - row_base);
+        const int64_t span_lo = std::max(row_base, table.host_mirror_synced);
+        const int64_t span_hi = std::min(row_base + rows_in_page, n);  // exclusive
+        if (span_lo < span_hi) {
+            const auto& page = layer_pages_[layer][table.page_ids[p]];
+            const int r0 = static_cast<int>(span_lo - row_base);
+            const int cnt = static_cast<int>(span_hi - span_lo);
+            float* k_dst = k_base + static_cast<size_t>(span_lo) * kv_dim;
+            float* v_dst = v_base + static_cast<size_t>(span_lo) * kv_dim;
+            for (int r = 0; r < cnt; ++r) {
+                if (k_fp32) {
+                    std::memcpy(k_dst + static_cast<size_t>(r) * kv_dim,
+                                page.key.fp32_row(r0 + r), row_bytes);
+                } else {
+                    KVCache::dequantize_row(kv_config_.type_k, page.key.q_row(r0 + r),
+                                            k_dst + static_cast<size_t>(r) * kv_dim, kv_dim);
+                }
+                if (v_fp32) {
+                    std::memcpy(v_dst + static_cast<size_t>(r) * kv_dim,
+                                page.value.fp32_row(r0 + r), row_bytes);
+                } else {
+                    KVCache::dequantize_row(kv_config_.type_v, page.value.q_row(r0 + r),
+                                            v_dst + static_cast<size_t>(r) * kv_dim, kv_dim);
+                }
+            }
+        }
+        row_base += rows_in_page;
+    }
+    table.host_mirror_synced = n;
+
+    // Contiguous [n, kv_dim] views into the persistent mirror storage: no copy,
+    // and the next read re-materializes only rows appended after this call.
+    *k_out = std::make_shared<Tensor>(table.host_key_mirror->slice(0, 0, n));
+    *v_out = std::make_shared<Tensor>(table.host_value_mirror->slice(0, 0, n));
+    return true;
 }
 
 // =========================================================================

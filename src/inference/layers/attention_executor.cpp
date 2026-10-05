@@ -508,6 +508,27 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
                         v_out = mv;
                     }
                 }
+                // Phase 4-D: the host twin. A CPU-backed pool feeding CPU
+                // attention (the non-offloaded layers under partial offload)
+                // hands out its persistent host row mirror, so the window is
+                // materialized once and then appended one row per step,
+                // instead of re-dequantizing the whole window into two fresh
+                // tensors on every call — O(context) host work per layer per
+                // decode step. Measured (Qwen2.5-7B Q4_0, RTX 4050, -ngl 16,
+                // 4165-token needle, n=24): with quantized KV (q8_0) the twin
+                // saves ~35 ms/step (~21%, 163.7 -> 129.2 ms/tok, matching the
+                // contiguous cache); with F16 KV it is neutral — the per-row
+                // f16->fp32 conversion is cheap enough that full-window
+                // materialization was never the bottleneck. On a miss the
+                // legacy materialization path runs unchanged.
+                if (!k_out && dev == DeviceType::CPU &&
+                    storage_->device() == DeviceType::CPU) {
+                    TensorPtr mk, mv;
+                    if (storage_->read_window_host(layer_idx, seq_id, &mk, &mv)) {
+                        k_out = mk;
+                        v_out = mv;
+                    }
+                }
                 if (!k_out) k_out = storage_->read_key_seq(layer_idx, seq_id);
                 if (!k_out || !v_out) v_out = storage_->read_value_seq(layer_idx, seq_id);
             }

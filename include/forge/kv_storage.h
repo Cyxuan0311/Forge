@@ -230,6 +230,16 @@ public:
                                   TensorPtr* /*v_out*/) {
         return false;
     }
+    // Host-side row mirror read (Phase 4-D): the CPU twin of read_window_cuda.
+    // Returns persistent FP32 host views covering rows [0, logical_len) of
+    // (layer, seq_id) for a CPU-backed pool that feeds CPU attention, so the
+    // caller no longer re-materializes the whole window every step. Returns
+    // false when unsupported; callers fall back to read_key_seq /
+    // read_value_seq.
+    virtual bool read_window_host(int /*layer*/, int /*seq_id*/, TensorPtr* /*k_out*/,
+                                  TensorPtr* /*v_out*/) {
+        return false;
+    }
     // Phase 4-C: deferred device row writes for CPU-backed paged pools serving
     // CUDA decode. enqueue stashes one single-row K/V write: it advances the
     // sequence's logical_len (so attention sees the row this step, exactly as
@@ -365,6 +375,18 @@ struct SequencePageTable {
     TensorPtr cuda_value_mirror = nullptr;
     int64_t cuda_mirror_rows = 0;    // allocated rows (grow-only, amortized 2x)
     int64_t cuda_mirror_synced = 0;  // rows [0, synced) are valid on the device
+
+    // Phase 4-D: the same mirror on the host, for CPU-backed pools serving CPU
+    // attention (read_window_host). Without it every attention call on a
+    // non-offloaded layer re-dequantizes the whole window into two freshly
+    // allocated tensors -- O(context) host work per layer per decode step,
+    // which is what kept paged decode ~20% behind the contiguous cache at long
+    // context. Holds rows [0, host_mirror_synced); invalidated by exactly the
+    // same write-side hooks as the CUDA mirror.
+    TensorPtr host_key_mirror = nullptr;  // [host_mirror_rows, kv_dim] FP32 CPU
+    TensorPtr host_value_mirror = nullptr;
+    int64_t host_mirror_rows = 0;    // allocated rows (grow-only, amortized 2x)
+    int64_t host_mirror_synced = 0;  // rows [0, synced) are valid on the host
 
     // Phase 4-C: the deferred decode row that is visible via logical_len but
     // has not landed in its page yet (page write happens at flush time).
@@ -510,6 +532,7 @@ public:
     void* const* d_value_page_ptrs(int layer) const override;
     const int32_t* upload_seq_page_table(int layer, int seq_id) override;
     bool read_window_cuda(int layer, int seq_id, TensorPtr* k_out, TensorPtr* v_out) override;
+    bool read_window_host(int layer, int seq_id, TensorPtr* k_out, TensorPtr* v_out) override;
     bool enqueue_device_row_write(int layer, int seq_id, int64_t pos, const TensorPtr& k,
                                   const TensorPtr& v) override;
     void flush_pending_writes() override;
