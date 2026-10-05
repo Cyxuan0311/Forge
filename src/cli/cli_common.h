@@ -162,6 +162,19 @@ inline std::string magenta(const std::string& s) { return wrap("35", s); }
 inline std::string red(const std::string& s)     { return wrap("1;31", s); }
 inline std::string dim(const std::string& s)     { return wrap("2", s); }
 inline std::string bold(const std::string& s)    { return wrap("1", s); }
+
+// Orange input echo (interactive prompt): the SGR code is emitted OPEN — no
+// reset appended, unlike wrap() — before std::getline, so the terminal echoes
+// the characters the user types in orange too (terminal echo adopts whatever
+// attributes are active at the time). The matching sgr_reset() must be
+// printed as soon as getline returns. Only meaningful when stdin is a real
+// tty: piped/redirected input is never echoed, so there is nothing to color
+// and leaving a span open would leak into subsequent output.
+inline bool input_echo_color() {
+    return enabled() && ::isatty(fileno(stdin)) != 0;
+}
+inline std::string orange_open() { return enabled() ? "\x1b[38;5;208m" : ""; }
+inline std::string sgr_reset()   { return enabled() ? "\x1b[0m" : ""; }
 }  // namespace cli_color
 
 // 安全地格式化 tok/s: 分母为 0 时返回 "—" (避免 inf tok/s)

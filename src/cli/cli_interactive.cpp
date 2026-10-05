@@ -74,12 +74,24 @@ void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
     PrefixCache prefix_cache;
 
     while (!g_interrupted) {
-        std::cout << cli_color::blue("> ");
+        // Orange input prompt: open the SGR span before reading so the
+        // terminal's own echo of the typed line renders orange as well, then
+        // close it the moment getline returns (see input_echo_color()).
+        const bool orange_input = cli_color::input_echo_color();
+        if (orange_input)
+            std::cout << cli_color::orange_open() << "> ";
+        else
+            std::cout << "> ";
+        std::cout.flush();
         std::string user_input;
         if (!std::getline(std::cin, user_input)) {
+            if (orange_input)
+                std::cout << cli_color::sgr_reset();
             std::cout << "\n";
             break;
         }
+        if (orange_input)
+            std::cout << cli_color::sgr_reset();
 
         user_input = trim(user_input);
         if (user_input.empty())
