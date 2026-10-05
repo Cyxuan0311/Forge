@@ -416,12 +416,22 @@ void Tokenizer::ensure_special_tokens_cached() const {
             }
         }
 
-        // 2. Heuristic: tokens containing control-like characters are special
+        // 2. Heuristic fallback: only treat a token as special if it is a
+        //    *complete* delimiter — starts with '<' or '[' and ends with '>'
+        //    or ']' (length >= 3). This deliberately EXCLUDES sub-strings of
+        //    real special tokens (e.g. '>', '|', '|i', '.<') which previously
+        //    polluted the cache and caused parse_special to shred tokens like
+        //    <|im_end|> into literal text (the "<|im_end|>" -> "|iend|>"
+        //    multi-turn echo bug).
         if (!is_special) {
-            for (char c : token) {
-                if (c == '<' || c == '>' || c == '|' || c == '[' || c == ']') {
-                    is_special = true;
-                    break;
+            size_t n = token.size();
+            if (n >= 3) {
+                char f = token.front(), b = token.back();
+                if ((f == '<' && b == '>') || (f == '[' && b == ']')) {
+                    // Exclude byte-token escapes like "<0x0A>" (they encode raw
+                    // bytes, not semantic delimiters) unless type-marked above.
+                    if (!(n >= 5 && token[1] == '0' && token[2] == 'x'))
+                        is_special = true;
                 }
             }
         }
