@@ -3,6 +3,7 @@
 #include "forge/inference/graph/deepseek_graph_builder.h"
 #include "forge/inference/graph/llama_graph_builder.h"
 #include "forge/inference/graph/qwen35_graph_builder.h"
+#include "forge/inference/graph/qwen3vl_graph_builder.h"
 
 namespace forge {
 
@@ -23,6 +24,11 @@ std::shared_ptr<LayerGraphBuilder> create_graph_builder(const std::string& arch)
     // Qwen3.5 (SSM hybrid: FullAttention + LinearAttention with Gated Delta Net)。
     if (arch == "qwen35") {
         return std::make_shared<Qwen35GraphBuilder>();
+    }
+
+    // Qwen3-VL: standard GQA decoder with per-head QK-Norm + MRoPE.
+    if (arch == "qwen3vl") {
+        return std::make_shared<Qwen3vlGraphBuilder>();
     }
 
     return nullptr;

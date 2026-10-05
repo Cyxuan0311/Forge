@@ -297,11 +297,13 @@ add_library(
   src/inference/layers/qwen35_rope.cpp
   src/inference/layers/qwen35_full_attention.cpp
   src/inference/layers/qwen35_linear_attention.cpp
+  src/inference/layers/qwen3vl_full_attention.cpp
   src/inference/graph/graph_key.cpp
   src/inference/graph/layer_graph_builder.cpp
   src/inference/graph/llama_graph_builder.cpp
   src/inference/graph/deepseek_graph_builder.cpp
   src/inference/graph/qwen35_graph_builder.cpp
+  src/inference/graph/qwen3vl_graph_builder.cpp
   src/inference/graph/graph_runtime.cpp
   src/inference/graph/graph_cuda_runner.cpp
   src/inference/context.cpp
