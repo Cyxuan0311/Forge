@@ -149,6 +149,8 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     stats.num_prompt_tokens = result.num_prompt_tokens;
     stats.num_generated_tokens = result.num_generated_tokens;
     stats.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    stats.prompt_eval_ms = result.prefill_ms;
+    stats.decode_ms = result.decode_ms;
     if (result.spec_stats) {
         // Copy the whole struct rather than a hand-picked field list, which is
         // how the fallback-reason and per-position counters silently read as
@@ -247,6 +249,8 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     stats.num_prompt_tokens = result.num_prompt_tokens;
     stats.num_generated_tokens = result.num_generated_tokens;
     stats.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    stats.prompt_eval_ms = result.prefill_ms;
+    stats.decode_ms = result.decode_ms;
     if (result.spec_stats) {
         // Copy the whole struct rather than a hand-picked field list, which is
         // how the fallback-reason and per-position counters silently read as

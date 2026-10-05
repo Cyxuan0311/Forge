@@ -117,8 +117,9 @@ std::vector<int32_t> apply_chat_template(const forge::Tokenizer& tokenizer,
 struct GenerationStats {
     int num_prompt_tokens = 0;
     int num_generated_tokens = 0;
-    double elapsed_ms = 0;
-    double prompt_eval_ms = 0;
+    double elapsed_ms = 0;       // wall clock: prefill + decode + sampling overhead
+    double prompt_eval_ms = 0;   // prompt forward + first-token sample
+    double decode_ms = 0;        // decode loop only (excludes prefill)
     forge::SpeculativeStats spec;  // speculative decoding stats (zeroed when not enabled)
 };
 
@@ -175,25 +176,58 @@ inline std::string forge_fmt_tok_s(double tokens, double ms) {
 }
 
 // 带颜色的生成统计行: 不同字段用不同颜色
+//   分拆 prefill / decode 两阶段, 避免把 prefill 时间算进 "generated tok/s"
+//   分母 (旧行为会把 decode 速度低估). 同时把投机解码接受率内联展示.
 inline void forge_print_stats_line(const GenerationStats& stats) {
     if (stats.num_generated_tokens <= 0)
         return;
     using namespace cli_color;
+
+    // 防御: decode_ms 来自 generator, 但若未填充则用墙钟减去 prefill 兜底.
+    double decode_ms = stats.decode_ms;
+    if (decode_ms <= 0.0 && stats.elapsed_ms > stats.prompt_eval_ms)
+        decode_ms = stats.elapsed_ms - stats.prompt_eval_ms;
+
     std::string s;
     s += dim("  [");
+
+    // ---- Prefill ----
     s += bold(cyan(std::to_string(stats.num_prompt_tokens)));
     s += cyan(" prompt");
-    s += dim(", ");
-    s += dim(std::to_string((long long)stats.prompt_eval_ms)) + " " + dim("ms");
-    s += dim(", ");
-    s += yellow(forge_fmt_tok_s(stats.num_prompt_tokens, stats.prompt_eval_ms)) + " " + dim("tok/s");
+    s += dim(", prefill ");
+    s += dim(std::to_string((long long)stats.prompt_eval_ms)) + dim(" ms");
+    s += dim(" (");
+    s += yellow(forge_fmt_tok_s(stats.num_prompt_tokens, stats.prompt_eval_ms));
+    s += dim(" t/s)");
+
     s += dim(" | ");
+
+    // ---- Decode ----
     s += bold(green(std::to_string(stats.num_generated_tokens)));
-    s += green(" generated");
-    s += dim(", ");
-    s += dim(std::to_string((long long)stats.elapsed_ms)) + " " + dim("ms");
-    s += dim(", ");
-    s += yellow(forge_fmt_tok_s(stats.num_generated_tokens, stats.elapsed_ms)) + " " + dim("tok/s");
+    s += green(" gen");
+    s += dim(", decode ");
+    s += dim(std::to_string((long long)decode_ms)) + dim(" ms");
+    s += dim(" (");
+    s += yellow(forge_fmt_tok_s(stats.num_generated_tokens, decode_ms));
+    s += dim(" t/s");
+    if (stats.num_generated_tokens > 0 && decode_ms > 0.0) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1f", decode_ms / stats.num_generated_tokens);
+        s += dim(", ") + dim(buf) + dim(" ms/tok");
+    }
+    s += dim(")");
+
+    // ---- Speculative inline summary ----
+    if (stats.spec.n_spec_steps > 0 || stats.spec.n_fallback_steps > 0) {
+        s += dim(" | spec ");
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.0f%%", stats.spec.acceptance_rate() * 100.0);
+        s += magenta(buf);
+    }
+
+    // ---- Total wall ----
+    s += dim(" | total ");
+    s += dim(std::to_string((long long)stats.elapsed_ms)) + dim(" ms");
     s += dim("]");
     s += "\n";
     std::cout << s;

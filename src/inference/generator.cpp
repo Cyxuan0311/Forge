@@ -303,6 +303,9 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             result.finished = true;
             result.finish_reason = "eos";
             result.num_generated_tokens = 1;
+            result.prefill_ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - prefill_start)
+                                    .count();
             dump_prefill_if_enabled();
             return result;
         }
