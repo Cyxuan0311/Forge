@@ -271,6 +271,62 @@ struct SlotGuard {
     ~SlotGuard() { state.release_slot(); }
 };
 
+// Dashboard per-request handle for a route handler.
+//
+// Created as the FIRST statement of the handler so its arrival timestamp is the
+// moment the HTTP request landed. Everything between here and the inference
+// lock -- JSON parsing, template rendering, admission control, waiting behind
+// other queued requests -- is time the client actually spent, so folding it into
+// TTFT is what makes the number match what a user perceives. A handle created
+// deeper in the stack would report an optimistically small TTFT and hide exactly
+// the queueing the dashboard exists to reveal.
+//
+// Cheap when the registry is disabled: the RequestScope constructor checks one
+// relaxed atomic and leaves every field inert.
+class RequestTracker {
+public:
+    RequestTracker(bool streaming, const std::string& session_id, int64_t arrival_ms,
+                   double arrival_mono)
+        : scope_(streaming, forge::fnv1a32(session_id), arrival_ms, arrival_mono) {}
+
+    forge::MetricsRegistry::RequestScope* operator->() {
+        return scope_.recording() ? &scope_ : nullptr;
+    }
+    forge::MetricsRegistry::RequestScope* get() {
+        return scope_.recording() ? &scope_ : nullptr;
+    }
+    explicit operator bool() const { return scope_.recording(); }
+    /// Stop the scope from recording anything on destruction.
+    ///
+    /// Required on every path that bails out after the scope was constructed but
+    /// before inference ran: the scope's destructor publishes an Error for a
+    /// request that never reached finish(), which would double-count a 429 as
+    /// both "rejected" and "error". Pair with record_early_exit().
+    void discard() { scope_.abandon(); }
+
+private:
+    forge::MetricsRegistry::RequestScope scope_;
+};
+
+// Records a request that never reached inference (429 / 400), so the dashboard's
+// request table and rejection counter reflect the traffic the engine actually
+// refused rather than silently dropping it.
+//
+// Every call site must first call RequestTracker::discard() on the live scope,
+// because the scope's destructor publishes an Error for a request that never
+// reached finish(). Without the discard, a single 429 produced TWO rows: one
+// "rejected" from here and one "error" from the destructor, which is how this
+// was found (a 429 burst showed n_errors climbing alongside n_rejected).
+//
+// The two parse-failure call sites have no live scope -- the RequestScope is
+// constructed after parsing -- so they have nothing to discard.
+void record_early_exit(int64_t arrival_ms, int prompt_tokens, forge::RequestStatus status,
+                       bool streaming, const std::string& session_id) {
+    forge::MetricsRegistry::instance().record_rejected(arrival_ms, prompt_tokens, status,
+                                                       streaming,
+                                                       forge::fnv1a32(session_id));
+}
+
 void handle_health(httplib::Response& res) {
     res.set_content(R"({"status":"ok"})", "application/json");
 }
@@ -287,6 +343,12 @@ void handle_models(const fsrv::ServerState& state, httplib::Response& res) {
 
 void handle_chat_completions(const httplib::Request& http_req, httplib::Response& res,
                              fsrv::ServerState& state) {
+    // Dashboard arrival stamp, taken before any parsing or admission work so
+    // TTFT includes everything the client actually waited through. `stream` and
+    // `session_id` only become known after the body is parsed, so the RequestScope
+    // is built a few lines below and backdated with these two values.
+    const int64_t arrival_ms = forge::now_wall_ms();
+    const double arrival_mono = forge::now_mono_ms_f();
     // Debug: FORGE_DUMP_REQ=/path.json dumps the raw request body (e.g. what
     // opencode actually sends) for server-side diagnosis.
     if (const char* dump_path = std::getenv("FORGE_DUMP_REQ")) {
@@ -299,12 +361,22 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
     fsrv::ChatCompletionRequest creq;
     std::string err;
     if (!parse_chat_request(http_req, creq, err)) {
+        record_early_exit(arrival_ms, 0, forge::RequestStatus::BadRequest, false, std::string());
         send_error(res, 400, err, "invalid_request_error", "400");
         return;
     }
 
+    // Dashboard per-request handle, backdated to the arrival stamp above. Held by
+    // shared_ptr because the streaming path must keep it alive past the return
+    // of this handler (see below).
+    auto tracker = std::make_shared<RequestTracker>(creq.stream, creq.session_id, arrival_ms,
+                                                    arrival_mono);
+
     // Admission control: reject when the inference queue is full.
     if (!state.try_acquire_slot()) {
+        if (tracker) tracker->discard();
+        record_early_exit(arrival_ms, 0, forge::RequestStatus::Rejected, creq.stream,
+                          creq.session_id);
         // Under KVMem the queue is capped at one by construction (the working set
         // is a single-conversation policy object), so a rejection there is a
         // configuration property, not transient load -- say so, and do not invite
@@ -327,13 +399,18 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
         SlotGuard guard{state};
         fsrv::ChatCompletionResult r;
         try {
-            r = state.chat_completion(creq, nullptr);
+            r = state.chat_completion(creq, nullptr, nullptr, tracker->get());
         } catch (const fsrv::ContextLengthExceededError& e) {
             // Client-fixable request: reject with 400 before any prefill work,
             // mirroring vLLM's max-context admission error.
+            if (tracker) tracker->discard();
+            record_early_exit(arrival_ms, 0, forge::RequestStatus::BadRequest, false,
+                              creq.session_id);
             send_error(res, 400, e.what(), "invalid_request_error", "400");
             return;
         } catch (const std::exception& e) {
+            if (tracker) tracker->discard();
+            record_early_exit(arrival_ms, 0, forge::RequestStatus::Error, false, creq.session_id);
             send_error(res, 500, std::string("Inference failed: ") + e.what(), "server_error",
                        "500");
             return;
@@ -362,13 +439,16 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
     // The admission slot must live until generation finishes inside the chunk
     // provider (the handler returns before the provider runs), so the guard is
     // shared into the provider lambda and released when httplib destroys it.
-    auto slot = std::shared_ptr<SlotGuard>(new SlotGuard{state});
+    // The dashboard tracker moves the same way: it must outlive the handler or
+    // the TTFT it is about to measure would start after generation had already
+    // ended, reporting a near-zero queue time for every streaming request.
+    auto slot = std::make_shared<SlotGuard>(SlotGuard{state});
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
     res.set_chunked_content_provider(
         "text/event-stream",
-        [&state, creq, id, created, slot](size_t, httplib::DataSink& sink) -> bool {
+        [&state, creq, id, created, slot, tracker, arrival_ms](size_t, httplib::DataSink& sink) -> bool {
             auto make_chunk = [&](json delta, const char* finish) {
                 json chunk;
                 chunk["id"] = id;
@@ -415,12 +495,18 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
                 return sink.write(payload.data(), payload.size());
             };
             try {
-                r = state.chat_completion(creq, on_token, on_reasoning);
+                r = state.chat_completion(creq, on_token, on_reasoning, tracker->get());
             } catch (const fsrv::ContextLengthExceededError& e) {
                 error_text = e.what();
                 error_type = "invalid_request_error";
+                if (tracker) tracker->discard();
+                record_early_exit(arrival_ms, 0, forge::RequestStatus::BadRequest, true,
+                                  creq.session_id);
             } catch (const std::exception& e) {
                 error_text = e.what();
+                if (tracker) tracker->discard();
+                record_early_exit(arrival_ms, 0, forge::RequestStatus::Error, true,
+                                  creq.session_id);
             }
 
             if (sink.is_writable()) {
@@ -659,6 +745,10 @@ json responses_usage(const fsrv::ChatCompletionResult& r) {
 
 void handle_responses(const httplib::Request& http_req, httplib::Response& res,
                       fsrv::ServerState& state) {
+    // Dashboard arrival stamp, taken before parsing/admission so TTFT covers
+    // everything the client waited through. See handle_chat_completions.
+    const int64_t arrival_ms = forge::now_wall_ms();
+    const double arrival_mono = forge::now_mono_ms_f();
     if (const char* dump_path = std::getenv("FORGE_DUMP_REQ")) {
         if (FILE* fp = fopen(dump_path, "w")) {
             fwrite(http_req.body.data(), 1, http_req.body.size(), fp);
@@ -677,11 +767,18 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
         }
     }
     if (!parse_responses_request(http_req, creq, err)) {
+        record_early_exit(arrival_ms, 0, forge::RequestStatus::BadRequest, false, std::string());
         send_error(res, 400, err, "invalid_request_error", "400");
         return;
     }
 
+    auto tracker = std::make_shared<RequestTracker>(creq.stream, creq.session_id, arrival_ms,
+                                                    arrival_mono);
+
     if (!state.try_acquire_slot()) {
+        if (tracker) tracker->discard();
+        record_early_exit(arrival_ms, 0, forge::RequestStatus::Rejected, creq.stream,
+                          creq.session_id);
         // Under KVMem the queue is capped at one by construction (the working set
         // is a single-conversation policy object), so a rejection there is a
         // configuration property, not transient load -- say so, and do not invite
@@ -704,11 +801,17 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
         SlotGuard guard{state};
         fsrv::ChatCompletionResult r;
         try {
-            r = state.chat_completion(creq, nullptr);
+            r = state.chat_completion(creq, nullptr, nullptr, tracker->get());
         } catch (const fsrv::ContextLengthExceededError& e) {
+            if (tracker) tracker->discard();
+            record_early_exit(arrival_ms, 0, forge::RequestStatus::BadRequest, false,
+                              creq.session_id);
             send_error(res, 400, e.what(), "invalid_request_error", "400");
             return;
         } catch (const std::exception& e) {
+            if (tracker) tracker->discard();
+            record_early_exit(arrival_ms, 0, forge::RequestStatus::Error, false,
+                              creq.session_id);
             send_error(res, 500, std::string("Inference failed: ") + e.what(),
                        "server_error", "500");
             return;
@@ -732,13 +835,15 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
     // ---- streaming (Responses SSE) ----
     const std::string id = gen_id("resp");
     const std::string item_id = gen_id("msg");
+    // Shared into the chunk provider for the same reason as SlotGuard: the
+    // handler returns before generation runs.
     auto slot = std::shared_ptr<SlotGuard>(new SlotGuard{state});
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
     res.set_chunked_content_provider(
         "text/event-stream",
-        [&state, creq, id, item_id, slot](size_t, httplib::DataSink& sink) -> bool {
+        [&state, creq, id, item_id, slot, tracker, arrival_ms](size_t, httplib::DataSink& sink) -> bool {
             auto sse = [&](const std::string& type, json data) -> bool {
                 if (!sink.is_writable())
                     return false;
@@ -838,12 +943,18 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
             };
 
             try {
-                r = state.chat_completion(creq, on_token, on_reasoning);
+                r = state.chat_completion(creq, on_token, on_reasoning, tracker->get());
             } catch (const fsrv::ContextLengthExceededError& e) {
                 error_text = e.what();
                 error_type = "invalid_request_error";
+                if (tracker) tracker->discard();
+                record_early_exit(arrival_ms, 0, forge::RequestStatus::BadRequest, true,
+                                  creq.session_id);
             } catch (const std::exception& e) {
                 error_text = e.what();
+                if (tracker) tracker->discard();
+                record_early_exit(arrival_ms, 0, forge::RequestStatus::Error, true,
+                                  creq.session_id);
             }
 
             if (!sink.is_writable())

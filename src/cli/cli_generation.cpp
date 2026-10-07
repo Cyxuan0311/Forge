@@ -13,6 +13,8 @@
 #include "forge/generator.h"
 #include "forge/inference/forward_request.h"
 #include "forge/kv_memory.h"
+#include "forge/metrics.h"
+#include "forge/perf_profiler.h"
 #include "forge/prefix_cache.h"
 #include "forge/sampler.h"
 #include "forge/tensor.h"
@@ -25,13 +27,95 @@
 
 using namespace forge;
 
+// One-shot completion and --bench do not keep a conversation between turns, so
+// the dashboard reports 0 sessions there and 1 in interactive mode (which sets
+// it explicitly via publish_cli_engine_gauges's `sessions` argument).
+static constexpr int kCliSessions = 0;
+
+// Opens a per-request PerfProfiler window for the dashboard's operator panel.
+//
+// Only called when the user passed --dashboard-ops. Recording a scope per
+// operator is not free, so arming it implicitly whenever the dashboard happened
+// to be enabled would trade decode throughput for a chart nobody asked for.
+static void begin_operator_window() {
+    PerfProfiler::instance().reset();
+    PerfProfiler::instance().enable();
+}
+
+// Closes the window opened by begin_operator_window() and attaches the rows to
+// `scope`. Must be called AT MOST ONCE per window: PerfProfiler::summary()
+// merges every thread-local accumulator into the global records_ on each call,
+// so a second call in the same window double-counts every operator (the same
+// trap forge-server's --perf-detail path documents).
+static void end_operator_window(forge::MetricsRegistry::RequestScope& scope) {
+    if (!scope.recording())
+        return;
+#ifdef USE_CUDA
+    // Merge CUDA-event timings recorded asynchronously during the request.
+    PerfProfiler::instance().flush_deferred();
+#endif
+    auto rows = PerfProfiler::instance().summary();
+    std::sort(rows.begin(), rows.end(),
+              [](const std::pair<std::string, PerfRecord>& a,
+                 const std::pair<std::string, PerfRecord>& b) {
+                  return a.second.total_ms > b.second.total_ms;
+              });
+    std::vector<forge::OperatorRecord> ops;
+    ops.reserve(rows.size());
+    for (auto& [name, r] : rows) {
+        forge::OperatorRecord o;
+        o.name = name;
+        o.total_ms = r.total_ms;
+        o.count = r.count;
+        o.min_ms = r.min_ms;
+        o.max_ms = r.max_ms;
+        o.avg_ms = r.count > 0 ? r.total_ms / static_cast<double>(r.count) : 0.0;
+        ops.push_back(std::move(o));
+    }
+    scope.set_operators(std::move(ops));
+}
+
+void fill_cli_engine_gauges(InferenceContext& ctx, const PrefixCache* prefix_cache, int sessions,
+                            forge::EngineGauges& g) {
+    g.sessions = sessions;
+    // The CLI keeps its PrefixCache as a function-local (interactive mode owns
+    // one per process; the one-shot path builds one inline), so the hit rate has
+    // to be handed in rather than read off the context.
+    if (prefix_cache) {
+        g.prefix_cache_hits = prefix_cache->hits();
+        g.prefix_cache_misses = prefix_cache->misses();
+    }
+    if (auto* eng = ctx.engine()) {
+        if (auto* mem = eng->kv_memory()) {
+            g.paged_kv = mem->is_paged();
+            g.tiered_kv = mem->tiered();
+            auto& st = mem->storage();
+            g.kv_total_bytes = static_cast<int64_t>(st.nbytes());
+            g.kv_active_bytes = static_cast<int64_t>(st.active_bytes());
+            g.kv_free_pages = mem->is_paged() ? st.num_free_pages() : -1;
+            g.kv_pool_tokens = mem->is_paged() ? mem->max_pool_tokens() : 0;
+            g.kv_page_size = st.page_size();
+        }
+    }
+}
+
+void publish_cli_engine_gauges(InferenceContext& ctx, const PrefixCache* prefix_cache,
+                               int sessions) {
+    auto& reg = forge::MetricsRegistry::instance();
+    if (!reg.enabled())
+        return;
+    forge::EngineGauges g;
+    fill_cli_engine_gauges(ctx, prefix_cache, sessions, g);
+    reg.publish_engine_gauges(g);
+}
+
 GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& tokenizer,
                                    const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
                                    float temperature, int top_k, float top_p, float repeat_penalty,
                                    int repeat_last_n, bool do_sample, uint64_t seed,
                                    int eos_token_id, const SpeculativeConfig& spec_cfg,
-                                   forge::PrefixCache* prefix_cache,
-                                   std::string* out_text) {
+                                   forge::PrefixCache* prefix_cache, std::string* out_text,
+                                   bool capture_operators) {
     // Apply speculative config to context before generation
     if (spec_cfg.enabled) {
         ctx.params_mut().speculative_config = spec_cfg;
@@ -69,8 +153,8 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     // seq_ids, invalidates the window layout on_prompt() plans against -- the next
     // turn would then skip prefilling a prefix that no longer exists. Mirrors
     // forge-server's tiered branch (server_state.cpp).
-    const bool tiered = paged && ctx.engine()->kv_memory() &&
-                        ctx.engine()->kv_memory()->working_set() != nullptr;
+    const bool tiered =
+        paged && ctx.engine()->kv_memory() && ctx.engine()->kv_memory()->working_set() != nullptr;
     if (paged && prefix_cache && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             km->storage().release(0);
@@ -85,8 +169,19 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     // Generator routes through SpeculativeExecutor, so draft/verify/accept (and the
     // resulting stats) are now exercised in streaming mode too. Flush decoded text in
     // small chunks to mimic the previous incremental-output behavior.
+    // Dashboard per-request handle. The CLI is single-threaded, so there is no
+    // queue to wait behind and queue_ms will be ~0 -- the same code path is kept
+    // anyway so the two binaries report identical fields.
+    forge::MetricsRegistry::RequestScope scope(/*streaming=*/true);
+    scope.set_prompt_tokens(static_cast<int>(prompt_tokens.size()));
+
     std::vector<int32_t> token_buffer;
     auto stream_cb = [&](int32_t tok, int /*step*/) {
+        // TTFT and inter-token latency come from here, not from
+        // generator.cpp: this callback already fires once per emitted token, so
+        // the decode loop needs no new instrumentation at all.
+        if (scope.recording())
+            scope.on_token();
         token_buffer.push_back(tok);
         if (token_buffer.size() >= 4) {
             std::cout << tokenizer.decode(token_buffer, true, false);
@@ -97,7 +192,8 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
 
     if (std::getenv("FORGE_GEN_DEBUG")) {
         std::fprintf(stderr, "[gen-debug] prompt_ids(%zu):", prompt_tokens.size());
-        for (int32_t t : prompt_tokens) std::fprintf(stderr, " %d", t);
+        for (int32_t t : prompt_tokens)
+            std::fprintf(stderr, " %d", t);
         std::fprintf(stderr, "\n");
     }
 
@@ -107,7 +203,8 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
 
     if (std::getenv("FORGE_GEN_DEBUG")) {
         std::fprintf(stderr, "[gen-debug] gen_ids(%zu):", result.token_ids.size());
-        for (int32_t t : result.token_ids) std::fprintf(stderr, " %d", t);
+        for (int32_t t : result.token_ids)
+            std::fprintf(stderr, " %d", t);
         std::fprintf(stderr, "\n[gen-debug] per-token decode:");
         for (int32_t t : result.token_ids) {
             std::fprintf(stderr, " [%d]=%s", t,
@@ -130,12 +227,21 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
             // KV unreferenced, and the next turn's release(0) discarded it -- so
             // every turn re-prefilled the whole previous assistant message.
             std::vector<int32_t> resident(prompt_tokens);
-            resident.insert(resident.end(), result.token_ids.begin(),
-                            result.token_ids.end());
+            resident.insert(resident.end(), result.token_ids.begin(), result.token_ids.end());
             prefix_cache->register_prefix(resident, 0, km->storage());
             prefix_cache->evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
         }
     }
+    if (scope.recording()) {
+        scope.set_prefix_reused(gen_cfg.prefix_len);
+        if (capture_operators)
+            end_operator_window(scope);
+        scope.finish(result, forge::RequestStatus::Ok);
+    }
+    // Published after the request, from the thread that owns the context: the
+    // dashboard thread must not read KV occupancy itself (see
+    // publish_cli_engine_gauges).
+    publish_cli_engine_gauges(ctx, prefix_cache, kCliSessions);
 
     if (!token_buffer.empty()) {
         const std::string tail_text = tokenizer.decode(token_buffer, true, false);
@@ -166,7 +272,7 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
                                float temperature, int top_k, float top_p, float repeat_penalty,
                                int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
                                const SpeculativeConfig& spec_cfg, forge::PrefixCache* prefix_cache,
-                               std::string* out_text) {
+                               std::string* out_text, bool capture_operators) {
     // Apply speculative config to context before generation
     if (spec_cfg.enabled) {
         ctx.params_mut().speculative_config = spec_cfg;
@@ -196,8 +302,8 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     // register this request's prefix afterwards. Never reset the whole cache.
     const bool paged = (ctx.params().kv_storage_mode == KVStorageMode::Paged);
     // See the streaming path above: under KVMem the tier owns seq 0's window.
-    const bool tiered = paged && ctx.engine()->kv_memory() &&
-                        ctx.engine()->kv_memory()->working_set() != nullptr;
+    const bool tiered =
+        paged && ctx.engine()->kv_memory() && ctx.engine()->kv_memory()->working_set() != nullptr;
     if (paged && prefix_cache && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             km->storage().release(0);
@@ -208,19 +314,39 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
 
     Generator gen(ctx, sampler_cfg);
 
+    // --no-stream has no per-token callback, so ITL degrades to the aggregate
+    // decode rate here; TTFT is still exact because the first token comes out of
+    // prefill. The scope is created at the same point as in the streaming path so
+    // the two produce the same field set.
+    forge::MetricsRegistry::RequestScope scope(/*streaming=*/false);
+    scope.set_prompt_tokens(static_cast<int>(prompt_tokens.size()));
+
     if (std::getenv("FORGE_GEN_DEBUG")) {
         std::fprintf(stderr, "[gen-debug] prompt_ids(%zu):", prompt_tokens.size());
-        for (int32_t t : prompt_tokens) std::fprintf(stderr, " %d", t);
+        for (int32_t t : prompt_tokens)
+            std::fprintf(stderr, " %d", t);
         std::fprintf(stderr, "\n");
     }
 
     auto t_start = std::chrono::high_resolution_clock::now();
     auto result = gen.generate(prompt_tokens, gen_cfg);
     auto t_end = std::chrono::high_resolution_clock::now();
+    if (scope.recording()) {
+        // No callback fired, so stamp the first token at the end of the call:
+        // generation is synchronous, so "now" is the completion instant and the
+        // resulting ttft_ms equals total_ms, which is the honest answer for a
+        // request whose first byte is only observable after it finishes.
+        scope.on_token();
+        scope.set_prefix_reused(gen_cfg.prefix_len);
+        if (capture_operators)
+            end_operator_window(scope);
+        scope.finish(result, forge::RequestStatus::Ok);
+    }
 
     if (std::getenv("FORGE_GEN_DEBUG")) {
         std::fprintf(stderr, "[gen-debug] gen_ids(%zu):", result.token_ids.size());
-        for (int32_t t : result.token_ids) std::fprintf(stderr, " %d", t);
+        for (int32_t t : result.token_ids)
+            std::fprintf(stderr, " %d", t);
         std::fprintf(stderr, "\n[gen-debug] per-token decode:");
         for (int32_t t : result.token_ids) {
             std::fprintf(stderr, " [%d]=%s", t,
@@ -232,12 +358,15 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     if (paged && prefix_cache && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             std::vector<int32_t> resident(prompt_tokens);
-            resident.insert(resident.end(), result.token_ids.begin(),
-                            result.token_ids.end());
+            resident.insert(resident.end(), result.token_ids.begin(), result.token_ids.end());
             prefix_cache->register_prefix(resident, 0, km->storage());
             prefix_cache->evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
         }
     }
+
+    // Same rationale as the streaming path above: publish after the prefix
+    // registration so the hit rate is current.
+    publish_cli_engine_gauges(ctx, prefix_cache, kCliSessions);
 
     auto text = tokenizer.decode(result.token_ids, true, false);
     if (out_text)

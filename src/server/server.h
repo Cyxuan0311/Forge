@@ -24,10 +24,12 @@
 
 #include "forge/agent/agent_pipeline.h"
 #include "forge/chat_template.h"
-#include "forge/generator.h"
 #include "forge/cli_common_args.h"
+#include "forge/cli_dashboard_args.h"
 #include "forge/cli_spec_args.h"
+#include "forge/generator.h"
 #include "forge/kv_working_set.h"
+#include "forge/metrics.h"
 #include "forge/model.h"
 #include "forge/prefix_cache.h"
 #include "forge/tokenizer.h"
@@ -63,14 +65,14 @@ struct ServerOptions {
     std::string host = "127.0.0.1";
     int port = 8080;
     int n_keep = 0;  // llama.cpp-style: leading tokens never evicted on context shift
-                      // (0 = keep only the system prompt; >0 = keep that many prefix tokens)
+                     // (0 = keep only the system prompt; >0 = keep that many prefix tokens)
     bool log_prompt_prefix = false;  // Diagnostic: per-depth prompt-prefix hashes
     // Budget (MB) for the per-weight FP16 dequant cache used by the TensorCore
     // matmul path. -1 = default (1024 MB); 0 = cache disabled (callers fall
     // back to transient scratch); >0 = explicit budget.
     long dequant_cache_mb = -1;
-    std::string api_key;     // "" = no auth; otherwise "Authorization: Bearer <key>" required
-    int max_inflight = 4;    // max queued inference requests (excess -> 429)
+    std::string api_key;   // "" = no auth; otherwise "Authorization: Bearer <key>" required
+    int max_inflight = 4;  // max queued inference requests (excess -> 429)
     // Per-request performance logging on stdout after every chat completion:
     //   --perf        one summary line (tokens, prefill/decode ms, tok/s)
     //   --perf-detail summary + top operator list from PerfProfiler (needs a
@@ -78,12 +80,17 @@ struct ServerOptions {
     //                 summary line works in any build)
     bool perf = false;
     bool perf_detail = false;
+    // Live web dashboard (--dashboard). Parsed by forge::parse_dashboard_arg()
+    // and served by forge_dashboard on its OWN loopback port, never on --port:
+    // the API listener's pre-routing handler demands a Bearer key for every
+    // request and a browser cannot send one, so mounting the dashboard there
+    // would mean punching a hole in authentication.
+    forge::DashboardArgs dashboard;
     // The reserve fallback is sized for a request's default max_tokens (512),
     // which is what this binary's callers use; forge-cli sizes it for -n. Both
     // go through CommonArgs::kvem_config(), which had been duplicated in each
     // binary and had drifted (256 in the CLI, 512 here).
     forge::KVemConfig kvem_config() const { return common.kvem_config(); }
-
 };
 
 // ---- Tool calling (OpenAI function-calling contract) ----
@@ -117,10 +124,10 @@ struct ChatCompletionRequest {
     // without them. Explicit request fields still override these.
     float temperature = 0.7f;
     float top_p = 1.0f;
-    int top_k = 40;  // not an OpenAI field
+    int top_k = 40;               // not an OpenAI field
     float repeat_penalty = 1.1f;  // not an OpenAI field
     int repeat_last_n = 64;       // not an OpenAI field
-    int max_tokens = -1;  // <=0 -> engine default
+    int max_tokens = -1;          // <=0 -> engine default
     uint64_t seed = 0;
     bool stream = false;
     std::vector<std::string> stop;  // OpenAI stop strings (up to 4, OpenAI spec)
@@ -133,10 +140,10 @@ struct ChatCompletionRequest {
 
 struct ChatCompletionResult {
     std::string text;
-    std::string reasoning;      // <think> content separated from text (may be empty)
+    std::string reasoning;  // <think> content separated from text (may be empty)
     int prompt_tokens = 0;
     int completion_tokens = 0;
-    std::string finish_reason;  // normalized to "stop" | "length" | "tool_calls"
+    std::string finish_reason;         // normalized to "stop" | "length" | "tool_calls"
     std::vector<ToolCall> tool_calls;  // non-empty -> finish_reason "tool_calls"
 };
 
@@ -160,72 +167,97 @@ public:
     /// callback signals client disconnect (generation still completes in
     /// Phase 1 - abort propagation is deferred). `on_reasoning`, when
     /// provided, receives the <think> deltas separated from the content.
+    ///
+    /// `scope`, when non-null, is the per-request dashboard handle created by
+    /// the route handler so that its arrival timestamp is the moment the HTTP
+    /// request landed, not the moment this function was entered (admission
+    /// control, JSON parsing and the queue wait all sit in between and the
+    /// user perceives them). chat_completion fills it in and finishes it.
     ChatCompletionResult chat_completion(
         const ChatCompletionRequest& req,
         const std::function<bool(const std::string& delta)>& on_token,
-        const std::function<bool(const std::string& reasoning_delta)>& on_reasoning = {});
+        const std::function<bool(const std::string& reasoning_delta)>& on_reasoning = {},
+        MetricsRegistry::RequestScope* scope = nullptr);
 
     const std::string& model_id() const { return model_id_; }
+    /// Model architecture string (e.g. "qwen35"), for the dashboard header.
+    std::string arch() const;
+
+    // ---- Dashboard accessors (read from the dashboard thread) ----
+    // Only lock-free atomics and immutable geometry are exposed here; KV
+    // occupancy is published by publish_engine_gauges() from inside the
+    // inference lock, because KVCache::active_bytes() and num_free_slots()
+    // walk their cell tables without any synchronization.
+    int active_requests() const { return active_requests_.load(std::memory_order_relaxed); }
+    /// Snapshot of the engine-side gauges. Safe to call from any thread: it
+    /// only reads the last atomically published values.
+    EngineGauges engine_gauges() const;
+    /// Recomputes and republishes the engine gauges. MUST be called from the
+    /// thread holding inference_mutex_ (i.e. from inside chat_completion).
+    void publish_engine_gauges();
+    /// Fills `g` without publishing. Safe only from the inference thread; this
+    /// is what the dashboard's live hook calls mid-generation.
+    void fill_engine_gauges(EngineGauges& g);
 
     // ---- Admission control (queue-full -> 429) ----
-/// Returns false when max_inflight requests are already queued.
-bool try_acquire_slot();
+    /// Returns false when max_inflight requests are already queued.
+    bool try_acquire_slot();
 
-// ---- Per-session state ----
-// The KV cache is a single shared resource, so before sessions every request
-// addressed seq 0 and reused one token mirror: two interleaved conversations
-// overwrote each other's prefix and the next turn re-prefilled from scratch.
-// A session owns a seq_id plus its own mirror, so conversations stop stepping on
-// each other.
-//
-// session_id is optional in the request. Absent (or empty) means the default
-// session, which is exactly the old single-slot behaviour -- existing clients are
-// unaffected.
-struct SessionState {
-    // Working-set seq. Allocated from a range above the radix cache's cache
-    // seq_ids so the two allocators cannot collide.
-    int seq_id = 0;
-    // Tokens this session has resident: prompt + generated. The prefix-reuse
-    // mirror for the contiguous backend.
-    std::vector<int32_t> kv_tokens;
-    // Conversation history as sent by the client, accumulated across turns so a
-    // delta request can be rendered in full context. Empty for sessions that
-    // only ever send the complete history.
-    std::vector<ChatTemplateMessage> messages;
-    // The reply we produced last turn. A delta client does not know it, so the
-    // assistant turn is re-inserted from here to keep the conversation
-    // alternating (and so tool_calls replies survive, which a client cannot
-    // reproduce byte-for-byte).
-    std::string last_reply;
-    // Tokens fed into the working set's logical history (KVMem path), kept in
-    // step with kv_tokens so a session can be restored or inspected.
-    int64_t last_active_ms = 0;
-    uint64_t use_count = 0;
-};
+    // ---- Per-session state ----
+    // The KV cache is a single shared resource, so before sessions every request
+    // addressed seq 0 and reused one token mirror: two interleaved conversations
+    // overwrote each other's prefix and the next turn re-prefilled from scratch.
+    // A session owns a seq_id plus its own mirror, so conversations stop stepping on
+    // each other.
+    //
+    // session_id is optional in the request. Absent (or empty) means the default
+    // session, which is exactly the old single-slot behaviour -- existing clients are
+    // unaffected.
+    struct SessionState {
+        // Working-set seq. Allocated from a range above the radix cache's cache
+        // seq_ids so the two allocators cannot collide.
+        int seq_id = 0;
+        // Tokens this session has resident: prompt + generated. The prefix-reuse
+        // mirror for the contiguous backend.
+        std::vector<int32_t> kv_tokens;
+        // Conversation history as sent by the client, accumulated across turns so a
+        // delta request can be rendered in full context. Empty for sessions that
+        // only ever send the complete history.
+        std::vector<ChatTemplateMessage> messages;
+        // The reply we produced last turn. A delta client does not know it, so the
+        // assistant turn is re-inserted from here to keep the conversation
+        // alternating (and so tool_calls replies survive, which a client cannot
+        // reproduce byte-for-byte).
+        std::string last_reply;
+        // Tokens fed into the working set's logical history (KVMem path), kept in
+        // step with kv_tokens so a session can be restored or inspected.
+        int64_t last_active_ms = 0;
+        uint64_t use_count = 0;
+    };
 
-// Maximum retained sessions. Beyond this the least-recently-used one has its seq
-// released, so a long tail of distinct ids cannot pin the whole page pool.
-static constexpr int kMaxSessions = 32;
+    // Maximum retained sessions. Beyond this the least-recently-used one has its seq
+    // released, so a long tail of distinct ids cannot pin the whole page pool.
+    static constexpr int kMaxSessions = 32;
 
-/// Resolve (creating on first use) the state for `session_id`, evicting the
-/// least-recently-used session if the table is full. Empty `session_id` maps to
-/// the default session, preserving the pre-session single-slot behaviour.
-SessionState& acquire_session(const std::string& session_id);
+    /// Resolve (creating on first use) the state for `session_id`, evicting the
+    /// least-recently-used session if the table is full. Empty `session_id` maps to
+    /// the default session, preserving the pre-session single-slot behaviour.
+    SessionState& acquire_session(const std::string& session_id);
 
-/// Drop a session and release its KV working set. Called on eviction and on
-/// request failure.
-void drop_session(const std::string& session_id, bool release_kv);
+    /// Drop a session and release its KV working set. Called on eviction and on
+    /// request failure.
+    void drop_session(const std::string& session_id, bool release_kv);
 
-/// Number of live sessions (diagnostics/tests).
-int session_count() const { return static_cast<int>(sessions_.size()); }
+    /// Number of live sessions (diagnostics/tests).
+    int session_count() const { return static_cast<int>(sessions_.size()); }
 
-/// True when the KVMem tiered working set is active. It owns seq 0's slot layout
-/// with process-wide state (logical_hist_, archived_chunks_), so it serves one
-/// conversation at a time regardless of max_inflight -- see try_acquire_slot().
-bool tiered_kv_active() const;
+    /// True when the KVMem tiered working set is active. It owns seq 0's slot layout
+    /// with process-wide state (logical_hist_, archived_chunks_), so it serves one
+    /// conversation at a time regardless of max_inflight -- see try_acquire_slot().
+    bool tiered_kv_active() const;
 
-/// Default session id used when a request does not carry one.
-static const char* default_session_id() { return ""; }
+    /// Default session id used when a request does not carry one.
+    static const char* default_session_id() { return ""; }
     void release_slot();
 
 private:
@@ -235,20 +267,16 @@ private:
     std::unique_ptr<InferenceContext> ctx_;
     std::unique_ptr<ChatTemplateEngine> chat_template_;
     AgentPipelineConfig agent_cfg_;  // resolved once in load() (FORGE_TOOL_DIALECT)
-    std::mutex inference_mutex_;  // serializes all inference (single KV cache)
+    std::mutex inference_mutex_;     // serializes all inference (single KV cache)
     std::string model_id_;
     std::atomic<int> active_requests_{0};
 
-
-
-// Session token mirrors live in SessionState::kv_tokens (see acquire_session()).
+    // Session token mirrors live in SessionState::kv_tokens (see acquire_session()).
 
     // Live sessions, keyed by the request's session_id ("" = default session).
     // Guarded by inference_mutex_.
     std::unordered_map<std::string, SessionState> sessions_;
     int next_session_seq_ = 0;
-
-
 
     // ---- Paged-mode radix prefix cache ----
     // Mirrors the RequestScheduler's page-level prefix sharing. Each request's

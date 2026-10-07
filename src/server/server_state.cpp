@@ -5,31 +5,28 @@
  * tokenizer -> model -> engine -> KV cache -> CUDA warmup.
  */
 
-#include "server.h"
-
 #include <algorithm>
-#include <cctype>
-#include <cstdlib>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
-
-#include "forge/logger.h"
-
-#include <nlohmann/json.hpp>
 
 #include "forge/arch_registry.h"
 #include "forge/engines/transformer_engine.h"
 #include "forge/gguf_model.h"
 #include "forge/kv_memory.h"
+#include "forge/logger.h"
 #include "forge/model_loader.h"
 #include "forge/ninf_model.h"
 #include "forge/perf_profiler.h"
 #include "forge/prefix_cache.h"
 #include "forge/threads.h"
+#include "server.h"
 
 namespace forge {
 
@@ -122,9 +119,9 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         return false;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
-    std::cout << "Tokenizer loaded: vocab_size=" << tokenizer_->vocab_size() << ", bos="
-              << tokenizer_->bos_token_id() << ", eos=" << tokenizer_->eos_token_id() << " ["
-              << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms]\n";
+    std::cout << "Tokenizer loaded: vocab_size=" << tokenizer_->vocab_size()
+              << ", bos=" << tokenizer_->bos_token_id() << ", eos=" << tokenizer_->eos_token_id()
+              << " [" << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms]\n";
 
     // ---- Model ----
     auto t2 = std::chrono::high_resolution_clock::now();
@@ -203,8 +200,8 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         } else if (cfg.n_swa > 0) {
             // PagedKVStorage::kvmem_supported() rejects mixed policies: pages can
             // only be archived uniformly when every layer is Full-attention.
-            std::cerr << "Warning: --kvmem needs all-Full attention layers; model has "
-                      << cfg.n_swa << " sliding-window layer(s); tiered KV disabled\n";
+            std::cerr << "Warning: --kvmem needs all-Full attention layers; model has " << cfg.n_swa
+                      << " sliding-window layer(s); tiered KV disabled\n";
         } else {
             // 0 = keep the device-sized pool; the budget then falls back to it.
             if (opt.common.kvmem_budget > 0)
@@ -223,8 +220,8 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         ctx_->params_mut().speculative_config = opt.spec;
         std::cout << "Speculative decoding: arch="
                   << (opt.spec.draft_arch.empty() ? "n-gram" : opt.spec.draft_arch)
-                  << ", n_draft=" << opt.spec.n_draft
-                  << ", draft_n=" << opt.spec.draft_n_spec << "\n";
+                  << ", n_draft=" << opt.spec.n_draft << ", draft_n=" << opt.spec.draft_n_spec
+                  << "\n";
     }
 
     // offload_kqv and offload_embedding now come from the flags (they were
@@ -259,8 +256,7 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         const char* vn = kv_cache_dtype_name(kv.type_v);
         std::cout << "KV Cache" << (paged ? " (paged)" : "") << ": dtype="
                   << (kv.type_k == kv.type_v ? kn : std::string(kn) + "/" + vn + " (K/V)")
-                  << ", size=" << (bytes / (1024 * 1024)) << " MB, max_seq=" << max_seq
-                  << "\n";
+                  << ", size=" << (bytes / (1024 * 1024)) << " MB, max_seq=" << max_seq << "\n";
     }
 
     // ---- Attach the KVMem working-set manager ----
@@ -277,15 +273,14 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         } else {
             const int page_size = kv_mem->storage().page_size();
             const int pool_tokens = kv_mem->max_pool_tokens();
-            auto ws = std::make_unique<KVWorkingSetManager>(opt.kvem_config(), page_size,
-                                                           pool_tokens);
+            auto ws =
+                std::make_unique<KVWorkingSetManager>(opt.kvem_config(), page_size, pool_tokens);
             std::cout << "KVMem tiered KV enabled: budget=" << ws->budget()
-                      << ", sink=" << ws->sink_tokens()
-                      << ", gen_reserve=" << ws->gen_reserve()
+                      << ", sink=" << ws->sink_tokens() << ", gen_reserve=" << ws->gen_reserve()
                       << ", retrieval=" << opt.common.kvmem_retrieval << "\n"
                       << "  logical ctx=" << kv_mem->max_seq_len()
-                      << " tokens, gpu pool=" << pool_tokens
-                      << " tokens, page=" << page_size << "\n";
+                      << " tokens, gpu pool=" << pool_tokens << " tokens, page=" << page_size
+                      << "\n";
             ws->attach_storage(&kv_mem->storage(), kv_mem->storage().num_layers(), 0);
             kv_mem->set_working_set(std::move(ws));
         }
@@ -316,18 +311,26 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
 
     // Model id = file name without directory / extension.
     auto slash = opt.common.model_path.find_last_of("/\\");
-    std::string name = (slash == std::string::npos) ? opt.common.model_path : opt.common.model_path.substr(slash + 1);
+    std::string name = (slash == std::string::npos) ? opt.common.model_path
+                                                    : opt.common.model_path.substr(slash + 1);
     auto dot = name.find_last_of('.');
     model_id_ = (dot == std::string::npos) ? name : name.substr(0, dot);
     return true;
 }
 
 ChatCompletionResult ServerState::chat_completion(
-    const ChatCompletionRequest& req,
-    const std::function<bool(const std::string& delta)>& on_token,
-    const std::function<bool(const std::string& reasoning_delta)>& on_reasoning) {
+    const ChatCompletionRequest& req, const std::function<bool(const std::string& delta)>& on_token,
+    const std::function<bool(const std::string& reasoning_delta)>& on_reasoning,
+    MetricsRegistry::RequestScope* scope) {
     // Single model / KV cache instance: serialize inference across HTTP workers.
     std::lock_guard<std::mutex> lock(inference_mutex_);
+
+    // Everything below runs under inference_mutex_, so this is the one safe
+    // place to read KV occupancy for the dashboard. See engine.h's note.
+    if (scope && scope->recording()) {
+        scope->on_lock_acquired();
+        scope->set_prompt_tokens(static_cast<int>(req.messages.size()));
+    }
 
     // Per-request agent pipeline: tool catalogue injection (dialect-rendered),
     // streaming think-separation, and the final reasoning/tool-call split.
@@ -362,17 +365,15 @@ ChatCompletionResult ServerState::chat_completion(
         // window — exactly the case the tier exists to serve. The logical bound
         // is max_seq_len; the working set drops/recalls history inside it.
         if (auto* mem = eng->kv_memory(); mem && mem->is_paged()) {
-            kv_capacity = tiered ? mem->max_seq_len()
-                                 : std::min(mem->max_seq_len(), mem->max_pool_tokens());
-            LOG_WARN("[capacity-check] paged storage: max_seq=" +
-                     std::to_string(mem->max_seq_len()) + " pool_tokens=" +
-                     std::to_string(mem->max_pool_tokens()) + " tiered=" +
-                     std::to_string(tiered ? 1 : 0) + " -> capacity=" +
-                     std::to_string(kv_capacity));
+            kv_capacity =
+                tiered ? mem->max_seq_len() : std::min(mem->max_seq_len(), mem->max_pool_tokens());
+            LOG_WARN(
+                "[capacity-check] paged storage: max_seq=" + std::to_string(mem->max_seq_len()) +
+                " pool_tokens=" + std::to_string(mem->max_pool_tokens()) + " tiered=" +
+                std::to_string(tiered ? 1 : 0) + " -> capacity=" + std::to_string(kv_capacity));
         } else if (auto* kvc = eng->kv_cache()) {
             kv_capacity = kvc->max_seq_len();
-            LOG_WARN("[capacity-check] contiguous cache: capacity=" +
-                     std::to_string(kv_capacity));
+            LOG_WARN("[capacity-check] contiguous cache: capacity=" + std::to_string(kv_capacity));
         } else {
             LOG_WARN("[capacity-check] no kv_memory and no kv_cache");
         }
@@ -454,9 +455,10 @@ ChatCompletionResult ServerState::chat_completion(
         history = req.messages;
     }
 
-    std::vector<ChatTemplateMessage> tooled_messages = tools_json.empty()
-        ? pipeline.inject_tools(history, req.tools, req.tool_choice, &tools_active)
-        : history;
+    std::vector<ChatTemplateMessage> tooled_messages =
+        tools_json.empty()
+            ? pipeline.inject_tools(history, req.tools, req.tool_choice, &tools_active)
+            : history;
 
     ChatTemplateInput input;
     input.messages = tooled_messages;
@@ -471,22 +473,30 @@ ChatCompletionResult ServerState::chat_completion(
     if (std::getenv("FORGE_DEBUG_TEMPLATE")) {
         std::string dbg_render = chat_template_->render(input);
         size_t img_pad = 0, p = 0;
-        while ((p = dbg_render.find("image_pad", p)) != std::string::npos) { ++img_pad; p += 9; }
-        size_t vision = 0; p = 0;
-        while ((p = dbg_render.find("vision", p)) != std::string::npos) { ++vision; p += 6; }
+        while ((p = dbg_render.find("image_pad", p)) != std::string::npos) {
+            ++img_pad;
+            p += 9;
+        }
+        size_t vision = 0;
+        p = 0;
+        while ((p = dbg_render.find("vision", p)) != std::string::npos) {
+            ++vision;
+            p += 6;
+        }
         std::cerr << "[debug-template] messages=" << input.messages.size()
                   << " jinja=" << (chat_template_->uses_jinja() ? 1 : 0)
-                  << " rendered_len=" << dbg_render.size()
-                  << " prompt_tokens=" << prompt_ids.size()
+                  << " rendered_len=" << dbg_render.size() << " prompt_tokens=" << prompt_ids.size()
                   << " 'image_pad'=" << img_pad << " 'vision'=" << vision << "\n";
         for (size_t mi = 0; mi < input.messages.size(); ++mi) {
             std::cerr << "[debug-template]   msg[" << mi << "] role=" << input.messages[mi].role
                       << " content_len=" << input.messages[mi].content.size() << "\n";
         }
         std::string head = dbg_render.size() > 1600 ? dbg_render.substr(0, 1600) : dbg_render;
-        std::cerr << "[debug-template] RENDER_HEAD:\n" << head << "\n"
+        std::cerr << "[debug-template] RENDER_HEAD:\n"
+                  << head << "\n"
                   << "[debug-template] RENDER_TAIL:\n"
-                  << (dbg_render.size() > 400 ? dbg_render.substr(dbg_render.size() - 400) : dbg_render)
+                  << (dbg_render.size() > 400 ? dbg_render.substr(dbg_render.size() - 400)
+                                              : dbg_render)
                   << "\n";
     }
 
@@ -529,7 +539,7 @@ ChatCompletionResult ServerState::chat_completion(
         const size_t last_keep_idx = tooled_messages.size() - 1;  // always keep final message
 
         std::vector<ChatTemplateMessage> kept(tooled_messages.begin(),
-                                             tooled_messages.begin() + first_drop_idx);
+                                              tooled_messages.begin() + first_drop_idx);
 
         auto render = [&](const std::vector<ChatTemplateMessage>& msgs) {
             ChatTemplateInput inp;
@@ -567,10 +577,9 @@ ChatCompletionResult ServerState::chat_completion(
             // (preserves more of the boundary turn than a wholesale drop).
             if (drop_upto < last_keep_idx) {
                 const auto& m = tooled_messages[drop_upto];
-                int overflow =
-                    static_cast<int>(ids.size()) + gen_budget - kv_capacity;
-                int m_tok = static_cast<int>(
-                    tokenizer_->encode(m.content, false, false, false).size());
+                int overflow = static_cast<int>(ids.size()) + gen_budget - kv_capacity;
+                int m_tok =
+                    static_cast<int>(tokenizer_->encode(m.content, false, false, false).size());
                 int keep = m_tok - overflow;
                 if (keep > 0) {
                     ChatTemplateMessage tm = m;
@@ -592,20 +601,17 @@ ChatCompletionResult ServerState::chat_completion(
         }
 
         if (fits) {
-            std::cout << "[server] context shifted to fit KV capacity " << kv_capacity
-                      << " (kept " << first_drop_idx << " prefix message(s)"
-                      << (trimmed ? ", token-trimmed 1 boundary message" : "")
-                      << ", dropped " << (drop_upto - first_drop_idx)
-                      << " oldest history message(s))\n";
+            std::cout << "[server] context shifted to fit KV capacity " << kv_capacity << " (kept "
+                      << first_drop_idx << " prefix message(s)"
+                      << (trimmed ? ", token-trimmed 1 boundary message" : "") << ", dropped "
+                      << (drop_upto - first_drop_idx) << " oldest history message(s))\n";
         } else {
             // Even the minimal message set does not fit. Fail loudly instead of
             // corrupting the KV cache.
             throw ContextLengthExceededError(
-                "prompt exceeds model context capacity (" +
-                std::to_string(prompt_ids.size()) + " tokens > " +
-                std::to_string(kv_capacity - gen_budget) +
-                " available after reserving " + std::to_string(gen_budget) +
-                " generation tokens)");
+                "prompt exceeds model context capacity (" + std::to_string(prompt_ids.size()) +
+                " tokens > " + std::to_string(kv_capacity - gen_budget) +
+                " available after reserving " + std::to_string(gen_budget) + " generation tokens)");
         }
     }
 
@@ -622,21 +628,33 @@ ChatCompletionResult ServerState::chat_completion(
     if (!tiered && kv_capacity > 0 &&
         static_cast<int>(prompt_ids.size()) + gen_budget > kv_capacity) {
         LOG_WARN("[capacity-check] REJECTING: prompt=" + std::to_string(prompt_ids.size()) +
-                 " budget=" + std::to_string(gen_budget) + " capacity=" +
-                 std::to_string(kv_capacity));
+                 " budget=" + std::to_string(gen_budget) +
+                 " capacity=" + std::to_string(kv_capacity));
         throw ContextLengthExceededError(
             "This model's maximum context length is " + std::to_string(kv_capacity) +
             " tokens, but the request is " +
-            std::to_string(static_cast<int>(prompt_ids.size()) + gen_budget) +
-            " tokens (prompt " + std::to_string(prompt_ids.size()) + " + generation " +
-            std::to_string(gen_budget) + ")");
+            std::to_string(static_cast<int>(prompt_ids.size()) + gen_budget) + " tokens (prompt " +
+            std::to_string(prompt_ids.size()) + " + generation " + std::to_string(gen_budget) +
+            ")");
     }
 
     // OpenAI default: temperature=0 means greedy; other defaults are the
     // anti-degeneration choices in ChatCompletionRequest (repeat penalty etc.).
-    // --perf-detail: open a fresh profiling window for this request.
-    if (opt_.perf_detail) {
+    // --perf-detail: open a fresh profiling window for this request. The
+    // dashboard's operator panel reads the same window, so it needs the reset
+    // too -- otherwise the "per-request" breakdown would accumulate across
+    // every request since start-up.
+    // The dashboard's operator panel needs an explicit opt-in (--dashboard-ops):
+    // arming PerfProfiler around every request would slow decode for a chart the
+    // user may not even have open. --perf-detail has always paid that cost
+    // because it is a diagnostic flag.
+    const bool want_operator_panel =
+        opt_.perf_detail || (opt_.dashboard.capture_operators && scope && scope->recording());
+    if (want_operator_panel) {
         PerfProfiler::instance().reset();
+        // Recording is opt-in and not free (a mutex-guarded accumulator update
+        // per scope), so only arm it when something will actually read it.
+        PerfProfiler::instance().enable();
     }
     GenerationConfig gen_cfg;
     gen_cfg.max_new_tokens = req.max_tokens > 0 ? req.max_tokens : 512;
@@ -689,6 +707,12 @@ ChatCompletionResult ServerState::chat_completion(
 
     Generator::TokenCallback cb;
     cb = [&](int32_t tok, int /*step*/) {
+        // Dashboard TTFT / inter-token latency. Called before the early returns
+        // below so EOS and stop tokens still count as emitted steps: the time
+        // to produce them was spent, and the client's first byte did not wait
+        // for them.
+        if (scope && scope->recording())
+            scope->on_token();
         if (tok == gen_cfg.eos_token_id) {
             // EOS is invoked by generate() before stopping; decode_token() does
             // not skip special tokens, so emit nothing for it (the non-stream
@@ -825,14 +849,13 @@ ChatCompletionResult ServerState::chat_completion(
                     const long free_tokens = (long)free_after * page;
                     throw ContextLengthExceededError(
                         "This model's paged KV pool holds " +
-                        std::to_string(km->max_pool_tokens()) +
-                        " tokens total, but only " + std::to_string(free_tokens) +
+                        std::to_string(km->max_pool_tokens()) + " tokens total, but only " +
+                        std::to_string(free_tokens) +
                         " are free after evicting cached prefixes; the request "
                         "needs " +
-                        std::to_string(tail + gen_budget) +
-                        " new tokens (prompt " + std::to_string(prompt_ids.size()) +
-                        " - cached prefix " + std::to_string(prefix_len) +
-                        " + max_tokens " + std::to_string(gen_budget) +
+                        std::to_string(tail + gen_budget) + " new tokens (prompt " +
+                        std::to_string(prompt_ids.size()) + " - cached prefix " +
+                        std::to_string(prefix_len) + " + max_tokens " + std::to_string(gen_budget) +
                         "). Reduce the input length, lower max_tokens, or enlarge "
                         "the KV pool (free VRAM for the 741MB Q3K scratch via a "
                         "tensor-core-eligible quant, or raise --max-num-seqs).");
@@ -884,6 +907,8 @@ ChatCompletionResult ServerState::chat_completion(
         std::cout << "[server] prefix reuse: " << prefix_len << "/" << prompt_ids.size()
                   << " tokens from cache (" << (prompt_ids.size() - prefix_len) << " to prefill)\n";
     }
+    if (scope && scope->recording())
+        scope->set_prefix_reused(prefix_len);
 
     GenerationResult result;
     try {
@@ -931,8 +956,7 @@ ChatCompletionResult ServerState::chat_completion(
                 // threw it away -- so every turn re-prefilled the entire previous
                 // assistant message. The contiguous branch below already did this.
                 std::vector<int32_t> resident(prompt_ids);
-                resident.insert(resident.end(), result.token_ids.begin(),
-                                result.token_ids.end());
+                resident.insert(resident.end(), result.token_ids.begin(), result.token_ids.end());
                 prefix_cache_.register_prefix(resident, sess_seq, km->storage());
                 prefix_cache_.evict_lru(PrefixCache::DEFAULT_MAX_ENTRIES, km->storage());
             }
@@ -941,7 +965,7 @@ ChatCompletionResult ServerState::chat_completion(
         // Contiguous single-entry mirror.
         cached_kv_tokens = prompt_ids;
         cached_kv_tokens.insert(cached_kv_tokens.end(), result.token_ids.begin(),
-                                 result.token_ids.end());
+                                result.token_ids.end());
         if (static_cast<int>(cached_kv_tokens.size()) + gen_budget > kv_capacity) {
             cached_kv_tokens.clear();
         }
@@ -968,9 +992,22 @@ ChatCompletionResult ServerState::chat_completion(
     // cut the turn at the first turn-terminator or EOS literal.
     out.text = tokenizer_->decode(result.token_ids, false, false);
     {
-        const char* const kTurnEnds[] = {"<|" "im_end" "|>", "<|" "im_start" "|>",
-                                         "</" "s" ">", "<|" "end" "|>",
-                                         "<|" "eot_id" "|>"};
+        const char* const kTurnEnds[] = {
+            "<|"
+            "im_end"
+            "|>",
+            "<|"
+            "im_start"
+            "|>",
+            "</"
+            "s"
+            ">",
+            "<|"
+            "end"
+            "|>",
+            "<|"
+            "eot_id"
+            "|>"};
         size_t cut = std::string::npos;
         for (const char* s : kTurnEnds) {
             const size_t p = out.text.find(s);
@@ -1034,19 +1071,56 @@ ChatCompletionResult ServerState::chat_completion(
         out.finish_reason = "tool_calls";
     }
 
+    // ---- PerfProfiler window: close it EXACTLY ONCE per request ----
+    //
+    // PerfProfiler::summary() is not idempotent -- it merges every thread-local
+    // accumulator into the global records_ on each call -- so calling it twice
+    // for one request doubles every number (the same trap forge-cli's bench path
+    // documents). Both consumers therefore share ONE capture here: the dashboard
+    // stores the copy, --perf-detail prints from it.
+    std::vector<std::pair<std::string, PerfRecord>> perf_rows;
+    if (opt_.perf_detail || (scope && scope->recording())) {
+        // flush_deferred merges CUDA-event timings that were recorded
+        // asynchronously during the request.
+#ifdef USE_CUDA
+        PerfProfiler::instance().flush_deferred();
+#endif
+        perf_rows = PerfProfiler::instance().summary();
+        std::sort(perf_rows.begin(), perf_rows.end(),
+                  [](const std::pair<std::string, PerfRecord>& a,
+                     const std::pair<std::string, PerfRecord>& b) {
+                      return a.second.total_ms > b.second.total_ms;
+                  });
+    }
+    if (scope && scope->recording()) {
+        std::vector<OperatorRecord> ops;
+        ops.reserve(perf_rows.size());
+        for (const auto& [name, r] : perf_rows) {
+            OperatorRecord o;
+            o.name = name;
+            o.total_ms = r.total_ms;
+            o.count = r.count;
+            o.min_ms = r.min_ms;
+            o.max_ms = r.max_ms;
+            o.avg_ms = r.count > 0 ? r.total_ms / static_cast<double>(r.count) : 0.0;
+            ops.push_back(std::move(o));
+        }
+        scope->set_operators(std::move(ops));
+        scope->finish(
+            result, result.finish_reason == "aborted" ? RequestStatus::Aborted : RequestStatus::Ok);
+        publish_engine_gauges();
+    }
+
     // ---- --perf / --perf-detail report (stdout, after every completion) ----
     if (opt_.perf) {
         const int gen_tok = result.num_generated_tokens;
         const double prefill_ms = result.prefill_ms;
         const double decode_ms = result.decode_ms;
-        std::cout << "[perf] prompt=" << out.prompt_tokens
-                  << " tok | gen=" << gen_tok << " tok"
-                  << " | prefill=" << std::fixed << std::setprecision(1) << prefill_ms
-                  << " ms (" << std::setprecision(2) << result.prefill_ms_per_1k()
-                  << " ms/1k-tok)"
+        std::cout << "[perf] prompt=" << out.prompt_tokens << " tok | gen=" << gen_tok << " tok"
+                  << " | prefill=" << std::fixed << std::setprecision(1) << prefill_ms << " ms ("
+                  << std::setprecision(2) << result.prefill_ms_per_1k() << " ms/1k-tok)"
                   << " | decode=" << std::setprecision(1) << decode_ms << " ms"
-                  << " | " << std::setprecision(2) << result.tokens_per_sec()
-                  << " tok/s"
+                  << " | " << std::setprecision(2) << result.tokens_per_sec() << " tok/s"
                   << " | finish=" << out.finish_reason << std::endl;
         if (result.spec_stats) {
             std::cout << "[perf] speculative: accepted=" << result.spec_stats->n_accepted_tokens
@@ -1055,31 +1129,20 @@ ChatCompletionResult ServerState::chat_completion(
                       << 100.0 * result.spec_stats->acceptance_rate() << "%)\n";
         }
         if (opt_.perf_detail) {
-            // Per-request window: PerfProfiler is reset at the start of every
-            // chat_completion (below), so this summary covers exactly the
-            // current request. flush_deferred merges CUDA-event timings that
-            // were recorded asynchronously during the request.
-#ifdef USE_CUDA
-            PerfProfiler::instance().flush_deferred();
-#endif
-            auto rows = PerfProfiler::instance().summary();
-            std::sort(rows.begin(), rows.end(),
-                      [](const auto& a, const auto& b) {
-                          return a.second.total_ms > b.second.total_ms;
-                      });
+            // Reads the single capture taken above; must NOT call summary() again.
             const size_t top_n = 12;
             std::cout << "[perf] top operators (this request):\n";
-            if (rows.empty()) {
+            if (perf_rows.empty()) {
                 std::cout << "  (no operator data - rebuild with "
                              "FORGE_PROFILING=ON for --perf-detail)\n";
             }
-            for (size_t i = 0; i < rows.size() && i < top_n; ++i) {
-                const auto& [name, rec] = rows[i];
-                const double avg = rec.count > 0 ? rec.total_ms / rec.count : 0.0;
-                std::cout << "  " << std::left << std::setw(38) << name << std::right
-                          << " n=" << std::setw(6) << rec.count
-                          << "  total=" << std::fixed << std::setprecision(2)
-                          << std::setw(9) << rec.total_ms << " ms"
+            for (size_t i = 0; i < perf_rows.size() && i < top_n; ++i) {
+                const auto& [rname, rec] = perf_rows[i];
+                const double avg =
+                    rec.count > 0 ? rec.total_ms / static_cast<double>(rec.count) : 0.0;
+                std::cout << "  " << std::left << std::setw(38) << rname << std::right
+                          << " n=" << std::setw(6) << rec.count << "  total=" << std::fixed
+                          << std::setprecision(2) << std::setw(9) << rec.total_ms << " ms"
                           << "  avg=" << std::setw(7) << avg << " ms\n";
             }
             std::cout.flush();
@@ -1135,8 +1198,7 @@ ServerState::SessionState& ServerState::acquire_session(const std::string& sessi
     SessionState st;
     // seq 0 is reserved for the default session so that a request without a
     // session_id keeps hitting exactly the pages it did before sessions existed.
-    st.seq_id = session_id.empty() ? 0
-                                   : kSessionSeqBase + static_cast<int>(next_session_seq_++);
+    st.seq_id = session_id.empty() ? 0 : kSessionSeqBase + static_cast<int>(next_session_seq_++);
     st.last_active_ms = now;
     st.use_count = 1;
     auto res = sessions_.emplace(session_id, std::move(st));
@@ -1188,6 +1250,69 @@ bool ServerState::try_acquire_slot() {
 
 void ServerState::release_slot() {
     active_requests_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// ============================================================================
+// Dashboard gauges
+// ============================================================================
+
+std::string ServerState::arch() const {
+    return model_ ? model_->config().arch_type : std::string();
+}
+//
+// publish_engine_gauges() is the ONLY function that reads KV occupancy, and it
+// must be called from the thread holding inference_mutex_.
+//
+// The reason is specific to the contiguous backend: KVCache::active_bytes()
+// (kv_cache.cpp) walks every layer's logical_filled counter and
+// KVCache::num_free_slots() iterates the per-layer cell tables looking at
+// is_free() -- neither takes a lock, so a concurrent reader from the dashboard
+// thread is a data race, not merely a stale value. PagedKVStorage's equivalents
+// DO lock, which is exactly the kind of asymmetry that makes "just poll it from
+// the HTTP handler" look correct on a paged build and corrupt on a contiguous
+// one.
+//
+// So the inference thread publishes an atomic snapshot at the end of every
+// request, and the dashboard thread only ever reads that snapshot. Between
+// requests the numbers do not change anyway -- nothing else mutates the KV
+// cache -- so a per-request cadence is exactly as fresh as the data allows.
+
+EngineGauges ServerState::engine_gauges() const {
+    // Reads the last published snapshot, never prefix_cache_ directly: those
+    // counters are only written under inference_mutex_, and taking that lock
+    // from a const accessor would make the dashboard's 1 Hz poll contend with
+    // real inference.
+    return MetricsRegistry::instance().engine_gauges();
+}
+
+void ServerState::fill_engine_gauges(EngineGauges& g) {
+    // Caller must hold inference_mutex_.
+    g.sessions = session_count();
+    g.tiered_kv = tiered_kv_active();
+    g.prefix_cache_hits = prefix_cache_.hits();
+    g.prefix_cache_misses = prefix_cache_.misses();
+    if (auto* eng = ctx_ ? ctx_->engine() : nullptr) {
+        if (auto* mem = eng->kv_memory()) {
+            g.paged_kv = mem->is_paged();
+            auto& st = mem->storage();
+            g.kv_total_bytes = static_cast<int64_t>(st.nbytes());
+            g.kv_active_bytes = static_cast<int64_t>(st.active_bytes());
+            g.kv_free_pages = st.is_paged() ? st.num_free_pages() : -1;
+            g.kv_pool_tokens = mem->is_paged() ? mem->max_pool_tokens() : 0;
+            g.kv_page_size = st.page_size();
+        }
+    }
+}
+
+void ServerState::publish_engine_gauges() {
+    if (!MetricsRegistry::instance().enabled())
+        return;
+    EngineGauges g;
+    // active_requests is deliberately left at 0 here: MetricsRegistry overwrites
+    // it from the live RequestScope count, so setting it would be misleading
+    // (this runs before the scope that is about to be created).
+    fill_engine_gauges(g);
+    MetricsRegistry::instance().publish_engine_gauges(g);
 }
 
 }  // namespace forge

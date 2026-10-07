@@ -12,13 +12,14 @@
  *       "models": { "<model-file-stem>": {} } } } }
  */
 
+#include <httplib.h>
+
 #include <atomic>
 #include <csignal>
 #include <iostream>
 #include <string>
 
-#include <httplib.h>
-
+#include "forge/dashboard.h"
 #include "forge/logger.h"
 #include "server.h"
 
@@ -26,6 +27,7 @@ namespace fsrv = forge;
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
+
 #    include "forge/cuda_kernels.h"
 #endif
 
@@ -53,7 +55,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             std::string err;
             const forge::ParseResult r =
                 forge::parse_common_arg(arg, argc, argv, i, opt.common, &err);
-            if (r == forge::ParseResult::Ok) continue;
+            if (r == forge::ParseResult::Ok)
+                continue;
             if (r == forge::ParseResult::Error) {
                 std::cerr << err << "\n";
                 std::exit(1);
@@ -65,8 +68,23 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             std::string err;
             const forge::SpecParseResult r =
                 forge::parse_spec_arg(arg, argc, argv, i, opt.spec, &err);
-            if (r == forge::SpecParseResult::Ok) continue;
+            if (r == forge::SpecParseResult::Ok)
+                continue;
             if (r == forge::SpecParseResult::Error) {
+                std::cerr << err << "\n";
+                std::exit(1);
+            }
+        }
+
+        // Web dashboard, shared verbatim with forge-cli (see
+        // forge/cli_dashboard_args.h for why these live in forge_infer).
+        {
+            std::string err;
+            const forge::DashboardParseResult r =
+                forge::parse_dashboard_arg(arg, argc, argv, i, opt.dashboard, &err);
+            if (r == forge::DashboardParseResult::Ok)
+                continue;
+            if (r == forge::DashboardParseResult::Error) {
                 std::cerr << err << "\n";
                 std::exit(1);
             }
@@ -105,7 +123,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "                          context, reduced only when VRAM cannot hold it)\n"
                 << "  -t, --threads N         CPU threads (default: auto)\n"
                 << "      --kv-cache-dtype T  KV dtype for BOTH K and V (default: f16)\n"
-                << "                          allowed: " << forge::kv_cache_dtype_allowed_values() << "\n"
+                << "                          allowed: " << forge::kv_cache_dtype_allowed_values()
+                << "\n"
                 << "      -ctk, --cache-type-k T  KV dtype for K only\n"
                 << "      -ctv, --cache-type-v T  KV dtype for V only\n"
                 << "                          At equal bit width K is the more sensitive of the\n"
@@ -141,7 +160,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "      --spec-dspark-topk N     DSpark markov top-k (0 = full vocab)\n"
                 << "      --spec-dspark-conf F     DSpark confidence truncation (0 = off)\n"
                 << "      --spec-min-acc F   Disable drafting while acceptance EWMA < F\n"
-                << "      --adaptive-draft        Size each round's draft to the recent accepted length (off)\n"
+                << "      --adaptive-draft        Size each round's draft to the recent accepted "
+                   "length (off)\n"
                 << "      --spec-n-min N, --spec-p-min F, --spec-ngram-n N,\n"
                 << "      --spec-ngram-min N, --spec-ngram-mod[-n|-min|-max],\n"
                 << "      --no-ngram, --spec-mtp, --spec-stats   See forge-cli --help\n"
@@ -149,6 +169,19 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "      --perf              Log a per-request perf summary after each\n"
                 << "                          completion (prefill/decode ms, tok/s)\n"
                 << "      --perf-detail       --perf + top operators from PerfProfiler\n"
+                << "\n"
+                << "Web dashboard (shared with forge-cli):\n"
+                << "      --dashboard         Serve a live performance dashboard on its OWN\n"
+                << "                          loopback port (never on --port, so --api-key\n"
+                << "                          is not bypassed). Opens a browser unless\n"
+                << "                          --no-open / stdout is not a TTY\n"
+                << "      --dashboard-port N  Preferred port (default: 9090; if busy the next\n"
+                << "                          free port is used; 0 = let the OS choose)\n"
+                << "      --dashboard-host H  Dashboard bind address (default: 127.0.0.1)\n"
+                << "      --dashboard-ops     Also record the per-operator breakdown panel.\n"
+                << "                          Opt-in: arming PerfProfiler slows decode, and only\n"
+                << "                          works on a -DFORGE_PROFILING=ON build\n"
+                << "      --no-open           Do not launch a browser\n"
                 << "  -h, --help              Show this help\n";
             std::exit(0);
         } else {
@@ -175,6 +208,7 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
 }
 
 httplib::Server* g_svr = nullptr;
+forge::DashboardServer* g_dash = nullptr;
 std::atomic<bool> g_stopping{false};
 
 void handle_signal(int) {
@@ -184,6 +218,12 @@ void handle_signal(int) {
     // tripping httplib's assertion in Server::stop() and aborting the process.
     if (g_svr && !g_stopping.exchange(true)) {
         g_svr->stop();
+    }
+    // The dashboard owns a second listener with the same stop() contract, so it
+    // needs its own guard rather than sharing the exchange above -- by the time a
+    // second signal arrives the API listener is already unwinding.
+    if (g_dash && g_dash->running()) {
+        g_dash->stop();
     }
 }
 
@@ -245,6 +285,43 @@ int main(int argc, char** argv) {
               << "  (model: " << state.model_id() << ")\n"
               << "OpenAI-compatible base URL: http://" << opt.host << ":" << opt.port << "/v1\n"
               << "Endpoints: GET /health | GET /v1/models | POST /v1/chat/completions\n\n";
+
+    // ---- Live web dashboard (--dashboard) ----
+    // Started AFTER the API listener has printed its banner but BEFORE
+    // listen(), so the URL is visible even if the API port turns out to be busy
+    // and the process exits. Own port, own thread: the API listener's auth
+    // middleware must not have to be bypassed for a browser to see charts.
+    if (opt.dashboard.enabled) {
+        forge::MetricsRegistry::instance().set_app("forge-server");
+        forge::MetricsRegistry::instance().set_model(state.model_id(), state.arch());
+        forge::MetricsRegistry::instance().set_enabled(true);
+        // Safe before listen(): no request can be in flight yet, so this is the
+        // one publish_engine_gauges() call made outside the inference lock.
+        state.publish_engine_gauges();
+        // Mid-generation KV refresh, driven from the inference thread by
+        // MetricsRegistry. See ServerState::fill_engine_gauges.
+        forge::MetricsRegistry::instance().set_live_gauge_provider(
+            [&state](forge::EngineGauges& g) { state.fill_engine_gauges(g); });
+
+        forge::DashboardServer dash;
+        std::string dash_err;
+        if (dash.start(opt.dashboard, dash_err)) {
+            g_dash = &dash;
+            std::cout << "Dashboard: " << dash.url() << "\n\n";
+        } else {
+            // A dashboard that cannot bind must not take the server down with
+            // it: the API is the thing the user actually asked for.
+            std::cerr << "Warning: dashboard not started (" << dash_err << ")\n\n";
+        }
+
+        if (!svr.listen(opt.host, opt.port)) {
+            std::cerr << "Error: failed to listen on " << opt.host << ":" << opt.port << "\n";
+            dash.stop();
+            return 1;
+        }
+        dash.stop();
+        return 0;
+    }
 
     if (!svr.listen(opt.host, opt.port)) {
         std::cerr << "Error: failed to listen on " << opt.host << ":" << opt.port << "\n";

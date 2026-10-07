@@ -116,12 +116,30 @@ static void print_usage(const char* prog) {
            "       --system-prompt TEXT  System prompt\n"
            "\n"
            "       --no-jinja             Force fallback to hardcoded chat templates\n"
+           "       --embed               Embedding mode: encode -p <text> and print the\n"
+           "                           pooled embedding vector (embedding models only)\n"
            "\n"
            "Info & Debug:\n"
            "       --info                Show model info and exit\n"
            "       --bench               Run performance benchmark\n"
            "  -v,  --verbose             Verbose logging\n"
            "  -h,  --help                Show this help\n"
+           "\n"
+           "Web dashboard (shared with forge-server):\n"
+           "       --dashboard           Serve a live performance dashboard (TTFT, tok/s,\n"
+           "                           inter-token latency, VRAM/KV, per-request table) on\n"
+           "                           its OWN loopback port. Opens a browser unless\n"
+           "                           --no-open / stdout is not a TTY\n"
+           "       --dashboard-port N    Preferred port (default: 9090; if busy the next\n"
+           "                           free port is used; 0 = let the OS choose)\n"
+           "       --dashboard-host H    Dashboard bind address (default: 127.0.0.1)\n"
+           "       --dashboard-ops       Also record the per-operator breakdown panel.\n"
+           "                           Opt-in: arming PerfProfiler slows decode, and only\n"
+           "                           works on a -DFORGE_PROFILING=ON build\n"
+           "       --no-open             Do not launch a browser\n"
+           "\n"
+           "  Note: with -p/--prompt the process holds open after generation so the\n"
+           "        dashboard stays reachable; press Ctrl-C to exit.\n"
            "\n"
            "Interactive commands:\n"
            "  /quit, /exit     Exit\n"
@@ -190,6 +208,19 @@ CliArgs parse_args(int argc, char** argv) {
                 forge::parse_spec_arg(arg, argc, argv, i, args.spec, &err);
             if (r == forge::SpecParseResult::Ok) continue;
             if (r == forge::SpecParseResult::Error) {
+                std::cerr << err << "\n";
+                std::exit(1);
+            }
+        }
+
+        // Web dashboard, shared with forge-server (see
+        // forge/cli_dashboard_args.h for why these live in forge_infer).
+        {
+            std::string err;
+            const forge::DashboardParseResult r =
+                forge::parse_dashboard_arg(arg, argc, argv, i, args.dashboard, &err);
+            if (r == forge::DashboardParseResult::Ok) continue;
+            if (r == forge::DashboardParseResult::Error) {
                 std::cerr << err << "\n";
                 std::exit(1);
             }
@@ -395,6 +426,8 @@ CliArgs parse_args(int argc, char** argv) {
             args.common.prefetch = false;
         } else if (arg == "--info") {
             args.info_only = true;
+        } else if (arg == "--embed") {
+            args.embed = true;
         } else if (arg == "--bench") {
             args.bench = true;
         } else if (arg == "--spec") {

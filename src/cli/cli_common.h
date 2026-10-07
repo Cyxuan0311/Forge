@@ -12,12 +12,14 @@
 #include <vector>
 
 #ifndef _WIN32
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 #include "forge/chat_template.h"
 #include "forge/cli_common_args.h"
+#include "forge/cli_dashboard_args.h"
 #include "forge/kv_working_set.h"
+#include "forge/metrics.h"
 #include "forge/prefix_cache.h"
 #include "forge/speculative.h"
 
@@ -65,6 +67,7 @@ struct CliArgs {
     bool no_stream = false;
     bool info_only = false;
     bool bench = false;
+    bool embed = false;  // --embed: encode prompt, print pooled embedding vector
 
     // Chat template
     bool no_jinja = false;  // Force fallback to hardcoded templates
@@ -83,6 +86,12 @@ struct CliArgs {
     bool expert_paging = false;  // enable per-expert weight movement (ExpertPageCache)
     int expert_budget_mb = 0;    // VRAM budget for resident experts, MB (0 = unbounded)
 
+    // Live web dashboard (--dashboard). Parsed by
+    // forge::parse_dashboard_arg() and served by forge_dashboard on its own
+    // loopback port, exactly as forge-server does. The flags live in
+    // forge_infer so the two binaries cannot disagree about the default port or
+    // whether a browser is launched.
+    forge::DashboardArgs dashboard;
 };
 
 CliArgs parse_args(int argc, char** argv);
@@ -117,9 +126,9 @@ std::vector<int32_t> apply_chat_template(const forge::Tokenizer& tokenizer,
 struct GenerationStats {
     int num_prompt_tokens = 0;
     int num_generated_tokens = 0;
-    double elapsed_ms = 0;       // wall clock: prefill + decode + sampling overhead
-    double prompt_eval_ms = 0;   // prompt forward + first-token sample
-    double decode_ms = 0;        // decode loop only (excludes prefill)
+    double elapsed_ms = 0;         // wall clock: prefill + decode + sampling overhead
+    double prompt_eval_ms = 0;     // prompt forward + first-token sample
+    double decode_ms = 0;          // decode loop only (excludes prefill)
     forge::SpeculativeStats spec;  // speculative decoding stats (zeroed when not enabled)
 };
 
@@ -154,14 +163,30 @@ inline std::string wrap(const char* code, const std::string& s) {
         return s;
     return std::string("\x1b[") + code + "m" + s + "\x1b[0m";
 }
-inline std::string blue(const std::string& s)    { return wrap("1;34", s); }
-inline std::string cyan(const std::string& s)    { return wrap("36", s); }
-inline std::string green(const std::string& s)   { return wrap("32", s); }
-inline std::string yellow(const std::string& s)  { return wrap("33", s); }
-inline std::string magenta(const std::string& s) { return wrap("35", s); }
-inline std::string red(const std::string& s)     { return wrap("1;31", s); }
-inline std::string dim(const std::string& s)     { return wrap("2", s); }
-inline std::string bold(const std::string& s)    { return wrap("1", s); }
+inline std::string blue(const std::string& s) {
+    return wrap("1;34", s);
+}
+inline std::string cyan(const std::string& s) {
+    return wrap("36", s);
+}
+inline std::string green(const std::string& s) {
+    return wrap("32", s);
+}
+inline std::string yellow(const std::string& s) {
+    return wrap("33", s);
+}
+inline std::string magenta(const std::string& s) {
+    return wrap("35", s);
+}
+inline std::string red(const std::string& s) {
+    return wrap("1;31", s);
+}
+inline std::string dim(const std::string& s) {
+    return wrap("2", s);
+}
+inline std::string bold(const std::string& s) {
+    return wrap("1", s);
+}
 
 // Orange input echo (interactive prompt): the SGR code is emitted OPEN — no
 // reset appended, unlike wrap() — before std::getline, so the terminal echoes
@@ -173,8 +198,12 @@ inline std::string bold(const std::string& s)    { return wrap("1", s); }
 inline bool input_echo_color() {
     return enabled() && ::isatty(fileno(stdin)) != 0;
 }
-inline std::string orange_open() { return enabled() ? "\x1b[38;5;208m" : ""; }
-inline std::string sgr_reset()   { return enabled() ? "\x1b[0m" : ""; }
+inline std::string orange_open() {
+    return enabled() ? "\x1b[38;5;208m" : "";
+}
+inline std::string sgr_reset() {
+    return enabled() ? "\x1b[0m" : "";
+}
 }  // namespace cli_color
 
 // 安全地格式化 tok/s: 分母为 0 时返回 "—" (避免 inf tok/s)
@@ -250,21 +279,48 @@ inline void forge_print_stats_line(const GenerationStats& stats) {
 // Generation functions
 // ============================================================================
 
-GenerationStats generate_streaming(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
-                                   const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
-                                   float temperature, int top_k, float top_p, float repeat_penalty,
-                                   int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
-                                   const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{},
-                                   forge::PrefixCache* prefix_cache = nullptr,
-                                   std::string* out_text = nullptr);
+// `capture_operators` opens a per-request PerfProfiler window for the
+// dashboard's operator panel. Opt-in (--dashboard-ops) because recording a scope
+// per operator is not free; see DashboardArgs::capture_operators.
+GenerationStats generate_streaming(
+    forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
+    const std::vector<int32_t>& prompt_tokens, int max_new_tokens, float temperature, int top_k,
+    float top_p, float repeat_penalty, int repeat_last_n, bool do_sample, uint64_t seed,
+    int eos_token_id, const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{},
+    forge::PrefixCache* prefix_cache = nullptr, std::string* out_text = nullptr,
+    bool capture_operators = false);
 
-GenerationStats generate_batch(forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
-                               const std::vector<int32_t>& prompt_tokens, int max_new_tokens,
-                               float temperature, int top_k, float top_p, float repeat_penalty,
-                               int repeat_last_n, bool do_sample, uint64_t seed, int eos_token_id,
-                               const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{},
-                               forge::PrefixCache* prefix_cache = nullptr,
-                               std::string* out_text = nullptr);
+GenerationStats generate_batch(
+    forge::InferenceContext& ctx, const forge::Tokenizer& tokenizer,
+    const std::vector<int32_t>& prompt_tokens, int max_new_tokens, float temperature, int top_k,
+    float top_p, float repeat_penalty, int repeat_last_n, bool do_sample, uint64_t seed,
+    int eos_token_id, const forge::SpeculativeConfig& spec_cfg = forge::SpeculativeConfig{},
+    forge::PrefixCache* prefix_cache = nullptr, std::string* out_text = nullptr,
+    bool capture_operators = false);
+
+/// Publishes the engine-side dashboard gauges (KV occupancy, prefix-cache hit
+/// rate) from the thread that owns the context.
+///
+/// Lives in forge_infer's MetricsRegistry rather than being read on demand for
+/// the same reason forge-server does it this way: `KVCache::active_bytes()` and
+/// `num_free_slots()` walk their cell tables with NO lock, so a dashboard thread
+/// polling them directly would be racing the inference thread. Publishing from
+/// here means the dashboard only ever reads an already-finished snapshot.
+///
+/// `sessions` is 1 in interactive mode (one conversation per process) and 0 for
+/// one-shot / --bench, matching the server's semantics where the count comes
+/// from its session table. The active-request count is NOT a parameter:
+/// MetricsRegistry derives it from the number of live RequestScopes, which is
+/// what fixed one-shot mode reporting 0 active requests for a whole generation.
+void publish_cli_engine_gauges(forge::InferenceContext& ctx, const forge::PrefixCache* prefix_cache,
+                               int sessions);
+
+/// Fills `g` with the current KV geometry and prefix-cache counts WITHOUT
+/// publishing it. Split out so the dashboard's live hook can refresh the gauges
+/// mid-generation from this thread -- the only thread allowed to read them --
+/// without duplicating the field mapping.
+void fill_cli_engine_gauges(forge::InferenceContext& ctx, const forge::PrefixCache* prefix_cache,
+                            int sessions, forge::EngineGauges& g);
 
 // ============================================================================
 // Interactive chat

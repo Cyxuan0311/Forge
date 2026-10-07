@@ -52,8 +52,8 @@ void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
     print_logo();
 
     std::cout << "\n";
-    std::cout << "  " << cli_color::green("Model:") << " " << cli_color::bold(cfg.arch_type)
-              << " (" << cli_color::cyan(std::to_string(cfg.num_layers)) << " layers)\n";
+    std::cout << "  " << cli_color::green("Model:") << " " << cli_color::bold(cfg.arch_type) << " ("
+              << cli_color::cyan(std::to_string(cfg.num_layers)) << " layers)\n";
     std::cout << "  " << cli_color::green("Device:") << " "
               << cli_color::bold(args.common.n_gpu_layers == 0 ? "CPU" : "CUDA") << "\n";
     std::cout << "  " << cli_color::green("GPU layers:") << " "
@@ -129,7 +129,9 @@ void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
             continue;
         } else if (user_input.rfind("/image ", 0) == 0) {
             if (!vision) {
-                std::cout << "  " << cli_color::red("[Error: Vision encoder not loaded, use --mmproj]") << "\n\n";
+                std::cout << "  "
+                          << cli_color::red("[Error: Vision encoder not loaded, use --mmproj]")
+                          << "\n\n";
                 continue;
             }
             std::string img_path = user_input.substr(7);
@@ -204,19 +206,24 @@ void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
         if (args.no_stream) {
             stats = generate_batch(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                   !args.no_sample, args.seed, tokenizer.eos_token_id(),
-                                   args.spec, &prefix_cache, &reply_text);
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec,
+                                   &prefix_cache, &reply_text, args.dashboard.capture_operators);
         } else {
             stats =
                 generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                   !args.no_sample, args.seed, tokenizer.eos_token_id(),
-                                   args.spec, &prefix_cache, &reply_text);
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec,
+                                   &prefix_cache, &reply_text, args.dashboard.capture_operators);
         }
 
         std::cout << "\n";
 
         forge_print_stats_line(stats);
+
+        // Dashboard: session count and KV occupancy for the turn that just
+        // finished. Safe to call every turn -- it early-outs on one relaxed
+        // atomic when the registry is disabled.
+        publish_cli_engine_gauges(ctx, &prefix_cache, 1);
 
         conversation.push_back({"assistant", reply_text});
 

@@ -19,24 +19,27 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iostream>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "cli_common.h"
 
 // Forge headers
 #include "forge/arch_registry.h"
 #include "forge/context.h"
+#include "forge/dashboard.h"
 #include "forge/engine.h"
 #include "forge/inference/forward_request.h"
+#include "forge/inference/tensor_device_utils.h"
 #include "forge/kv_cache.h"
 #include "forge/kv_memory.h"
 #include "forge/kv_storage.h"
 #include "forge/logger.h"
-
+#include "forge/metrics.h"
 #include "forge/model.h"
 #include "forge/perf_profiler.h"
 #include "forge/tensor.h"
@@ -438,6 +441,57 @@ std::vector<float> encode_image(VisionEncoder& vision, const std::string& image_
 }
 
 // ============================================================================
+// Dashboard helpers
+// ============================================================================
+
+// Stops the dashboard on every exit path from main().
+//
+// A plain local `DashboardServer` would already be destroyed on return, but
+// main() has six distinct `return 0` / `return 1` statements and the signal
+// handler also needs the pointer. Wrapping it means the shutdown happens in
+// exactly one place and cannot be forgotten by a future exit path.
+class DashboardGuard {
+public:
+    ~DashboardGuard() {
+        if (dash_)
+            dash_->stop();
+    }
+    bool start(const forge::DashboardArgs& args, std::string& error) {
+        return dash_->start(args, error);
+    }
+    forge::DashboardServer* get() { return dash_.get(); }
+
+private:
+    std::unique_ptr<forge::DashboardServer> dash_ = std::make_unique<forge::DashboardServer>();
+};
+
+// "qwen3-4b.gguf" -> "qwen3-4b": the same stem forge-server reports as the model
+// id, so a dashboard left open by either binary shows the same name.
+static std::string model_id_from_path(const std::string& path) {
+    auto slash = path.find_last_of("/\\");
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    auto dot = name.find_last_of('.');
+    return (dot == std::string::npos) ? name : name.substr(0, dot);
+}
+
+// Blocks until Ctrl-C so `--dashboard` is actually usable in one-shot mode.
+//
+// Without this the process would return from main() the moment generation
+// finished and take the HTTP listener with it, leaving the user staring at a
+// browser tab that had been pointed at a port that no longer exists. Opt-in via
+// --dashboard, so existing scripts that pass -p are unaffected.
+static void hold_for_dashboard() {
+    std::cout << "\n  (dashboard stays up; press Ctrl-C to exit)\n" << std::flush;
+    // Sleep in slices so a second Ctrl-C is still responsive: a single long
+    // sleep would make the process look hung to the user who just asked it to
+    // stop.
+    while (!g_interrupted) {
+        for (int i = 0; i < 200 && !g_interrupted; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -459,8 +513,7 @@ int main(int argc, char** argv) {
     // ERROR, -v 1 is WARN, and so on. WARN is where the operational warnings
     // live (KV truncation, dtype fallbacks), and they must be reachable.
     Logger::instance().set_level(
-        static_cast<LogLevel>(std::min<int>(args.verbose + 1,
-                                           static_cast<int>(LogLevel::TRACE))));
+        static_cast<LogLevel>(std::min<int>(args.verbose + 1, static_cast<int>(LogLevel::TRACE))));
 
     ensure_engines_registered();
     ensure_loaders_registered();
@@ -508,6 +561,21 @@ int main(int argc, char** argv) {
               << ", hidden=" << cfg.hidden_dim << ", heads=" << cfg.num_heads << " [" << model_ms
               << " ms]\n";
 
+    // ---- Embedding-model mode guards ----
+    // Embedding architectures (n_embd_out > 0) have no decode loop: they only
+    // produce pooled vectors, so they must run in --embed mode. Conversely,
+    // --embed makes no sense for a generative model.
+    const bool is_embedding_arch = (cfg.n_embd_out > 0);
+    if (args.embed && !is_embedding_arch) {
+        std::cerr << "Error: --embed requires an embedding model (e.g. gemma-embedding2)\n";
+        return 1;
+    }
+    // (--info is exempt: metadata inspection works for any architecture.)
+    if (is_embedding_arch && !args.embed && !args.info_only) {
+        std::cerr << "Error: '" << cfg.arch_type
+                  << "' is an embedding model; run with --embed -p <text>\n";
+        return 1;
+    }
 
     // ---- Model info only ----
     if (args.info_only) {
@@ -537,7 +605,8 @@ int main(int argc, char** argv) {
 
             vision = VisionEncoderRegistry::instance().create(vis_arch);
             if (!vision) {
-                std::cerr << "Warning: No vision encoder registered for arch '" << vis_arch << "'\n";
+                std::cerr << "Warning: No vision encoder registered for arch '" << vis_arch
+                          << "'\n";
             } else if (!vision->init(model.weights(), vis_cfg)) {
                 std::cerr << "Warning: Vision encoder initialization failed\n";
                 vision.reset();
@@ -591,12 +660,13 @@ int main(int argc, char** argv) {
         }
         // -b/--batch-size was parsed but never read, so it did nothing. Wire it
         // to the forward-batch budget it always claimed to control.
-        if (args.batch_size > 0) ctx.params_mut().n_batch = args.batch_size;
+        if (args.batch_size > 0)
+            ctx.params_mut().n_batch = args.batch_size;
         if (args.common.threads > 0) {
             std::cout << "CPU threads set to: " << args.common.threads << "\n";
         } else if (args.common.n_gpu_layers < cfg.num_layers) {
-            std::cout << "CPU threads auto-detected (hybrid offload): "
-                      << ctx.params().n_threads << "\n";
+            std::cout << "CPU threads auto-detected (hybrid offload): " << ctx.params().n_threads
+                      << "\n";
         }
         if (args.expert_stats || args.expert_paging) {
             tfm_eng->set_expert_paging(args.expert_paging);
@@ -605,16 +675,18 @@ int main(int argc, char** argv) {
                     << "Warning: --expert-paging is EXPERIMENTAL and currently only pays off when\n"
                        "         the MoE expert weights do NOT fit in VRAM. If the model already\n"
                        "         fits, paging adds host<->device transfer cost and is SLOWER, and\n"
-                       "         VRAM does not shrink because freed expert blocks stay in the CUDA\n"
+                       "         VRAM does not shrink because freed expert blocks stay in the "
+                       "CUDA\n"
                        "         pool. Measured (RTX 4050 6GB, Phi-mini-MoE 2.75GB, -ngl 99):\n"
                        "           baseline            20.5 tok/s, 4245 MiB\n"
                        "           paging budget 1GB   10.5 tok/s, 5816 MiB\n"
                        "         Output stays correct in both cases. Use only for MoE models that\n"
-                       "         exceed VRAM, and prefer --expert-stats alone for router analysis.\n";
+                       "         exceed VRAM, and prefer --expert-stats alone for router "
+                       "analysis.\n";
             }
             if (args.expert_budget_mb > 0) {
-                tfm_eng->set_expert_budget_bytes(
-                    static_cast<int64_t>(args.expert_budget_mb) * 1024 * 1024);
+                tfm_eng->set_expert_budget_bytes(static_cast<int64_t>(args.expert_budget_mb) *
+                                                 1024 * 1024);
             }
         }
     }
@@ -636,8 +708,8 @@ int main(int argc, char** argv) {
         } else if (cfg.n_swa > 0) {
             // PagedKVStorage::kvmem_supported() rejects mixed policies: pages can
             // only be archived uniformly when every layer is Full-attention.
-            std::cerr << "Warning: --kvmem needs all-Full attention layers; model has "
-                      << cfg.n_swa << " sliding-window layer(s); tiered KV disabled\n";
+            std::cerr << "Warning: --kvmem needs all-Full attention layers; model has " << cfg.n_swa
+                      << " sliding-window layer(s); tiered KV disabled\n";
         } else {
             // 0 = keep the device-sized pool; the budget then falls back to it.
             if (args.common.kvmem_budget > 0)
@@ -666,12 +738,18 @@ int main(int argc, char** argv) {
         // contiguous KVCache.
         auto kv_dtype_to_name = [](KVCacheDType t) -> const char* {
             switch (t) {
-            case KVCacheDType::F16:      return "f16";
-            case KVCacheDType::Q8_0:     return "q8_0";
-            case KVCacheDType::Q4_0:     return "q4_0";
-            case KVCacheDType::FP8_E4M3: return "fp8_e4m3";
-            case KVCacheDType::FP8_E5M2: return "fp8_e5m2";
-            default:                     return "fp32";
+            case KVCacheDType::F16:
+                return "f16";
+            case KVCacheDType::Q8_0:
+                return "q8_0";
+            case KVCacheDType::Q4_0:
+                return "q4_0";
+            case KVCacheDType::FP8_E4M3:
+                return "fp8_e4m3";
+            case KVCacheDType::FP8_E5M2:
+                return "fp8_e5m2";
+            default:
+                return "fp32";
             }
         };
         auto* kv_mem = tfm_eng->kv_memory();
@@ -681,15 +759,13 @@ int main(int argc, char** argv) {
         const auto type_str = [&](const KVCacheTypeConfig& c) {
             const char* k = kv_cache_dtype_name(c.type_k);
             const char* v = kv_cache_dtype_name(c.type_v);
-            return c.type_k == c.type_v ? std::string(k)
-                                       : std::string(k) + "/" + v + " (K/V)";
+            return c.type_k == c.type_v ? std::string(k) : std::string(k) + "/" + v + " (K/V)";
         };
         if (kv_mem && kv_mem->storage().is_paged()) {
             const auto& st = static_cast<const PagedKVStorage&>(kv_mem->storage());
             KVCacheTypeConfig c{st.kv_type_k(), st.kv_type_v()};
             std::cout << "KV Cache (paged): dtype=" << type_str(c)
-                      << ", size=" << format_bytes(st.nbytes())
-                      << ", max_seq=" << st.max_seq_len()
+                      << ", size=" << format_bytes(st.nbytes()) << ", max_seq=" << st.max_seq_len()
                       << " (pool_tokens=" << st.max_pool_tokens() << ")\n";
         } else {
             const KVCache* cache = tfm_eng->kv_cache();
@@ -714,14 +790,13 @@ int main(int argc, char** argv) {
             const int page_size = kv_mem->storage().page_size();
             const int pool_tokens = kv_mem->max_pool_tokens();
             auto ws = std::make_unique<KVWorkingSetManager>(args.common.kvem_config(), page_size,
-                                                           pool_tokens);
+                                                            pool_tokens);
             std::cout << "KVMem tiered KV enabled: budget=" << ws->budget()
-                      << ", sink=" << ws->sink_tokens()
-                      << ", gen_reserve=" << ws->gen_reserve()
+                      << ", sink=" << ws->sink_tokens() << ", gen_reserve=" << ws->gen_reserve()
                       << ", retrieval=" << args.common.kvmem_retrieval << "\n"
                       << "  logical ctx=" << kv_mem->max_seq_len()
-                      << " tokens, gpu pool=" << pool_tokens
-                      << " tokens, page=" << page_size << "\n";
+                      << " tokens, gpu pool=" << pool_tokens << " tokens, page=" << page_size
+                      << "\n";
             // Hand the manager its storage so clipped pages can be offloaded to the
             // host pool and (with FORGE_KVMEM_RECALL) pulled back by relevance.
             ws->attach_storage(&kv_mem->storage(), kv_mem->storage().num_layers(), 0);
@@ -747,9 +822,83 @@ int main(int argc, char** argv) {
               << ", model=" << model_ms << "ms"
               << ", ctx=" << ctx_ms << "ms)\n";
 
+    // ---- Live web dashboard (--dashboard) ----
+    //
+    // Started here, after the KV cache exists and the CUDA warmup has run, so
+    // the first paint shows real KV geometry instead of zeros, and before the
+    // mode dispatch so --bench and one-shot completion are covered too. It is
+    // deliberately NOT started for --info, which returns long before this point
+    // and has nothing to measure.
+    //
+    // The guard stops the listener on every remaining return statement.
+    DashboardGuard dashboard;
+    if (args.dashboard.enabled) {
+        auto& reg = forge::MetricsRegistry::instance();
+        reg.set_app("forge-cli");
+        reg.set_model(model_id_from_path(args.common.model_path), cfg.arch_type);
+        reg.set_enabled(true);
+        publish_cli_engine_gauges(ctx, nullptr, 0);
+        // Refresh the KV gauges mid-generation. This has to run on the thread
+        // that owns the context -- KV occupancy cannot be read concurrently --
+        // so MetricsRegistry calls it from inside the per-token callback a few
+        // times a second. Without it the KV gauge stayed frozen at its previous
+        // value for the whole decode.
+        reg.set_live_gauge_provider(
+            [&ctx](forge::EngineGauges& g) { fill_cli_engine_gauges(ctx, nullptr, 0, g); });
+
+        std::string dash_err;
+        if (dashboard.start(args.dashboard, dash_err)) {
+            std::cout << "Dashboard: " << dashboard.get()->url() << "\n";
+            if (forge::dashboard_asset_count() == 0) {
+                std::cout << "  (frontend not embedded in this build -- "
+                             "rebuild with -DFORGE_BUILD_DASHBOARD=ON and Node.js >= 18; "
+                             "the JSON API at /api/metrics still works)\n";
+            }
+        } else {
+            // A dashboard that cannot bind must not take the run down with it.
+            std::cerr << "Warning: dashboard not started (" << dash_err << ")\n";
+        }
+    }
+
+    // ---- Embedding mode (--embed) ----
+    // Encode the prompt, run a single forward pass through the embedding model
+    // and print the pooled vector. No KV cache / decode loop is involved.
+    if (args.embed) {
+        if (args.prompt.empty()) {
+            std::cerr << "Error: --embed requires a prompt (-p <text>)\n";
+            return 1;
+        }
+        auto ids =
+            tokenizer.encode(args.prompt, tokenizer.add_bos_token(), tokenizer.add_eos_token());
+        if (ids.empty()) {
+            std::cerr << "Error: encoding produced no tokens\n";
+            return 1;
+        }
+        auto input_ids =
+            std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{(int64_t)ids.size()},
+                                     DeviceType::CPU);
+        std::memcpy(input_ids->data(), ids.data(), ids.size() * sizeof(int32_t));
+        auto embd = ctx.engine()->forward_request(ForwardRequest::from_ids(input_ids, 0, 0));
+        if (!embd) {
+            std::cerr << "Error: forward_request failed\n";
+            return 1;
+        }
+        embd = ensure_cpu(embd);
+        const float* v = static_cast<const float*>(embd->data());
+        const int n = static_cast<int>(embd->numel());
+        std::cout << "Embedding dim: " << n << "\n";
+        for (int i = 0; i < n; ++i)
+            std::cout << v[i] << (i + 1 < n ? " " : "\n");
+        if (args.dashboard.enabled)
+            hold_for_dashboard();
+        return 0;
+    }
+
     // ---- Benchmark mode ----
     if (args.bench) {
         run_benchmark(ctx, tokenizer, args.common.n_gpu_layers);
+        if (args.dashboard.enabled)
+            hold_for_dashboard();
         return 0;
     }
 
@@ -757,19 +906,22 @@ int main(int argc, char** argv) {
     if (!args.interactive) {
         // Respect the model's tokenizer metadata (tokenizer.ggml.add_bos_token /
         // add_eos_token) instead of unconditionally prepending BOS.
-        auto prompt_ids = tokenizer.encode(args.prompt, tokenizer.add_bos_token(),
-                                           tokenizer.add_eos_token());
+        auto prompt_ids =
+            tokenizer.encode(args.prompt, tokenizer.add_bos_token(), tokenizer.add_eos_token());
         std::cout << "\n";
 
         GenerationStats stats;
         if (args.no_stream) {
             stats = generate_batch(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
                                    args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                   !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec);
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec,
+                                   nullptr, nullptr, args.dashboard.capture_operators);
         } else {
-            stats = generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
-                                       args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
-                                       !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec);
+            stats =
+                generate_streaming(ctx, tokenizer, prompt_ids, args.n_predict, args.temperature,
+                                   args.top_k, args.top_p, args.repeat_penalty, args.repeat_last_n,
+                                   !args.no_sample, args.seed, tokenizer.eos_token_id(), args.spec,
+                                   nullptr, nullptr, args.dashboard.capture_operators);
         }
 
         std::cout << "\n\n";
@@ -806,22 +958,24 @@ int main(int argc, char** argv) {
                 std::cout << "  Acceptance by position:";
                 for (int p = 0; p < 6; ++p) {
                     const double a = stats.spec.acceptance_at(p);
-                    if (a < 0.0) continue;
+                    if (a < 0.0)
+                        continue;
                     any = true;
                     std::cout << " " << kPosNames[p + 1] << "=" << (a * 100.0) << "%";
                 }
-                if (!any) std::cout << " (none)";
+                if (!any)
+                    std::cout << " (none)";
                 std::cout << "\n";
             }
             if (stats.spec.n_rank_samples > 0) {
                 std::cout << "  Draft rank in target dist (at 1st rejection):";
                 static const char* kRankNames[] = {"#1", "#2", "#3", "#4", "#5", "5+"};
                 for (int b = 0; b < 6; ++b) {
-                    if (stats.spec.n_rank_hist[b] == 0) continue;
+                    if (stats.spec.n_rank_hist[b] == 0)
+                        continue;
                     std::cout << " " << kRankNames[b] << "x" << stats.spec.n_rank_hist[b];
                 }
-                std::cout << std::fixed << std::setprecision(3)
-                          << "  (mean target prob on draft "
+                std::cout << std::fixed << std::setprecision(3) << "  (mean target prob on draft "
                           << (stats.spec.rank_prob_sum / stats.spec.n_rank_samples) << ")\n";
             }
             // Proposed length per round: a single dominant bucket means the
@@ -830,7 +984,8 @@ int main(int argc, char** argv) {
                 static const char* kLenNames[] = {"0", "1", "2", "3", "4-5", "6-7", "8+"};
                 std::cout << "  Rounds by draft length:";
                 for (int b = 0; b < 7; ++b) {
-                    if (stats.spec.n_rounds_by_len[b] == 0) continue;
+                    if (stats.spec.n_rounds_by_len[b] == 0)
+                        continue;
                     std::cout << " " << kLenNames[b] << "x" << stats.spec.n_rounds_by_len[b];
                 }
                 std::cout << "\n";
@@ -843,6 +998,9 @@ int main(int argc, char** argv) {
             std::cout << tfm_eng->expert_stats_report();
         }
 
+        publish_cli_engine_gauges(ctx, nullptr, 0);
+        if (args.dashboard.enabled)
+            hold_for_dashboard();
         return 0;
     }
 
