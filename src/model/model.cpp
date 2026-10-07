@@ -604,7 +604,7 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
         }
 
         // Gemma4 per-layer embedding weights (model-level, not per-blk)
-        if (config_.arch_type == "gemma4") {
+        if (config_.arch_type == "gemma4" || config_.arch_type == "gemma-embedding2") {
             auto ple = load_tensor("per_layer_token_embd.weight", first_layer_dev);
             if (ple)
                 weight_store_.set("per_layer_tok_embd", ple);
@@ -641,7 +641,7 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
             set_if(base + ".up_proj", blk + ".ffn_up.weight");
 
             // Architecture-specific attention weights
-            if (config_.arch_type == "gemma4") {
+            if (config_.arch_type == "gemma4" || config_.arch_type == "gemma-embedding2") {
                 // Gemma4 attention weights with QK-norm
                 set_if(base + ".wq", blk + ".attn_q.weight");
                 set_if(base + ".wk", blk + ".attn_k.weight");
@@ -761,6 +761,37 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                 set_if(base + ".wo", blk + ".attn_output.weight");
                 set_if(base + ".attn_q_norm", blk + ".attn_q_norm.weight");
                 set_if(base + ".attn_k_norm", blk + ".attn_k_norm.weight");
+            } else if (config_.arch_type == "xing4_0") {
+                // Xing4.0: absorbed MLA (no attn_gate) + mHC hyper-connection
+                // mixers + leading dense FFN / sigmoid-routed MoE.
+                set_if(base + ".wq_a", blk + ".attn_q_a.weight");
+                set_if(base + ".attn_q_a_norm", blk + ".attn_q_a_norm.weight");
+                set_if(base + ".wq_b", blk + ".attn_q_b.weight");
+                set_if(base + ".kv_a_proj", blk + ".attn_kv_a_mqa.weight");
+                set_if(base + ".kv_a_norm", blk + ".attn_kv_a_norm.weight");
+                set_if(base + ".attn_k_b", blk + ".attn_k_b.weight");
+                set_if(base + ".attn_v_b", blk + ".attn_v_b.weight");
+                set_if(base + ".wo", blk + ".attn_output.weight");
+
+                set_if(base + ".hc_attn_fn", blk + ".hc_attn_fn.weight");
+                set_if(base + ".hc_attn_base", blk + ".hc_attn_base.weight");
+                set_if(base + ".hc_attn_scale", blk + ".hc_attn_scale.weight");
+                set_if(base + ".hc_ffn_fn", blk + ".hc_ffn_fn.weight");
+                set_if(base + ".hc_ffn_base", blk + ".hc_ffn_base.weight");
+                set_if(base + ".hc_ffn_scale", blk + ".hc_ffn_scale.weight");
+
+                // FFN: leading dense blocks use the common gate/up/down above;
+                // remaining layers are MoE (sigmoid routing + shared expert).
+                if (i >= config_.leading_dense_block_count) {
+                    set_if(base + ".ffn_gate_inp", blk + ".ffn_gate_inp.weight");
+                    set_if(base + ".ffn_exp_probs_b", blk + ".ffn_exp_probs_b.bias");
+                    set_if(base + ".ffn_gate_exps", blk + ".ffn_gate_exps.weight");
+                    set_if(base + ".ffn_up_exps", blk + ".ffn_up_exps.weight");
+                    set_if(base + ".ffn_down_exps", blk + ".ffn_down_exps.weight");
+                    set_if(base + ".ffn_gate_shexp", blk + ".ffn_gate_shexp.weight");
+                    set_if(base + ".ffn_up_shexp", blk + ".ffn_up_shexp.weight");
+                    set_if(base + ".ffn_down_shexp", blk + ".ffn_down_shexp.weight");
+                }
             } else if (config_.arch_type == "bailingmoe3") {
                 // Ling 3.0 hybrid: head_count_kv[i]==0 => GDN recurrent branch,
                 // >0 => absorbed MLA branch (per llama.cpp bailingmoe3.cpp).

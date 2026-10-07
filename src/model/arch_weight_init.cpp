@@ -304,4 +304,50 @@ void init_bailingmoe3_layer_weights(LayerWeightInitContext& ctx) {
     }
 }
 
+// Xing4.0: absorbed MLA (no attn_gate) + mHC hyper-connection tensors +
+// leading dense FFN / sigmoid-routed MoE with shared expert.
+void init_xing4_0_layer_weights(LayerWeightInitContext& ctx) {
+    const auto& store = ctx.store;
+    auto& lw = ctx.lw;
+    std::string base = "layers." + std::to_string(ctx.layer_idx);
+
+    load_if_present(store, lw, "attn_norm", base + ".attn_norm");
+    load_if_present(store, lw, "ffn_norm", base + ".ffn_norm");
+
+    // Absorbed MLA low-rank branch (deepseek2 conventions, no output gate).
+    load_if_present(store, lw, "wq_a", base + ".wq_a");
+    load_if_present(store, lw, "attn_q_a_norm", base + ".attn_q_a_norm");
+    load_if_present(store, lw, "wq_b", base + ".wq_b");
+    load_if_present(store, lw, "kv_a_proj", base + ".kv_a_proj");
+    load_if_present(store, lw, "kv_a_norm", base + ".kv_a_norm");
+    load_if_present(store, lw, "attn_k_b", base + ".attn_k_b");
+    load_if_present(store, lw, "attn_v_b", base + ".attn_v_b");
+    load_if_present(store, lw, "wo", base + ".wo");
+
+    // mHC per-layer mixers.
+    load_if_present(store, lw, "hc_attn_fn", base + ".hc_attn_fn");
+    load_if_present(store, lw, "hc_attn_base", base + ".hc_attn_base");
+    load_if_present(store, lw, "hc_attn_scale", base + ".hc_attn_scale");
+    load_if_present(store, lw, "hc_ffn_fn", base + ".hc_ffn_fn");
+    load_if_present(store, lw, "hc_ffn_base", base + ".hc_ffn_base");
+    load_if_present(store, lw, "hc_ffn_scale", base + ".hc_ffn_scale");
+
+    // FFN: leading dense blocks vs MoE (same store keys as bailingmoe3: the
+    // GGUF loader canonicalizes blk.N.ffn_{gate,down,up} into gate/down/up_proj).
+    if (ctx.layer_idx >= ctx.config.leading_dense_block_count) {
+        load_if_present(store, lw, "ffn_gate_inp", base + ".ffn_gate_inp");
+        load_if_present(store, lw, "ffn_exp_probs_b", base + ".ffn_exp_probs_b");
+        load_if_present(store, lw, "ffn_gate_exps", base + ".ffn_gate_exps");
+        load_if_present(store, lw, "ffn_up_exps", base + ".ffn_up_exps");
+        load_if_present(store, lw, "ffn_down_exps", base + ".ffn_down_exps");
+        load_if_present(store, lw, "ffn_gate_shexp", base + ".ffn_gate_shexp");
+        load_if_present(store, lw, "ffn_up_shexp", base + ".ffn_up_shexp");
+        load_if_present(store, lw, "ffn_down_shexp", base + ".ffn_down_shexp");
+    } else {
+        load_if_present(store, lw, "w1", base + ".gate_proj");
+        load_if_present(store, lw, "w2", base + ".down_proj");
+        load_if_present(store, lw, "w3", base + ".up_proj");
+    }
+}
+
 }  // namespace forge

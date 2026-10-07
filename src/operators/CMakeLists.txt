@@ -55,6 +55,7 @@ if(CUDAToolkit_FOUND)
             cuda/cuda_ssm.cu
             cuda/cuda_gdn.cu
             cuda/cuda_mla.cu
+            cuda/cuda_xing4.cu
             cuda/cuda_mmq.cu
             cuda/kernel_selector.cpp)
   target_compile_definitions(forge_ops PUBLIC USE_CUDA)

@@ -436,6 +436,77 @@ ModelConfig parse_bailingmoe3_config(ModelLoader& loader, const std::string& arc
     return cfg;
 }
 
+// Xing4.0 (China Telecom): DeepSeek-V3 style absorbed MLA + sigmoid-routed MoE,
+// wrapped in Manifold-Constrained Hyper-Connections (mHC): a 4-way residual
+// stream mixed per layer by hc_{attn,ffn}_{fn,scale,base} tensors (Sinkhorn-
+// normalized 4x4 combiner). Mirrors llama.cpp PR #29012 xing4_0.cpp.
+ModelConfig parse_xing4_0_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    cfg.tie_embeddings = false;  // separate output.weight (Q5_K)
+    cfg.ffn_type = FFNType::MoE;
+    cfg.ffn_activation = ActivationType::SiLU_GELU;
+    cfg.use_neox_rope = false;
+    cfg.rope_type = RopeType::Standard;  // NORM interleaved rope on the MLA pe part
+    cfg.use_mla = true;
+    cfg.use_ssm = false;
+
+    // MLA low-rank dims (deepseek2 conventions)
+    cfg.kv_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".attention.kv_lora_rank", 0));
+    cfg.q_lora_rank = static_cast<int>(loader.get_metadata_int(arch + ".attention.q_lora_rank", 0));
+    cfg.mla_key_dim = static_cast<int>(loader.get_metadata_int(arch + ".attention.key_length_mla", 0));
+    cfg.mla_value_dim = static_cast<int>(loader.get_metadata_int(arch + ".attention.value_length_mla", 0));
+    cfg.rope_dimension_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+
+    // MoE routing / expert dims (sigmoid gating + shared expert)
+    cfg.n_expert = static_cast<int>(loader.get_metadata_int(arch + ".expert_count", 0));
+    cfg.n_expert_used = static_cast<int>(loader.get_metadata_int(arch + ".expert_used_count", 0));
+    cfg.moe_group_count = static_cast<int>(loader.get_metadata_int(arch + ".expert_group_count", 0));
+    cfg.moe_group_used_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_group_used_count", 0));
+    cfg.moe_gating_func = static_cast<int>(loader.get_metadata_int(arch + ".expert_gating_func", 2));
+    cfg.moe_weights_scale =
+        static_cast<float>(loader.get_metadata_float(arch + ".expert_weights_scale", 0.0f));
+    cfg.moe_weights_norm = loader.get_metadata_int(arch + ".expert_weights_norm", 0) != 0;
+    cfg.expert_feed_forward_length =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_feed_forward_length", 0));
+    cfg.expert_shared_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_shared_count", 1));
+    cfg.expert_shared_feed_forward_length = static_cast<int>(
+        loader.get_metadata_int(arch + ".expert_shared_feed_forward_length", 0));
+    if (cfg.expert_shared_feed_forward_length == 0)
+        cfg.expert_shared_feed_forward_length = cfg.expert_feed_forward_length;
+    cfg.leading_dense_block_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".leading_dense_block_count", 0));
+
+    // mHC hyper-connections
+    cfg.hc_count = static_cast<int>(loader.get_metadata_int(arch + ".hyper_connection.count", 0));
+    cfg.hc_sinkhorn_iters = static_cast<int>(
+        loader.get_metadata_int(arch + ".hyper_connection.sinkhorn_iterations", 20));
+    cfg.hc_epsilon = static_cast<float>(
+        loader.get_metadata_float(arch + ".hyper_connection.epsilon", 1e-6f));
+    if (cfg.hc_count != 0 && cfg.hc_count != 4)
+        throw std::runtime_error("xing4_0: only hyper_connection.count == 4 is supported");
+
+    // nextn_predict_layers = 1 in the metadata but this GGUF carries NO MTP
+    // tensors (no blk.40.* / nextn.* weights), so trunk = block_count. Force 0:
+    // subtracting would silently drop a real layer.
+    cfg.n_nextn_layers = 0;
+
+    // YaRN rope scaling: with factor=64 / orig_ctx=4096 the scaling is a no-op
+    // for absolute positions < 4096 (freq_scale=1, mscale=1 -> kq_scale =
+    // 1/sqrt(key_length_mla)). Beyond that this engine has no YaRN and would
+    // silently degrade; warn loudly here.
+    if (loader.get_metadata_int(arch + ".context_length", 0) >
+        loader.get_metadata_int(arch + ".rope.scaling.original_context_length", 0)) {
+        LOG_WARN("xing4_0: GGUF declares YaRN rope scaling (orig ctx " +
+                 std::to_string(loader.get_metadata_int(
+                     arch + ".rope.scaling.original_context_length", 0)) +
+                 "); this engine only supports prompts up to the original context");
+    }
+    return cfg;
+}
+
 ModelConfig parse_phi3_config(ModelLoader& loader, const std::string& arch) {
     auto cfg = parse_common_gguf_config(loader, arch);
     cfg.use_neox_rope = true;
@@ -598,6 +669,95 @@ ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch) {
         // degenerate repetition loops in generated output
         cfg.suppress_tokens = {258882, 258883};
     }
+
+    return cfg;
+}
+
+// ============================================================================
+// gemma-embedding2 (EmbeddingGemma 2): embedding-only Gemma4 block stack
+// ============================================================================
+// Gemma4 blocks (QK-norm + SWA/global mix + per-layer embeddings + out_scale)
+// with embedding-model differences: bidirectional attention (no causal mask),
+// symmetric SWA window, no KV cache (whole prompt attends at once), exact-erf
+// GELU everywhere, and a final output projection to n_embd_out (768).
+
+ModelConfig parse_gemma_embedding2_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    cfg.use_neox_rope = false;           // GGUF already stores weights in half-split format
+    cfg.rope_type = RopeType::Standard;  // Half-split format → standard RoPE pairing
+    cfg.tie_embeddings = false;          // real output projection to n_embd_out
+    cfg.ffn_activation = ActivationType::GeGLU;
+    cfg.ffn_type = FFNType::GeGLU;       // exact-erf gelu(gate)*up
+    cfg.use_qk_norm = true;
+    cfg.non_causal_attention = true;
+    cfg.pooling_type =
+        static_cast<int>(loader.get_metadata_int(arch + ".pooling_type", 1));
+
+    // Per-layer embeddings (projection only; no per-layer token embd in this arch)
+    cfg.n_embd_per_layer =
+        static_cast<int>(loader.get_metadata_int(arch + ".embedding_length_per_layer_input", 0));
+    cfg.n_embd_out =
+        static_cast<int>(loader.get_metadata_int(arch + ".embedding_length_out", 0));
+
+    // Sliding Window Attention (symmetric: mask when |i-j| > n_swa/2)
+    cfg.n_swa = static_cast<int>(loader.get_metadata_int(arch + ".attention.sliding_window", 0));
+
+    // SWA layer pattern (BOOL array)
+    auto swa_pattern =
+        loader.get_metadata_int_array(arch + ".attention.sliding_window_pattern", {});
+    cfg.swa_layers.resize(cfg.num_layers, 0);
+    for (size_t i = 0; i < swa_pattern.size() && i < (size_t)cfg.num_layers; ++i) {
+        cfg.swa_layers[i] = static_cast<int>(swa_pattern[i]);
+    }
+
+    // Every layer has its own KV (unused at runtime — no KV cache for embeddings)
+    int n_kv_shared =
+        static_cast<int>(loader.get_metadata_int(arch + ".attention.shared_kv_layers", 0));
+    cfg.n_layer_kv_from_start = cfg.num_layers - n_kv_shared;
+
+    // SWA-specific head geometry
+    int key_length_swa =
+        static_cast<int>(loader.get_metadata_int(arch + ".attention.key_length_swa", 0));
+    if (key_length_swa > 0) {
+        cfg.head_dim_swa = key_length_swa;
+    } else {
+        cfg.head_dim_swa = cfg.head_dim;
+    }
+    cfg.num_heads_swa = cfg.num_heads;
+
+    // Per-layer KV head counts: attention.head_count_kv is an ARRAY here
+    // (e.g. [2,2,2,2,2,1] pattern) — SWA layers carry 2, global layers 1.
+    auto kv_heads_arr = loader.get_metadata_int_array(arch + ".attention.head_count_kv", {});
+    if (!kv_heads_arr.empty()) {
+        int global_kv = -1, swa_kv = -1;
+        for (size_t i = 0;
+             i < kv_heads_arr.size() && i < (size_t)cfg.num_layers; ++i) {
+            if (cfg.swa_layers[i] == 1) {
+                if (swa_kv < 0) swa_kv = static_cast<int>(kv_heads_arr[i]);
+            } else if (global_kv < 0) {
+                global_kv = static_cast<int>(kv_heads_arr[i]);
+            }
+        }
+        if (global_kv > 0) cfg.num_kv_heads = global_kv;
+        if (swa_kv > 0) {
+            cfg.num_kv_heads_swa = swa_kv;
+        } else {
+            cfg.num_kv_heads_swa = cfg.num_kv_heads;
+        }
+    } else {
+        cfg.num_kv_heads_swa = cfg.num_kv_heads;
+    }
+    cfg.use_gqa = (cfg.num_kv_heads != cfg.num_heads) || (cfg.num_kv_heads_swa != cfg.num_heads);
+
+    // Dual RoPE frequency bases (global vs SWA layers)
+    cfg.rope_theta_swa =
+        static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base_swa", cfg.rope_theta));
+
+    // RoPE dimension counts (both equal the full head dims here)
+    cfg.rope_dim_count =
+        static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count", 0));
+    cfg.rope_dim_count_swa =
+        static_cast<int>(loader.get_metadata_int(arch + ".rope.dimension_count_swa", 0));
 
     return cfg;
 }

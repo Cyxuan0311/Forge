@@ -100,6 +100,11 @@ struct ModelConfig {
     std::vector<int32_t>
         suppress_tokens;  // tokens to suppress during generation (set to -INF in logits)
 
+    // Embedding-model fields (gemma-embedding2 / EmbeddingGemma)
+    bool non_causal_attention = false;  // bidirectional attention (no causal mask)
+    int n_embd_out = 0;                 // output projection dimension (0 = no projection)
+    int pooling_type = 0;               // 1 = MEAN (LLAMA_POOLING_TYPE_MEAN)
+
     // ---- DFlash / DSPark standalone draft model (speculative decoding) ----
     // The drafter is a lightweight transformer that shares the target model's
     // token embedding and lm_head; its encoder consumes target hidden states.
@@ -155,6 +160,13 @@ struct ModelConfig {
     float kda_gate_lower_bound = 0.0f;  // kda.gate_lower_bound
     std::vector<int32_t> head_count_kv; // per-layer KV heads: 0 => SSM/linear branch, >0 => MLA
     int expert_shared_count = 0;         // shared expert count (derived; usually 1)
+
+    // ---- Xing4.0 mHC (Manifold-Constrained Hyper-Connections) ----
+    // 4-way residual stream: each layer runs hc_pre -> norm -> body -> hc_post
+    // twice (attn + ffn); streams are averaged before the output head.
+    int hc_count = 0;                   // residual stream count (4); 0 = no mHC
+    int hc_sinkhorn_iters = 20;         // hyper_connection.sinkhorn_iterations
+    float hc_epsilon = 1e-6f;           // hyper_connection.epsilon (denominators only)
 };
 
 class WeightStore {

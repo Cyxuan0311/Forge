@@ -21,11 +21,13 @@
 #include "forge/engines/deepseek_engine.h"
 #include "forge/engines/dflash_engine.h"
 #include "forge/engines/gemma4_engine.h"
+#include "forge/engines/gemma_embedding2_engine.h"
 #include "forge/engines/generic_engine.h"
 #include "forge/engines/lfm2_engine.h"
 #include "forge/engines/phimoe_engine.h"
 #include "forge/engines/qwen35_engine.h"
 #include "forge/engines/spark25_engine.h"
+#include "forge/engines/xing4_engine.h"
 #include "forge/logger.h"
 #include "forge/model.h"
 
@@ -163,6 +165,23 @@ static ArchCapabilityAutoRegister _cap_gemma4("gemma4", ArchCapability{
                                                             .use_qk_norm = true,
                                                             .embedding_scale = true});
 
+// --- Gemma-embedding2 (EmbeddingGemma 2: embedding-only Gemma4 stack) ---
+static EngineAutoRegister _eng_gemma_embedding2(
+    "gemma-embedding2",
+    [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        return std::make_unique<GemmaEmbedding2Engine>(m, c);
+    });
+static ConfigParserAutoRegister _cfg_gemma_embedding2("gemma-embedding2",
+                                                      parse_gemma_embedding2_config);
+static WeightInitAutoRegister _winit_gemma_embedding2("gemma-embedding2",
+                                                      init_gemma4_layer_weights);
+static ArchCapabilityAutoRegister _cap_gemma_embedding2(
+    "gemma-embedding2", ArchCapability{.use_gqa = true,
+                                       .use_neox_rope = true,
+                                       .ffn_activation = ActivationType::GeGLU,
+                                       .use_qk_norm = true,
+                                       .embedding_scale = true});
+
 // ============================================================================
 // Falcon (LayerNorm + bias + parallel residual)
 // ============================================================================
@@ -264,6 +283,19 @@ static WeightInitAutoRegister _winit_bailingmoe3("bailingmoe3",
 static ArchCapabilityAutoRegister _cap_bailingmoe3(
     "bailingmoe3",
     ArchCapability{.use_mla = true, .use_ssm = true});
+
+// ============================================================================
+// Xing4.0 (China Telecom): absorbed MLA + sigmoid MoE + mHC hyper-connections
+// ============================================================================
+
+static EngineAutoRegister _eng_xing4_0(
+    "xing4_0", [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        return std::make_unique<Xing4_0Engine>(m, c);
+    });
+static ConfigParserAutoRegister _cfg_xing4_0("xing4_0", parse_xing4_0_config);
+static WeightInitAutoRegister _winit_xing4_0("xing4_0", init_xing4_0_layer_weights);
+static ArchCapabilityAutoRegister _cap_xing4_0("xing4_0",
+                                               ArchCapability{.use_mla = true, .use_ssm = false});
 
 // ============================================================================
 // DFlash / DSPark (standalone lightweight drafter for speculative decoding)

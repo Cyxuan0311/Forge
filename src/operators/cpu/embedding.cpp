@@ -448,19 +448,6 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
         embed_dim = static_cast<int>(weight->shape()[1]);
     }
 
-    if (std::getenv("FORGE_EMB_DEBUG")) {
-        const bool tr =
-            (weight->shape().size() >= 2 && weight->shape()[0] < weight->shape()[1]);
-        std::fprintf(stderr,
-                     "[EMB] dtype=%d ndim=%zu s0=%lld s1=%lld embed_dim=%d vocab=%d "
-                     "transposed=%d quantized=%d cache=%s dev=%d\n",
-                     (int)weight->dtype(), weight->shape().size(),
-                     (long long)(weight->shape().size() > 0 ? weight->shape()[0] : -1),
-                     (long long)(weight->shape().size() > 1 ? weight->shape()[1] : -1),
-                     embed_dim, vocab_size, (int)tr, (int)is_quantized_type(weight->dtype()),
-                     fp32_cache ? "yes" : "no", (int)weight->device());
-    }
-
     auto out = std::make_shared<Tensor>(
         DataType::FP32, std::vector<int64_t>{num_indices, embed_dim}, weight->device());
 
@@ -658,6 +645,22 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                     } else {
                         std::memset(o_data, 0, num_indices * embed_dim * sizeof(float));
                     }
+                }
+            }
+        } else if (weight->dtype() == DataType::FP16) {
+            // FP16 weights are kept natively (zero-copy, 2 bytes per element);
+            // reading the buffer as float would misinterpret every element.
+            const uint16_t* w_data = static_cast<const uint16_t*>(weight->data());
+            for (int i = 0; i < num_indices; ++i) {
+                int vocab_idx = idx_data[i];
+                if (vocab_idx < 0 || vocab_idx >= vocab_size)
+                    continue;
+                const uint16_t* row = w_data + static_cast<size_t>(vocab_idx) * embed_dim;
+                float* o = o_data + static_cast<size_t>(i) * embed_dim;
+                for (int d = 0; d < embed_dim; ++d) {
+                    __half h;
+                    std::memcpy(&h, &row[d], sizeof(h));
+                    o[d] = __half2float(h);
                 }
             }
         } else {

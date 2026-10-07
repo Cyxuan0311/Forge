@@ -89,6 +89,11 @@ TensorPtr Gemma4Embedding::embed(const TensorPtr& ids_on_dev, const TensorPtr& t
         }
 
         per_layer_input_cache_ = ple;
+    } else if (cfg.n_embd_per_layer > 0 && per_layer_proj_cache_) {
+        // gemma-embedding2 has NO per-layer token embeddings: the per-layer
+        // input is the (already RMS-normalized) projection alone
+        // (llama.cpp build_inp_per_layer). Share the projection cache.
+        per_layer_input_cache_ = per_layer_proj_cache_;
     }
 
     return hidden;
@@ -111,34 +116,25 @@ TensorPtr Gemma4Embedding::apply_per_layer(const TensorPtr& output,
 
     auto gated = ops::matmul_transB(output, lw.per_layer_inp_gate());
 
-#ifdef USE_CUDA
-    if (gated->device() == DeviceType::CUDA &&
-        per_layer_input_cache_->device() == DeviceType::CUDA) {
-        cuda::launch_gelu_tanh_multiply(
-            static_cast<float*>(gated->data()),
-            static_cast<const float*>(per_layer_input_cache_->data()), n_per, n_layer, layer_idx,
-            seq_len);
-    } else
-#endif
-    {
-        gated = ensure_cpu(gated);
-        float* gated_data = static_cast<float*>(gated->data());
-        for (int i = 0; i < static_cast<int>(gated->numel()); ++i) {
-            float x = gated_data[i];
-            gated_data[i] =
-                0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-        }
-        auto ple_cpu = ensure_cpu(per_layer_input_cache_);
-        const float* ple_data = static_cast<const float*>(ple_cpu->data());
-        for (int s = 0; s < seq_len; ++s) {
-            const float* layer_embd = ple_data + s * n_per * n_layer + layer_idx * n_per;
-            float* gated_row = gated_data + s * n_per;
-            for (int d = 0; d < n_per; ++d) {
-                gated_row[d] *= layer_embd[d];
-            }
-        }
-        gated = restore_device(gated, dev);
+    // Exact-erf GELU (llama.cpp ggml_gelu), NOT the tanh approximation.
+    // per_layer_input_cache_ is always CPU (embed() leaves it there), so the
+    // slice-multiply runs on CPU and hops the small [seq, n_per] gate back.
+    gated = ensure_cpu(gated);
+    float* gated_data = static_cast<float*>(gated->data());
+    for (int i = 0; i < static_cast<int>(gated->numel()); ++i) {
+        float x = gated_data[i];
+        gated_data[i] = 0.5f * x * (1.0f + std::erf(x * 0.7071067811865475f));
     }
+    auto ple_cpu = ensure_cpu(per_layer_input_cache_);
+    const float* ple_data = static_cast<const float*>(ple_cpu->data());
+    for (int s = 0; s < seq_len; ++s) {
+        const float* layer_embd = ple_data + s * n_per * n_layer + layer_idx * n_per;
+        float* gated_row = gated_data + s * n_per;
+        for (int d = 0; d < n_per; ++d) {
+            gated_row[d] *= layer_embd[d];
+        }
+    }
+    gated = restore_device(gated, dev);
 
     auto pe_out = ops::matmul_transB(gated, lw.per_layer_proj());
     if (lw.per_layer_post_norm()) {

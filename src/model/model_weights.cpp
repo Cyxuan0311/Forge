@@ -206,7 +206,13 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
     dflash_selector_next = store.get("dflash_selector_next");
     dflash_selector_hidden = store.get("dflash_selector_hidden");
 
-    if (output_weight && output_weight->device() == DeviceType::CPU) {
+    // Q8_0 re-quantization is a decode-GEMV optimization for LM heads (large
+    // vocab, M==1 rows). Embedding models project to n_embd_out with
+    // return_all_logits (M = seq_len > 1) and need the full-precision result,
+    // so skip it there -- the Q8_0 prefill path is both lossy and, for this
+    // shape, wrong.
+    if (output_weight && output_weight->device() == DeviceType::CPU &&
+        config.n_embd_out == 0) {
         bool has_fused_kernel =
             (output_weight->dtype() == DataType::Q4_0 || output_weight->dtype() == DataType::Q8_0 ||
              output_weight->dtype() == DataType::Q4_1 || output_weight->dtype() == DataType::Q4_K ||
@@ -325,7 +331,8 @@ bool ModelWeights::init(const WeightStore& store, const ModelConfig& config) {
         }
 
         if (lw.layer_type == LayerType::FullAttention && !is_qwen35) {
-            bool is_gemma4 = (config.arch_type == "gemma4");
+            bool is_gemma4 = (config.arch_type == "gemma4" ||
+                              config.arch_type == "gemma-embedding2");
             bool is_lfm2 = (config.arch_type == "lfm2");
             // Gemma4: wv is optional (may use wk as fallback);
             // lfm2 attention layers use the canonical attn_* names.

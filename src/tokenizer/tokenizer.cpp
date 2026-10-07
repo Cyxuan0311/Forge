@@ -339,10 +339,15 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
     }
 
     // Set model type
-    if (tok_model == "gpt2" || tok_model == "bpe") {
+    if (tok_model == "gpt2" || tok_model == "bpe" || tok_model == "gemma4") {
         model_type_ = TokenizerModelType::BPE;
     } else {
         model_type_ = TokenizerModelType::SPM;
+    }
+    // gemma4 GGUFs omit tokenizer.ggml.pre; llama.cpp forces the gemma4
+    // pre-tokenizer (space -> ▁ then [^\n]+|[\n]+ splits, raw UTF-8 BPE).
+    if (tok_model == "gemma4" && pre_type_.empty()) {
+        pre_type_ = "gemma4";
     }
 
     // Build vocab
@@ -973,6 +978,22 @@ std::vector<std::string> Tokenizer::bpe_pre_tokenize(const std::string& text) co
         return bpe_pre_tokenize_spark25(text);
     }
 
+    // gemma4 (SPM-style BPE): the normalizer already replaced spaces with ▁;
+    // llama.cpp only splits on newline runs so that BPE merge lookup never
+    // sees a newline inside a token ("[^\n]+|[\n]+").
+    if (pre_type_ == "gemma4") {
+        std::vector<std::string> chunks;
+        size_t i = 0;
+        while (i < text.size()) {
+            bool is_nl = (text[i] == '\n');
+            size_t j = i;
+            while (j < text.size() && (text[j] == '\n') == is_nl) ++j;
+            chunks.push_back(text.substr(i, j - i));
+            i = j;
+        }
+        return chunks;
+    }
+
     // GPT-2 pre-tokenization regex
     // Pattern: '(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
     std::vector<std::string> chunks;
@@ -1142,9 +1163,65 @@ std::vector<std::string> Tokenizer::bpe_apply(const std::vector<std::string>& wo
 std::vector<int32_t> Tokenizer::encode_bpe(const std::string& text, bool add_bos,
                                            bool add_eos) const {
     std::vector<int32_t> result;
-
     if (add_bos && bos_id_ >= 0) {
         result.push_back(bos_id_);
+    }
+
+    // gemma4: SPM-style BPE. Spaces are escaped to ▁ BEFORE the pre-split,
+    // tokens are raw UTF-8 (no GPT-2 byte encoding), and a pure-newline run
+    // found verbatim in the vocab is emitted whole (llama.cpp PR #21343).
+    if (pre_type_ == "gemma4") {
+        static const std::string spm_space = "\xe2\x96\x81";  // ▁ U+2581
+        std::string escaped;
+        escaped.reserve(text.size() + 8);
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i] == ' ') {
+                escaped += spm_space;
+            } else {
+                escaped += text[i];
+            }
+        }
+
+        for (const auto& chunk : bpe_pre_tokenize(escaped)) {
+            bool pure_newlines = (chunk.find_first_not_of('\n') == std::string::npos);
+            auto whole = vocab_.token_to_id.find(chunk);
+            if (pure_newlines && whole != vocab_.token_to_id.end()) {
+                result.push_back(whole->second);
+                continue;
+            }
+
+            // Split into UTF-8 characters and run BPE merges on raw text.
+            std::vector<std::string> chars;
+            size_t pos = 0;
+            while (pos < chunk.size()) {
+                uint8_t b = static_cast<uint8_t>(chunk[pos]);
+                int char_len = 1;
+                if (b >= 0xF0)
+                    char_len = 4;
+                else if (b >= 0xE0)
+                    char_len = 3;
+                else if (b >= 0xC0)
+                    char_len = 2;
+                if (pos + char_len > chunk.size())
+                    char_len = 1;
+                chars.push_back(chunk.substr(pos, char_len));
+                pos += char_len;
+            }
+
+            for (const auto& tok : bpe_apply(chars)) {
+                auto it = vocab_.token_to_id.find(tok);
+                if (it != vocab_.token_to_id.end()) {
+                    result.push_back(it->second);
+                } else if (unk_id_ >= 0) {
+                    result.push_back(unk_id_);
+                }
+            }
+        }
+
+        if (add_eos && eos_id_ >= 0) {
+            result.push_back(eos_id_);
+        }
+        return result;
     }
 
     // Pre-tokenize
@@ -1227,8 +1304,12 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special
         result += vocab_.tokens[id];
     }
 
-    // Convert SPM ▁ to space and <0xHH> byte tokens to characters
-    if (model_type_ == TokenizerModelType::SPM) {
+    // Convert SPM ▁ to space and <0xHH> byte tokens to characters.
+    // gemma4 tokens are raw UTF-8 with escaped spaces (no byte encoding), so
+    // they decode the same way as SPM (minus the dummy-prefix strip).
+    bool spm_style_decode =
+        (model_type_ == TokenizerModelType::SPM || pre_type_ == "gemma4");
+    if (spm_style_decode) {
         std::string decoded;
         decoded.reserve(result.size());
         for (size_t i = 0; i < result.size();) {
@@ -1270,7 +1351,9 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special
         // SPM encodes with a dummy ▁ at the start, which becomes a space.
         // The original text didn't have this leading space.
         // Only strip when decoding a complete sequence (not partial/streaming).
-        if (strip_leading_space && !decoded.empty() && decoded[0] == ' ') {
+        // gemma4 has no dummy prefix, so nothing is stripped for it.
+        if (strip_leading_space && model_type_ == TokenizerModelType::SPM && !decoded.empty() &&
+            decoded[0] == ' ') {
             decoded.erase(decoded.begin());
         }
         result = std::move(decoded);
