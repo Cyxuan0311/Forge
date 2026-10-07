@@ -59,6 +59,76 @@
 | `-v, --verbose` | Enable verbose logging |
 | `-h, --help` | Show help message |
 
+### Web Dashboard
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--dashboard` | off | Serve a live performance dashboard on its own loopback port |
+| `--dashboard-port N` | `9090` | Preferred port; if busy the next free port is used. `0` = let the OS choose |
+| `--dashboard-host H` | `127.0.0.1` | Dashboard bind address |
+| `--dashboard-ops` | off | Also record the per-operator breakdown panel |
+| `--no-open` | — | Do not launch a browser (also implied when stdout is not a TTY, or `FORGE_NO_OPEN=1`) |
+
+The same flags exist on `forge-server`. The dashboard listens on its **own**
+port rather than the API port, so `--api-key` still protects every API request
+and the OpenAI surface is unchanged.
+
+Panels: decode rate (live and lifetime), TTFT p50/p90/p99, inter-token latency
+p50/p90/p99 plus a histogram, prefill vs decode time, cumulative tokens, request
+count, queue wait, prefix-cache hit rate, VRAM and KV-cache gauges, and a
+per-request table. `--dashboard-ops` adds the `PerfProfiler` per-operator
+breakdown.
+
+> The operator panel needs a `-DFORGE_PROFILING=ON` build (see
+> [build.md](build.md)). It is opt-in because arming the profiler slows decode.
+
+Two controls sit in the header, next to the uptime readout:
+
+**Theme.** A single button cycling light → dark → system. `system` follows your
+OS setting and keeps following it while the page is open; the choice is stored
+in `localStorage`, so it survives a reload. Note the storage is keyed by origin
+*including port*, so if the engine falls back to a different port because 9090
+was busy, the theme resets to `system`.
+
+**Export.** Serialises the same `/api/metrics` snapshot the charts are drawing,
+so a saved file always matches what was on screen. Four formats:
+
+| Format | What you get |
+| --- | --- |
+| JSON | The full snapshot, lossless, wrapped with the export time and generator |
+| CSV | Time series, requests and operators as separate blocks in one file |
+| Markdown | A summary report, copied to the clipboard for pasting into a bug report |
+| Prometheus | Gauges in text exposition format, as a file |
+
+All four escape their contents properly (RFC 4180 for CSV, `\`, `"` and newline
+for Prometheus labels), so a model path containing a quote will not corrupt the
+output.
+
+> The CSV is a **multi-block** file, not a single rectangular table — strict CSV
+> cannot hold nested data. Excel and LibreOffice show the blocks as separate
+> regions; `pandas.read_csv` will not parse it, use the JSON export for that.
+>
+> The Prometheus export is a **file**, not a scrape endpoint. It suits the
+> node_exporter textfile collector or a manual import. Nothing scrapes it, and
+> live scraping would need a server route (`/api/export`) that this dashboard
+> deliberately does not have — exports happen in your browser, so there is
+> nothing for `curl` to call.
+
+`--dashboard` with `-p` / `--prompt` holds the process open after generation so
+the dashboard stays reachable; press `Ctrl-C` to exit. Interactive mode and
+`--bench` keep running as usual.
+
+Building it into the binary requires Node.js 20.19+ (Vite 7):
+
+```bash
+cmake -B build -DFORGE_BUILD_DASHBOARD=ON
+cmake --build build -j
+```
+
+Without it the dashboard still serves `/api/metrics` and `/dashboard/` explains
+how to rebuild. Frontend sources live in [`web/`](../web) (Vue 3 + TypeScript +
+Vite + ECharts); `npm run dev` gives hot reload against a running engine.
+
 ### `forge-inspect`
 
 A separate tool for GGUF analysis. It reads a model file and reports its

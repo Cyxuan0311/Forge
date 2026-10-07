@@ -58,6 +58,70 @@
 | `-v, --verbose` | 启用详细日志 |
 | `-h, --help` | 显示帮助信息 |
 
+### Web 仪表盘
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--dashboard` | 关闭 | 在独立的本地端口上提供实时性能仪表盘 |
+| `--dashboard-port N` | `9090` | 期望端口；被占用时自动使用下一个空闲端口。`0` = 由系统分配 |
+| `--dashboard-host H` | `127.0.0.1` | 仪表盘绑定地址 |
+| `--dashboard-ops` | 关闭 | 额外记录逐算子耗时拆解面板 |
+| `--no-open` | — | 不自动拉起浏览器（stdout 非 TTY 或设置了 `FORGE_NO_OPEN=1` 时同样不会打开） |
+
+`forge-server` 也支持同样的参数。仪表盘使用**独立**端口而不是 API 端口，
+因此 `--api-key` 仍然保护着每一个 API 请求，OpenAI 接口行为完全不变。
+
+面板内容：实时与全程解码速率、TTFT p50/p90/p99、token 间延迟 p50/p90/p99
+及其直方图、prefill 与 decode 耗时、累计 token 数、请求数、排队等待、
+前缀缓存命中率、显存与 KV 缓存仪表，以及逐请求明细表。
+`--dashboard-ops` 会额外加上 `PerfProfiler` 的逐算子耗时拆解。
+
+> 算子面板需要 `-DFORGE_PROFILING=ON` 构建（见 [build_zh.md](build_zh.md)）。
+> 它是显式开启的，因为启用 Profiler 会拖慢 decode。
+
+表头处、uptime 读数旁边有两个控件：
+
+**主题。** 单个按钮按 浅色 → 深色 → 跟随系统 循环。`跟随系统` 会读取操作系统的
+设置，并在页面打开期间持续跟随；选择保存在 `localStorage` 中，刷新后仍然有效。
+注意该存储按「源 + 端口」区分，因此当 9090 被占用、引擎退到其他端口时，主题会
+回到 `跟随系统`。
+
+**导出。** 序列化图表当前绘制的同一份 `/api/metrics` 快照，因此保存下来的文件
+与屏幕上看到的内容一致。共四种格式：
+
+| 格式 | 内容 |
+| --- | --- |
+| JSON | 完整快照，无损，并附带导出时间与生成方 |
+| CSV | 时间序列、请求与算子三个数据块，放在同一个文件里 |
+| Markdown | 摘要报告，复制到剪贴板，便于粘贴进 issue |
+| Prometheus | 文本曝光格式的 gauge，以文件形式给出 |
+
+四种格式都做了正确的转义（CSV 遵循 RFC 4180，Prometheus 标签转义 `\`、`"`
+与换行），所以包含引号的模型路径不会破坏输出。
+
+> CSV 是**多数据块**文件，并非单一矩形表格——严格的 CSV 无法容纳嵌套数据。
+> Excel 与 LibreOffice 会把各数据块显示为独立区域；`pandas.read_csv` 无法解析，
+> 需要程序化读取时请改用 JSON 导出。
+>
+> Prometheus 导出是一个**文件**，不是抓取端点。它适用于 node_exporter 的
+> textfile collector 或手动导入；没有任何程序会去抓取它。若要实时抓取，需要服务端
+> 路由（`/api/export`），而本仪表盘刻意没有提供——导出发生在你的浏览器里，
+> 因此没有可供 `curl` 调用的接口。
+
+在 `-p` / `--prompt` 模式下，`--dashboard` 会让进程在生成完成后继续驻留，
+以便仪表盘保持可访问；按 `Ctrl-C` 退出。交互模式与 `--bench` 则照常常驻。
+
+编译进二进制需要 Node.js 20.19+（Vite 7）：
+
+```bash
+cmake -B build -DFORGE_BUILD_DASHBOARD=ON
+cmake --build build -j
+```
+
+不开启时仪表盘仍会提供 `/api/metrics`，而 `/dashboard/` 会说明如何重新构建。
+前端源码位于 [`web/`](../web)（Vue 3 + TypeScript + Vite + ECharts）；
+`npm run dev` 可对着正在运行的引擎做热重载。
+
 ### `forge-inspect`
 
 独立的 GGUF 分析工具。读取模型文件，输出元数据、tensor 布局、dtype 直方图、

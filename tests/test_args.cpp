@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "forge/cli_common_args.h"
+#include "forge/cli_dashboard_args.h"
 #include "forge/cli_spec_args.h"
 #include "forge/kv_cache_dtype.h"
 
@@ -349,12 +350,133 @@ static void test_spec_parser() {
           "--spec-draft with no value is an error");
 }
 
+// ---------------------------------------------------------------------------
+// Web dashboard parser
+//
+// Shared by forge-cli and forge-server for the same reason the rest of this
+// file exists: two independent flag parsers drift. --dashboard-port in
+// particular had a real failure mode worth pinning -- atoi() returns 0 for a
+// typo, and 0 here means "let the OS pick a port", so "--dashboard-port abc"
+// would have silently worked.
+// ---------------------------------------------------------------------------
+static forge::DashboardParseResult run_dash(const std::vector<const char*>& a,
+                                            forge::DashboardArgs& d, std::string& err) {
+    set_args(a);
+    // Mirror of parse_common()'s helper: the parser takes (int argc, char** argv,
+    // int& i) and advances i past a flag's value, so argv has to be a real
+    // char** and the loop index has to be an int.
+    std::vector<char*> cargv;
+    for (auto& str : g_argv_storage) cargv.push_back(const_cast<char*>(str.c_str()));
+    // Keep scanning after a hit, exactly as the callers in forge-cli and
+    // forge-server do. Bailing out on the first match would make combinations
+    // like "--dashboard --no-open" untestable and would not reflect real argv
+    // handling.
+    forge::DashboardParseResult result = forge::DashboardParseResult::NotMine;
+    for (int i = 1; i < static_cast<int>(cargv.size()); ++i) {
+        const forge::DashboardParseResult r = forge::parse_dashboard_arg(
+            cargv[i], static_cast<int>(cargv.size()), cargv.data(), i, d, &err);
+        if (r == forge::DashboardParseResult::Error) return r;
+        if (r == forge::DashboardParseResult::Ok) result = r;
+    }
+    return result;
+}
+
+static void test_dashboard_parser() {
+    std::printf("\n--- dashboard parser ---\n");
+    forge::DashboardArgs d;
+    std::string err;
+
+    // Defaults: off, loopback, 9090, browser allowed.
+    d = forge::DashboardArgs();
+    CHECK(!d.enabled, "dashboard is off by default");
+    CHECK(d.host == "127.0.0.1", "dashboard binds loopback by default");
+    CHECK(d.port == 9090, "dashboard port defaults to 9090");
+    CHECK(d.open_browser, "the browser is launched by default");
+
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--dashboard"}, d, err) == forge::DashboardParseResult::Ok &&
+              d.enabled,
+          "--dashboard enables the dashboard");
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--no-open"}, d, err) == forge::DashboardParseResult::Ok &&
+              !d.open_browser,
+          "--no-open suppresses the browser");
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--dashboard", "--no-open"}, d, err) ==
+              forge::DashboardParseResult::Ok &&
+              d.enabled && !d.open_browser,
+          "--dashboard and --no-open combine");
+    d = forge::DashboardArgs();
+    CHECK(!d.capture_operators, "the operator panel is opt-in by default");
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--dashboard-ops"}, d, err) == forge::DashboardParseResult::Ok &&
+              d.capture_operators && d.enabled,
+          "--dashboard-ops enables the panel and implies --dashboard");
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--dashboard-host", "0.0.0.0"}, d, err) ==
+              forge::DashboardParseResult::Ok &&
+              d.host == "0.0.0.0",
+          "--dashboard-host sets the bind address");
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--dashboard-port", "9123"}, d, err) ==
+              forge::DashboardParseResult::Ok &&
+              d.port == 9123 && d.enabled,
+          "--dashboard-port sets the port and implies --dashboard");
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--dashboard-port", "0"}, d, err) == forge::DashboardParseResult::Ok &&
+              d.port == 0,
+          "--dashboard-port 0 means \"OS picks\"");
+
+    // A typo must be an error, not a silent 0 (= "OS picks a port").
+    d = forge::DashboardArgs();
+    err.clear();
+    CHECK(run_dash({"forge", "--dashboard-port", "abc"}, d, err) ==
+              forge::DashboardParseResult::Error &&
+              !err.empty(),
+          "--dashboard-port abc is an error, not port 0");
+    d = forge::DashboardArgs();
+    err.clear();
+    CHECK(run_dash({"forge", "--dashboard-port", "80x"}, d, err) ==
+              forge::DashboardParseResult::Error,
+          "--dashboard-port with trailing garbage is an error");
+    d = forge::DashboardArgs();
+    err.clear();
+    CHECK(run_dash({"forge", "--dashboard-port", "70000"}, d, err) ==
+              forge::DashboardParseResult::Error,
+          "out-of-range port is an error");
+
+    // Missing value must not read past the end of argv.
+    d = forge::DashboardArgs();
+    err.clear();
+    CHECK(run_dash({"forge", "--dashboard-port"}, d, err) == forge::DashboardParseResult::Error &&
+              !err.empty(),
+          "--dashboard-port with no value is an error");
+
+    d = forge::DashboardArgs();
+    err.clear();
+    CHECK(run_dash({"forge", "--dashboard-host"}, d, err) ==
+              forge::DashboardParseResult::Error,
+          "--dashboard-host with no value is an error");
+
+    d = forge::DashboardArgs();
+    err.clear();
+    CHECK(run_dash({"forge", "--temp", "0.5"}, d, err) ==
+              forge::DashboardParseResult::NotMine,
+          "a non-dashboard flag is NotMine");
+    d = forge::DashboardArgs();
+    CHECK(run_dash({"forge", "--dashboard"}, d, err) == forge::DashboardParseResult::Ok &&
+              is_dashboard_arg("--dashboard"),
+          "is_dashboard_arg recognises the flag");
+    CHECK(!is_dashboard_arg("--dashboardx"), "is_dashboard_arg is not a prefix match");
+}
+
 int main() {
     std::printf("=== forge-args-test ===\n");
     test_kv_dtype_parse();
     test_kv_type_pair();
     test_common_parser();
     test_spec_parser();
+    test_dashboard_parser();
     std::printf("\n=== %d/%d checks passed ===\n", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;
 }

@@ -84,6 +84,15 @@ add_executable(forge-server-session-test test_server_session_state.cpp)
 forge_link_native(forge-server-session-test)
 add_test(NAME server-session COMMAND forge-server-session-test)
 
+# Dashboard metrics registry: percentile math, ring bounds, TTFT/queue semantics
+# (including the backdated-arrival path the HTTP handlers use), the RAII
+# destructor that records requests which never reached finish(), and a
+# publisher/poller race. Model-free and host-only -- these are the checks that
+# catch a dashboard rendering plausible-but-wrong numbers.
+add_executable(forge-metrics-test test_metrics.cpp)
+forge_link_native(forge-metrics-test)
+add_test(NAME metrics COMMAND forge-metrics-test)
+
 # Mixed-dtype fused attention (-ctk/-ctv): every (K,V) format pair the selector
 # can route to the mixed kernel, checked against a CPU FP32 reference computed
 # from the dequantized rows. Guards the per-head byte offsets (the two sides
