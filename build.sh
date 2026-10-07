@@ -130,6 +130,31 @@ esac
 echo -e "  → PerfProfiler: ${GREEN}$FORGE_PROFILING${NC}"
 echo
 
+# --- Web dashboard (npm frontend) ---
+echo -e "${CYAN}Web dashboard:${NC}"
+if command -v npm &>/dev/null; then
+    FORGE_BUILD_DASHBOARD=$(ask_option "Build the web dashboard frontend with npm? (y/n)" "n")
+    case $FORGE_BUILD_DASHBOARD in
+        y|Y|yes) FORGE_BUILD_DASHBOARD="ON" ;;
+        *) FORGE_BUILD_DASHBOARD="OFF" ;;
+    esac
+    if [ "$FORGE_BUILD_DASHBOARD" = "ON" ]; then
+        # Vite 7 needs Node ^20.19 || >=22.12. Catching it here beats a cryptic
+        # esbuild parse failure halfway through the build.
+        NPM_MAJOR=$(npm --version 2>/dev/null | cut -d. -f1)
+        if [ -n "$NPM_MAJOR" ] && [ "$NPM_MAJOR" -lt 10 ]; then
+            echo -e "  ${YELLOW}npm $(npm --version) found but Node is too old for Vite 7${NC}"
+            echo -e "  ${YELLOW}-> disabling the dashboard; /api/metrics will still work${NC}"
+            FORGE_BUILD_DASHBOARD="OFF"
+        fi
+    fi
+else
+    echo -e "  ${YELLOW}npm not found${NC}"
+    FORGE_BUILD_DASHBOARD="OFF"
+fi
+echo -e "  → Dashboard: ${GREEN}$FORGE_BUILD_DASHBOARD${NC}"
+echo
+
 # --- Cross-arch tests (ARM64/PPC64 under QEMU) ---
 echo -e "${CYAN}Cross-arch tests:${NC}"
 USE_CROSS_TESTS=$(ask_option "Build ARM/PPC cross tests under QEMU? (y/n)" "n")
@@ -204,6 +229,7 @@ if [ "$USE_CUDA" = "ON" ]; then
 fi
 echo -e "  OpenBLAS:       ${GREEN}$USE_OPENBLAS${NC}"
 echo -e "  PerfProfiler:   ${GREEN}$FORGE_PROFILING${NC}"
+echo -e "  Dashboard:      ${GREEN}$FORGE_BUILD_DASHBOARD${NC}"
 echo -e "  Cross Tests:    ${GREEN}$USE_CROSS_TESTS${NC}"
 echo -e "  Native Build:   ${GREEN}$USE_NATIVE${NC}"
 echo -e "  Python:         ${GREEN}$USE_PYTHON${NC}"
@@ -244,6 +270,7 @@ if [ "$USE_OPENBLAS" = "ON" ]; then
 fi
 
 CMAKE_ARGS+=(-DFORGE_PROFILING="$FORGE_PROFILING")
+CMAKE_ARGS+=(-DFORGE_BUILD_DASHBOARD="$FORGE_BUILD_DASHBOARD")
 CMAKE_ARGS+=(-DFORGE_NATIVE_BUILD="$USE_NATIVE")
 CMAKE_ARGS+=(-DFORGE_BUILD_PYTHON="$USE_PYTHON")
 CMAKE_ARGS+=(-DFORGE_BUILD_TESTS="$USE_TESTS")

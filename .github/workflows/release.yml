@@ -44,6 +44,12 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
 
+      # FORGE_BUILD_DASHBOARD stays OFF here on purpose. The dashboard is
+      # embedded into the binary (cmake/EmbedDashboardAssets.cmake), so there is
+      # no asset directory to ship -- which is what keeps the tarball a single
+      # self-contained executable. Turning it on would add ~1 MB of Vue/ECharts
+      # bundle to every download for a feature most users do not open. The
+      # build.yml matrix covers the frontend separately.
       - name: Build
         run: cmake --build build -j "$(nproc)"
 

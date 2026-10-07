@@ -16,6 +16,7 @@ lion.png
 TOM_and_JERRY.mp4
 .mimocode/
 .trae/
+node_modules/
 
 # Compiled test binaries (cross-compiled for QEMU)
 tests/arch/*/test_gemv_m_multi_row
@@ -44,6 +45,15 @@ dist/
 venv/
 .venv/
 env/
+
+# Node (web dashboard)
+# node_modules/ is never committed; package-lock.json IS, so `npm ci` in CI
+# resolves to the exact versions the bundle was built and tested against.
+node_modules/
+npm-debug.log*
+.npm/
+# SSR output of `npm run smoke` / the jsdom bundle test
+web/dist-smoke/
 
 # Pytest & Benchmarks
 .pytest_cache/

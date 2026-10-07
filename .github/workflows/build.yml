@@ -13,6 +13,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Web dashboard (web/: Vue 3 + TypeScript + Vite + ECharts).
+  #
+  # Separate from the CUDA build on purpose: it fails in well under a minute
+  # instead of after a full build, and it is the job that keeps the frontend
+  # from silently rotting when nobody builds with -DFORGE_BUILD_DASHBOARD=ON.
+  # `npm run typecheck` is its own step so a type error is reported as one.
+  dashboard:
+    name: Web dashboard (frontend)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # Vite 7 requires Node ^20.19 || >=22.12.
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Audit
+        run: npm audit --audit-level=high
+
+      # Renders every chart option against a real headless ECharts instance.
+      # This is the net for `componentType "markLine" illegal`: a chart that uses
+      # a component nobody registered type-checks, builds, and only throws at
+      # runtime in a browser.
+      - name: Smoke test (headless chart render)
+        run: npm run smoke
+
+      - name: Build
+        run: npm run build
+
+      # Loads the REAL dist/assets/*.js -- the exact bytes embedded into
+      # forge-cli / forge-server -- into a DOM with a mocked /api/metrics and
+      # asserts the dashboard actually mounts and creates its canvases. This
+      # catches bundling defects (a collapsed namespace import, a missing
+      # renderer) and bundle-size regressions.
+      - name: Bundle test (mount the built assets)
+        run: npm run test:bundle
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-dashboard-dist
+          path: web/dist
+          retention-days: 7
+
   build-linux:
     name: Linux (CUDA ${{ matrix.cuda }}, Python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -62,17 +120,37 @@ jobs:
           echo "Python: $(python3 --version)"
           echo "GCC: $(gcc --version | head -1)"
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Configure CMake
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES="86;89"
+            -DCMAKE_CUDA_ARCHITECTURES="86;89" \
+            -DFORGE_BUILD_DASHBOARD=ON
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
 
       - name: Test CLI
         run: ./build/forge-cli --help
+
+      # The dashboard is embedded at build time, so a broken embed script or an
+      # unbuildable bundle would otherwise only show up as a 404 in a browser.
+      - name: Test dashboard assets are embedded
+        run: |
+          set -euo pipefail
+          # /api/metrics answers on any build; the HTML only exists when the
+          # frontend was embedded, which is what this asserts.
+          ./build/forge-cli --help | grep -q -- '--dashboard'
+          test -f build/dashboard_assets.cpp
+          grep -q 'dashboard_asset_count' build/dashboard_assets.cpp
+          grep -q 'kAssets' build/dashboard_assets.cpp
 
       - name: Run Python tests (no external model)
         run: |

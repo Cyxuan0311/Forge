@@ -277,9 +277,11 @@ add_library(
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/lfm2_engine.cpp
   src/inference/engines/gemma4_engine.cpp
+  src/inference/engines/gemma_embedding2_engine.cpp
   src/inference/engines/spark25_engine.cpp
   src/inference/engines/phimoe_engine.cpp
   src/inference/engines/bailingmoe3_engine.cpp
+  src/inference/engines/xing4_engine.cpp
   src/inference/engines/generic_engine.cpp
   src/inference/layers/norm_executor.cpp
   src/inference/layers/rope_executor.cpp
@@ -308,6 +310,7 @@ add_library(
   src/inference/graph/graph_cuda_runner.cpp
   src/inference/context.cpp
   src/inference/sampler.cpp
+  src/inference/metrics.cpp
   src/inference/generator.cpp
   src/inference/attention_mask.cpp
   src/inference/request_scheduler.cpp
@@ -316,6 +319,7 @@ add_library(
   src/inference/kv_cache_dtype.cpp
   src/inference/cli_common_args.cpp
   src/inference/cli_spec_args.cpp
+  src/inference/cli_dashboard_args.cpp
   src/inference/model_draft_provider.cpp
   src/inference/mtp_draft_provider.cpp
   src/inference/threads.cpp
@@ -356,6 +360,7 @@ target_link_libraries(
           forge_ops
           forge_core
           forge_tokenizer
+          forge_dashboard
           forge_vision
           $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
 if(CUDAToolkit_FOUND)
@@ -376,6 +381,144 @@ target_include_directories(
 find_package(Threads REQUIRED)
 target_link_libraries(forge_httplib PUBLIC Threads::Threads)
 
+# ---- Web dashboard (shared by forge-cli and forge-server) ----
+#
+# The frontend lives in web/ (Vue 3 + TypeScript + Vite + ECharts) and is built
+# by npm. Its output is embedded into the binary rather than loaded from disk:
+# the release tarball ships a bare `forge-cli` with no asset directory beside it
+# (see .github/workflows/release.yml), so a runtime file lookup would need a
+# --dashboard-root escape hatch and would break for every installed copy.
+#
+# Default is OFF so that a plain `cmake -B build` needs no Node.js toolchain.
+# When it is ON and npm is missing we warn and degrade instead of failing: the
+# dashboard still serves /api/metrics, and /dashboard/ explains how to rebuild.
+option(FORGE_BUILD_DASHBOARD
+       "Build the web dashboard frontend with npm (requires Node.js >= 18)" OFF)
+find_program(FORGE_NPM_EXECUTABLE NAMES npm)
+if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
+  set(_forge_web_dir ${CMAKE_CURRENT_SOURCE_DIR}/web)
+  set(_forge_web_dist ${CMAKE_CURRENT_BINARY_DIR}/web/dist)
+  # `npm ci` deletes and recreates node_modules, so two concurrent builds racing
+  # on it fail with ENOTEMPTY. Gating it behind a stamp file means it runs once
+  # per lockfile change instead of on every `cmake --build`, which removes that
+  # race in practice and stops every incremental build from spending a minute
+  # reinstalling ~200 packages it already has.
+  set(_forge_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-dashboard-npm.stamp)
+  add_custom_command(
+    OUTPUT ${_forge_npm_stamp}
+    # --cache pins the store inside the build tree so a dashboard build never
+    # writes to ~/.npm (read-only CI containers) and never pollutes the repo.
+    COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_web_dir} -- --cache
+            ${CMAKE_CURRENT_BINARY_DIR}/npm-cache
+    COMMAND ${CMAKE_COMMAND} -E touch ${_forge_npm_stamp}
+    WORKING_DIRECTORY ${_forge_web_dir}
+    DEPENDS ${_forge_web_dir}/package.json ${_forge_web_dir}/package-lock.json
+    COMMENT "npm ci (web dashboard dependencies)"
+    VERBATIM)
+  add_custom_target(forge-dashboard-deps DEPENDS ${_forge_npm_stamp})
+  # Every frontend source file is an explicit build dependency.
+  #
+  # An explicit list, not file(GLOB_RECURSE ... CONFIGURE_DEPENDS). The
+  # CONFIGURE_DEPENDS variant re-globbed at build time, reported "GLOB
+  # mismatch!" on every invocation, and re-ran configure mid-build until
+  # `cmake --build` wedged. A couple of dozen paths cost nothing to write down
+  # and make the dependency set deterministic.
+  #
+  # Some dependency list is mandatory either way: without one, editing a .vue
+  # file left dist/ (and therefore the embedded binary) untouched, so the build
+  # silently relinked the OLD bundle -- a change that looks like it did nothing.
+  set(_forge_web_sources
+      ${_forge_web_dir}/index.html
+      ${_forge_web_dir}/vite.config.ts
+      ${_forge_web_dir}/tsconfig.json
+      ${_forge_web_dir}/env.d.ts
+      ${_forge_web_dir}/src/main.ts
+      ${_forge_web_dir}/src/App.vue
+      ${_forge_web_dir}/src/api.ts
+      ${_forge_web_dir}/src/types.ts
+      ${_forge_web_dir}/src/theme.ts
+      ${_forge_web_dir}/src/style.css
+      ${_forge_web_dir}/src/echarts.ts
+      ${_forge_web_dir}/src/charts/gauge.ts
+      ${_forge_web_dir}/src/charts/latency.ts
+      ${_forge_web_dir}/src/charts/lines.ts
+      ${_forge_web_dir}/src/charts/operators.ts
+      ${_forge_web_dir}/src/charts/option.ts
+      ${_forge_web_dir}/src/charts/timeseries.ts
+      ${_forge_web_dir}/src/composables/palette.ts
+      ${_forge_web_dir}/src/composables/theme.ts
+      ${_forge_web_dir}/src/export/format.ts
+      ${_forge_web_dir}/src/export/io.ts
+      ${_forge_web_dir}/src/components/EChart.vue
+      ${_forge_web_dir}/src/components/ExportMenu.vue
+      ${_forge_web_dir}/src/components/GaugePanel.vue
+      ${_forge_web_dir}/src/components/LatencyChart.vue
+      ${_forge_web_dir}/src/components/OperatorChart.vue
+      ${_forge_web_dir}/src/components/RequestTable.vue
+      ${_forge_web_dir}/src/components/StatTile.vue
+      ${_forge_web_dir}/src/components/ThemeButton.vue
+      ${_forge_web_dir}/src/components/TimeSeriesChart.vue)
+  add_custom_command(
+    OUTPUT ${_forge_web_dist}/index.html
+    # --outDir sends the bundle into the build tree so a `npm run build` never
+    # leaves generated files in the source checkout. --emptyOutDir is what
+    # suppresses Vite's interactive confirmation for an outDir outside the
+    # project root, which would otherwise hang a non-interactive build.
+    COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir ${_forge_web_dist}
+            --emptyOutDir
+    WORKING_DIRECTORY ${_forge_web_dir}
+    DEPENDS ${_forge_npm_stamp} ${_forge_web_sources}
+    COMMENT "npm run build (web dashboard)"
+    VERBATIM)
+  add_custom_target(forge-dashboard-assets ALL
+                    DEPENDS ${_forge_web_dist}/index.html)
+
+  set(_forge_dashboard_assets_src
+      ${CMAKE_CURRENT_BINARY_DIR}/dashboard_assets.cpp)
+  add_custom_command(
+    OUTPUT ${_forge_dashboard_assets_src}
+    COMMAND
+      ${CMAKE_COMMAND} -DINPUT_DIR=${_forge_web_dist}
+      -DOUTPUT_FILE=${_forge_dashboard_assets_src} -P
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedDashboardAssets.cmake
+    # Depend on the FILE, not on the forge-dashboard-assets TARGET. A target
+    # dependency gives ordering but no file-level staleness, so make happily
+    # considered a dashboard_assets.cpp from hours earlier up to date and the
+    # binary kept serving the old bundle. Vite rewrites index.html on every
+    # build, so its mtime is a reliable "the bundle changed" signal even though
+    # the hashed files live in a sibling directory.
+    DEPENDS ${_forge_web_dist}/index.html
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedDashboardAssets.cmake
+    COMMENT "Embedding web dashboard assets"
+    VERBATIM)
+
+  add_library(forge_dashboard STATIC src/dashboard/dashboard_server.cpp
+                                     ${_forge_dashboard_assets_src})
+  target_compile_definitions(forge_dashboard PUBLIC FORGE_DASHBOARD_EMBEDDED=1)
+  add_dependencies(forge_dashboard forge-dashboard-assets)
+else()
+  if(FORGE_BUILD_DASHBOARD)
+    message(
+      WARNING
+        "FORGE_BUILD_DASHBOARD=ON but npm was not found. Building without the "
+        "web frontend: /api/metrics will still work, /dashboard/ will explain "
+        "how to rebuild. Install Node.js >= 18 and reconfigure.")
+  else()
+    message(
+      STATUS
+        "Web dashboard frontend OFF (-DFORGE_BUILD_DASHBOARD=ON to build it with npm)"
+    )
+  endif()
+  add_library(forge_dashboard STATIC src/dashboard/dashboard_server.cpp)
+endif()
+target_include_directories(
+  forge_dashboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                         ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(forge_dashboard PUBLIC forge_infer forge_httplib)
+if(CUDAToolkit_FOUND)
+  target_compile_definitions(forge_dashboard PUBLIC USE_CUDA)
+endif()
+
 add_executable(
   forge-server src/server/server_main.cpp src/server/server_state.cpp
                src/server/server_routes.cpp)
@@ -395,6 +538,7 @@ target_link_libraries(
           forge_core
           forge_tokenizer
           forge_agent
+          forge_dashboard
           forge_vision
           forge_httplib
           $<$<BOOL:${USE_OPENBLAS}>:${OPENBLAS_LIBRARIES}>)
