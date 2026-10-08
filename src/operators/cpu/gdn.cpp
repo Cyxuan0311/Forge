@@ -131,6 +131,53 @@ void apply_rope_interleaved(float* vec, int dim, int64_t pos, float theta) {
     }
 }
 
+void apply_rope_yarn(float* vec, int dim, int64_t pos, float theta,
+                     const MlaRopeYarn& y) {
+    if (!y.enabled) {
+        apply_rope_interleaved(vec, dim, pos, theta);
+        return;
+    }
+    // llama.cpp ggml_rope_yarn_corr_dim:
+    //   corr_dim(n_dims, n_ctx_orig, n_rot, base)
+    //     = n_dims * ln(n_ctx_orig / (n_rot * 2pi)) / (2 * ln(base))
+    auto corr_dim = [&](float n_rot) {
+        return static_cast<float>(dim) *
+               std::log(static_cast<float>(y.n_ctx_orig) /
+                        (n_rot * 2.0f * 3.14159265358979323846f)) /
+               (2.0f * std::log(theta));
+    };
+    const float low = std::max(0.0f, std::floor(corr_dim(y.beta_fast)));
+    const float high = std::min(static_cast<float>(dim - 1), std::ceil(corr_dim(y.beta_slow)));
+
+    // rope_yarn(): theta = freq_scale*theta_extrap blended back towards
+    // theta_extrap by the ramp, and the rotation magnitude scaled by mscale.
+    const float mscale = (y.ext_factor != 0.0f)
+                             ? y.attn_factor * (1.0f + 0.1f * std::log(1.0f / y.freq_scale))
+                             : y.attn_factor;
+
+    const float theta_scale = std::pow(theta, -2.0f / static_cast<float>(dim));
+    float theta_extrap = static_cast<float>(pos);
+    for (int i0 = 0; i0 + 1 < dim; i0 += 2) {
+        const float theta_interp = y.freq_scale * theta_extrap;
+        float t = theta_interp;
+        if (y.ext_factor != 0.0f) {
+            // rope_yarn_ramp(low, high, i0) = 1 - clamp((i0/2 - low)/(high-low))
+            const float denom = std::max(0.001f, high - low);
+            const float yr = (static_cast<float>(i0 / 2) - low) / denom;
+            const float ramp = 1.0f - std::min(1.0f, std::max(0.0f, yr));
+            const float ramp_mix = ramp * y.ext_factor;
+            t = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        }
+        const float c = std::cos(t) * mscale;
+        const float s = std::sin(t) * mscale;
+        const float a = vec[i0];
+        const float b = vec[i0 + 1];
+        vec[i0] = a * c - b * s;
+        vec[i0 + 1] = a * s + b * c;
+        theta_extrap *= theta_scale;
+    }
+}
+
 void sigmoid_inplace(const TensorPtr& x) {
     if (!x)
         return;
@@ -314,7 +361,8 @@ TensorPtr bailingmoe3_mla_attention(const TensorPtr& q_flat,
                                     const TensorPtr& gate, int start_pos,
                                     int seq_len, int total, int n_head,
                                     int kv_lora, int qk_nope_dim, int rope_dim,
-                                    int v_dim, float theta, float scale) {
+                                    int v_dim, float theta, float scale,
+                                    const MlaRopeYarn* yarn) {
     const int qk_head_dim = qk_nope_dim + rope_dim;
     const int v_stride = n_head * v_dim;
     const int q_stride = n_head * qk_head_dim;
@@ -363,7 +411,10 @@ TensorPtr bailingmoe3_mla_attention(const TensorPtr& q_flat,
         for (int h = 0; h < n_head; ++h) {
             const float* q_rope = q_heads + static_cast<int64_t>(h) * qk_head_dim + qk_nope_dim;
             std::memcpy(q_rope_rot.data(), q_rope, q_rope_rot.size() * sizeof(float));
-            apply_rope_interleaved(q_rope_rot.data(), rope_dim, qi, theta);
+            if (yarn)
+                apply_rope_yarn(q_rope_rot.data(), rope_dim, qi, theta, *yarn);
+            else
+                apply_rope_interleaved(q_rope_rot.data(), rope_dim, qi, theta);
             const float* q_abs = q_abs_full.data() +
                                  (static_cast<int64_t>(s) * n_head + h) * kv_lora;
             const float* vV_h = va_d + static_cast<int64_t>(h) * v_dim;

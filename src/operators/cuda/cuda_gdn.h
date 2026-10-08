@@ -61,17 +61,22 @@ void moe_accumulate_launch(float* acc_dev, const float* src_dev, float w, int n)
 //   `v_all`    [total, n_head*v_dim] — value contraction (precomputed)
 // `c_nope_norm` [total, kv_lora] and `kb` (attn_k_b) are still needed for the
 // query-side contraction and the nope score term. Returns [seq, n_head*v_dim].
+// `yarn_s` (optional) is a device array of `rope_dim` per-element frequency
+// scales and `yarn_mscale` the rotation magnitude — the YaRN correction
+// (llama.cpp rope_yarn). Pass nullptr / 1.0f for plain rope.
 void mla_attention_launch(const TensorPtr& q_flat, const TensorPtr& c_nope_norm,
                          const TensorPtr& k_pe_rot, const TensorPtr& kb,
                          const TensorPtr& v_all, const TensorPtr& gate,
                          int start_pos, int seq_len, int total, int n_head,
                          int kv_lora, int qk_nope_dim, int rope_dim, int v_dim,
-                         float theta, float scale, TensorPtr& out);
+                         float theta, float scale, TensorPtr& out,
+                         const float* yarn_s = nullptr, float yarn_mscale = 1.0f);
 
 // Rotate the new c_rope rows (absolute positions start_pos .. start_pos+total-1)
 // into k_pe_rot. Mirrors the RoPE the CPU reference applies per history key.
 void mla_rope_launch(const TensorPtr& c_rope, TensorPtr& k_pe_rot, int start_pos,
-                     int total, int rope_dim, float theta);
+                     int total, int rope_dim, float theta,
+                     const float* yarn_s = nullptr, float yarn_mscale = 1.0f);
 
 // Value contraction v_all[j][h*v_dim+d] = vb[(h*v_dim+d)*kv_lora+k] · c_nope_norm[j].
 // Computes only the `total` supplied rows (the engine appends them to its cache).

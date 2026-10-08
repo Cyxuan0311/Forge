@@ -37,6 +37,29 @@ TensorPtr expert_quant_view(const TensorPtr& t, int e, int n_expert);
 // In-place interleaved RoPE on a single vector (dim must be even).
 void apply_rope_interleaved(float* vec, int dim, int64_t pos, float theta);
 
+// YaRN rope parameters (llama.cpp ggml_rope_ext / rope_yarn + llama-context.cpp
+// yarn_attn_factor_adjust). `enabled == false` means plain (unscaled) rope.
+//
+// llama.cpp applies the YaRN frequency interpolation at EVERY position (it is
+// not gated on pos >= n_ctx_orig): theta_i = pos * inv_freq_i * s_i where
+// s_i = freq_scale*(1-ramp_mix_i) + ramp_mix_i, and the whole rotation is
+// scaled by mscale = attn_factor * (ext_factor != 0 ? 1 + 0.1*ln(1/freq_scale)
+// : 1). See ggml/src/ggml-cpu/ops.cpp rope_yarn().
+struct MlaRopeYarn {
+    bool enabled = false;
+    float freq_scale = 1.0f;     // 1 / rope.scaling.factor
+    float ext_factor = 0.0f;     // 0 disables the extrapolation ramp
+    float attn_factor = 1.0f;    // cparams.yarn_attn_factor (pre-adjustment)
+    float beta_fast = 32.0f;
+    float beta_slow = 1.0f;
+    int n_ctx_orig = 0;          // rope.scaling.original_context_length
+};
+
+// In-place YaRN-interleaved RoPE. Falls back to apply_rope_interleaved when
+// `y.enabled == false`. `theta` is the rope frequency base.
+void apply_rope_yarn(float* vec, int dim, int64_t pos, float theta,
+                     const MlaRopeYarn& y);
+
 // In-place elementwise sigmoid. `forge::ops::sigmoid` is declared in
 // operator_activation.h but has no CPU implementation, so keep this local.
 void sigmoid_inplace(const TensorPtr& x);
@@ -99,7 +122,8 @@ TensorPtr bailingmoe3_mla_attention(const TensorPtr& q_flat,
                                     const TensorPtr& gate, int start_pos,
                                     int seq_len, int total, int n_head,
                                     int kv_lora, int qk_nope_dim, int rope_dim,
-                                    int v_dim, float theta, float scale);
+                                    int v_dim, float theta, float scale,
+                                    const MlaRopeYarn* yarn = nullptr);
 
 }  // namespace ops
 }  // namespace forge
