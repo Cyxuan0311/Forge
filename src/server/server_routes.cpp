@@ -15,6 +15,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "forge/dashboard.h"
 #include "server.h"
 
 namespace fsrv = forge;
@@ -61,6 +62,22 @@ json build_tool_calls_array(const std::vector<fsrv::ToolCall>& calls) {
     return tcs;
 }
 
+// Token counts in OpenAI's `usage` shape, plus the server-side timings. Clients
+// that only know the OpenAI fields ignore the extras; clients that want a real
+// per-turn perf line (the bundled chat UI) read prefill_ms / decode_ms /
+// tokens_per_sec instead of guessing from their own clocks.
+json build_usage(const fsrv::ChatCompletionResult& r) {
+    json u = json{{"prompt_tokens", r.prompt_tokens},
+                  {"completion_tokens", r.completion_tokens},
+                  {"total_tokens", r.prompt_tokens + r.completion_tokens}};
+    if (r.prefill_ms > 0.0 || r.decode_ms > 0.0) {
+        u["prefill_ms"] = r.prefill_ms;
+        u["decode_ms"] = r.decode_ms;
+        u["tokens_per_sec"] = r.tokens_per_sec();
+    }
+    return u;
+}
+
 // Build the assistant message: tool_calls when present, else plain content.
 // Separated <think> reasoning travels in the DeepSeek-style
 // `reasoning_content` field, which OpenAI-compatible clients that do not use
@@ -80,6 +97,36 @@ json build_assistant_message(const fsrv::ChatCompletionResult& r) {
 }
 
 // ---- Request parsing -------------------------------------------------------
+
+// Standard base64 -> bytes (supports the data: URL payloads the chat UI sends).
+static bool decode_base64(const std::string& in, std::vector<uint8_t>& out) {
+    auto b64val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    out.clear();
+    int buf = 0, bits = 0;
+    for (char c : in) {
+        if (c == '=')
+            break;  // padding: everything after is ignored
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t')
+            continue;
+        const int v = b64val(c);
+        if (v < 0)
+            return false;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+        }
+    }
+    return true;
+}
 
 // Parse one OpenAI `messages`-shaped array into `out`. Shared by `messages` and
 // `delta_messages` so both accept exactly the same message form.
@@ -126,11 +173,49 @@ static bool parse_message_array(const nlohmann::json& arr,
         } else if (m["content"].is_string()) {
             msg.content = m["content"].get<std::string>();
         } else if (m["content"].is_array()) {
-            // Multimodal-style content parts: Phase 1 concatenates text parts only.
+            // Multimodal-style content parts: text is concatenated into the
+            // message; image_url parts are decoded (data: base64) and kept on
+            // msg.images for the vision path. Remote (http) URLs are not fetched
+            // server-side -- the client must inline them as data: URLs.
             for (const auto& part : m["content"]) {
-                if (part.is_object() && part.value("type", "") == "text" &&
-                    part.contains("text") && part["text"].is_string()) {
+                if (!part.is_object())
+                    continue;
+                const std::string type = part.value("type", "");
+                if (type == "text" && part.contains("text") && part["text"].is_string()) {
                     msg.content += part["text"].get<std::string>();
+                } else if (type == "image_url") {
+                    std::string url;
+                    if (part.contains("image_url") && part["image_url"].is_object() &&
+                        part["image_url"].contains("url") &&
+                        part["image_url"]["url"].is_string()) {
+                        url = part["image_url"]["url"].get<std::string>();
+                    } else if (part.contains("url") && part["url"].is_string()) {
+                        url = part["url"].get<std::string>();
+                    }
+                    if (url.empty())
+                        continue;
+                    if (url.rfind("data:", 0) != 0) {
+                        *err = "only inline data: (base64) image URLs are supported; remote "
+                               "image URLs are not fetched by the server";
+                        return false;
+                    }
+                    const auto comma = url.find(',');
+                    if (comma == std::string::npos) {
+                        *err = "malformed data: image URL";
+                        return false;
+                    }
+                    const std::string meta = url.substr(5, comma - 5);
+                    const std::string b64 = url.substr(comma + 1);
+                    if (meta.find("base64") == std::string::npos) {
+                        *err = "only base64 data: image URLs are supported";
+                        return false;
+                    }
+                    std::vector<uint8_t> bytes;
+                    if (!decode_base64(b64, bytes)) {
+                        *err = "invalid base64 image payload";
+                        return false;
+                    }
+                    msg.images.push_back(std::move(bytes));
                 }
             }
         } else {
@@ -210,6 +295,11 @@ bool parse_chat_request(const httplib::Request& http_req, fsrv::ChatCompletionRe
         out.seed = body["seed"].get<uint64_t>();
     if (body.contains("stream") && body["stream"].is_boolean())
         out.stream = body["stream"].get<bool>();
+    if (body.contains("stream_options") && body["stream_options"].is_object()) {
+        const json& so = body["stream_options"];
+        if (so.contains("include_usage") && so["include_usage"].is_boolean())
+            out.stream_include_usage = so["include_usage"].get<bool>();
+    }
     if (body.contains("stop")) {
         if (body["stop"].is_string()) {
             std::string s = body["stop"].get<std::string>();
@@ -366,6 +456,32 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
         return;
     }
 
+    // Multimodal input: reject image parts when the server has no vision encoder,
+    // and also when an encoder is loaded but this model's generation path has not
+    // yet been wired to condition image tokens (engine work). A clear error beats
+    // silently dropping the image and answering from text only.
+    {
+        bool any_images = false;
+        for (const auto& m : creq.messages)
+            if (!m.images.empty()) any_images = true;
+        for (const auto& m : creq.delta_messages)
+            if (!m.images.empty()) any_images = true;
+        if (any_images) {
+            if (!state.has_vision()) {
+                record_early_exit(arrival_ms, 0, forge::RequestStatus::BadRequest, false,
+                                  std::string());
+                send_error(res, 400,
+                           "This model/server has no vision encoder. Start the server with "
+                           "--mmproj and a vision-capable GGUF to enable image input.",
+                           "invalid_request_error", "400");
+                return;
+            }
+            // Vision encoder loaded: let the request through. chat_completion()
+            // decodes + encodes each image and splices the vision embeddings into
+            // the transformer via the Generator's from_embedding prefill path.
+        }
+    }
+
     // Dashboard per-request handle, backdated to the arrival stamp above. Held by
     // shared_ptr because the streaming path must keep it alive past the return
     // of this handler (see below).
@@ -425,9 +541,7 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
             {"index", 0},
             {"message", build_assistant_message(r)},
             {"finish_reason", r.finish_reason}}});
-        out["usage"] = json{{"prompt_tokens", r.prompt_tokens},
-                            {"completion_tokens", r.completion_tokens},
-                            {"total_tokens", r.prompt_tokens + r.completion_tokens}};
+        out["usage"] = build_usage(r);
         res.set_content(out.dump(), "application/json");
         return;
     }
@@ -540,6 +654,21 @@ void handle_chat_completions(const httplib::Request& http_req, httplib::Response
                     }
                     std::string fin = make_chunk(delta, r.finish_reason.c_str());
                     sink.write(fin.data(), fin.size());
+                }
+                // Optional usage-only tail chunk (OpenAI's
+                // stream_options.include_usage shape: empty `choices`). The
+                // chat UI opts in so each answer can show real token counts and
+                // timings instead of client-side estimates.
+                if (creq.stream_include_usage) {
+                    json u = json::object();
+                    u["id"] = id;
+                    u["object"] = "chat.completion.chunk";
+                    u["created"] = created;
+                    u["model"] = state.model_id();
+                    u["choices"] = json::array();
+                    u["usage"] = build_usage(r);
+                    const std::string payload = "data: " + u.dump() + "\n\n";
+                    sink.write(payload.data(), payload.size());
                 }
                 const char* done = "data: [DONE]\n\n";
                 sink.write(done, std::strlen(done));
@@ -1057,6 +1186,39 @@ void handle_responses(const httplib::Request& http_req, httplib::Response& res,
         });
 }
 
+// Serve the embedded chat UI (web-chat/, Vue) from the build-time table, the
+// same scheme DashboardServer uses for /dashboard/. Assets are an in-memory
+// table matched with exact string equality, so ".." or an absolute path can
+// never escape it. Everything is served no-store: the chat bundle's file names
+// are not content-hashed (single-page build), so a cached shell would keep
+// serving a stale UI after an upgrade.
+void serve_chat_asset(httplib::Response& res, const std::string& path) {
+    static const std::string kPrefix = "/chat/";
+    if (path.compare(0, kPrefix.size(), kPrefix) != 0) {
+        res.status = 404;
+        res.set_content("not found", "text/plain");
+        return;
+    }
+    const std::string rel = path.substr(kPrefix.size());
+    // "/chat/" (the banner URL) is the document root: map it to index.html so
+    // the SPA entry needs no redirect round-trip.
+    const std::string name = rel.empty() ? "index.html" : rel;
+    const forge::DashboardAsset* assets = forge::chat_assets();
+    const size_t n = forge::chat_asset_count();
+    for (size_t i = 0; i < n; ++i) {
+        if (name == assets[i].path) {
+            res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+            res.set_content(assets[i].body, assets[i].size, assets[i].mime);
+            return;
+        }
+    }
+    res.status = 404;
+    res.set_content(n == 0 ? "chat UI not embedded in this binary (build with Node.js "
+                             "and -DFORGE_BUILD_DASHBOARD=ON)"
+                           : "asset not found",
+                    "text/plain");
+}
+
 }  // namespace
 
 namespace forge {
@@ -1077,7 +1239,15 @@ void setup_middleware(httplib::Server& svr, const ServerOptions& opt) {
             res.status = 204;
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (!expect.empty() && req.get_header_value("Authorization") != expect) {
+        // The embedded chat UI is exempt from the API-key gate: static assets
+        // carry no data, the browser cannot send a Bearer header before the
+        // page loads, and the UI collects the key itself (Connection panel)
+        // to authenticate every /v1 call. Same rationale as the dashboard's
+        // dedicated port (see include/forge/dashboard.h), but on the main port.
+        const bool chat_asset = req.method == "GET" &&
+                                (req.path == "/chat" || req.path.compare(0, 6, "/chat/") == 0);
+        if (!chat_asset && !expect.empty() &&
+            req.get_header_value("Authorization") != expect) {
             json j;
             j["error"]["message"] =
                 "Invalid API key. Provide it as 'Authorization: Bearer <key>'.";
@@ -1110,6 +1280,15 @@ void register_routes(httplib::Server& svr, ServerState& state) {
     svr.Post("/v1/responses", [&state](const httplib::Request& req,
                                        httplib::Response& res) {
         handle_responses(req, res, state);
+    });
+
+    // Embedded chat UI (web-chat/, Vue). /chat redirects to the SPA entry;
+    // everything under /chat/ is served from the build-time asset table.
+    svr.Get("/chat", [](const httplib::Request&, httplib::Response& res) {
+        res.set_redirect("/chat/index.html", 302);
+    });
+    svr.Get(R"(/chat/.*)", [](const httplib::Request& req, httplib::Response& res) {
+        serve_chat_asset(res, req.path);
     });
 }
 

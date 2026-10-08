@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -90,7 +91,9 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             }
         }
 
-        if (arg == "--host") {
+        if (arg == "--chat") {
+            opt.chat_ui = true;
+        } else if (arg == "--host") {
             opt.host = value_of(i, "--host");
         } else if (arg == "--port") {
             opt.port = std::stoi(value_of(i, "--port"));
@@ -102,6 +105,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             opt.dequant_cache_mb = std::stol(value_of(i, "--dequant-cache-mb"));
         } else if (arg == "--api-key") {
             opt.api_key = value_of(i, "--api-key");
+        } else if (arg == "--mmproj") {
+            opt.mmproj_path = value_of(i, "--mmproj");
         } else if (arg == "--max-inflight") {
             opt.max_inflight = std::stoi(value_of(i, "--max-inflight"));
         } else if (arg == "--perf") {
@@ -146,6 +151,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "      --dequant-cache-mb MB  Per-weight FP16 dequant cache budget in MB\n"
                 << "      --load-mode MODE    mmap | mlock | mmap_mlock (default: mmap)\n"
                 << "      --api-key KEY       Require 'Authorization: Bearer KEY' (default: off)\n"
+                << "      --mmproj PATH       Load a vision encoder (mmproj GGUF) so the model can\n"
+                << "                          accept image inputs (OpenAI vision messages)\n"
                 << "      --max-inflight N    Max queued requests (default: 4, excess get 429)\n"
                 << "\n"
                 << "Speculative decoding (shared with forge-cli):\n"
@@ -182,6 +189,12 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "                          Opt-in: arming PerfProfiler slows decode, and only\n"
                 << "                          works on a -DFORGE_PROFILING=ON build\n"
                 << "      --no-open           Do not launch a browser\n"
+                << "\n"
+                << "Chat UI:\n"
+                << "      --chat              Open the embedded chat UI in a browser after\n"
+                << "                          startup (served at http://HOST:PORT/chat/; static\n"
+                << "                          assets are key-exempt, /v1 still requires the\n"
+                << "                          API key). Needs a Node.js build\n"
                 << "  -h, --help              Show this help\n";
             std::exit(0);
         } else {
@@ -285,6 +298,33 @@ int main(int argc, char** argv) {
               << "  (model: " << state.model_id() << ")\n"
               << "OpenAI-compatible base URL: http://" << opt.host << ":" << opt.port << "/v1\n"
               << "Endpoints: GET /health | GET /v1/models | POST /v1/chat/completions\n\n";
+
+    // ---- Embedded chat UI (--chat) ----
+    // Served on the MAIN port under /chat/ (static assets are exempt from the
+    // Bearer gate; every /v1 call still authenticates). The browser is opened
+    // just before listen(), same as the dashboard: start-up latency covers the
+    // tiny window before the accept loop is live. --no-open (shared with the
+    // dashboard flags) suppresses it.
+    if (opt.chat_ui) {
+        const std::string ui_host = opt.host == "0.0.0.0" ? "127.0.0.1" : opt.host;
+        const std::string chat_url =
+            "http://" + ui_host + ":" + std::to_string(opt.port) + "/chat/";
+        std::cout << "Chat UI:   " << chat_url << "\n";
+        if (opt.dashboard.open_browser) {
+#ifdef _WIN32
+            ShellExecuteA(nullptr, "open", chat_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif __APPLE__
+            if (std::system(("open '" + chat_url + "' >/dev/null 2>&1 &").c_str()) != 0) {
+                /* non-fatal */
+            }
+#else
+            if (std::system(("xdg-open '" + chat_url + "' >/dev/null 2>&1 &").c_str()) != 0) {
+                /* non-fatal */
+            }
+#endif
+        }
+        std::cout << "\n";
+    }
 
     // ---- Live web dashboard (--dashboard) ----
     // Started AFTER the API listener has printed its banner but BEFORE

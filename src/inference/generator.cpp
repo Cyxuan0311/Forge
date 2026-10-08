@@ -86,9 +86,15 @@ const SpeculativeStats* Generator::spec_stats() const {
 
 GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
                                      const GenerationConfig& config,
-                                     const TokenCallback& callback) {
+                                     const TokenCallback& callback,
+                                     const TensorPtr& prefill_embeddings) {
     GenerationResult result;
     result.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
+
+    // Multimodal: the caller supplies pre-built [prompt_len, H] embeddings
+    // (text + vision spliced). When set, the prefill below bypasses the
+    // token-embedding lookup and feeds them straight into the transformer.
+    const bool has_emb = prefill_embeddings != nullptr;
 
     auto* engine = ctx_.engine();
     if (!engine) {
@@ -127,8 +133,9 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     KVemTurnPlan ws_plan;
     bool tiered = false;
     int64_t rope_pos_offset = 0;
-    if (auto* kv_mem = engine->kv_memory()) {
-        if (auto* ws = kv_mem->working_set()) {
+    if (!has_emb) {
+        if (auto* kv_mem = engine->kv_memory()) {
+            if (auto* ws = kv_mem->working_set()) {
             tiered = true;
             // Per-request generation reserve: the window reserves decode headroom
             // for exactly this request's max_new_tokens (clamped inside the plan).
@@ -146,6 +153,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             rope_pos_offset = ws_plan.tail_rope_offset;
         }
     }
+    }
 
     // ---- Session prefix reuse ----
     // The caller guarantees that KV positions [0, prefix_len) already hold
@@ -157,7 +165,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     int prefix_len = 0;
     if (tiered) {
         prefix_len = static_cast<int>(ws_plan.kept_window_len);
-    } else if (config.prefix_len > 0 && prompt_len > 1) {
+    } else if (!has_emb && config.prefix_len > 0 && prompt_len > 1) {
         prefix_len = std::min(config.prefix_len, prompt_len - 1);
     }
     // Where the tail forward writes. Equals prefix_len normally; when a pinned sink
@@ -184,7 +192,7 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             if (auto* kv = engine->kv_cache()) {
                 kv->rollback(prefix_len);
             }
-        } else if (config.reset_kv_cache) {
+        } else if (config.reset_kv_cache || has_emb) {
             ctx_.reset_kv_cache();
         }
     } else if (auto* kv_mem = engine->kv_memory()) {
@@ -259,26 +267,40 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
             // exhaust the page pool.
         }
 
-        auto input_ids = std::make_shared<Tensor>(DataType::INT32, std::vector<int64_t>{fwd_len},
-                                                  DeviceType::CPU);
-        // Tiered: forward ws_plan.new_to_compute (the non-resident tail), not
-        // prompt_tokens[prefix_len:].
-        const int32_t* fwd_src = tiered ? ws_plan.new_to_compute.data()
-                                        : prompt_tokens.data() + prefix_len;
-        std::memcpy(input_ids->data(), fwd_src, fwd_len * sizeof(int32_t));
+        TensorPtr logits;
+        if (has_emb) {
+            // Multimodal: prefill directly from the pre-built embeddings
+            // (text + vision spliced). No token-embedding lookup.
+            auto emb = prefill_embeddings;
+            if (dev == DeviceType::CUDA)
+                emb->to_device(DeviceType::CUDA);
+            auto prefill_req =
+                ForwardRequest::from_embedding(emb, fwd_len, fwd_start_slot, 0);
+            prefill_req.rope_pos_offset = rope_pos_offset;
+            logits = engine->forward_request(prefill_req);
+        } else {
+            auto input_ids = std::make_shared<Tensor>(DataType::INT32,
+                                                      std::vector<int64_t>{fwd_len},
+                                                      DeviceType::CPU);
+            // Tiered: forward ws_plan.new_to_compute (the non-resident tail), not
+            // prompt_tokens[prefix_len:].
+            const int32_t* fwd_src = tiered ? ws_plan.new_to_compute.data()
+                                            : prompt_tokens.data() + prefix_len;
+            std::memcpy(input_ids->data(), fwd_src, fwd_len * sizeof(int32_t));
 
-        if (dev == DeviceType::CUDA) {
-            input_ids->to_device(DeviceType::CUDA);
+            if (dev == DeviceType::CUDA) {
+                input_ids->to_device(DeviceType::CUDA);
+            }
+
+            // In tiered mode the mask/KV cursors use window slots (prefix_len)
+            // while RoPE must use logical positions: the window's first slot
+            // carries logical position rope_pos_offset, which keeps archived KV
+            // at its true relative distance. Untiered, rope_pos_offset stays 0
+            // and this is a no-op.
+            auto prefill_req = ForwardRequest::from_ids(input_ids, fwd_start_slot);
+            prefill_req.rope_pos_offset = rope_pos_offset;
+            logits = engine->forward_request(prefill_req);
         }
-
-        // In tiered mode the mask/KV cursors use window slots (prefix_len) while
-        // RoPE must use logical positions: the window's first slot carries
-        // logical position rope_pos_offset, which keeps archived KV at its true
-        // relative distance. Untiered, rope_pos_offset stays 0 and this is a
-        // no-op.
-        auto prefill_req = ForwardRequest::from_ids(input_ids, fwd_start_slot);
-        prefill_req.rope_pos_offset = rope_pos_offset;
-        auto logits = engine->forward_request(prefill_req);
 
         // The engine may return sparse logits ([1, vocab]: prefill projects only
         // the final row) or the legacy full [fwd_len, vocab] buffer; the row we

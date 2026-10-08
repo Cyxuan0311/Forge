@@ -37,6 +37,10 @@ struct ChatTemplateMessage {
     // Assistant-only replay fields (empty/unused on other roles):
     std::string reasoning_content;
     std::vector<ChatTemplateToolCall> tool_calls;
+    // Raw image bytes attached to this message (multimodal / vision). Populated
+    // by the OpenAI chat-completions parser when a content part is an image_url;
+    // the generation path consumes them only when a vision encoder is loaded.
+    std::vector<std::vector<uint8_t>> images;
 };
 
 // ---- Input to ChatTemplateEngine ----

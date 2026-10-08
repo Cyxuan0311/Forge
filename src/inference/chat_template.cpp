@@ -135,6 +135,26 @@ std::string ChatTemplateEngine::render_jinja(const ChatTemplateInput& input) con
         json jm = json{{"role", msg.role}, {"content", msg.content}};
         if (!msg.reasoning_content.empty())
             jm["reasoning_content"] = msg.reasoning_content;
+        // Multimodal: VLM chat templates (Qwen2.5-VL / Qwen3-VL family) iterate
+        // the message content ARRAY and emit one
+        // <|vision_start|><|image_pad|><|vision_end|> per image part; a string
+        // content carries no image signal at all, so the prompt would end up
+        // with zero image placeholders. Shape the OpenAI parts array they
+        // expect (text part first, then one image part per image), and keep
+        // the legacy `images` field alongside for templates that consume it.
+        if (!msg.images.empty()) {
+            json parts = json::array();
+            if (!msg.content.empty())
+                parts.push_back(json{{"type", "text"}, {"text", msg.content}});
+            for (size_t ii = 0; ii < msg.images.size(); ++ii)
+                parts.push_back(json{{"type", "image"}});
+            json imgs = json::array();
+            for (size_t ii = 0; ii < msg.images.size(); ++ii)
+                imgs.push_back(json{{"index", static_cast<int>(ii)}});
+            jm = json{{"role", msg.role},
+                      {"content", std::move(parts)},
+                      {"images", std::move(imgs)}};
+        }
         if (!msg.tool_calls.empty()) {
             json tcs = json::array();
             for (const auto& tc : msg.tool_calls) {

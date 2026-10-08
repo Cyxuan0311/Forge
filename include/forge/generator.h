@@ -10,6 +10,7 @@
 #include "context.h"
 #include "model.h"
 #include "sampler.h"
+#include "tensor.h"
 
 namespace forge {
 
@@ -71,8 +72,14 @@ public:
 
     using TokenCallback = std::function<void(int32_t token_id, int step)>;
 
+    // `prefill_embeddings`, when non-null, is a [prompt_len, hidden_dim] tensor
+    // of pre-computed embeddings (text token embeddings with vision embeddings
+    // spliced in for multimodal requests). When supplied, the prefill skips the
+    // token-embedding lookup and feeds these straight into the transformer
+    // (ForwardRequest::from_embedding). Text-only requests always pass nullptr.
     GenerationResult generate(const std::vector<int32_t>& prompt_tokens,
-                              const GenerationConfig& config, const TokenCallback& callback);
+                              const GenerationConfig& config, const TokenCallback& callback,
+                              const TensorPtr& prefill_embeddings = nullptr);
 
     // Speculation statistics of the underlying executor (nullptr when the
     // speculative config is disabled).

@@ -26,9 +26,43 @@
 #include "forge/perf_profiler.h"
 #include "forge/prefix_cache.h"
 #include "forge/threads.h"
+#include "forge/vision_encoder.h"
+#include "forge/vision_registry.h"
+#include "forge/operator_embedding.h"
+#include "forge/tensor.h"
+#include "forge/weight_store.h"
 #include "server.h"
 
+// Vendored single-header image decoder (public domain, https://github.com/nothings/stb).
+// The CLI only handles PPM; the server must decode the PNG/JPEG (etc.) images the
+// web dashboard sends as data URLs.
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 namespace forge {
+
+namespace {
+// Decode a PNG/JPEG/BMP/TGA/GIF (stb_image) into interleaved RGB float
+// [w*h*3], values 0..255 -- the exact layout the vision encoder's preprocess
+// expects (matching the CLI's PPM path).
+bool decode_image_rgb(const std::vector<uint8_t>& bytes, int& w, int& h,
+                      std::vector<float>& rgb) {
+    if (bytes.empty()) return false;
+    int ch = 0;
+    stbi_uc* px = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()),
+                                        &w, &h, &ch, 3);
+    if (!px) return false;
+    const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h) * 3u;
+    rgb.resize(n);
+    for (size_t i = 0; i < n; ++i) rgb[i] = static_cast<float>(px[i]);
+    stbi_image_free(px);
+    return true;
+}
+}  // namespace
+
+ServerState::~ServerState() {
+    delete vision_;
+}
 
 // Tool-call catalogue injection, dialect parsing and wrapper stripping moved
 // to the forge_agent module (src/agent/, include/forge/agent/); the request
@@ -140,6 +174,47 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     std::cout << "Model loaded: arch=" << cfg.arch_type << ", layers=" << cfg.num_layers
               << ", hidden=" << cfg.hidden_dim << ", heads=" << cfg.num_heads << " ["
               << std::chrono::duration<double, std::milli>(t3 - t2).count() << " ms]\n";
+
+    // ---- Vision encoder (multimodal / VLM) ----
+    // Mirrors forge-cli: load the mmproj weights and create the registered
+    // encoder. Absent or failed => text-only; requests carrying images are then
+    // rejected at the API boundary with a clear error rather than silently
+    // dropping the image. The final step -- splicing the encoded image tokens
+    // into the transformer -- is engine work that lives outside this file.
+    if (!opt.mmproj_path.empty()) {
+        (void)forge::_vision_registrations_linked;
+        (void)VisionEncoderRegistry::instance().registered_encoders();
+        if (!model_->load_vision_weights(opt.mmproj_path, DeviceType::CPU)) {
+            std::cerr << "Warning: failed to load vision encoder (mmproj): " << opt.mmproj_path
+                      << "\n";
+        } else {
+            auto vloader = ModelLoaderRegistry::instance().create_loader(opt.mmproj_path);
+            std::string vis_arch;
+            VisionConfig vis_cfg;
+            if (vloader && vloader->load(opt.mmproj_path)) {
+                vis_arch = detect_vision_arch(*vloader);
+                vis_cfg = VisionConfigParserRegistry::instance().parse(*vloader, vis_arch);
+                vloader->close();
+            }
+            // The projector output dim is the LLM hidden dim, never the raw
+            // mmproj metadata: forge-cli and the Python bindings override it
+            // after parsing (see forge_cli.cpp / multimodal.cpp), but this path
+            // did not, so Qwen3-VL requests failed the projection check with
+            // "vision projection_dim (0) != model hidden_dim (2560)".
+            vis_cfg.projection_dim = model_->config().hidden_dim;
+            vision_ = VisionEncoderRegistry::instance().create(vis_arch).release();
+            if (!vision_) {
+                std::cerr << "Warning: no vision encoder registered for arch '" << vis_arch
+                          << "'\n";
+            } else if (!vision_->init(model_->weights(), vis_cfg)) {
+                std::cerr << "Warning: vision encoder initialization failed\n";
+                delete vision_;
+                vision_ = nullptr;
+            } else {
+                std::cout << "Vision encoder loaded: arch=" << vis_arch << "\n";
+            }
+        }
+    }
 
     // ---- Inference context ----
     auto t4 = std::chrono::high_resolution_clock::now();
@@ -500,6 +575,144 @@ ChatCompletionResult ServerState::chat_completion(
                   << "\n";
     }
 
+    // ---- Multimodal (vision) embedding injection ----
+    // When a vision encoder is loaded (--mmproj) and the request carries images,
+    // decode + encode each image and splice the resulting vision embeddings into
+    // the token-embedding matrix at the template's <|image_pad|> placeholder
+    // positions. The prefill then runs from those embeddings (Generator's
+    // from_embedding path) so the model actually conditions on the image.
+    // Text-only requests are completely unaffected.
+    bool multimodal = false;
+    TensorPtr mm_embeddings;
+    {
+        std::vector<std::vector<uint8_t>> all_images;
+        for (const auto& m : tooled_messages)
+            for (const auto& im : m.images) all_images.push_back(im);
+        if (vision_ && !all_images.empty()) {
+            // build_mm expands each image placeholder into the encoder's full
+            // feature run, so prompt_ids (and thus the prefill token count)
+            // grows to match the returned embedding matrix. The tiered working
+            // set plans window slots from the UNexpanded ids, so the two paths
+            // cannot be combined yet — reject explicitly instead of desyncing.
+            if (tiered)
+                throw std::runtime_error(
+                    "multimodal (image) requests are not supported with --kvmem yet");
+            // Build [prompt_len, H] embeddings = text token embeddings with each
+            // image's vision embeddings spliced over its placeholder tokens.
+            auto build_mm = [this](std::vector<int32_t>& pids,
+                                   const std::vector<std::vector<uint8_t>>& imgs)
+                                  -> TensorPtr {
+                static const char* kPadCandidates[] = {
+                    "<|image_pad|>", "<|IMAGE_PLACEHOLDER|>", "<image>",
+                    "<|vision_pad|>", "<|img_pad|>", "<|IMAGE_TOKEN|>"};
+                int pad_id = -1;
+                for (const char* c : kPadCandidates) {
+                    const int id = tokenizer_->token_to_id(c);
+                    if (id >= 0) {
+                        pad_id = id;
+                        break;
+                    }
+                }
+                if (pad_id < 0)
+                    throw std::runtime_error(
+                        "multimodal: vision encoder loaded but the tokenizer has no image "
+                        "placeholder token (e.g. <|image_pad|>); cannot inject image "
+                        "embeddings. The model's chat template must emit image placeholders.");
+                const int H = model_->config().hidden_dim;
+                const int proj = vision_->config().projection_dim;
+                if (proj != H)
+                    throw std::runtime_error(
+                        "multimodal: vision projection_dim (" + std::to_string(proj) +
+                        ") != model hidden_dim (" + std::to_string(H) + ")");
+
+                std::vector<std::vector<float>> img_embs;
+                std::vector<size_t> vis_counts;
+                size_t total_vis = 0;
+                for (const auto& img : imgs) {
+                    int w = 0, h = 0;
+                    std::vector<float> rgb;
+                    if (!decode_image_rgb(img, w, h, rgb))
+                        throw std::runtime_error(
+                            "multimodal: failed to decode image (" +
+                            std::to_string(img.size()) +
+                            " bytes); the server decodes PNG/JPEG/BMP/TGA/GIF.");
+                    std::vector<float> emb = vision_->encode(rgb.data(), w, h, 3);
+                    const size_t nfeat = emb.size() / static_cast<size_t>(proj);
+                    if (emb.size() != nfeat * static_cast<size_t>(proj))
+                        throw std::runtime_error(
+                            "multimodal: vision encoder produced an unexpected output size.");
+                    img_embs.push_back(std::move(emb));
+                    vis_counts.push_back(nfeat);
+                    total_vis += nfeat;
+                }
+
+                size_t pad_count = 0;
+                for (int t : pids)
+                    if (t == pad_id) ++pad_count;
+                if (pad_count != imgs.size())
+                    throw std::runtime_error(
+                        "multimodal: prompt has " + std::to_string(pad_count) +
+                        " image placeholder tokens for " + std::to_string(imgs.size()) +
+                        " image(s); expected exactly one <|image_pad|> per image "
+                        "(the chat template must emit the vision placeholder).");
+
+                // Expand placeholders: the template emits ONE <|image_pad|> per
+                // image (Qwen-VL convention), while the encoder produces nfeat
+                // feature rows per image. Expand each placeholder into nfeat
+                // pad tokens (llama.cpp-style) so the splice below fills every
+                // row and prompt_ids stays aligned with the returned embedding
+                // matrix the prefill consumes. Must happen BEFORE the token
+                // embedding lookup, whose row count follows pids.size().
+                {
+                    std::vector<int32_t> expanded;
+                    expanded.reserve(pids.size() + total_vis - pad_count);
+                    size_t img_idx = 0;
+                    for (int t : pids) {
+                        if (t == pad_id) {
+                            for (size_t f = 0; f < vis_counts[img_idx]; ++f)
+                                expanded.push_back(pad_id);
+                            ++img_idx;
+                        } else {
+                            expanded.push_back(t);
+                        }
+                    }
+                    pids = std::move(expanded);
+                }
+
+                auto token_emb = model_->weights().get("token_embedding");
+                if (!token_emb)
+                    throw std::runtime_error("multimodal: token_embedding weight not found");
+                const int nt = static_cast<int>(pids.size());
+                auto ids_tensor = std::make_shared<Tensor>(
+                    DataType::INT32, std::vector<int64_t>{nt}, DeviceType::CPU);
+                std::memcpy(ids_tensor->data(), pids.data(),
+                            static_cast<size_t>(nt) * sizeof(int32_t));
+                TensorPtr text_emb = ops::embedding(token_emb, ids_tensor);
+                text_emb->to_device(DeviceType::CPU);
+
+                float* out = static_cast<float*>(text_emb->data());
+                size_t img_idx = 0, feat_idx = 0;
+                for (int t : pids) {
+                    if (t == pad_id) {
+                        const float* src =
+                            img_embs[img_idx].data() + feat_idx * static_cast<size_t>(H);
+                        std::memcpy(out, src, static_cast<size_t>(H) * sizeof(float));
+                        if (++feat_idx >= vis_counts[img_idx]) {
+                            feat_idx = 0;
+                            ++img_idx;
+                        }
+                    }
+                    out += H;
+                }
+                return text_emb;
+            };
+            mm_embeddings = build_mm(prompt_ids, all_images);
+            multimodal = true;
+            std::cout << "[server] multimodal: injected " << all_images.size()
+                      << " image(s) through the vision encoder\n";
+        }
+    }
+
     // Tiered (KVMem): skip the structural context shift. The working set
     // already decides, per turn, which prefix stays resident (its sink) and
     // which stale history is archived/recalled, and it does so in *logical*
@@ -507,7 +720,7 @@ ChatCompletionResult ServerState::chat_completion(
     // rewrite the prompt under the manager's feet — its common-prefix match
     // would diverge every turn and the resident window would be recomputed
     // from scratch, which is the opposite of what the tier is for.
-    if (!tiered && kv_capacity > 0 &&
+    if (!multimodal && !tiered && kv_capacity > 0 &&
         static_cast<int>(prompt_ids.size()) + gen_budget > kv_capacity &&
         tooled_messages.size() > 2) {
         // ---- Context shift (llama.cpp `n_keep` semantics) ----
@@ -825,7 +1038,9 @@ ChatCompletionResult ServerState::chat_completion(
             // never be evicted.
             prefix_cache_.release_prefix(sess_seq, km->storage());
             km->storage().release(sess_seq);
-            prefix_len = prefix_cache_.try_lookup(prompt_ids, sess_seq, km->storage());
+            prefix_len = multimodal
+                             ? 0
+                             : prefix_cache_.try_lookup(prompt_ids, sess_seq, km->storage());
             // vLLM-style on-demand eviction before prefill. Cached prefixes
             // hold pages after register_prefix(); a new sequence needs
             // ceil((prompt_tail + gen_budget) / page_size) fresh pages in every
@@ -913,7 +1128,8 @@ ChatCompletionResult ServerState::chat_completion(
     GenerationResult result;
     try {
         Generator gen(*ctx_, sampler_cfg);
-        result = gen.generate(prompt_ids, gen_cfg, cb);
+        result = gen.generate(prompt_ids, gen_cfg, cb,
+                              multimodal ? mm_embeddings : nullptr);
     } catch (...) {
         // A failed request can leave the KV cache partially overwritten, so the
         // recorded prefix no longer describes what is resident. Drop the mirror
@@ -1054,6 +1270,10 @@ ChatCompletionResult ServerState::chat_completion(
 
     out.prompt_tokens = result.num_prompt_tokens;
     out.completion_tokens = result.num_generated_tokens;
+    // Timings for the client's per-turn perf line (the same numbers --perf
+    // prints); zero when the generator did not time the request.
+    out.prefill_ms = result.prefill_ms;
+    out.decode_ms = result.decode_ms;
 
     if (stop_hit) {
         out.finish_reason = "stop";

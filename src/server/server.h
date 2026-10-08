@@ -40,6 +40,8 @@ class Server;
 
 namespace forge {
 
+class VisionEncoder;  // forward-declared; defined in forge/vision_encoder.h
+
 // ---- CLI options ----
 
 struct ServerOptions {
@@ -73,6 +75,7 @@ struct ServerOptions {
     long dequant_cache_mb = -1;
     std::string api_key;   // "" = no auth; otherwise "Authorization: Bearer <key>" required
     int max_inflight = 4;  // max queued inference requests (excess -> 429)
+    std::string mmproj_path;  // "" = no vision encoder; otherwise the mmproj GGUF
     // Per-request performance logging on stdout after every chat completion:
     //   --perf        one summary line (tokens, prefill/decode ms, tok/s)
     //   --perf-detail summary + top operator list from PerfProfiler (needs a
@@ -86,6 +89,12 @@ struct ServerOptions {
     // request and a browser cannot send one, so mounting the dashboard there
     // would mean punching a hole in authentication.
     forge::DashboardArgs dashboard;
+    // --chat: open the embedded chat UI (web-chat/, Vue) in a browser. Unlike
+    // the dashboard it is served on the MAIN port under /chat/ — static assets
+    // are exempt from the Bearer gate in setup_middleware (see server_routes.cpp
+    // for the rationale), so no second port is needed. A no-op when the binary
+    // was built without Node.js: /chat/ then returns a 404 with rebuild hints.
+    bool chat_ui = false;
     // The reserve fallback is sized for a request's default max_tokens (512),
     // which is what this binary's callers use; forge-cli sizes it for -n. Both
     // go through CommonArgs::kvem_config(), which had been duplicated in each
@@ -130,6 +139,9 @@ struct ChatCompletionRequest {
     int max_tokens = -1;          // <=0 -> engine default
     uint64_t seed = 0;
     bool stream = false;
+    // OpenAI's stream_options.include_usage: when streaming, emit a final
+    // usage-only chunk (choices: []) carrying token counts and timings.
+    bool stream_include_usage = false;
     std::vector<std::string> stop;  // OpenAI stop strings (up to 4, OpenAI spec)
     // Function calling: OpenAI `tools` (functions) and `tool_choice`.
     // tool_choice "none" disables calling; any other value ("auto" or a
@@ -145,6 +157,17 @@ struct ChatCompletionResult {
     int completion_tokens = 0;
     std::string finish_reason;         // normalized to "stop" | "length" | "tool_calls"
     std::vector<ToolCall> tool_calls;  // non-empty -> finish_reason "tool_calls"
+    // Server-side timings, already computed for the --perf line. Reported in
+    // `usage` (and in the streaming usage chunk) so a client can show real
+    // numbers per turn instead of estimating them from its own clocks.
+    double prefill_ms = 0.0;  // prompt forward + first-token sample
+    double decode_ms = 0.0;   // decode loop, excludes prefill
+    double prefill_ms_per_1k() const {
+        return prompt_tokens > 0 ? prefill_ms * 1000.0 / prompt_tokens : 0.0;
+    }
+    double tokens_per_sec() const {
+        return completion_tokens > 0 ? completion_tokens / (decode_ms / 1000.0) : 0.0;
+    }
 };
 
 // Thrown before prefill when the rendered prompt + generation budget exceeds
@@ -161,6 +184,10 @@ public:
     /// Load tokenizer + model + engine + KV cache (blocking, called once at
     /// startup). Returns false and fills `error` on failure.
     bool load(const ServerOptions& opt, std::string& error);
+
+    /// Defined out-of-line so the vision encoder (forward-declared here) is a
+    /// complete type when destroyed.
+    ~ServerState();
 
     /// Run one chat completion. When `on_token` is provided it receives
     /// UTF-8-safe decoded deltas (streaming); returning false from the
@@ -251,6 +278,11 @@ public:
     /// Number of live sessions (diagnostics/tests).
     int session_count() const { return static_cast<int>(sessions_.size()); }
 
+    /// True when this server was started with a vision encoder (--mmproj) that a
+    /// multimodal model can consume. Requests carrying images are rejected with a
+    /// clear error when this is false.
+    bool has_vision() const { return vision_ != nullptr; }
+
     /// True when the KVMem tiered working set is active. It owns seq 0's slot layout
     /// with process-wide state (logical_hist_, archived_chunks_), so it serves one
     /// conversation at a time regardless of max_inflight -- see try_acquire_slot().
@@ -266,6 +298,7 @@ private:
     std::unique_ptr<Tokenizer> tokenizer_;
     std::unique_ptr<InferenceContext> ctx_;
     std::unique_ptr<ChatTemplateEngine> chat_template_;
+    VisionEncoder* vision_ = nullptr;  // loaded only when --mmproj is set (raw: avoids incomplete-type dtor)
     AgentPipelineConfig agent_cfg_;  // resolved once in load() (FORGE_TOOL_DIALECT)
     std::mutex inference_mutex_;     // serializes all inference (single KV cache)
     std::string model_id_;
