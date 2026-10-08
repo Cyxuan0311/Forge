@@ -411,10 +411,17 @@ __global__ void fused_attn_qtiled_v2_kernel(
     constexpr int DPT = HEAD_DIM / 32;   // dims per lane (HEAD_DIM multiple of 32)
     const int base_d = lane * DPT;
 
-    __shared__ typename Dequant::StageT s_k[BLOCK_N * HEAD_DIM];
+    // Row stride padded by one element. The QK dot below reads
+    // s_k[lane * STAGE_STRIDE + d], so a plain HEAD_DIM stride (a multiple of 32
+    // for every head dim the dispatcher instantiates) would land all 32 lanes of
+    // a warp on the SAME shared-memory bank -- a 32-way conflict in the
+    // innermost loop, which is where this kernel spends its time. HEAD_DIM + 1
+    // spreads consecutive lanes across consecutive banks.
+    constexpr int STAGE_STRIDE = HEAD_DIM + 1;
+    __shared__ typename Dequant::StageT s_k[BLOCK_N * STAGE_STRIDE];
     // V may stage as a different width than K when the two dtypes differ
     // (e.g. FP32 K needs float tiles, V can be __half).
-    __shared__ typename DequantV::StageT s_v[BLOCK_N * HEAD_DIM];
+    __shared__ typename DequantV::StageT s_v[BLOCK_N * STAGE_STRIDE];
     __shared__ float s_q[BLOCK_M * HEAD_DIM];
 
     // Cooperative Q load for this block's query tile.
@@ -453,8 +460,10 @@ __global__ void fused_attn_qtiled_v2_kernel(
                 const int j = t0 + jj;
                 const uint8_t* krow = kv.krow(j);
                 const uint8_t* vrow = kv.vrow(j);
-                s_k[jj * HEAD_DIM + d] = Dequant::stage(Dequant::deq<HEAD_DIM>(krow, d, j, kv_h, num_kv_heads, k_scales));
-                s_v[jj * HEAD_DIM + d] = DequantV::stage(DequantV::deq<HEAD_DIM>(vrow, d, j, kv_h, num_kv_heads, v_scales));
+                s_k[jj * STAGE_STRIDE + d] = Dequant::stage(
+                    Dequant::deq<HEAD_DIM>(krow, d, j, kv_h, num_kv_heads, k_scales));
+                s_v[jj * STAGE_STRIDE + d] = DequantV::stage(
+                    DequantV::deq<HEAD_DIM>(vrow, d, j, kv_h, num_kv_heads, v_scales));
             }
         }
         __syncthreads();
@@ -476,7 +485,8 @@ __global__ void fused_attn_qtiled_v2_kernel(
                 // both resident in shared). Each lane owns one KV position jj=lane.
                 float dot = 0.0f;
                 for (int d = 0; d < HEAD_DIM; ++d)
-                    dot += s_q[warp_id * HEAD_DIM + d] * Dequant::load(s_k[lane * HEAD_DIM + d]);
+                    dot += s_q[warp_id * HEAD_DIM + d] *
+                           Dequant::load(s_k[lane * STAGE_STRIDE + d]);
                 dot *= attn_scale;
                 if (mask) dot += mval;
                 s_self = dot;
@@ -503,7 +513,7 @@ __global__ void fused_attn_qtiled_v2_kernel(
         for (int j = 0; j < tile_end; ++j) {
             const float wj = rt * __shfl_sync(0xffffffff, w_self, j);
             if (wj > 0.0f) {
-                const typename DequantV::StageT* vrow = &s_v[j * HEAD_DIM];
+                const typename DequantV::StageT* vrow = &s_v[j * STAGE_STRIDE];
 #pragma unroll
                 for (int i = 0; i < DPT; ++i) acc[i] += wj * DequantV::load(vrow[base_d + i]);
             }
@@ -583,7 +593,7 @@ static inline void launch_qtiled(const float* Q, const void* q_K, const void* q_
     const int page_size = 0;
     int bm, bn;
     if (head_dim <= 128) {
-        bm = 8;
+        bm = 16;
         bn = 32;
     } else if (head_dim <= 256) {
         bm = 4;
@@ -596,10 +606,10 @@ static inline void launch_qtiled(const float* Q, const void* q_K, const void* q_
     dim3 block(bm * 32);
 
     switch (head_dim) {
-    case 32:  QTILED_V2_CASE(DEQ, false, 32,  8, 32); break;
-    case 64:  QTILED_V2_CASE(DEQ, false, 64,  8, 32); break;
-    case 96:  QTILED_V2_CASE(DEQ, false, 96,  8, 32); break;
-    case 128: QTILED_V2_CASE(DEQ, false, 128, 8, 32); break;
+    case 32:  QTILED_V2_CASE(DEQ, false, 32, 16, 32); break;
+    case 64:  QTILED_V2_CASE(DEQ, false, 64, 16, 32); break;
+    case 96:  QTILED_V2_CASE(DEQ, false, 96, 16, 32); break;
+    case 128: QTILED_V2_CASE(DEQ, false, 128, 16, 32); break;
     case 256: QTILED_V2_CASE(DEQ, false, 256, 4, 32); break;
     case 512: QTILED_V2_CASE(DEQ, false, 512, 2, 16); break;
     default:  launch_quant<DEQ>(Q, q_K, q_V, O, q_len, kv_len, num_heads, num_kv_heads, head_dim, row_bytes, mask, causal, k_scales, v_scales, stream, tag); break;
@@ -734,6 +744,19 @@ static inline void launch_fp32(const float* Q, const float* Kf, const float* Vf,
                                int q_len, int kv_len, int num_heads, int num_kv_heads,
                                int head_dim, const float* mask, bool causal,
                                cudaStream_t stream) {
+    // Query-tiled (v2) for every head dim it covers, matching what the quantized
+    // contiguous paths already do. The per-(query, head) kernel below restreams
+    // the whole K/V for every single query, which is what made a 2304-token ViT
+    // tower (16 heads x 64 dims) cost seconds per block; the tiled kernel stages
+    // each K/V tile once and shares it across BLOCK_M queries. Head dims that
+    // are not a multiple of 32 (16, 72) or exceed the float-staged shared-memory
+    // budget (> 128) keep the per-(query, head) kernel.
+    if (head_dim % 32 == 0 && head_dim <= DqFp32::kMaxQtiledHD) {
+        launch_qtiled<DqFp32>(Q, Kf, Vf, O, q_len, kv_len, num_heads, num_kv_heads, head_dim,
+                              (size_t)num_kv_heads * head_dim * sizeof(float), mask, causal,
+                              /*k_scales=*/nullptr, /*v_scales=*/nullptr, stream, "fp32");
+        return;
+    }
     dim3 grid(q_len, num_heads);
     const uint8_t* K = reinterpret_cast<const uint8_t*>(Kf);
     const uint8_t* V = reinterpret_cast<const uint8_t*>(Vf);

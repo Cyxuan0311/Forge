@@ -24,6 +24,7 @@
 
 #include "forge/cuda_kernels.h"
 
+using forge::cuda::launch_flash_attention;
 using forge::cuda::launch_flash_attention_gqa_decode;
 using forge::cuda::launch_flash_attention_gqa_vectorized;
 using forge::cuda::launch_fused_flash_attention_gqa_prefill_f16;
@@ -218,6 +219,46 @@ int main() {
         cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
     }
     }  // want("prefill_fp32")
+
+    // Qwen3-VL vision tower: 768px input / 16px patches -> a 48x48 grid, i.e.
+    // q_len == kv_len == 2304 queries over 16 heads of 64 dims, bidirectional
+    // (causal=false, no mask). Every ViT block runs this shape, so it is the
+    // workload that decides whether an image request feels instant or hangs.
+    printf("\n=== PREFILL FP32: ViT tower shape, legacy per-query vs query-tiled (ms) ===\n");
+    if (want("prefill_vit")) {
+    {
+        const int vh = 16, vhd = 64, vlen = 2304;
+        std::vector<float> K((size_t)vlen * vh * vhd), V(K.size()),
+            Q((size_t)vlen * vh * vhd);
+        for (auto& x : K) x = ur(rng);
+        for (auto& x : V) x = ur(rng);
+        for (auto& x : Q) x = ur(rng);
+        float *d_Q, *d_K, *d_V, *d_O;
+        cudaMalloc(&d_Q, Q.size() * 4);
+        cudaMalloc(&d_K, K.size() * 4);
+        cudaMalloc(&d_V, V.size() * 4);
+        cudaMalloc(&d_O, Q.size() * 4);
+        cudaMemcpy(d_Q, Q.data(), Q.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_K, K.data(), K.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_V, V.data(), V.size() * 4, cudaMemcpyHostToDevice);
+        // Legacy: one block per (query, head), so K/V are restreamed per query.
+        auto run_legacy = [&]() {
+            launch_flash_attention_gqa_vectorized(d_Q, d_K, d_V, d_O, vlen, vlen, vh, vh, vhd,
+                                                  nullptr, false, 0);
+        };
+        // Production entry for this shape (routes to the query-tiled FP32 kernel).
+        auto run_tiled = [&]() {
+            forge::cuda::launch_flash_attention(d_Q, d_K, d_V, d_O, vlen, vlen, vh, vhd, nullptr,
+                                                false, 0);
+        };
+        float lg = time_ms(run_legacy, 10), tg = time_ms(run_tiled, 10);
+        const double flops = 4.0 * vlen * (double)vlen * vhd * vh;
+        printf("  ViT q=kv=%d h=%d hd=%d  legacy=%.3f ms  tiled=%.3f ms  speedup=%.2fx"
+               "  (%.1f -> %.1f GFLOP/s)\n",
+               vlen, vh, vhd, lg, tg, lg / tg, flops / (lg * 1e6), flops / (tg * 1e6));
+        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+    }
+    }  // want("prefill_vit")
 
     printf("\n=== PREFILL Q8_0: tiled (no materialize) vs materialize+vectorized (q_len=512, ms) ===\n");
     if (want("prefill_q8")) {

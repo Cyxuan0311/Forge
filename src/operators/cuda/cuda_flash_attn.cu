@@ -6,6 +6,20 @@
 #include "cuda_attn_common.cuh"
 #include "cuda_flash_attn.h"
 
+// Query-tiled FP32 prefill launcher (defined in cuda_tiled_prefill.cu, declared
+// in forge/cuda_kernels.h). Declared here rather than including that header:
+// this TU only needs the symbol, and cuda_kernels.h pulls the whole kernel
+// surface into every attention translation unit.
+namespace forge {
+namespace cuda {
+void launch_fused_flash_attention_gqa_prefill_fp32(const float* Q, const float* K, const float* V,
+                                                   float* O, int q_len, int kv_len, int num_heads,
+                                                   int num_kv_heads, int head_dim,
+                                                   const float* mask, bool causal,
+                                                   cudaStream_t stream);
+}  // namespace cuda
+}  // namespace forge
+
 namespace forge {
 namespace cuda {
 
@@ -89,6 +103,18 @@ __global__ void flash_attn_kernel(const float* Q, const float* K, const float* V
 void launch_flash_attention(const float* Q, const float* K, const float* V, float* O, int q_len,
                             int kv_len, int num_heads, int head_dim,
                             const float* mask, bool causal, cudaStream_t stream) {
+    // Prefer the query-tiled FP32 kernel wherever it applies (head_dim a
+    // multiple of 32 and within the float-staged shared-memory budget). The
+    // kernel below runs one block per (query, head) and re-reads all of K/V for
+    // each query, so a vision tower with thousands of tokens pays thousands of
+    // times the KV traffic; the tiled kernel amortizes each staged K/V tile
+    // across BLOCK_M queries. num_kv_heads == num_heads here (non-GQA entry).
+    // Head dims outside the tiled kernel's range keep the per-query kernel.
+    if (head_dim % 32 == 0 && head_dim <= 128) {
+        launch_fused_flash_attention_gqa_prefill_fp32(Q, K, V, O, q_len, kv_len, num_heads,
+                                                      num_heads, head_dim, mask, causal, stream);
+        return;
+    }
     dim3 grid(q_len, num_heads);
     int threads = 128;
 #define LAUNCH(HD) flash_attn_kernel<HD, 128><<<grid, threads, 0, stream>>>(Q, K, V, O, q_len, kv_len, num_heads, mask, causal)
