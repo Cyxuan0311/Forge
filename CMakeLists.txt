@@ -393,8 +393,10 @@ target_link_libraries(forge_httplib PUBLIC Threads::Threads)
 # Default is OFF so that a plain `cmake -B build` needs no Node.js toolchain.
 # When it is ON and npm is missing we warn and degrade instead of failing: the
 # dashboard still serves /api/metrics, and /dashboard/ explains how to rebuild.
-option(FORGE_BUILD_DASHBOARD
-       "Build the web frontends (dashboard + chat UI) with npm (requires Node.js >= 18)" OFF)
+option(
+  FORGE_BUILD_DASHBOARD
+  "Build the web frontends (dashboard + chat UI) with npm (requires Node.js >= 18)"
+  OFF)
 find_program(FORGE_NPM_EXECUTABLE NAMES npm)
 
 # ---- Standalone chat UI (web-chat/) ----------------------------------------
@@ -509,8 +511,8 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
   set(_forge_chat_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-chat-npm.stamp)
   add_custom_command(
     OUTPUT ${_forge_chat_npm_stamp}
-    COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_chat_dir} -- --cache
-            ${CMAKE_CURRENT_BINARY_DIR}/npm-cache
+    COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_chat_dir} --
+            --cache ${CMAKE_CURRENT_BINARY_DIR}/npm-cache
     COMMAND ${CMAKE_COMMAND} -E touch ${_forge_chat_npm_stamp}
     WORKING_DIRECTORY ${_forge_chat_dir}
     DEPENDS ${_forge_chat_dir}/package.json ${_forge_chat_dir}/package-lock.json
@@ -541,13 +543,14 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
       ${_forge_chat_dir}/src/components/TopBar.vue)
   add_custom_command(
     OUTPUT ${_forge_chat_dist}/index.html
-    COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir ${_forge_chat_dist}
-            --emptyOutDir
+    COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir
+            ${_forge_chat_dist} --emptyOutDir
     WORKING_DIRECTORY ${_forge_chat_dir}
     DEPENDS ${_forge_chat_npm_stamp} ${_forge_chat_sources}
     COMMENT "npm run build (web chat UI)"
     VERBATIM)
-  add_custom_target(forge-chat-assets ALL DEPENDS ${_forge_chat_dist}/index.html)
+  add_custom_target(forge-chat-assets ALL
+                    DEPENDS ${_forge_chat_dist}/index.html)
 
   add_custom_command(
     OUTPUT ${_forge_chat_assets_src}
@@ -561,10 +564,10 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
     COMMENT "Embedding web chat UI assets"
     VERBATIM)
 
-  add_library(forge_dashboard STATIC src/dashboard/dashboard_server.cpp
-                                     src/dashboard/launcher.cpp
-                                     ${_forge_dashboard_assets_src}
-                                     ${_forge_chat_assets_src})
+  add_library(
+    forge_dashboard STATIC
+    src/dashboard/dashboard_server.cpp src/dashboard/launcher.cpp
+    ${_forge_dashboard_assets_src} ${_forge_chat_assets_src})
   target_compile_definitions(forge_dashboard PUBLIC FORGE_DASHBOARD_EMBEDDED=1)
   add_dependencies(forge_dashboard forge-dashboard-assets forge-chat-deps)
 else()
@@ -585,9 +588,9 @@ else()
 endif()
 
 target_include_directories(
-  forge_dashboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                         ${CMAKE_CURRENT_SOURCE_DIR}/src
-                         ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+  forge_dashboard
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+         ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_link_libraries(forge_dashboard PUBLIC forge_infer forge_httplib)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(forge_dashboard PUBLIC USE_CUDA)
