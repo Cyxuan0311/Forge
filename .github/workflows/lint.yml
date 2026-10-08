@@ -25,10 +25,13 @@ jobs:
 
       - name: Check CMake formatting
         run: |
+          # third_party/cutlass is a submodule: its CMake files are upstream's,
+          # not ours to reformat.
           find . -name 'CMakeLists.txt' \
             -not -path './build/*' \
             -not -path './_deps/*' \
             -not -path './.cache/*' \
+            -not -path './third_party/*' \
             -exec cmake-format --check {} +
 
   python-lint:

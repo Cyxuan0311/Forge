@@ -1,5 +1,13 @@
 #pragma once
 
+// windows.h defines min/max as macros, which turn every std::min/std::max below
+// into a macro expansion and break the MSVC build with "illegal token on right
+// side of '::'". NOMINMAX has to be defined before that header arrives, so it
+// is set here -- every backend including this header goes through it.
+#if defined(_WIN32) && !defined(NOMINMAX)
+#    define NOMINMAX
+#endif
+
 // Persistent pinned CPU thread pool — Forge's built-in thread scheduler.
 //
 // This is the single, architecture-agnostic home of the pool. Every backend

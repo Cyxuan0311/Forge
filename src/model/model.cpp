@@ -731,7 +731,14 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
                         uint8_t* dst = static_cast<uint8_t*>(out->data());
                         size_t bytes = static_cast<size_t>(row_end - row_begin) * row_bytes;
                         if (qkv->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
                             cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+#else
+                            // A CUDA tensor cannot exist without CUDA compiled in, but
+                            // the branch is still type-checked on PPC64LE/other hosts
+                            // with no CUDA toolkit.
+                            std::memcpy(dst, src, bytes);
+#endif
                         } else {
                             std::memcpy(dst, src, bytes);
                         }
