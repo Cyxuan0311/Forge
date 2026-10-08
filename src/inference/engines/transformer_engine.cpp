@@ -539,6 +539,17 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
         return nullptr;
     }
 
+    TensorPtr hidden;
+    if (req.input_embeddings) {
+        // Hidden-state entry (multimodal prefill): caller built the full
+        // [nt, H] embedding matrix (text + vision spliced). Skip the token
+        // embedding lookup entirely — req.input_ids is null on this path.
+        hidden = req.input_embeddings;
+        if (hidden->device() != first_dev.type)
+            hidden = transfer_hidden(hidden, first_dev);
+        return forward_layers(hidden, req);
+    }
+
     // When token_embedding is on CPU (offload_embedding=false), run embedding on CPU
     // then transfer result to the first layer's device.
     DeviceType emb_dev = token_emb->device();
@@ -547,7 +558,6 @@ TensorPtr TransformerEngine::forward_request(const ForwardRequest& req) {
                                            ? DeviceTarget::cpu()
                                            : first_dev);
 
-    TensorPtr hidden;
     {
         PERF_SCOPE("forward/embedding");
         hidden = ops::embedding(token_emb, ids_for_embed, weights_.token_embedding_fp32);

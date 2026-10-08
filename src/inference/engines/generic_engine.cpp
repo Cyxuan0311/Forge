@@ -65,36 +65,47 @@ TensorPtr GenericEngine::forward_request(const ForwardRequest& req) {
         kv_memory_->storage().set_defer_device_writes(true);
 
     DeviceType first_dev = layer_device(0);
-    auto ids_on_dev = transfer_hidden(req.input_ids, first_dev);
 
-    auto token_emb = model_.weights().get("token_embedding");
     TensorPtr hidden;
-    {
-        PERF_SCOPE("forward/embedding");
-        hidden = ops::embedding(token_emb, ids_on_dev, weights_.token_embedding_fp32);
-    }
+    if (req.input_embeddings) {
+        // Hidden-state entry (multimodal prefill): the caller already built the
+        // full [nt, H] matrix (token embeddings with the vision features
+        // spliced in). Skip the embedding lookup — req.input_ids is null here.
+        hidden = req.input_embeddings;
+        if (hidden->device() != first_dev)
+            hidden = transfer_hidden(hidden, first_dev);
+    } else {
+        auto ids_on_dev = transfer_hidden(req.input_ids, first_dev);
 
-    // Embedding scaling (Gemma/Gemma2/Gemma4: hidden *= sqrt(n_embd))
-    if (plan_.use_embedding_scale) {
-        PERF_SCOPE("forward/emb_scale");
-        float scale = std::sqrt(static_cast<float>(cfg.hidden_dim));
-        bool was_cuda = (hidden->device() == DeviceType::CUDA);
-        if (was_cuda) {
-            auto hidden_cpu =
-                std::make_shared<Tensor>(DataType::FP32, hidden->shape(), DeviceType::CPU);
-            hidden_cpu->copy_from(*hidden);
-            hidden = hidden_cpu;
+        auto token_emb = model_.weights().get("token_embedding");
+        {
+            PERF_SCOPE("forward/embedding");
+            hidden = ops::embedding(token_emb, ids_on_dev, weights_.token_embedding_fp32);
         }
-        int n = static_cast<int>(hidden->numel());
-        float* data = static_cast<float*>(hidden->data());
-        for (int i = 0; i < n; ++i) {
-            data[i] *= scale;
-        }
-        if (was_cuda) {
-            auto hidden_back =
-                std::make_shared<Tensor>(DataType::FP32, hidden->shape(), DeviceType::CUDA);
-            hidden_back->copy_from(*hidden);
-            hidden = hidden_back;
+
+        // Embedding scaling (Gemma/Gemma2/Gemma4: hidden *= sqrt(n_embd)) —
+        // token-embedding property, so it must not touch spliced vision rows.
+        if (plan_.use_embedding_scale) {
+            PERF_SCOPE("forward/emb_scale");
+            float scale = std::sqrt(static_cast<float>(cfg.hidden_dim));
+            bool was_cuda = (hidden->device() == DeviceType::CUDA);
+            if (was_cuda) {
+                auto hidden_cpu =
+                    std::make_shared<Tensor>(DataType::FP32, hidden->shape(), DeviceType::CPU);
+                hidden_cpu->copy_from(*hidden);
+                hidden = hidden_cpu;
+            }
+            int n = static_cast<int>(hidden->numel());
+            float* data = static_cast<float*>(hidden->data());
+            for (int i = 0; i < n; ++i) {
+                data[i] *= scale;
+            }
+            if (was_cuda) {
+                auto hidden_back =
+                    std::make_shared<Tensor>(DataType::FP32, hidden->shape(), DeviceType::CUDA);
+                hidden_back->copy_from(*hidden);
+                hidden = hidden_back;
+            }
         }
     }
 
