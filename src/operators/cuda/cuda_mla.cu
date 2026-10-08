@@ -81,7 +81,8 @@ __global__ void k_mla_score_write(const float* q_flat, const float* q_abs_full,
                                  float* out, int start_pos, int seq_len, int total,
                                  int n_head, int kv_lora, int qk_nope_dim,
                                  int rope_dim, int v_dim, int qk_head_dim,
-                                 float theta, float scale) {
+                                 float theta, float scale,
+                                 const float* yarn_s, float yarn_mscale) {
     int s = static_cast<int>(blockIdx.x);
     int h = static_cast<int>(blockIdx.y);
     if (s >= seq_len || h >= n_head) return;
@@ -99,8 +100,9 @@ __global__ void k_mla_score_write(const float* q_flat, const float* q_abs_full,
     for (int i = 0; i + 1 < rope_dim; i += 2) {
         float a = q_rope[i], b = q_rope[i + 1];
         float freq = __powf(theta, -static_cast<float>(i) / static_cast<float>(rope_dim));
+        if (yarn_s) freq *= yarn_s[i];
         float ang = static_cast<float>(qi) * freq;
-        float c = __cosf(ang), sn = __sinf(ang);
+        float c = __cosf(ang) * yarn_mscale, sn = __sinf(ang) * yarn_mscale;
         qr[i] = a * c - b * sn;
         qr[i + 1] = a * sn + b * c;
     }
@@ -149,7 +151,8 @@ void mla_attention_launch(const TensorPtr& q_flat, const TensorPtr& c_nope_norm,
                          const TensorPtr& v_all, const TensorPtr& gate,
                          int start_pos, int seq_len, int total, int n_head,
                          int kv_lora, int qk_nope_dim, int rope_dim, int v_dim,
-                         float theta, float scale, TensorPtr& out) {
+                         float theta, float scale, TensorPtr& out,
+                         const float* yarn_s, float yarn_mscale) {
     const int qk_head_dim = qk_nope_dim + rope_dim;
     const int v_stride = n_head * v_dim;
     const int64_t qa_bytes =
@@ -182,7 +185,7 @@ void mla_attention_launch(const TensorPtr& q_flat, const TensorPtr& c_nope_norm,
     k_mla_score_write<<<grid, 1>>>(qf_d, qa_d, cnp_d, kpr_d, va_d, g_d, out_d,
                                    start_pos, seq_len, total, n_head, kv_lora,
                                    qk_nope_dim, rope_dim, v_dim, qk_head_dim,
-                                   theta, scale);
+                                   theta, scale, yarn_s, yarn_mscale);
 }
 
 void mla_split_latent(const float* latent_dev, float* c_nope_dev, float* c_rope_dev,
@@ -198,7 +201,8 @@ void mla_split_latent(const float* latent_dev, float* c_nope_dev, float* c_rope_
 // into k_pe_rot. Identical to the RoPE the CPU reference applies per history key;
 // the engine calls this once per token over only the new rows.
 __global__ void k_mla_rope(const float* c_rope, float* k_pe_rot, int start_pos,
-                           int total, int rope_dim, float theta) {
+                           int total, int rope_dim, float theta,
+                           const float* yarn_s, float yarn_mscale) {
     int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (j >= total) return;
     int64_t base = j * rope_dim;
@@ -207,22 +211,24 @@ __global__ void k_mla_rope(const float* c_rope, float* k_pe_rot, int start_pos,
     float pos = static_cast<float>(start_pos) + static_cast<float>(j);
     for (int i = 0; i + 1 < rope_dim; i += 2) {
         const float a = kp[i], b = kp[i + 1];
-        const float freq =
+        float freq =
             __powf(theta, -static_cast<float>(i) / static_cast<float>(rope_dim));
+        if (yarn_s) freq *= yarn_s[i];
         const float ang = pos * freq;
-        const float c = __cosf(ang), sn = __sinf(ang);
+        const float c = __cosf(ang) * yarn_mscale, sn = __sinf(ang) * yarn_mscale;
         kr[i] = a * c - b * sn;
         kr[i + 1] = a * sn + b * c;
     }
 }
 
 void mla_rope_launch(const TensorPtr& c_rope, TensorPtr& k_pe_rot, int start_pos,
-                     int total, int rope_dim, float theta) {
+                     int total, int rope_dim, float theta,
+                     const float* yarn_s, float yarn_mscale) {
     int block = 256;
     int grid = static_cast<int>((static_cast<int64_t>(total) + block - 1) / block);
     k_mla_rope<<<grid, block>>>(static_cast<const float*>(c_rope->data()),
                                 static_cast<float*>(k_pe_rot->data()), start_pos,
-                                total, rope_dim, theta);
+                                total, rope_dim, theta, yarn_s, yarn_mscale);
 }
 
 // Value contraction v_all[j][h*v_dim+d] = vb[(h*v_dim+d)*kv_lora+k] · c_nope_norm[j].

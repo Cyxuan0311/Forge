@@ -32,6 +32,18 @@ struct ModelConfig {
 
     float rope_theta = 10000.0f;
     float rope_scaling_factor = 1.0f;
+
+    // YaRN rope scaling (llama.cpp: rope_ext + yarn_attn_factor_adjust).
+    // rope_yarn_enabled == false means plain rope (freq_scale 1, mscale 1).
+    bool rope_yarn_enabled = false;
+    float rope_yarn_freq_scale = 1.0f;  // 1 / rope.scaling.factor
+    float rope_yarn_ext_factor = 0.0f;  // 1 when scaling type is yarn
+    float rope_yarn_attn_factor = 1.0f; // cparams.yarn_attn_factor
+    float rope_yarn_beta_fast = 32.0f;
+    float rope_yarn_beta_slow = 1.0f;
+    float rope_yarn_log_mul = 0.0f;     // mscale_all_dim (1.0 for xing4_0)
+    int rope_yarn_orig_ctx = 0;         // rope.scaling.original_context_length
+
     float rms_norm_eps = 1e-6f;
     float layer_norm_eps = 1e-12f;
 

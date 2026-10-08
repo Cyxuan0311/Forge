@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "forge/engines/transformer_engine.h"
+#include "forge/inference/layers/xing4_mhc.h"
 
 namespace forge {
 
@@ -42,16 +43,19 @@ protected:
     void init_kv_cache(const ModelConfig& cfg) override;
 
 private:
-    // ---- mHC helpers (device-dispatched) ----
-    // x4 [nt, 4H] -> x_in [nt, H] + post [nt,4] + comb [nt,16] (Sinkhorn).
-    TensorPtr hc_pre(const TensorPtr& x4, const TensorPtr& fn, const TensorPtr& scale,
-                     const TensorPtr& base, TensorPtr& post, TensorPtr& comb,
-                     DeviceType dev, int layer_idx);
-    // out4[dst] = x * post[dst] + sum_src res4[src] * comb[src,dst]
-    TensorPtr hc_post(const TensorPtr& x, const TensorPtr& res4, const TensorPtr& post,
-                      const TensorPtr& comb, DeviceType dev);
-    TensorPtr hc_mean(const TensorPtr& x4, DeviceType dev);
-    TensorPtr hc_expand(const TensorPtr& x, DeviceType dev);
+    // 4-way residual stream (mHC): expand/pre/post/mean live in layers/xing4_mhc.
+    MhcMixer mhc_;
+
+    // ---- YaRN rope ----
+    // Per-element frequency scale table s_i (device copy for the CUDA MLA
+    // kernels, host vector for the CPU path) + rotation magnitude mscale.
+    // Built once in init_weights(); empty when the model has no YaRN metadata.
+    void build_yarn_table();
+    // Lazily uploads `yarn_s_` to the device; returns nullptr when disabled.
+    const float* yarn_s_dev_ptr();
+    std::vector<float> yarn_s_;   // [rope_dim], 1.0 entries when disabled
+    TensorPtr yarn_s_dev_;        // device copy (CUDA path)
+    float yarn_mscale_ = 1.0f;
 
     // ---- layer body ----
     TensorPtr apply_mla(const TensorPtr& normed, const LayerExecutionContext& lctx);

@@ -38,7 +38,9 @@ namespace forge {
 // ============================================================================
 
 Xing4_0Engine::Xing4_0Engine(Model& model, InferenceContext& ctx)
-    : TransformerEngine(model, ctx) {
+    : TransformerEngine(model, ctx),
+      mhc_(model.config().hc_sinkhorn_iters, model.config().rms_norm_eps,
+           model.config().hidden_dim) {
     if (!init_weights())
         throw std::runtime_error("Xing4_0Engine: failed to initialize weights");
     n_layers_ = model_.config().num_layers;
@@ -47,7 +49,70 @@ Xing4_0Engine::Xing4_0Engine(Model& model, InferenceContext& ctx)
 }
 
 bool Xing4_0Engine::init_weights() {
+    build_yarn_table();
     return weights_.init(model_.weights(), model_.config());
+}
+
+// Per-dimension YaRN frequency scale s_i such that
+// theta_i = pos * inv_freq_i * s_i, plus the rotation magnitude mscale.
+// Mirrors ggml rope_yarn() + ggml_rope_yarn_corr_dims().
+void Xing4_0Engine::build_yarn_table() {
+    const auto& cfg = model_.config();
+    yarn_s_.clear();
+    yarn_mscale_ = 1.0f;
+    yarn_s_dev_ = nullptr;
+    if (!cfg.rope_yarn_enabled)
+        return;
+
+    const int dim = cfg.rope_dimension_count > 0 ? cfg.rope_dimension_count : 0;
+    if (dim <= 0)
+        return;
+
+    auto corr_dim = [&](float n_rot) {
+        return static_cast<float>(dim) *
+               std::log(static_cast<float>(cfg.rope_yarn_orig_ctx) /
+                        (n_rot * 2.0f * 3.14159265358979323846f)) /
+               (2.0f * std::log(cfg.rope_theta));
+    };
+    const float low = std::max(0.0f, std::floor(corr_dim(cfg.rope_yarn_beta_fast)));
+    const float high =
+        std::min(static_cast<float>(dim - 1), std::ceil(corr_dim(cfg.rope_yarn_beta_slow)));
+    const float denom = std::max(0.001f, high - low);
+
+    yarn_mscale_ = (cfg.rope_yarn_ext_factor != 0.0f)
+                       ? cfg.rope_yarn_attn_factor *
+                             (1.0f + 0.1f * std::log(1.0f / cfg.rope_yarn_freq_scale))
+                       : cfg.rope_yarn_attn_factor;
+
+    yarn_s_.assign(static_cast<size_t>(dim), 1.0f);
+    for (int i0 = 0; i0 + 1 < dim; i0 += 2) {
+        const float yr = (static_cast<float>(i0 / 2) - low) / denom;
+        const float ramp = 1.0f - std::min(1.0f, std::max(0.0f, yr));
+        const float ramp_mix = ramp * cfg.rope_yarn_ext_factor;
+        const float s = cfg.rope_yarn_freq_scale * (1.0f - ramp_mix) + ramp_mix;
+        yarn_s_[static_cast<size_t>(i0)] = s;
+        yarn_s_[static_cast<size_t>(i0) + 1] = s;
+    }
+
+}
+
+const float* Xing4_0Engine::yarn_s_dev_ptr() {
+    if (yarn_s_.empty())
+        return nullptr;
+#ifdef USE_CUDA
+    if (!yarn_s_dev_) {
+        const int dim = static_cast<int>(yarn_s_.size());
+        auto host = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{dim},
+                                             DeviceType::CPU);
+        std::memcpy(host->data(), yarn_s_.data(), sizeof(float) * dim);
+        yarn_s_dev_ = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{dim},
+                                               DeviceType::CUDA);
+        yarn_s_dev_->copy_from(*host);
+    }
+    return static_cast<const float*>(yarn_s_dev_->data());
+#else
+    return nullptr;
+#endif
 }
 
 void Xing4_0Engine::init_kv_cache(const ModelConfig& cfg) {
@@ -109,7 +174,7 @@ TensorPtr Xing4_0Engine::forward_request(const ForwardRequest& req) {
     }
 
     // mHC: replicate the embedding across the 4 residual streams [nt, 4*H].
-    hidden = hc_expand(hidden, first_dev.type);
+    hidden = mhc_.expand(hidden, first_dev.type);
     if (!hidden)
         return nullptr;
 
@@ -129,7 +194,7 @@ TensorPtr Xing4_0Engine::forward_request(const ForwardRequest& req) {
 
     // Average the residual streams -> single stream for the head.
     DeviceTarget last_dev = layer_device_target(n_layers_ - 1);
-    hidden = hc_mean(hidden, last_dev.type);
+    hidden = mhc_.mean(hidden, last_dev.type);
     if (!hidden)
         return nullptr;
 
@@ -257,8 +322,8 @@ TensorPtr Xing4_0Engine::forward_batch(const InferenceBatch& batch) {
 }
 
 // ============================================================================
-// forward_layer: hc_pre(attn) -> norm -> MLA -> hc_post -> hc_pre(ffn) ->
-//                norm -> FFN -> hc_post
+// forward_layer: mhc.pre(attn) -> norm -> MLA -> mhc.post -> mhc.pre(ffn) ->
+//                norm -> FFN -> mhc.post
 // ============================================================================
 
 TensorPtr Xing4_0Engine::forward_layer(const TensorPtr& hidden,
@@ -271,7 +336,7 @@ TensorPtr Xing4_0Engine::forward_layer(const TensorPtr& hidden,
 
     // ---- attention block ----
     TensorPtr post_a, comb_a;
-    TensorPtr x_in = hc_pre(x4, lw.get("hc_attn_fn"), lw.get("hc_attn_scale"),
+    TensorPtr x_in = mhc_.pre(x4, lw.get("hc_attn_fn"), lw.get("hc_attn_scale"),
                             lw.get("hc_attn_base"), post_a, comb_a, dev, lctx.layer_idx);
     if (!x_in)
         return nullptr;
@@ -279,13 +344,13 @@ TensorPtr Xing4_0Engine::forward_layer(const TensorPtr& hidden,
     TensorPtr attn_out = apply_mla(normed, lctx);
     if (!attn_out)
         return nullptr;
-    x4 = hc_post(attn_out, hidden, post_a, comb_a, dev);
+    x4 = mhc_.post(attn_out, hidden, post_a, comb_a, dev);
     if (!x4)
         return nullptr;
 
     // ---- ffn block ----
     TensorPtr post_f, comb_f;
-    x_in = hc_pre(x4, lw.get("hc_ffn_fn"), lw.get("hc_ffn_scale"), lw.get("hc_ffn_base"),
+    x_in = mhc_.pre(x4, lw.get("hc_ffn_fn"), lw.get("hc_ffn_scale"), lw.get("hc_ffn_base"),
                   post_f, comb_f, dev, lctx.layer_idx);
     if (!x_in)
         return nullptr;
@@ -295,214 +360,7 @@ TensorPtr Xing4_0Engine::forward_layer(const TensorPtr& hidden,
                             : apply_moe_ffn(normed, lctx);
     if (!ffn_out)
         return nullptr;
-    return hc_post(ffn_out, x4, post_f, comb_f, dev);
-}
-
-// ============================================================================
-// mHC helpers
-// ============================================================================
-
-// Sinkhorn normalization of the 4x4 combiner, c[src*4+dst]. Reference order:
-// softmax over src (no eps) -> norm_dst -> (iters-1) x {norm_src, norm_dst};
-// eps is only added to the normalization denominators.
-static void xing4_sinkhorn(float* c, int iters, float eps) {
-    auto norm_dst = [&]() {  // each src row sums to 1
-        for (int src = 0; src < 4; ++src) {
-            float sum = eps;
-            for (int dst = 0; dst < 4; ++dst) sum += c[src * 4 + dst];
-            for (int dst = 0; dst < 4; ++dst) c[src * 4 + dst] /= sum;
-        }
-    };
-    auto norm_src = [&]() {  // each dst column sums to 1
-        for (int dst = 0; dst < 4; ++dst) {
-            float sum = eps;
-            for (int src = 0; src < 4; ++src) sum += c[src * 4 + dst];
-            for (int src = 0; src < 4; ++src) c[src * 4 + dst] /= sum;
-        }
-    };
-    for (int dst = 0; dst < 4; ++dst) {  // softmax over src
-        float mx = -std::numeric_limits<float>::infinity();
-        for (int src = 0; src < 4; ++src) mx = std::max(mx, c[src * 4 + dst]);
-        float sum = 0.0f;
-        for (int src = 0; src < 4; ++src) {
-            const float e = std::exp(c[src * 4 + dst] - mx);
-            c[src * 4 + dst] = e;
-            sum += e;
-        }
-        for (int src = 0; src < 4; ++src) c[src * 4 + dst] /= sum;
-    }
-    norm_dst();
-    for (int i = 1; i < iters; ++i) {
-        norm_src();
-        norm_dst();
-    }
-}
-
-TensorPtr Xing4_0Engine::hc_pre(const TensorPtr& x4, const TensorPtr& fn,
-                                const TensorPtr& scale, const TensorPtr& base,
-                                TensorPtr& post, TensorPtr& comb, DeviceType dev,
-                                int layer_idx) {
-    PERF_SCOPE("layer/hc_pre");
-    const auto& cfg = model_.config();
-    const int H = cfg.hidden_dim;
-    const int nt = static_cast<int>(x4->shape()[0]);
-    const float eps = cfg.rms_norm_eps;
-
-    if (!fn || !scale || !base) {
-        LOG_ERROR("Xing4_0Engine: layer " + std::to_string(layer_idx) +
-                  " missing hc tensors");
-        return nullptr;
-    }
-
-    // mixes = rms_norm(x4) @ fn^T -> [nt, 24]; rows: 0:4 pre, 4:8 post, 8:24 comb
-    TensorPtr flat_norm = ops::rms_norm(x4, nullptr, eps);
-    TensorPtr mixes = ops::matmul_transB(flat_norm, fn);
-    if (!mixes)
-        return nullptr;
-
-    post = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{nt, 4}, dev);
-    comb = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{nt, 16}, dev);
-    auto x_in = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{nt, H}, dev);
-
-    if (dev == DeviceType::CUDA) {
-#ifdef USE_CUDA
-        cuda::xing4_hc_pre_launch(mixes, x4, scale, base, x_in, post, comb, nt, H, eps,
-                                  cfg.hc_sinkhorn_iters);
-#endif
-    } else {
-        const float* m = static_cast<const float*>(ensure_cpu(mixes)->data());
-        const float* sc = static_cast<const float*>(ensure_cpu(scale)->data());
-        const float* b = static_cast<const float*>(ensure_cpu(base)->data());
-        const float* x4d = static_cast<const float*>(ensure_cpu(x4)->data());
-        float* pd = static_cast<float*>(post->data());
-        float* cd = static_cast<float*>(comb->data());
-        float* xd = static_cast<float*>(x_in->data());
-
-        std::vector<float> c(16), pre(4);
-        for (int t = 0; t < nt; ++t) {
-            const float* mt = m + static_cast<int64_t>(t) * 24;
-            for (int i = 0; i < 4; ++i)
-                pre[i] = 1.0f / (1.0f + std::exp(-(sc[0] * mt[i] + b[i])));
-            for (int i = 0; i < 4; ++i)
-                pd[static_cast<int64_t>(t) * 4 + i] =
-                    (1.0f / (1.0f + std::exp(-(sc[1] * mt[4 + i] + b[4 + i])))) * 2.0f;
-            for (int r = 0; r < 16; ++r) {  // r = src + 4*dst
-                float v = sc[2] * mt[8 + r] + b[8 + r];
-                c[r] = std::clamp(v, -30.0f, 30.0f);
-            }
-            xing4_sinkhorn(c.data(), cfg.hc_sinkhorn_iters, eps);
-            for (int r = 0; r < 16; ++r)
-                cd[static_cast<int64_t>(t) * 16 + r] = c[r];
-            // x_in[t,d] = sum_ih x4[t, ih*H+d] * pre[ih]
-            float* xr = xd + static_cast<int64_t>(t) * H;
-            const float* x4r = x4d + static_cast<int64_t>(t) * 4 * H;
-            for (int d = 0; d < H; ++d) {
-                float acc = 0.0f;
-                for (int ih = 0; ih < 4; ++ih)
-                    acc += x4r[ih * H + d] * pre[ih];
-                xr[d] = acc;
-            }
-        }
-    }
-    return x_in;
-}
-
-TensorPtr Xing4_0Engine::hc_post(const TensorPtr& x, const TensorPtr& res4,
-                                 const TensorPtr& post, const TensorPtr& comb,
-                                 DeviceType dev) {
-    PERF_SCOPE("layer/hc_post");
-    const int H = model_.config().hidden_dim;
-    const int nt = static_cast<int>(x->shape()[0]);
-    auto out4 = std::make_shared<Tensor>(DataType::FP32,
-                                         std::vector<int64_t>{nt, static_cast<int64_t>(4) * H},
-                                         dev);
-    if (dev == DeviceType::CUDA) {
-#ifdef USE_CUDA
-        cuda::xing4_hc_post_launch(x, res4, post, comb, out4, nt, H);
-#endif
-    } else {
-        const float* xd = static_cast<const float*>(x->data());
-        const float* rd = static_cast<const float*>(res4->data());
-        const float* pd = static_cast<const float*>(post->data());
-        const float* cd = static_cast<const float*>(comb->data());
-        float* od = static_cast<float*>(out4->data());
-        for (int t = 0; t < nt; ++t) {
-            for (int dst = 0; dst < 4; ++dst) {
-                const float pw = pd[static_cast<int64_t>(t) * 4 + dst];
-                const float* xr = xd + static_cast<int64_t>(t) * H;
-                float* orow = od + static_cast<int64_t>(t) * 4 * H + dst * H;
-                const float* rrow = rd + static_cast<int64_t>(t) * 4 * H;
-                const float* crow = cd + static_cast<int64_t>(t) * 16;
-                for (int d = 0; d < H; ++d) {
-                    float acc = xr[d] * pw;
-                    for (int src = 0; src < 4; ++src)
-                        acc += rrow[src * H + d] * crow[src * 4 + dst];
-                    orow[d] = acc;
-                }
-            }
-        }
-    }
-    return out4;
-}
-
-TensorPtr Xing4_0Engine::hc_mean(const TensorPtr& x4, DeviceType dev) {
-    PERF_SCOPE("head/hc_mean");
-    const int H = model_.config().hidden_dim;
-    const int nt = static_cast<int>(x4->shape()[0]);
-    auto out = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{nt, H}, dev);
-    if (dev == DeviceType::CUDA) {
-#ifdef USE_CUDA
-        cuda::xing4_hc_mean_launch(x4, out, nt, H);
-#endif
-    } else {
-        const float* xd = static_cast<const float*>(x4->data());
-        float* od = static_cast<float*>(out->data());
-        for (int t = 0; t < nt; ++t) {
-            const float* xr = xd + static_cast<int64_t>(t) * 4 * H;
-            float* orow = od + static_cast<int64_t>(t) * H;
-            for (int d = 0; d < H; ++d)
-                orow[d] = (xr[d] + xr[H + d] + xr[2 * H + d] + xr[3 * H + d]) * 0.25f;
-        }
-    }
-    return out;
-}
-
-TensorPtr Xing4_0Engine::hc_expand(const TensorPtr& x, DeviceType dev) {
-    const int H = model_.config().hidden_dim;
-    const int nt = static_cast<int>(x->shape()[0]);
-    if (x->shape()[1] == static_cast<int64_t>(4) * H)
-        return x;  // already a 4-way stream
-    auto x4 = std::make_shared<Tensor>(DataType::FP32,
-                                       std::vector<int64_t>{nt, static_cast<int64_t>(4) * H},
-                                       dev);
-    if (x->device() != dev) {
-        // Caller guarantees placement; guard anyway.
-        auto xc = ensure_cpu(x);
-        const float* src = static_cast<const float*>(xc->data());
-        float* dst = static_cast<float*>(x4->data());
-        for (int t = 0; t < nt; ++t) {
-            const float* row = src + static_cast<int64_t>(t) * H;
-            float* orow = dst + static_cast<int64_t>(t) * 4 * H;
-            for (int ih = 0; ih < 4; ++ih)
-                std::memcpy(orow + ih * H, row, H * sizeof(float));
-        }
-        return x4;
-    }
-    if (dev == DeviceType::CUDA) {
-#ifdef USE_CUDA
-        cuda::xing4_hc_expand_launch(x, x4, nt, H);
-#endif
-    } else {
-        const float* src = static_cast<const float*>(x->data());
-        float* dst = static_cast<float*>(x4->data());
-        for (int t = 0; t < nt; ++t) {
-            const float* row = src + static_cast<int64_t>(t) * H;
-            float* orow = dst + static_cast<int64_t>(t) * 4 * H;
-            for (int ih = 0; ih < 4; ++ih)
-                std::memcpy(orow + ih * H, row, H * sizeof(float));
-        }
-    }
-    return x4;
+    return mhc_.post(ffn_out, x4, post_f, comb_f, dev);
 }
 
 // ============================================================================
@@ -572,7 +430,27 @@ TensorPtr Xing4_0Engine::apply_mla(const TensorPtr& normed, const LayerExecution
     const int kv_lora = cfg.kv_lora_rank;
     const int latent_dim = kv_lora + rope_dim;
     const float theta = cfg.rope_theta;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(qk_head_dim));
+
+    // YaRN: llama.cpp xing4_0.cpp build_graph pre-scales kq_scale with mscale^2
+    // and applies the interpolated rope frequencies at every position.
+    ops::MlaRopeYarn yarn;
+    float scale = 1.0f / std::sqrt(static_cast<float>(qk_head_dim));
+    if (cfg.rope_yarn_enabled) {
+        yarn.enabled = true;
+        yarn.freq_scale = cfg.rope_yarn_freq_scale;
+        yarn.ext_factor = cfg.rope_yarn_ext_factor;
+        yarn.attn_factor = cfg.rope_yarn_attn_factor;
+        yarn.beta_fast = cfg.rope_yarn_beta_fast;
+        yarn.beta_slow = cfg.rope_yarn_beta_slow;
+        yarn.n_ctx_orig = cfg.rope_yarn_orig_ctx;
+
+        const float fs = cfg.rope_yarn_freq_scale;
+        const float ln_inv = std::log(1.0f / fs);
+        const float attn_factor_org = cfg.rope_yarn_attn_factor * (1.0f + 0.1f * ln_inv);
+        const float mscale =
+            attn_factor_org * (1.0f + 0.1f * cfg.rope_yarn_log_mul * ln_inv);
+        scale = mscale * mscale / std::sqrt(static_cast<float>(qk_head_dim));
+    }
 
     // Q low-rank path: q = wq_b @ RMSNorm(x @ wq_a; attn_q_a_norm)
     TensorPtr q_low = ops::matmul_transB(normed, lw.wq_a());
@@ -650,7 +528,9 @@ TensorPtr Xing4_0Engine::apply_mla(const TensorPtr& normed, const LayerExecution
                                                  std::vector<int64_t>{cur_n, rope_dim}, dev);
     if (on_cuda) {
 #ifdef USE_CUDA
-        cuda::mla_rope_launch(c_rope_new, k_pe_rot_new, rope_pos, cur_n, rope_dim, theta);
+        const float* ys = yarn_s_dev_ptr();
+        cuda::mla_rope_launch(c_rope_new, k_pe_rot_new, rope_pos, cur_n, rope_dim, theta,
+                              ys, yarn_mscale_);
 #endif
     } else {
         const float* cr = static_cast<const float*>(c_rope_new->data());
@@ -659,7 +539,7 @@ TensorPtr Xing4_0Engine::apply_mla(const TensorPtr& normed, const LayerExecution
             float* dst = kr + static_cast<int64_t>(r) * rope_dim;
             std::memcpy(dst, cr + static_cast<int64_t>(r) * rope_dim,
                         rope_dim * sizeof(float));
-            ops::apply_rope_interleaved(dst, rope_dim, rope_pos + r, theta);
+            ops::apply_rope_yarn(dst, rope_dim, rope_pos + r, theta, yarn);
         }
     }
 
@@ -718,14 +598,17 @@ TensorPtr Xing4_0Engine::apply_mla(const TensorPtr& normed, const LayerExecution
     TensorPtr out;
     if (on_cuda) {
 #ifdef USE_CUDA
+        const float* ys = yarn_s_dev_ptr();
         cuda::mla_attention_launch(q_flat, c_nope_norm_full, k_pe_rot_full, kb, v_all_full,
                                    nullptr, start_pos, seq_len, total, n_heads, kv_lora,
-                                   qk_nope_dim, rope_dim, v_dim, theta, scale, out);
+                                   qk_nope_dim, rope_dim, v_dim, theta, scale, out, ys,
+                                   yarn_mscale_);
 #endif
     } else {
         out = ops::bailingmoe3_mla_attention(
             q_flat, c_nope_norm_full, k_pe_rot_full, kb, v_all_full, nullptr, start_pos,
-            seq_len, total, n_heads, kv_lora, qk_nope_dim, rope_dim, v_dim, theta, scale);
+            seq_len, total, n_heads, kv_lora, qk_nope_dim, rope_dim, v_dim, theta, scale,
+            cfg.rope_yarn_enabled ? &yarn : nullptr);
     }
     if (!out)
         return nullptr;

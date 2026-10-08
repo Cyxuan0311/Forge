@@ -493,16 +493,52 @@ ModelConfig parse_xing4_0_config(ModelLoader& loader, const std::string& arch) {
     // subtracting would silently drop a real layer.
     cfg.n_nextn_layers = 0;
 
-    // YaRN rope scaling: with factor=64 / orig_ctx=4096 the scaling is a no-op
-    // for absolute positions < 4096 (freq_scale=1, mscale=1 -> kq_scale =
-    // 1/sqrt(key_length_mla)). Beyond that this engine has no YaRN and would
-    // silently degrade; warn loudly here.
-    if (loader.get_metadata_int(arch + ".context_length", 0) >
-        loader.get_metadata_int(arch + ".rope.scaling.original_context_length", 0)) {
-        LOG_WARN("xing4_0: GGUF declares YaRN rope scaling (orig ctx " +
-                 std::to_string(loader.get_metadata_int(
-                     arch + ".rope.scaling.original_context_length", 0)) +
-                 "); this engine only supports prompts up to the original context");
+    // YaRN rope scaling. llama.cpp applies the interpolated frequencies at
+    // EVERY position (rope_yarn(): theta = freq_scale*theta_extrap blended by
+    // the ext_factor ramp) — it is NOT a no-op below the original context.
+    // Parameters follow llama-context.cpp's yarn_attn_factor_adjust.
+    const double yarn_factor = loader.get_metadata_float(arch + ".rope.scaling.factor", 0.0);
+    if (yarn_factor > 0.0) {
+        const float factor = static_cast<float>(yarn_factor);
+        cfg.rope_yarn_enabled = true;
+        cfg.rope_yarn_freq_scale = 1.0f / factor;
+        cfg.rope_yarn_orig_ctx = static_cast<int>(
+            loader.get_metadata_int(arch + ".rope.scaling.original_context_length", 0));
+        cfg.rope_yarn_beta_fast =
+            static_cast<float>(loader.get_metadata_float(arch + ".rope.scaling.yarn_beta_fast", 32.0));
+        cfg.rope_yarn_beta_slow =
+            static_cast<float>(loader.get_metadata_float(arch + ".rope.scaling.yarn_beta_slow", 1.0));
+        // The converter writes mscale_all_dim pre-multiplied by 0.1; llama.cpp
+        // cancels that in the xing4_0 loader (rope_yarn_log_mul /= 0.1f).
+        cfg.rope_yarn_log_mul = static_cast<float>(
+                                    loader.get_metadata_float(arch + ".rope.scaling.yarn_log_multiplier", 0.0)) /
+                                0.1f;
+        // llama-context.cpp: yarn_ext_factor defaults to 1.0 for LLAMA_ROPE_SCALING_TYPE_YARN
+        cfg.rope_yarn_ext_factor = 1.0f;
+
+        auto get_mscale = [](float s, float m) {
+            return s <= 1.0f ? 1.0f : (0.1f * m * std::log(s) + 1.0f);
+        };
+        float attn = 1.0f;
+        if (cfg.rope_yarn_ext_factor != 0.0f) {
+            if (cfg.rope_yarn_log_mul != 0.0f) {
+                // note: llama.cpp assumes mscale == 1.0f unless arch == DEEPSEEK2
+                attn = get_mscale(factor, 1.0f) / get_mscale(factor, cfg.rope_yarn_log_mul);
+            } else {
+                attn = get_mscale(factor, 1.0f);
+            }
+            // cancel the factor ggml's rope_yarn() re-applies
+            attn *= 1.0f / (1.0f + 0.1f * std::log(factor));
+        }
+        // rope.scaling.attn_factor is absent in this GGUF -> hparams value 1.0
+        cfg.rope_yarn_attn_factor = attn;
+
+        LOG_INFO("xing4_0: YaRN enabled (factor " + std::to_string(factor) +
+                 ", freq_scale " + std::to_string(cfg.rope_yarn_freq_scale) +
+                 ", orig_ctx " + std::to_string(cfg.rope_yarn_orig_ctx) +
+                 ", ext_factor " + std::to_string(cfg.rope_yarn_ext_factor) +
+                 ", attn_factor " + std::to_string(cfg.rope_yarn_attn_factor) +
+                 ", log_mul " + std::to_string(cfg.rope_yarn_log_mul) + ")");
     }
     return cfg;
 }
