@@ -26,6 +26,7 @@
 
 #include "forge/backend.h"
 #include "forge/dashboard.h"
+#include "dashboard/launcher.h"
 
 #ifdef _WIN32
 #    include <io.h>
@@ -218,6 +219,7 @@ std::string DashboardServer::snapshot_to_json(const MetricsSnapshot& s) {
 
 struct DashboardServer::Impl {
     httplib::Server svr;
+    forge::ProcessLauncher launcher;  // start/stop/status a child forge-server
 };
 
 DashboardServer::~DashboardServer() {
@@ -370,6 +372,56 @@ bool DashboardServer::start(const DashboardArgs& args, std::string& error) {
                         "application/json");
     });
 
+    // ---- Chat launcher: start / stop / status a child forge-server ----------
+    // The dashboard lets the browser launch a model-serving child (with the same
+    // CLI the server binary takes) so the Chat page can talk to a real server
+    // without the operator dropping to a terminal. The child runs on its own API
+    // port; this dashboard stays on its own loopback port.
+    impl_->svr.Post("/api/launch", [&](const httplib::Request& req, httplib::Response& res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            res.status = 400;
+            res.set_content(R"({"ok":false,"error":"invalid JSON body"})", "application/json");
+            return;
+        }
+        forge::LaunchConfig cfg;
+        cfg.model = body.value("model", std::string());
+        cfg.ngl = body.value("ngl", -1);
+        cfg.ctx_size = body.value("ctx", 0);
+        cfg.threads = body.value("threads", 0);
+        cfg.host = body.value("host", std::string("127.0.0.1"));
+        cfg.port = body.value("port", 8080);
+        cfg.api_key = body.value("apiKey", std::string());
+        cfg.mmproj = body.value("mmproj", std::string());
+        if (body.contains("extra") && body["extra"].is_array()) {
+            for (const auto& e : body["extra"]) {
+                if (e.is_string())
+                    cfg.extra.push_back(e.get<std::string>());
+            }
+        }
+        std::string err;
+        const bool ok = impl_->launcher.start(cfg, err);
+        res.set_content(json{{"ok", ok}, {"error", err}, {"port", cfg.port}}.dump(),
+                        "application/json");
+    });
+    impl_->svr.Post("/api/launch/stop", [&](const httplib::Request&, httplib::Response& res) {
+        impl_->launcher.stop();
+        res.set_content(json{{"ok", true}}.dump(), "application/json");
+    });
+    impl_->svr.Get("/api/launch", [&](const httplib::Request&, httplib::Response& res) {
+        const forge::LaunchStatus s = impl_->launcher.status();
+        res.set_content(json{{"running", s.running},
+                            {"pid", s.pid},
+                            {"host", s.host},
+                            {"port", s.port},
+                            {"model", s.model},
+                            {"started_at", s.started_at},
+                            {"logs", s.logs},
+                            {"error", s.error}}
+                              .dump(),
+                        "application/json");
+    });
+
     // Bind before announcing, so the banner and the browser both get the port
     // that actually worked. A requested port is a preference: 9090 is commonly
     // taken, and failing the whole run over it is worse than landing on 9091.
@@ -480,6 +532,14 @@ size_t dashboard_asset_count() {
     return 0;
 }
 const DashboardAsset* dashboard_assets() {
+    return nullptr;
+}
+// The chat UI follows the dashboard: no npm build means no embedded assets,
+// and /chat/ answers 404 with a hint (see serve_chat_asset in server_routes.cpp).
+size_t chat_asset_count() {
+    return 0;
+}
+const DashboardAsset* chat_assets() {
     return nullptr;
 }
 #endif

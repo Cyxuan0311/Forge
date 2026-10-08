@@ -37,7 +37,15 @@ static constexpr int kCliSessions = 0;
 // Only called when the user passed --dashboard-ops. Recording a scope per
 // operator is not free, so arming it implicitly whenever the dashboard happened
 // to be enabled would trade decode throughput for a chart nobody asked for.
-static void begin_operator_window() {
+//
+// Takes the scope for the same reason end_operator_window() does: when the
+// dashboard is off, scope.recording() is false and there is nothing to attach
+// rows to, so the profiler must not be armed either. Checking it here rather
+// than only at close time is what keeps --dashboard-ops from slowing decode
+// down for a panel that will never be rendered.
+static void begin_operator_window(const forge::MetricsRegistry::RequestScope& scope) {
+    if (!scope.recording())
+        return;
     PerfProfiler::instance().reset();
     PerfProfiler::instance().enable();
 }
@@ -174,6 +182,8 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     // anyway so the two binaries report identical fields.
     forge::MetricsRegistry::RequestScope scope(/*streaming=*/true);
     scope.set_prompt_tokens(static_cast<int>(prompt_tokens.size()));
+    if (capture_operators)
+        begin_operator_window(scope);
 
     std::vector<int32_t> token_buffer;
     auto stream_cb = [&](int32_t tok, int /*step*/) {
@@ -320,6 +330,8 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     // the two produce the same field set.
     forge::MetricsRegistry::RequestScope scope(/*streaming=*/false);
     scope.set_prompt_tokens(static_cast<int>(prompt_tokens.size()));
+    if (capture_operators)
+        begin_operator_window(scope);
 
     if (std::getenv("FORGE_GEN_DEBUG")) {
         std::fprintf(stderr, "[gen-debug] prompt_ids(%zu):", prompt_tokens.size());

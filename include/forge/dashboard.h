@@ -87,4 +87,13 @@ struct DashboardAsset {
 size_t dashboard_asset_count();
 const DashboardAsset* dashboard_assets();
 
+// Chat UI assets (web-chat/, a Vue 3 + Vite project mirroring the dashboard
+// frontend). Built by the same npm pipeline and embedded with FUNC_PREFIX=chat
+// by cmake/EmbedDashboardAssets.cmake; served by forge-server on the API port
+// under /chat/. The static files are exempt from --api-key (a browser cannot
+// send a Bearer header before it has loaded the page that asks for it); every
+// /v1 endpoint stays authenticated.
+size_t chat_asset_count();
+const DashboardAsset* chat_assets();
+
 }  // namespace forge
