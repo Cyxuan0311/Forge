@@ -1,0 +1,23 @@
+<!doctype html>
+<!--
+  Forge Chat - a standalone, ChatGPT-style chat UI for forge-server.
+
+  Vue 3 + Vite project (mirrors web/, the performance dashboard). Built by
+  CMake and embedded into the binaries by cmake/EmbedDashboardAssets.cmake;
+  forge-server serves it from /chat/ on the API port. It talks to the
+  OpenAI-compatible API at the SAME origin (/v1), so no base URL or CORS
+  configuration is needed when opened from the server itself.
+
+  All user-facing text is English.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Forge Chat</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

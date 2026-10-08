@@ -300,6 +300,7 @@ add_library(
   src/inference/layers/qwen35_full_attention.cpp
   src/inference/layers/qwen35_linear_attention.cpp
   src/inference/layers/qwen3vl_full_attention.cpp
+  src/inference/layers/xing4_mhc.cpp
   src/inference/graph/graph_key.cpp
   src/inference/graph/layer_graph_builder.cpp
   src/inference/graph/llama_graph_builder.cpp
@@ -393,8 +394,20 @@ target_link_libraries(forge_httplib PUBLIC Threads::Threads)
 # When it is ON and npm is missing we warn and degrade instead of failing: the
 # dashboard still serves /api/metrics, and /dashboard/ explains how to rebuild.
 option(FORGE_BUILD_DASHBOARD
-       "Build the web dashboard frontend with npm (requires Node.js >= 18)" OFF)
+       "Build the web frontends (dashboard + chat UI) with npm (requires Node.js >= 18)" OFF)
 find_program(FORGE_NPM_EXECUTABLE NAMES npm)
+
+# ---- Standalone chat UI (web-chat/) ----------------------------------------
+# A Vue 3 + Vite project mirroring web/ (the dashboard), built by the same npm
+# pipeline and embedded with FUNC_PREFIX=chat so the accessors become
+# chat_assets()/chat_asset_count(). forge-server serves it on the API port
+# under /chat/ (see server_routes.cpp); the dashboard keeps its own loopback
+# port. Without Node.js the chat tables degrade to the empty stubs in
+# dashboard_server.cpp, same as the dashboard's.
+set(_forge_chat_dir ${CMAKE_CURRENT_SOURCE_DIR}/web-chat)
+set(_forge_chat_dist ${CMAKE_CURRENT_BINARY_DIR}/web-chat/dist)
+set(_forge_chat_assets_src ${CMAKE_CURRENT_BINARY_DIR}/chat_assets.cpp)
+
 if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
   set(_forge_web_dir ${CMAKE_CURRENT_SOURCE_DIR}/web)
   set(_forge_web_dist ${CMAKE_CURRENT_BINARY_DIR}/web/dist)
@@ -456,7 +469,7 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
       ${_forge_web_dir}/src/components/OperatorChart.vue
       ${_forge_web_dir}/src/components/RequestTable.vue
       ${_forge_web_dir}/src/components/StatTile.vue
-      ${_forge_web_dir}/src/components/ThemeButton.vue
+      ${_forge_web_dir}/src/components/ThemeSlider.vue
       ${_forge_web_dir}/src/components/TimeSeriesChart.vue)
   add_custom_command(
     OUTPUT ${_forge_web_dist}/index.html
@@ -492,10 +505,68 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
     COMMENT "Embedding web dashboard assets"
     VERBATIM)
 
+  # ---- chat UI: npm ci + build + embed (mirrors the dashboard pipeline) ----
+  set(_forge_chat_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-chat-npm.stamp)
+  add_custom_command(
+    OUTPUT ${_forge_chat_npm_stamp}
+    COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_chat_dir} -- --cache
+            ${CMAKE_CURRENT_BINARY_DIR}/npm-cache
+    COMMAND ${CMAKE_COMMAND} -E touch ${_forge_chat_npm_stamp}
+    WORKING_DIRECTORY ${_forge_chat_dir}
+    DEPENDS ${_forge_chat_dir}/package.json ${_forge_chat_dir}/package-lock.json
+    COMMENT "npm ci (web chat UI dependencies)"
+    VERBATIM)
+  add_custom_target(forge-chat-deps DEPENDS ${_forge_chat_npm_stamp})
+
+  set(_forge_chat_sources
+      ${_forge_chat_dir}/index.html
+      ${_forge_chat_dir}/vite.config.ts
+      ${_forge_chat_dir}/tsconfig.json
+      ${_forge_chat_dir}/env.d.ts
+      ${_forge_chat_dir}/package.json
+      ${_forge_chat_dir}/src/main.ts
+      ${_forge_chat_dir}/src/App.vue
+      ${_forge_chat_dir}/src/api.ts
+      ${_forge_chat_dir}/src/markdown.ts
+      ${_forge_chat_dir}/src/store.ts
+      ${_forge_chat_dir}/src/types.ts
+      ${_forge_chat_dir}/src/style.css
+      ${_forge_chat_dir}/src/components/Composer.vue
+      ${_forge_chat_dir}/src/components/ConnectionPanel.vue
+      ${_forge_chat_dir}/src/components/ModalShell.vue
+      ${_forge_chat_dir}/src/components/MessageItem.vue
+      ${_forge_chat_dir}/src/components/Sidebar.vue
+      ${_forge_chat_dir}/src/components/SettingsPanel.vue
+      ${_forge_chat_dir}/src/components/ThinkingIndicator.vue
+      ${_forge_chat_dir}/src/components/TopBar.vue)
+  add_custom_command(
+    OUTPUT ${_forge_chat_dist}/index.html
+    COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir ${_forge_chat_dist}
+            --emptyOutDir
+    WORKING_DIRECTORY ${_forge_chat_dir}
+    DEPENDS ${_forge_chat_npm_stamp} ${_forge_chat_sources}
+    COMMENT "npm run build (web chat UI)"
+    VERBATIM)
+  add_custom_target(forge-chat-assets ALL DEPENDS ${_forge_chat_dist}/index.html)
+
+  add_custom_command(
+    OUTPUT ${_forge_chat_assets_src}
+    COMMAND
+      ${CMAKE_COMMAND} -DINPUT_DIR=${_forge_chat_dist}
+      -DOUTPUT_FILE=${_forge_chat_assets_src} -DFUNC_PREFIX=chat -P
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedDashboardAssets.cmake
+    # File-level staleness on the dist shell (see the dashboard embed above).
+    DEPENDS ${_forge_chat_dist}/index.html
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedDashboardAssets.cmake
+    COMMENT "Embedding web chat UI assets"
+    VERBATIM)
+
   add_library(forge_dashboard STATIC src/dashboard/dashboard_server.cpp
-                                     ${_forge_dashboard_assets_src})
+                                     src/dashboard/launcher.cpp
+                                     ${_forge_dashboard_assets_src}
+                                     ${_forge_chat_assets_src})
   target_compile_definitions(forge_dashboard PUBLIC FORGE_DASHBOARD_EMBEDDED=1)
-  add_dependencies(forge_dashboard forge-dashboard-assets)
+  add_dependencies(forge_dashboard forge-dashboard-assets forge-chat-deps)
 else()
   if(FORGE_BUILD_DASHBOARD)
     message(
@@ -509,10 +580,13 @@ else()
         "Web dashboard frontend OFF (-DFORGE_BUILD_DASHBOARD=ON to build it with npm)"
     )
   endif()
-  add_library(forge_dashboard STATIC src/dashboard/dashboard_server.cpp)
+  add_library(forge_dashboard STATIC src/dashboard/dashboard_server.cpp
+                                     src/dashboard/launcher.cpp)
 endif()
+
 target_include_directories(
   forge_dashboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                         ${CMAKE_CURRENT_SOURCE_DIR}/src
                          ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_link_libraries(forge_dashboard PUBLIC forge_infer forge_httplib)
 if(CUDAToolkit_FOUND)
