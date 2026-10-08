@@ -453,35 +453,48 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
 
     if (weight->device() == DeviceType::CUDA) {
 #ifdef USE_CUDA
+        // Every launch_* kernel below dereferences the index array on the
+        // device, so a caller that assembles indices on the host (e.g. the
+        // multimodal path, which expands image placeholders itself) would hand
+        // the kernel a host pointer and fault with an illegal memory access.
+        // Stage the indices on the device once, up front.
+        TensorPtr idx_dev;
+        const int32_t* idx_ptr = static_cast<const int32_t*>(indices->data());
+        if (indices->device() != DeviceType::CUDA) {
+            idx_dev = std::make_shared<Tensor>(indices->dtype(), indices->shape(),
+                                               DeviceType::CUDA);
+            idx_dev->copy_from(*indices);
+            idx_ptr = static_cast<const int32_t*>(idx_dev->data());
+        }
         bool transposed = (weight->shape().size() >= 2 && weight->shape()[0] < weight->shape()[1]);
         if (weight->dtype() == DataType::Q4_0) {
             cuda::launch_embedding_q4_0(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q4_1) {
             cuda::launch_embedding_q4_1(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q4_K) {
             cuda::launch_embedding_q4_k(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q5_K) {
             cuda::launch_embedding_q5_k(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q6_K) {
             cuda::launch_embedding_q6_k(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q2_K) {
             cuda::launch_embedding_q2_k(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::Q3_K) {
             cuda::launch_embedding_q3_k(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size, transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (weight->dtype() == DataType::IQ3_S) {
             // Device-side row gather straight from the quantized table: keeps
             // the indices on device (the generic fallback below does a blocking
@@ -490,9 +503,8 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
             bool transposed =
                 (weight->shape().size() >= 2 && weight->shape()[0] < weight->shape()[1]);
             cuda::launch_embedding_iq3_s(
-                weight->data(), static_cast<const int32_t*>(indices->data()),
-                static_cast<float*>(out->data()), num_indices, embed_dim, vocab_size,
-                transposed);
+                weight->data(), idx_ptr, static_cast<float*>(out->data()), num_indices,
+                embed_dim, vocab_size, transposed);
         } else if (is_quantized_type(weight->dtype())) {
             auto dequant_fn = get_dequant_emb_fn(weight->dtype());
             if (dequant_fn) {
@@ -547,18 +559,15 @@ TensorPtr embedding(const TensorPtr& weight, const TensorPtr& indices,
                 }
             }
         } else if (weight->dtype() == DataType::FP16) {
-            cuda::launch_embedding_fp16(weight->data(),
-                                        static_cast<const int32_t*>(indices->data()),
+            cuda::launch_embedding_fp16(weight->data(), idx_ptr,
                                         static_cast<float*>(out->data()), num_indices, embed_dim,
                                         vocab_size, transposed);
         } else if (weight->dtype() == DataType::BF16) {
-            cuda::launch_embedding_bf16(weight->data(),
-                                        static_cast<const int32_t*>(indices->data()),
+            cuda::launch_embedding_bf16(weight->data(), idx_ptr,
                                         static_cast<float*>(out->data()), num_indices, embed_dim,
                                         vocab_size, transposed);
         } else {
-            cuda::launch_embedding_fp32(static_cast<const float*>(weight->data()),
-                                        static_cast<const int32_t*>(indices->data()),
+            cuda::launch_embedding_fp32(static_cast<const float*>(weight->data()), idx_ptr,
                                         static_cast<float*>(out->data()), num_indices, embed_dim,
                                         vocab_size, transposed);
         }
