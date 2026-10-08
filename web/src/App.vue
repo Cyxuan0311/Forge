@@ -22,7 +22,7 @@ import GaugePanel from './components/GaugePanel.vue'
 import LatencyChart from './components/LatencyChart.vue'
 import OperatorChart from './components/OperatorChart.vue'
 import RequestTable from './components/RequestTable.vue'
-import ThemeButton from './components/ThemeButton.vue'
+import ThemeSlider from './components/ThemeSlider.vue'
 import ExportMenu from './components/ExportMenu.vue'
 
 const data = ref<Metrics | null>(null)
@@ -146,7 +146,7 @@ const memSeriesNote = computed(() => {
       <span class="spacer" />
       <span v-if="paused" class="meta">paused (tab hidden)</span>
       <ExportMenu :data="data" />
-      <ThemeButton />
+      <ThemeSlider />
     </div>
 
     <!-- Live progress: the one element that makes an in-flight generation

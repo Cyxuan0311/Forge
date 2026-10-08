@@ -322,31 +322,30 @@ expect('a theme is applied before first paint', root.dataset.theme === 'light', 
 expect('color-scheme follows the theme', root.style.colorScheme === 'light', `got ${root.style.colorScheme}`)
 expect('theme control starts on system', themeBtn?.dataset.mode === 'system', `got ${themeBtn?.dataset.mode}`)
 
-// Cycle it twice: system -> light -> dark. Each click must move BOTH the
-// attribute and the persisted mode, and both must agree with each other.
-const seen = [root.dataset.theme]
-for (const expectedMode of ['light', 'dark']) {
-  themeBtn.click()
+// The slider has one stop per mode. Selecting a stop must move BOTH the
+// data-mode attribute and the persisted mode, and both must agree with the
+// resolved colour on <html> (system re-resolves from matchMedia -> light).
+const clickStop = (mode) => {
+  const stop = q(`[data-testid="theme-stop-${mode}"]`)
+  expect(`slider has a ${mode} stop`, !!stop, 'missing stop')
+  stop?.click()
+}
+const wantTheme = (mode) => (mode === 'system' ? 'light' : mode)
+for (const mode of ['light', 'dark', 'system']) {
+  clickStop(mode)
   await new Promise((r) => setTimeout(r, 5))
   expect(
-    `clicking the theme control advances to ${expectedMode}`,
-    themeBtn.dataset.mode === expectedMode,
+    `selecting ${mode} moves the slider`,
+    themeBtn.dataset.mode === mode,
     `data-mode=${themeBtn.dataset.mode}`,
   )
-  expect(`data-theme is ${expectedMode}`, root.dataset.theme === expectedMode, `got ${root.dataset.theme}`)
+  expect(`data-theme follows ${mode}`, root.dataset.theme === wantTheme(mode), `got ${root.dataset.theme}`)
   expect(
-    `${expectedMode} is persisted`,
-    dom.window.localStorage.getItem('forge.dashboard.theme') === expectedMode,
+    `${mode} is persisted`,
+    dom.window.localStorage.getItem('forge.dashboard.theme') === mode,
     `got ${dom.window.localStorage.getItem('forge.dashboard.theme')}`,
   )
-  seen.push(root.dataset.theme)
 }
-// Third click returns to system, which resolves back through matchMedia.
-themeBtn.click()
-await new Promise((r) => setTimeout(r, 5))
-expect('the cycle wraps back to system', themeBtn.dataset.mode === 'system')
-expect('system re-resolves from matchMedia', root.dataset.theme === 'light', `got ${root.dataset.theme}`)
-expect('the cycle visited each mode', seen.join(',') === 'light,light,dark', seen.join(','))
 
 // A light theme must not leave any hardcoded dark literal behind in the CSS the
 // bundle shipped, which is what would show as dark panels on a light page.

@@ -62,7 +62,7 @@ src/
     GaugePanel.vue      VRAM / KV donuts
     OperatorChart.vue   PerfProfiler top-operator bars
     RequestTable.vue    per-request table
-    ThemeButton.vue     the light/dark/system cycling button
+    ThemeSlider.vue     the light/dark/system slider
     ExportMenu.vue      the export button and its format menu
 scripts/
   smoke.ts              renders every option headlessly, in both themes

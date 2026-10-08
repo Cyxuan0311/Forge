@@ -83,8 +83,11 @@ export function exportFilename(m: Metrics, spec: ExportSpec): string {
 /**
  * Save text as a file.
  *
- * The object URL is revoked on the next macrotask rather than synchronously:
- * revoking it inside the click handler can race the download in some browsers.
+ * Both teardown steps are deferred to the next macrotask. Revoking the object URL
+ * synchronously can race the download in some browsers; removing the anchor
+ * synchronously can cancel the navigation outright, which is exactly the
+ * "clicked Export and nothing happened" symptom. Deferring keeps the anchor alive
+ * until the browser has started the save.
  */
 export function download(filename: string, text: string, mime: string): void {
   const blob = new Blob([text], { type: `${mime};charset=utf-8` })
@@ -95,8 +98,10 @@ export function download(filename: string, text: string, mime: string): void {
   a.rel = 'noopener'
   document.body.appendChild(a)
   a.click()
-  document.body.removeChild(a)
-  setTimeout(() => URL.revokeObjectURL(url), 0)
+  setTimeout(() => {
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }, 0)
 }
 
 /**

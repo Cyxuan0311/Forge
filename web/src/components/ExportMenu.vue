@@ -8,6 +8,10 @@
  * Purely client-side by design: there is no /api/export route, so nothing here
  * can be scripted with curl. The Prometheus entry is a textfile for the
  * node_exporter collector, not a scrape target, and its hint says so.
+ *
+ * The result line (Saved … / Copied … / export failed …) is a small toast that
+ * clears itself after a few seconds, and is also dropped whenever the menu is
+ * opened or dismissed, so a stale message from a previous export cannot linger.
  */
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { EXPORT_FORMATS, runExport, type ExportSpec } from '../export/io'
@@ -20,25 +24,55 @@ const props = defineProps<{
 
 const open = ref(false)
 const status = ref<string | null>(null)
+const statusTone = ref<'ok' | 'err'>('ok')
 const root = ref<HTMLElement | null>(null)
+let statusTimer: ReturnType<typeof setTimeout> | null = null
 
 const ready = computed(() => props.data !== null)
 
-function close() {
-  open.value = false
+function clearStatusSoon(): void {
+  if (statusTimer) clearTimeout(statusTimer)
+  statusTimer = setTimeout(() => {
+    status.value = null
+    statusTimer = null
+  }, 4000)
 }
 
-function toggle() {
-  open.value = !open.value
+function setStatus(msg: string, tone: 'ok' | 'err'): void {
+  status.value = msg
+  statusTone.value = tone
+  clearStatusSoon()
+}
+
+function close(): void {
+  open.value = false
+  status.value = null
+  if (statusTimer) {
+    clearTimeout(statusTimer)
+    statusTimer = null
+  }
+}
+
+function toggle(): void {
+  if (open.value) {
+    close()
+    return
+  }
+  open.value = true
+  status.value = null
+  if (statusTimer) {
+    clearTimeout(statusTimer)
+    statusTimer = null
+  }
 }
 
 /** Click outside and Escape both dismiss; the menu is not a modal. */
-function onDocClick(e: MouseEvent) {
+function onDocClick(e: MouseEvent): void {
   if (!open.value) return
   if (root.value && !root.value.contains(e.target as Node)) close()
 }
 
-function onKey(e: KeyboardEvent) {
+function onKey(e: KeyboardEvent): void {
   if (e.key === 'Escape' && open.value) close()
 }
 
@@ -47,16 +81,17 @@ document.addEventListener('keydown', onKey)
 onBeforeUnmount(() => {
   document.removeEventListener('click', onDocClick)
   document.removeEventListener('keydown', onKey)
+  if (statusTimer) clearTimeout(statusTimer)
 })
 
-async function pick(spec: ExportSpec) {
+async function pick(spec: ExportSpec): Promise<void> {
   close()
   if (!props.data) return
-  status.value = null
   try {
-    status.value = await runExport(props.data, spec)
+    const name = await runExport(props.data, spec)
+    setStatus(name, 'ok')
   } catch (err) {
-    status.value = 'export failed: ' + (err instanceof Error ? err.message : String(err))
+    setStatus('export failed: ' + (err instanceof Error ? err.message : String(err)), 'err')
   }
 }
 </script>
@@ -89,9 +124,14 @@ async function pick(spec: ExportSpec) {
       </button>
     </span>
 
-    <span v-if="status" class="status" role="status" data-testid="export-status">{{
-      status
-    }}</span>
+    <span
+      v-if="status"
+      class="status"
+      :class="statusTone"
+      role="status"
+      data-testid="export-status"
+      >{{ status }}</span
+    >
   </span>
 </template>
 
@@ -177,7 +217,7 @@ async function pick(spec: ExportSpec) {
   top: calc(100% + 6px);
   right: 0;
   z-index: 21;
-  max-width: 300px;
+  max-width: 320px;
   padding: 4px 8px;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -187,5 +227,13 @@ async function pick(spec: ExportSpec) {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.status.ok {
+  color: var(--text);
+  border-color: var(--green);
+}
+.status.err {
+  color: var(--red);
+  border-color: var(--danger-border);
 }
 </style>
