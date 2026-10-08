@@ -25,6 +25,10 @@
 #include "forge/vit_shared.h"
 #include "forge/vision_registry.h"
 
+#ifdef USE_CUDA
+#    include "forge/cuda_kernels.h"
+#endif
+
 namespace forge {
 
 // ---- helpers ----
@@ -122,69 +126,149 @@ bool Qwen3VLViTEncoder::init(const WeightStore& store, const VisionConfig& confi
 
 // ---- prepare_weights ----
 
+// FP32 staging policy
+// --------------------
+// The mmproj stores the tower in FP16 (792 MB for Qwen3-VL-4B), but the op chain
+// here (matmul_transB, layer_norm, gelu) is written against FP32, so the naive
+// "dequantize everything once" costs 1583 MB of VRAM -- permanently resident,
+// and more than a 6 GB card can spare next to the KV cache. Measured on a
+// 6 GB RTX 4050: a default-context server had 4201 MiB after startup and jumped
+// to 5874 MiB on the first image request, leaving 258 MiB and pushing the whole
+// process into allocator thrash.
+//
+// So: keep the FP16 masters resident (they ARE the file's precision, so this is
+// lossless), plus the FP32 tensors the GGUF already stores as FP32 (norms and
+// biases, ~1 MB total), and materialize FP32 copies of the big F16 weights into
+// one reusable scratch buffer right before the block that needs them. The tower
+// runs its blocks in order and never revisits one, so a single slot is enough:
+// ~50 MB instead of 1583 MB, at the cost of one device-side F16->FP32 conversion
+// per block (~24 x 0.1 ms per image).
 void Qwen3VLViTEncoder::prepare_weights(DeviceType dev) {
     if (weights_prepared_ && weights_device_ == dev)
         return;
 
-    auto to_dev = [dev](const TensorPtr& t) -> TensorPtr {
-        auto fp32 = dequant_to_fp32_cpu(t);
-        return fp32 ? to_device(fp32, dev) : nullptr;
+    // Resident: the FP16 masters themselves, plus everything the GGUF already
+    // stores as FP32. No FP32 copies of the F16 weights are made here.
+    auto stage_native = [dev](const TensorPtr& t) -> TensorPtr {
+        return t ? to_device(t, dev) : nullptr;
     };
 
-    // Per-layer weights
     cached_layers_.resize(config_.block_count);
     for (int i = 0; i < config_.block_count; ++i) {
         const auto& src = weights_.layers[i];
         auto& dst = cached_layers_[i];
-        dst.ln1_weight = to_dev(src.ln1_weight);
-        dst.ln1_bias = to_dev(src.ln1_bias);
-        dst.ln2_weight = to_dev(src.ln2_weight);
-        dst.ln2_bias = to_dev(src.ln2_bias);
-        dst.attn_qkv_weight = to_dev(src.attn_qkv_weight);
-        dst.attn_qkv_bias = to_dev(src.attn_qkv_bias);
-        dst.attn_q_weight = to_dev(src.attn_q_weight);
-        dst.attn_q_bias = to_dev(src.attn_q_bias);
-        dst.attn_k_weight = to_dev(src.attn_k_weight);
-        dst.attn_k_bias = to_dev(src.attn_k_bias);
-        dst.attn_v_weight = to_dev(src.attn_v_weight);
-        dst.attn_v_bias = to_dev(src.attn_v_bias);
-        dst.attn_out_weight = to_dev(src.attn_out_weight);
-        dst.attn_out_bias = to_dev(src.attn_out_bias);
-        dst.ffn_up_weight = to_dev(src.ffn_up_weight);
-        dst.ffn_up_bias = to_dev(src.ffn_up_bias);
-        dst.ffn_down_weight = to_dev(src.ffn_down_weight);
-        dst.ffn_down_bias = to_dev(src.ffn_down_bias);
+        // FP16 masters (converted to FP32 on demand by load_block).
+        dst.attn_qkv_weight = stage_native(src.attn_qkv_weight);
+        dst.attn_out_weight = stage_native(src.attn_out_weight);
+        dst.ffn_up_weight = stage_native(src.ffn_up_weight);
+        dst.ffn_down_weight = stage_native(src.ffn_down_weight);
+        // Separate q/k/v weights, for towers that do not use the fused layout.
+        dst.attn_q_weight = stage_native(src.attn_q_weight);
+        dst.attn_k_weight = stage_native(src.attn_k_weight);
+        dst.attn_v_weight = stage_native(src.attn_v_weight);
+        // FP32 in the GGUF already: norms and biases are tiny, keep them as-is.
+        dst.ln1_weight = stage_native(src.ln1_weight);
+        dst.ln1_bias = stage_native(src.ln1_bias);
+        dst.ln2_weight = stage_native(src.ln2_weight);
+        dst.ln2_bias = stage_native(src.ln2_bias);
+        dst.attn_qkv_bias = stage_native(src.attn_qkv_bias);
+        dst.attn_q_bias = stage_native(src.attn_q_bias);
+        dst.attn_k_bias = stage_native(src.attn_k_bias);
+        dst.attn_v_bias = stage_native(src.attn_v_bias);
+        dst.attn_out_bias = stage_native(src.attn_out_bias);
+        dst.ffn_up_bias = stage_native(src.ffn_up_bias);
+        dst.ffn_down_bias = stage_native(src.ffn_down_bias);
     }
 
-    // Patch embedding
+    // Patch embedding / position embedding stay on the host: both are consumed
+    // by CPU kernels before the hidden state moves to the device.
     cached_patch_w0_ = dequant_to_fp32_cpu(weights_.patch_embd_weight);
     cached_patch_w1_ = dequant_to_fp32_cpu(weights_.patch_embd_weight_1);
     cached_patch_b_ = dequant_to_fp32_cpu(weights_.patch_embd_bias);
-    // Position embedding stays on CPU (used before hidden moves to CUDA)
     cached_pos_embd_ = dequant_to_fp32_cpu(weights_.position_embd_weight);
-    // Post-LN
-    pst_ln_w_ = to_dev(weights_.post_ln_weight);
-    pst_ln_b_ = to_dev(weights_.post_ln_bias);
-    // mm projector
-    mm0_w_ = to_dev(weights_.mm0_weight);
-    mm0_b_ = to_dev(weights_.mm0_bias);
-    mm2_w_ = to_dev(weights_.mm2_weight);
-    mm2_b_ = to_dev(weights_.mm2_bias);
 
-    // Deepstack
-    for (auto& [layer_idx, dw] : weights_.deepstack_weights) {
-        CachedDeepstack cd;
-        cd.norm_w = to_dev(dw.norm_weight);
-        cd.norm_b = to_dev(dw.norm_bias);
-        cd.fc1_w = to_dev(dw.fc1_weight);
-        cd.fc1_b = to_dev(dw.fc1_bias);
-        cd.fc2_w = to_dev(dw.fc2_weight);
-        cd.fc2_b = to_dev(dw.fc2_bias);
-        cached_deepstack_[layer_idx] = std::move(cd);
-    }
+    // Post-LN and the projector biases are FP32 already; the two projector
+    // matrices stay FP16 masters and are materialized per image in project().
+    pst_ln_w_ = stage_native(weights_.post_ln_weight);
+    pst_ln_b_ = stage_native(weights_.post_ln_bias);
+    mm0_b_ = stage_native(weights_.mm0_bias);
+    mm2_b_ = stage_native(weights_.mm2_bias);
+    mm0_master_ = stage_native(weights_.mm0_weight);
+    mm2_master_ = stage_native(weights_.mm2_weight);
+
+    // DeepStack side features are computed but never injected (encode() runs the
+    // ViT blocks only), so staging its FP32 copies was 312 MB of pure waste on a
+    // 4B tower. forward_deepstack() materializes its own weights on demand.
 
     weights_device_ = dev;
     weights_prepared_ = true;
+    loaded_block_ = -1;
+}
+
+// Materialize `master` (FP16, resident) as an FP32 tensor on `dev`, reusing
+// `scratch` when its shape already matches so a 24-block tower converts into the
+// same ~50 MB of device memory rather than allocating per block.
+TensorPtr Qwen3VLViTEncoder::fp32_from_master(const TensorPtr& master, TensorPtr& scratch,
+                                              DeviceType dev) {
+    if (!master)
+        return nullptr;
+    if (master->dtype() == DataType::FP32)
+        return to_device(master, dev);
+
+    if (!scratch || scratch->shape() != master->shape())
+        scratch = std::make_shared<Tensor>(DataType::FP32, master->shape(), dev);
+
+    if (dev == DeviceType::CUDA && master->device() == DeviceType::CUDA) {
+        // Device-side conversion: the master is already resident, so this is a
+        // pure D2D pass (~25 MB read + 50 MB write per block).
+#ifdef USE_CUDA
+        const int64_t rows = master->shape()[0];
+        const int64_t cols = master->numel() / std::max<int64_t>(rows, 1);
+        cuda::launch_dequant_f16_matrix(master->data(), static_cast<float*>(scratch->data()),
+                                        static_cast<int>(rows), static_cast<int>(cols));
+#else
+        scratch->copy_from(*master);
+#endif
+    } else {
+        auto fp32 = dequant_to_fp32_cpu(master);
+        scratch->copy_from(*fp32);
+    }
+    return scratch;
+}
+
+// Fill `out` with block `i`'s weights, converting its FP16 masters into the
+// shared scratch. Every block has the same shapes, so the scratch is allocated
+// once and refilled; blocks are visited in ascending order, so tracking the
+// last-loaded index is all the bookkeeping needed.
+const ViTLayerWeights& Qwen3VLViTEncoder::load_block(int i, DeviceType dev) {
+    if (loaded_block_ == i)
+        return active_layer_;
+
+    auto& src = cached_layers_[i];
+    auto& dst = active_layer_;
+
+    dst.ln1_weight = src.ln1_weight;
+    dst.ln1_bias = src.ln1_bias;
+    dst.ln2_weight = src.ln2_weight;
+    dst.ln2_bias = src.ln2_bias;
+    dst.attn_qkv_bias = src.attn_qkv_bias;
+    dst.attn_q_bias = src.attn_q_bias;
+    dst.attn_k_bias = src.attn_k_bias;
+    dst.attn_v_bias = src.attn_v_bias;
+    dst.attn_out_bias = src.attn_out_bias;
+    dst.ffn_up_bias = src.ffn_up_bias;
+    dst.ffn_down_bias = src.ffn_down_bias;
+
+    dst.attn_qkv_weight = fp32_from_master(src.attn_qkv_weight, scratch_qkv_, dev);
+    dst.attn_out_weight = fp32_from_master(src.attn_out_weight, scratch_out_, dev);
+    dst.ffn_up_weight = fp32_from_master(src.ffn_up_weight, scratch_ffn_up_, dev);
+    dst.ffn_down_weight = fp32_from_master(src.ffn_down_weight, scratch_ffn_down_, dev);
+    dst.attn_q_weight = fp32_from_master(src.attn_q_weight, scratch_q_, dev);
+    dst.attn_k_weight = fp32_from_master(src.attn_k_weight, scratch_k_, dev);
+    dst.attn_v_weight = fp32_from_master(src.attn_v_weight, scratch_v_, dev);
+
+    loaded_block_ = i;
+    return dst;
 }
 
 // ---- preprocess ----
@@ -596,11 +680,31 @@ TensorPtr Qwen3VLViTEncoder::forward_vit_block(const TensorPtr& hidden, const Vi
 
 TensorPtr Qwen3VLViTEncoder::forward_deepstack(const TensorPtr& hidden, int layer_idx,
                                                  int num_patches, DeviceType dev) {
-    auto it = cached_deepstack_.find(layer_idx);
-    if (it == cached_deepstack_.end())
+    // Dead code in the current forward pass (encode() runs the ViT blocks only),
+    // and prepare_weights deliberately does not stage these -- 312 MB of FP32
+    // for a 4B tower for features nobody consumes. Materialize on demand so the
+    // function stays correct if deepstack injection is ever wired up.
+    auto it = weights_.deepstack_weights.find(layer_idx);
+    if (it == weights_.deepstack_weights.end())
         return nullptr;
+    if (cached_deepstack_.find(layer_idx) == cached_deepstack_.end()) {
+        const auto& dw = it->second;
+        CachedDeepstack cd;
+        cd.norm_w = dw.norm_weight ? to_device(dw.norm_weight, dev) : nullptr;
+        cd.norm_b = dw.norm_bias ? to_device(dw.norm_bias, dev) : nullptr;
+        cd.fc1_b = dw.fc1_bias ? to_device(dw.fc1_bias, dev) : nullptr;
+        cd.fc2_b = dw.fc2_bias ? to_device(dw.fc2_bias, dev) : nullptr;
+        // FP16 masters stay on the host: the FP32 forms go through the scratch.
+        cd.fc1_w = dw.fc1_weight;
+        cd.fc2_w = dw.fc2_weight;
+        cached_deepstack_[layer_idx] = std::move(cd);
+    }
 
-    const auto& cd = it->second;
+    const auto& cd_it = cached_deepstack_.find(layer_idx);
+    CachedDeepstack& cd = cd_it->second;
+    TensorPtr fc1_w = fp32_from_master(cd.fc1_w, cd.scratch_fc1_, dev);
+    TensorPtr fc2_w = fp32_from_master(cd.fc2_w, cd.scratch_fc2_, dev);
+
     int dim = config_.embedding_length;
     int merge_factor = config_.spatial_merge_size * config_.spatial_merge_size;  // 4
 
@@ -643,9 +747,9 @@ TensorPtr Qwen3VLViTEncoder::forward_deepstack(const TensorPtr& hidden, int laye
     if (cd.norm_w) {
         h = ops::layer_norm(h, cd.norm_w, cd.norm_b, config_.layer_norm_epsilon);
     }
-    auto fc1_out = ops::matmul_transB(h, cd.fc1_w, cd.fc1_b);
+    auto fc1_out = ops::matmul_transB(h, fc1_w, cd.fc1_b);
     fc1_out = ops::gelu(fc1_out);
-    return ops::matmul_transB(fc1_out, cd.fc2_w, cd.fc2_b);
+    return ops::matmul_transB(fc1_out, fc2_w, cd.fc2_b);
 }
 
 // ---- project ----
@@ -684,12 +788,16 @@ TensorPtr Qwen3VLViTEncoder::project(const TensorPtr& hidden, int num_patches, i
         }
     });
 
-    // mm projector: mm.0 (GELU) + mm.2
+    // mm projector: mm.0 (GELU) + mm.2. The matrices are FP16 masters staged in
+    // prepare_weights; their FP32 forms are materialized here, once per image,
+    // rather than held resident (~104 MB for the 4B tower).
     auto h = to_device(concat_tokens, dev);
-    if (mm0_w_) {
-        auto up = ops::matmul_transB(h, mm0_w_, mm0_b_);
+    auto mm0_w = fp32_from_master(mm0_master_, scratch_mm0_, dev);
+    auto mm2_w = fp32_from_master(mm2_master_, scratch_mm2_, dev);
+    if (mm0_w && mm2_w) {
+        auto up = ops::matmul_transB(h, mm0_w, mm0_b_);
         up = ops::gelu(up);
-        h = ops::matmul_transB(up, mm2_w_, mm2_b_);
+        h = ops::matmul_transB(up, mm2_w, mm2_b_);
     }
 
     return h;
@@ -792,8 +900,10 @@ std::vector<float> Qwen3VLViTEncoder::encode(const float* rgb_data, int width, i
     {
         PERF_SCOPE("vision.vit_blocks");
         for (int i = 0; i < config_.block_count; ++i) {
-            hidden = forward_vit_block(hidden, cached_layers_[i], num_heads, head_dim,
-                                       positions.data());
+            // Materializes block i's FP32 weights into the shared scratch
+            // (~50 MB) instead of holding an FP32 copy of all 24 blocks.
+            const ViTLayerWeights& lw = load_block(i, dev);
+            hidden = forward_vit_block(hidden, lw, num_heads, head_dim, positions.data());
 
             // DeepStack: collect side features at specific layers
             bool is_deepstack = false;

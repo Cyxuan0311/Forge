@@ -262,8 +262,21 @@ private:
     // Final 2x2 spatial merge + mm projector
     TensorPtr project(const TensorPtr& hidden, int num_patches, int nx, int ny, DeviceType dev);
 
-    // Pre-dequantize all weights to FP32
+    // Stage the resident weight set on `dev`: FP16 masters as-is (that is the
+    // precision the mmproj stores) plus the FP32 tensors (norms, biases). No
+    // FP32 copies of the F16 weights are made here -- see the comment above
+    // Qwen3VLViTEncoder::prepare_weights for the VRAM accounting.
     void prepare_weights(DeviceType dev);
+
+    // Materialize block `i`'s FP32 weights into the shared scratch and return
+    // them. Blocks are visited in ascending order and never revisited, so one
+    // scratch slot (~50 MB for a 1024-wide tower) replaces a full FP32 copy of
+    // every block.
+    const ViTLayerWeights& load_block(int i, DeviceType dev);
+
+    // FP32 view of an FP16 master, converting into `scratch` (reused when the
+    // shape matches). Device-side when both live on the GPU.
+    TensorPtr fp32_from_master(const TensorPtr& master, TensorPtr& scratch, DeviceType dev);
 
     VisionConfig config_;
     VisionWeights weights_;
@@ -272,18 +285,31 @@ private:
     // Cached FP32 weights on target device
     DeviceType weights_device_ = DeviceType::CPU;
     bool weights_prepared_ = false;
+    // Per-block resident weights. For Qwen3-VL the big entries are the FP16
+    // masters (converted on demand by load_block); the norm/bias entries are
+    // already FP32 in the GGUF.
     std::vector<ViTLayerWeights> cached_layers_;
+    // Block whose weights currently live in the scratch below (-1 = none).
+    int loaded_block_ = -1;
+    ViTLayerWeights active_layer_;
+    // Reusable FP32 staging for one block (~50 MB at hidden=1024).
+    TensorPtr scratch_qkv_, scratch_out_, scratch_ffn_up_, scratch_ffn_down_;
+    TensorPtr scratch_q_, scratch_k_, scratch_v_;
     TensorPtr cached_pos_embd_;
     TensorPtr cached_patch_w0_, cached_patch_w1_, cached_patch_b_;
-    // cached mm projector
-    TensorPtr mm0_w_, mm0_b_, mm2_w_, mm2_b_;
+    // cached mm projector: FP16 masters + FP32 biases, FP32 matrices staged
+    // per image (see project()).
+    TensorPtr mm0_master_, mm2_master_, mm0_b_, mm2_b_;
+    TensorPtr scratch_mm0_, scratch_mm2_;
     // cached post_ln
     TensorPtr pst_ln_w_, pst_ln_b_;
-    // cached deepstack
+    // cached deepstack (materialized on demand; unused by the current forward)
     struct CachedDeepstack {
         TensorPtr norm_w, norm_b;
         TensorPtr fc1_w, fc1_b;
         TensorPtr fc2_w, fc2_b;
+        // FP32 staging slots for the F16 matrices.
+        TensorPtr scratch_fc1_, scratch_fc2_;
     };
     std::unordered_map<int, CachedDeepstack> cached_deepstack_;
 };
