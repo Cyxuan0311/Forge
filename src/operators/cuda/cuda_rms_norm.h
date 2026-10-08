@@ -36,5 +36,12 @@ void launch_rms_norm_fp8(const uint8_t* x, const uint8_t* weight, uint8_t* out, 
 void launch_rms_norm_unweighted_fp8(const uint8_t* x, uint8_t* out, int rows, int cols, float eps,
                                     cudaStream_t stream = 0);
 
+// FP32 LayerNorm, one block per row, two-pass mean/variance (mirrors the CPU
+// reference's arithmetic). weight/bias may be null (unweighted / no bias).
+// Added for the vision towers: ops::layer_norm previously had no device kernel
+// and round-tripped x through the host on every call.
+void launch_layer_norm(const float* x, const float* weight, const float* bias, float* out,
+                       int rows, int cols, float eps, cudaStream_t stream = 0);
+
 }  // namespace cuda
 }  // namespace forge

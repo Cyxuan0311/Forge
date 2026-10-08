@@ -32,6 +32,11 @@ namespace cuda {
 void launch_rms_norm(const float* x, const float* weight, float* out, int rows, int cols, float eps,
                      cudaStream_t stream = 0);
 
+// FP32 LayerNorm (2-D x [rows, cols]); weight/bias may be null. Two-pass
+// mean/variance matching the CPU reference in operators/cpu/norm.cpp.
+void launch_layer_norm(const float* x, const float* weight, const float* bias, float* out,
+                       int rows, int cols, float eps, cudaStream_t stream = 0);
+
 void launch_rms_norm_unweighted(const float* x, float* out, int rows, int cols, float eps,
                                 cudaStream_t stream = 0);
 

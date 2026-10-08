@@ -656,5 +656,86 @@ void launch_rms_norm_unweighted_fp8(const uint8_t* x, uint8_t* out, int rows, in
     }
 }
 
+// =========================================================================
+// LayerNorm (FP32) -- two-pass mean/variance, one block per row.
+// =========================================================================
+// Arithmetic mirrors the CPU reference in operators/cpu/norm.cpp exactly:
+// mean first, then the variance measured around that mean, then
+// (x - mean) * rsqrt(var/cols + eps) * w + b. Only the summation order differs
+// (tree reduction here vs a serial loop on the host), so results agree to FP32
+// round-off rather than bit-exactly.
+//
+// This exists because ops::layer_norm had no device kernel at all: it copied x
+// D2H, normalized on the host, and copied back. A vision tower calls it twice
+// per block, so a 2304-token / 1024-wide tower paid ~900 MB of round-trip
+// traffic per image for the two norms alone.
+__device__ __forceinline__ float block_reduce_sum_ln(float val, float* s_partials) {
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    if (lane == 0)
+        s_partials[warp_id] = val;
+    __syncthreads();
+    // First warp folds the per-warp partials. Every thread reads all of them so
+    // the result is broadcast without a second __syncthreads.
+    val = (threadIdx.x < num_warps) ? s_partials[threadIdx.x] : 0.0f;
+    if (warp_id == 0) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        if (lane == 0)
+            s_partials[0] = val;
+    }
+    __syncthreads();
+    return s_partials[0];
+}
+
+__global__ void layer_norm_kernel(const float* __restrict__ x, const float* __restrict__ weight,
+                                  const float* __restrict__ bias, float* __restrict__ out, int rows,
+                                  int cols, float eps) {
+    const int row = blockIdx.x;
+    if (row >= rows)
+        return;
+
+    const float* x_row = x + static_cast<size_t>(row) * cols;
+    float* out_row = out + static_cast<size_t>(row) * cols;
+
+    __shared__ float s_partials[32];
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        sum += x_row[i];
+    const float mean = block_reduce_sum_ln(sum, s_partials) / cols;
+    __syncthreads();  // s_partials is reused by the variance pass
+
+    float var = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float d = x_row[i] - mean;
+        var += d * d;
+    }
+    const float inv_std = rsqrtf(block_reduce_sum_ln(var, s_partials) / cols + eps);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = (x_row[i] - mean) * inv_std;
+        if (weight)
+            v *= weight[i];
+        if (bias)
+            v += bias[i];
+        out_row[i] = v;
+    }
+}
+
+void launch_layer_norm(const float* x, const float* weight, const float* bias, float* out,
+                       int rows, int cols, float eps, cudaStream_t stream) {
+    // One block per row; 1024 threads covers the widest head dim the vision
+    // towers use, and fewer threads just means each one strides further.
+    const int threads = std::min(cols, 1024);
+    layer_norm_kernel<<<rows, threads, 0, stream>>>(x, weight, bias, out, rows, cols, eps);
+}
+
 }  // namespace cuda
 }  // namespace forge

@@ -304,6 +304,13 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-rms-norm-fp16-test)
   add_test(NAME rms-norm-fp16 COMMAND forge-rms-norm-fp16-test)
 
+  # Device LayerNorm (FP32): correctness against a double-precision reference
+  # (including the host gamma/beta staging path) + kernel throughput. Skips
+  # gracefully when no GPU present.
+  add_executable(forge-layer-norm-fp32-test test_layer_norm_fp32.cpp)
+  forge_link_native(forge-layer-norm-fp32-test)
+  add_test(NAME layer-norm-fp32 COMMAND forge-layer-norm-fp32-test)
+
   # Phase 6-B-2: native BF16 RMSNorm correctness (FP32 reference parity) +
   # micro-bench (BF16 vs FP32 + FP16 byte-parity sanity, two workload
   # regimes) + single-node graph smoke. Skips gracefully when no GPU present.

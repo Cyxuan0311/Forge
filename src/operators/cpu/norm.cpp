@@ -149,6 +149,57 @@ TensorPtr layer_norm(const TensorPtr& x, const TensorPtr& weight, const TensorPt
     int rows = static_cast<int>(x->shape()[0]);
     int cols = static_cast<int>(x->shape()[1]);
 
+    // Device path: FP32 activations with FP32 (or absent) weight/bias. The CPU
+    // reference below copies x D2H, normalizes on the host and copies back --
+    // fine for a single layer, ruinous for a vision tower that norms twice per
+    // block (a 2304x1024 tower moved ~900 MB per image through the host).
+    if (x->device() == DeviceType::CUDA) {
+#ifdef USE_CUDA
+        require_dtype_supported("ops::layer_norm/x", OpType::LAYER_NORM, x->dtype());
+        if (weight)
+            require_dtype_supported("ops::layer_norm/weight", OpType::LAYER_NORM, weight->dtype());
+        if (bias)
+            require_dtype_supported("ops::layer_norm/bias", OpType::LAYER_NORM, bias->dtype());
+
+        const bool fp32_path = x->dtype() == DataType::FP32 &&
+                               (!weight || weight->dtype() == DataType::FP32) &&
+                               (!bias || bias->dtype() == DataType::FP32);
+        if (fp32_path) {
+            // The kernel dereferences weight/bias on the device, so a host-side
+            // gamma/beta has to be staged (they are 1-D and tiny).
+            TensorPtr w_dev, b_dev;
+            const float* w_ptr = nullptr;
+            const float* b_ptr = nullptr;
+            if (weight) {
+                w_dev = (weight->device() == DeviceType::CUDA)
+                            ? weight
+                            : std::make_shared<Tensor>(DataType::FP32, weight->shape(),
+                                                       DeviceType::CUDA);
+                if (w_dev != weight)
+                    w_dev->copy_from(*weight);
+                w_ptr = static_cast<const float*>(w_dev->data());
+            }
+            if (bias) {
+                b_dev = (bias->device() == DeviceType::CUDA)
+                            ? bias
+                            : std::make_shared<Tensor>(DataType::FP32, bias->shape(),
+                                                       DeviceType::CUDA);
+                if (b_dev != bias)
+                    b_dev->copy_from(*bias);
+                b_ptr = static_cast<const float*>(b_dev->data());
+            }
+            auto out = std::make_shared<Tensor>(DataType::FP32, x->shape(), DeviceType::CUDA);
+            PERF_SCOPE("layer_norm");
+            cuda::launch_layer_norm(static_cast<const float*>(x->data()), w_ptr, b_ptr,
+                                    static_cast<float*>(out->data()), rows, cols, eps);
+            return out;
+        }
+        // FP16/BF16/FP8 activations, or a weight dtype with no kernel: fall
+        // through to the reference implementation below, which dequantizes on
+        // the host.
+#endif
+    }
+
     // Dequantize weight/bias to FP32 CPU first
     auto w_cpu = weight;
     auto b_cpu = bias;
