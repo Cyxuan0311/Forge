@@ -190,6 +190,7 @@ add_library(
   src/debug/logger.cpp
   src/inference/kv_block_swapper.cpp
   src/inference/kv_cache.cpp
+  src/inference/kv_l3_backend.cpp
   src/inference/kv_memory.cpp
   src/inference/kv_sizing.cpp
   src/inference/kv_storage.cpp
@@ -277,6 +278,7 @@ add_library(
   src/inference/engines/qwen35_engine.cpp
   src/inference/engines/lfm2_engine.cpp
   src/inference/engines/gemma4_engine.cpp
+  src/inference/engines/mellum_engine.cpp
   src/inference/engines/gemma_embedding2_engine.cpp
   src/inference/engines/spark25_engine.cpp
   src/inference/engines/phimoe_engine.cpp
@@ -294,6 +296,7 @@ add_library(
   src/inference/layers/gemma4_embedding.cpp
   src/inference/layers/gemma4_attention.cpp
   src/inference/layers/gemma4_moe.cpp
+  src/inference/layers/mellum_moe.cpp
   src/inference/layers/qwen35_recurrent_memory.cpp
   src/inference/layers/bailingmoe3_recurrent_memory.cpp
   src/inference/layers/qwen35_rope.cpp

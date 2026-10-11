@@ -445,6 +445,21 @@ if(CUDAToolkit_FOUND)
   forge_link_native(forge-moe-dp4a-ref-test)
   add_test(NAME moe-dp4a-ref COMMAND forge-moe-dp4a-ref-test)
 
+  # Slot-indexed fused MoE GEMV: the per-expert activation composition
+  # Σ_k w_k·down_{e_k}(silu(gate_{e_k}(x))⊙up_{e_k}(x)) must match a per-expert
+  # 2D GEMV reference for n_expert_used > 1 (the atomicAdd accumulation variant
+  # silently applies the nonlinearity to the cross-expert sum).
+  add_executable(forge-moe-slot-ref-test test_moe_slot_reference.cpp)
+  forge_link_native(forge-moe-slot-ref-test)
+  add_test(NAME moe-slot-ref COMMAND forge-moe-slot-ref-test)
+
+  # Mellum routed-MoE layer: the fused CUDA path must match the CPU path on the
+  # same synthetic weights (router layout, per-expert activation, weight applied
+  # once at the down step). Needs no GGUF.
+  add_executable(forge-mellum-moe-parity-test test_mellum_moe_parity.cpp)
+  forge_link_native(forge-mellum-moe-parity-test)
+  add_test(NAME mellum-moe-parity COMMAND forge-mellum-moe-parity-test)
+
   # Phase 1-B + 1-C: dual matmul (M==1 slice write) and output_proj cooperative
   # reduction vs FP32 CPU reference; output_proj also checked for run-to-run
   # bit-exactness (no atomicAdd).
