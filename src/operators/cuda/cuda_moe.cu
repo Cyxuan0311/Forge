@@ -278,6 +278,13 @@ __global__ void quantize_q8_1_batch_kernel(
     const float* __restrict__ x, block_q8_1_gemv* __restrict__ q8, int K, int n_tokens)
 {
     int groups_per_row = (K + 255) / 256;
+    // Per-token block stride MUST match the consumers' num_q8_blocks =
+    // (K + 31) / 32 (launch_moe_expert_{gateup,down}_slots). ceil(K/256)*8
+    // only equals (K+31)/32 when K is a multiple of 256; for K=896 (mellum
+    // expert FFN length) the old `gbase = bi * 8` stride was 32 while the
+    // reader used 28, so every slot after the first read a misaligned
+    // activation block and the writes ran past the end of the scratch buffer.
+    int blocks_per_row = (K + 31) / 32;
     int bi = blockIdx.x * blockDim.x + threadIdx.x;
     if (bi >= n_tokens * groups_per_row) return;
 
@@ -297,9 +304,13 @@ __global__ void quantize_q8_1_batch_kernel(
         }
     }
 
-    int gbase = bi * 8;  // blocks are contiguous across tokens: bi == row-local group id
+    int gbase = tok * blocks_per_row + g * 8;
+    int n_blocks = (n_el + 31) / 32;
     if (amax == 0.0f) {
-        q8[gbase].ds = make_float2(0.0f, 0.0f);
+        // Zero every block of this group: leaving ds undefined on the tail
+        // blocks makes the dot product read garbage scales.
+        for (int s = 0; s < n_blocks; ++s)
+            q8[gbase + s].ds = make_float2(0.0f, 0.0f);
         return;
     }
 
@@ -376,6 +387,14 @@ __device__ __forceinline__ float moe_dot_q8_1<DataType::Q6_K>(
     return sum;
 }
 
+template <>
+__device__ __forceinline__ float moe_dot_q8_1<DataType::Q5_0>(
+    const uint8_t* __restrict__ row_ptr, int bi,
+    const block_q8_1_gemv* __restrict__ x_q8_token) {
+    // Q5_0 block = 32 elements/22 bytes, 1:1 with a single Q8_1 block.
+    return vec_dot_q5_0_q8_1(row_ptr + (size_t)bi * 22, x_q8_token + bi);
+}
+
 template <DataType DT>
 __global__ void moe_expert_gemv_kernel(
     const block_q8_1_gemv* __restrict__ x_q8,   // [n_tokens, K/32] pre-quantized
@@ -383,7 +402,8 @@ __global__ void moe_expert_gemv_kernel(
     float* __restrict__ out,                      // [n_tokens, N] (output, pre-zeroed)
     const int* __restrict__ expert_indices,       // [n_tokens, n_expert_used] on GPU
     const float* __restrict__ expert_weights,     // [n_tokens, n_expert_used] on GPU
-    int K, int N, int n_expert, int n_expert_used, int n_tokens, int num_q8_blocks)
+    int K, int N, int n_expert, int n_expert_used, int n_tokens, int num_q8_blocks,
+    bool apply_weight)
 {
     constexpr int BE = CudaQuantTraits<DT>::block_elements;
     constexpr int BS = CudaQuantTraits<DT>::block_size;
@@ -424,7 +444,8 @@ __global__ void moe_expert_gemv_kernel(
         sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
 
         if (lane == 0) {
-            atomicAdd(&out[token * N + row], weight * sum);
+            const float w = apply_weight ? weight : 1.0f;
+            atomicAdd(&out[token * N + row], w * sum);
         }
     }
 }
@@ -434,7 +455,7 @@ void launch_moe_expert_gemv(
     const float* x, const void* q_w_3d, float* out,
     const int* expert_indices, const float* expert_weights,
     int K, int N, int n_expert, int n_expert_used, int n_tokens,
-    cudaStream_t stream)
+    cudaStream_t stream, bool apply_weight)
 {
     // Phase 1-A: quantize the activation x ([n_tokens, K]) to Q8_1 ONCE. All
     // routed experts for a token share the same activation, so a single
@@ -457,22 +478,229 @@ void launch_moe_expert_gemv(
     moe_expert_gemv_kernel<DT><<<grid, threads, 0, stream>>>(
         x_q8, static_cast<const uint8_t*>(q_w_3d), out,
         expert_indices, expert_weights,
-        K, N, n_expert, n_expert_used, n_tokens, num_q8_blocks);
+        K, N, n_expert, n_expert_used, n_tokens, num_q8_blocks, apply_weight);
 }
 
 // Explicit template instantiations
 template void launch_moe_expert_gemv<DataType::Q4_0>(
     const float*, const void*, float*, const int*, const float*,
-    int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, cudaStream_t, bool);
 template void launch_moe_expert_gemv<DataType::Q4_K>(
     const float*, const void*, float*, const int*, const float*,
-    int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, cudaStream_t, bool);
+template void launch_moe_expert_gemv<DataType::Q5_0>(
+    const float*, const void*, float*, const int*, const float*,
+    int, int, int, int, int, cudaStream_t, bool);
 template void launch_moe_expert_gemv<DataType::Q6_K>(
     const float*, const void*, float*, const int*, const float*,
-    int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, cudaStream_t, bool);
 template void launch_moe_expert_gemv<DataType::Q8_0>(
     const float*, const void*, float*, const int*, const float*,
-    int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, cudaStream_t, bool);
+
+// ============================================================================
+// Slot-Indexed Fused MoE GEMV — per-expert activation semantics
+// ============================================================================
+// 参考 MoE 语义 (llama.cpp 与各 engine 的 CPU 路径):
+//
+//   out[t] = Σ_k  w[t,k] · down_{e[t,k]}( silu(gate_{e[t,k]}(x[t])) ⊙ up_{e[t,k]}(x[t]) )
+//
+// 激活必须逐 expert 作用, 所以 gate/up 的结果要按 slot = t*n_expert_used + k
+// 分别存放。launch_moe_expert_gemv 做不到这一点: 它用 atomicAdd 把所有选中
+// expert 累加进同一行 out[token*N+row], 只能表达 Σ_k w_k·W_{e_k}·x (gemma4
+// 的旧融合路径用它, 因此 gate/up 先跨 expert 求和再过激活, n_expert_used>1
+// 时结果错误)。
+//
+// 下面这对 kernel 与 moe_expert_iq2_s_{gateup,down}_kernel (cuda_gemv.cu)
+// 同构, 但 dtype 泛型 (复用 moe_dot_q8_1<DT>), 覆盖
+// Q4_0/Q4_K/Q5_0/Q6_K/Q8_0。slot 布局与 launch_moe_router 写出的
+// indices/weights ([n_tokens, n_expert_used]) 完全一致, 无需任何重排。
+// 两者都是纯 store: 无 atomicAdd、无需预清零、结果确定 (按 slot 序累加)。
+
+template <DataType DT>
+__global__ void moe_expert_gateup_slots_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,  // [n_tokens, (K+31)/32]
+    const uint8_t* __restrict__ q_gate,        // [n_expert, N, K]
+    const uint8_t* __restrict__ q_up,          // [n_expert, N, K]
+    float* __restrict__ out_gate,              // [n_tokens*n_expert_used, N]
+    float* __restrict__ out_up,                // [n_tokens*n_expert_used, N]
+    const int* __restrict__ expert_indices,    // [n_tokens*n_expert_used]
+    int K, int N, int n_expert, int n_expert_used, int n_tokens, int num_q8_blocks,
+    int rows_per_block) {
+    constexpr int BE = CudaQuantTraits<DT>::block_elements;
+    constexpr int BS = CudaQuantTraits<DT>::block_size;
+    int num_blocks_row = (K + BE - 1) / BE;
+
+    int slot = blockIdx.x;
+    int chunk = blockIdx.y;
+    if (slot >= n_tokens * n_expert_used)
+        return;
+
+    int token = slot / n_expert_used;
+    int expert = expert_indices[slot];
+
+    const block_q8_1_gemv* x_row = x_q8 + (size_t)token * num_q8_blocks;
+    const uint8_t* gate_base = q_gate + (size_t)expert * N * num_blocks_row * BS;
+    const uint8_t* up_base = q_up + (size_t)expert * N * num_blocks_row * BS;
+
+    int tid = threadIdx.x;
+    int lane = tid % 32;
+    int warp_in_block = tid / 32;
+    int warps_per_block = blockDim.x / 32;
+
+    int row_start = chunk * rows_per_block;
+    int row_end = min(row_start + rows_per_block, N);
+
+    // 每个 warp 负责行子集; gate/up 共用同一份 x_q8 行。
+    for (int row = row_start + warp_in_block; row < row_end; row += warps_per_block) {
+        const uint8_t* g_row = gate_base + (size_t)row * num_blocks_row * BS;
+        const uint8_t* u_row = up_base + (size_t)row * num_blocks_row * BS;
+
+        float sg = 0.0f, su = 0.0f;
+        for (int bi = lane; bi < num_blocks_row; bi += 32) {
+            sg += moe_dot_q8_1<DT>(g_row, bi, x_row);
+            su += moe_dot_q8_1<DT>(u_row, bi, x_row);
+        }
+
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 16);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 8);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 4);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 2);
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, 1);
+
+        su += __shfl_down_sync(0xFFFFFFFF, su, 16);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 8);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 4);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 2);
+        su += __shfl_down_sync(0xFFFFFFFF, su, 1);
+
+        if (lane == 0) {
+            out_gate[(size_t)slot * N + row] = sg;
+            out_up[(size_t)slot * N + row] = su;
+        }
+    }
+}
+
+template <DataType DT>
+__global__ void moe_expert_down_slots_kernel(
+    const block_q8_1_gemv* __restrict__ x_q8,  // [n_tokens*n_expert_used, (K+31)/32] (gated)
+    const uint8_t* __restrict__ q_down,        // [n_expert, N, K]
+    float* __restrict__ out,                   // [n_tokens, N]
+    const int* __restrict__ expert_indices,    // [n_tokens*n_expert_used]
+    const float* __restrict__ expert_weights,  // [n_tokens*n_expert_used]
+    int K, int N, int n_expert, int n_expert_used, int n_tokens, int num_q8_blocks,
+    int rows_per_block) {
+    constexpr int BE = CudaQuantTraits<DT>::block_elements;
+    constexpr int BS = CudaQuantTraits<DT>::block_size;
+    int num_blocks_row = (K + BE - 1) / BE;
+
+    int token = blockIdx.x;
+    int chunk = blockIdx.y;
+    if (token >= n_tokens)
+        return;
+
+    int tid = threadIdx.x;
+    int lane = tid % 32;
+    int warp_in_block = tid / 32;
+    int warps_per_block = blockDim.x / 32;
+
+    int row_start = chunk * rows_per_block;
+    int row_end = min(row_start + rows_per_block, N);
+
+    for (int row = row_start + warp_in_block; row < row_end; row += warps_per_block) {
+        float acc = 0.0f;
+        // Σ_k w[t,k] · down_{e[t,k]}[row] · gated[t,k] — slot 序累加, 无原子操作。
+        for (int k = 0; k < n_expert_used; ++k) {
+            int slot = token * n_expert_used + k;
+            int expert = expert_indices[slot];
+            const uint8_t* d_row = q_down + (size_t)expert * N * num_blocks_row * BS +
+                                   (size_t)row * num_blocks_row * BS;
+            const block_q8_1_gemv* x_slot = x_q8 + (size_t)slot * num_q8_blocks;
+
+            float sum = 0.0f;
+            for (int bi = lane; bi < num_blocks_row; bi += 32) {
+                sum += moe_dot_q8_1<DT>(d_row, bi, x_slot);
+            }
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, 8);
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, 4);
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, 2);
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, 1);
+            if (lane == 0)
+                acc += expert_weights[slot] * sum;
+        }
+        if (lane == 0)
+            out[(size_t)token * N + row] = acc;
+    }
+}
+
+template <DataType DT>
+void launch_moe_expert_gateup_slots(const float* x, const void* q_gate, const void* q_up,
+                                    float* out_gate, float* out_up, const int* expert_indices,
+                                    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+                                    cudaStream_t stream) {
+    // x 只需量化一次: 同一 token 的所有 slot 共享激活。
+    int num_q8_blocks = (K + 31) / 32;
+    size_t q8_bytes = (size_t)n_tokens * num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+
+    int q_threads = 256;
+    int q_groups = (n_tokens * num_q8_blocks + q_threads - 1) / q_threads;
+    quantize_q8_1_batch_kernel<<<q_groups, q_threads, 0, stream>>>(x, x_q8, K, n_tokens);
+
+    const int warps_per_block = 8;
+    const int rows_per_block = 128;
+    const int threads = warps_per_block * 32;
+    int chunks = (N + rows_per_block - 1) / rows_per_block;
+    dim3 grid(n_tokens * n_expert_used, chunks);
+    moe_expert_gateup_slots_kernel<DT><<<grid, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_gate), static_cast<const uint8_t*>(q_up), out_gate,
+        out_up, expert_indices, K, N, n_expert, n_expert_used, n_tokens, num_q8_blocks,
+        rows_per_block);
+}
+
+template <DataType DT>
+void launch_moe_expert_down_slots(const float* x, const void* q_down, float* out,
+                                  const int* expert_indices, const float* expert_weights, int K,
+                                  int N, int n_expert, int n_expert_used, int n_tokens,
+                                  cudaStream_t stream) {
+    // 这里的 x 是 gated [n_tokens*n_expert_used, K]: 每个 slot 一行, 需整批量化。
+    int num_q8_blocks = (K + 31) / 32;
+    int n_rows = n_tokens * n_expert_used;
+    size_t q8_bytes = (size_t)n_rows * num_q8_blocks * sizeof(block_q8_1_gemv);
+    void* q8_buf = scratch_pool().ensure(q8_bytes);
+    auto* x_q8 = static_cast<block_q8_1_gemv*>(q8_buf);
+
+    int q_threads = 256;
+    int q_groups = (n_rows * num_q8_blocks + q_threads - 1) / q_threads;
+    quantize_q8_1_batch_kernel<<<q_groups, q_threads, 0, stream>>>(x, x_q8, K, n_rows);
+
+    const int warps_per_block = 8;
+    const int rows_per_block = 128;
+    const int threads = warps_per_block * 32;
+    int chunks = (N + rows_per_block - 1) / rows_per_block;
+    dim3 grid(n_tokens, chunks);
+    moe_expert_down_slots_kernel<DT><<<grid, threads, 0, stream>>>(
+        x_q8, static_cast<const uint8_t*>(q_down), out, expert_indices, expert_weights, K, N,
+        n_expert, n_expert_used, n_tokens, num_q8_blocks, rows_per_block);
+}
+
+#define FORGE_INSTANTIATE_MOE_SLOTS(DT)                                                           \
+    template void launch_moe_expert_gateup_slots<DT>(const float*, const void*, const void*,      \
+                                                     float*, float*, const int*, int, int, int,   \
+                                                     int, int, cudaStream_t);                     \
+    template void launch_moe_expert_down_slots<DT>(const float*, const void*, float*, const int*, \
+                                                   const float*, int, int, int, int, int,         \
+                                                   cudaStream_t);
+
+FORGE_INSTANTIATE_MOE_SLOTS(DataType::Q4_0)
+FORGE_INSTANTIATE_MOE_SLOTS(DataType::Q4_K)
+FORGE_INSTANTIATE_MOE_SLOTS(DataType::Q5_0)
+FORGE_INSTANTIATE_MOE_SLOTS(DataType::Q6_K)
+FORGE_INSTANTIATE_MOE_SLOTS(DataType::Q8_0)
+
+#undef FORGE_INSTANTIATE_MOE_SLOTS
 
 // ============================================================================
 // GeGLU Split Kernel — gate_up fused: split + GELU(tanh) + multiply

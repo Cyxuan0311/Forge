@@ -93,6 +93,31 @@ struct CudaQuantTraits<DataType::Q8_0> {
     }
 };
 
+// ---- Q5_0: 32 elements/block, 22 bytes/block ----
+// Layout: d(f16, 2B) + qh[4] (bit5) + qs[16] (4-bit nibbles).
+template <>
+struct CudaQuantTraits<DataType::Q5_0> {
+    static constexpr int block_elements = QuantTraits<DataType::Q5_0>::block_elements;  // 32
+    static constexpr int block_size = QuantTraits<DataType::Q5_0>::block_size;           // 22
+
+    static __device__ __forceinline__ float dot_block(
+        const uint8_t* block_ptr, const float* x, int base, int K) {
+        float d = __half2float(reinterpret_cast<const __half&>(*(const uint16_t*)block_ptr));
+        uint32_t qh;
+        memcpy(&qh, block_ptr + 2, 4);
+        const uint8_t* qs = block_ptr + 6;
+        float sum = 0.0f;
+        for (int j = 0; j < block_elements; ++j) {
+            if (base + j >= K) break;
+            int x0 = ((qs[j] & 0x0F) | (((qh >> j) & 1) << 4)) - 16;
+            int x1 = ((qs[j] >> 4) | (((qh >> (j + 16)) & 1) << 4)) - 16;
+            sum += x[base + j] * (static_cast<float>(x0) * d);
+            sum += x[base + j + 16] * (static_cast<float>(x1) * d);
+        }
+        return sum;
+    }
+};
+
 // ---- Q4_K: 256 elements/block, 144 bytes/block ----
 // Layout: d(f16, 2B) + dmin(f16, 2B) + scales[12] + qs[128]
 template <>

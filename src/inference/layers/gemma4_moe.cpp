@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -9,6 +10,7 @@
 
 #include "forge/cuda_kernels.h"
 #include "forge/engines/transformer_engine.h"
+#include "forge/inference/layers/moe_fused_common.h"
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/kernel_selector.h"
 #include "forge/operators.h"
@@ -62,11 +64,12 @@ TensorPtr build_router_input(const TensorPtr& attn_residual, const LayerWeights&
 }
 
 #ifdef USE_CUDA
-// 按 dtype 分派 MoE expert GEMV。支持集由统一 kernel selector 判定
-// (Q4_0/Q4_K/Q6_K/Q8_0 -> MOE_EXPERT_GEMV)；不支持的 dtype 不做任何事,
-// 与重构前一致。
-void moe_gemv(DataType dt, const float* x, const void* w, float* out, const int* d_indices,
-              const float* d_weights, int K, int N, int n_expert, int n_expert_used, int seq_len) {
+// 按 dtype 分派 slot 语义的融合 expert GEMV (Q4_0/Q4_K/Q6_K/Q8_0)。
+// gate/up 结果按 slot 逐 expert 存放, 激活后由 down 在 token 内按 slot 序加权
+// 累加, 完整语义 = Σ_k w_k · down_{e_k}(act(gate_{e_k}(x)) ⊙ up_{e_k}(x))。
+void moe_gateup_slots(DataType dt, const float* x, const void* w_gate, const void* w_up,
+                      float* o_gate, float* o_up, const int* d_indices, int K, int N, int n_expert,
+                      int n_expert_used, int seq_len) {
     KernelProblem problem;
     problem.domain = KernelDomain::MoE;
     problem.dtype = dt;
@@ -76,24 +79,90 @@ void moe_gemv(DataType dt, const float* x, const void* w, float* out, const int*
     if (select_kernel(problem) == KernelVariant::UNSUPPORTED)
         return;
     switch (dt) {
-        case DataType::Q4_0:
-            cuda::launch_moe_expert_gemv<DataType::Q4_0>(x, w, out, d_indices, d_weights, K, N,
-                                                         n_expert, n_expert_used, seq_len);
-            break;
-        case DataType::Q4_K:
-            cuda::launch_moe_expert_gemv<DataType::Q4_K>(x, w, out, d_indices, d_weights, K, N,
-                                                         n_expert, n_expert_used, seq_len);
-            break;
-        case DataType::Q6_K:
-            cuda::launch_moe_expert_gemv<DataType::Q6_K>(x, w, out, d_indices, d_weights, K, N,
-                                                         n_expert, n_expert_used, seq_len);
-            break;
-        case DataType::Q8_0:
-            cuda::launch_moe_expert_gemv<DataType::Q8_0>(x, w, out, d_indices, d_weights, K, N,
-                                                         n_expert, n_expert_used, seq_len);
-            break;
-        default:
-            break;
+    case DataType::Q4_0:
+        cuda::launch_moe_expert_gateup_slots<DataType::Q4_0>(
+            x, w_gate, w_up, o_gate, o_up, d_indices, K, N, n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q4_K:
+        cuda::launch_moe_expert_gateup_slots<DataType::Q4_K>(
+            x, w_gate, w_up, o_gate, o_up, d_indices, K, N, n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q5_0:
+        cuda::launch_moe_expert_gateup_slots<DataType::Q5_0>(
+            x, w_gate, w_up, o_gate, o_up, d_indices, K, N, n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q6_K:
+        cuda::launch_moe_expert_gateup_slots<DataType::Q6_K>(
+            x, w_gate, w_up, o_gate, o_up, d_indices, K, N, n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q8_0:
+        cuda::launch_moe_expert_gateup_slots<DataType::Q8_0>(
+            x, w_gate, w_up, o_gate, o_up, d_indices, K, N, n_expert, n_expert_used, seq_len, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+void moe_down_slots(DataType dt, const float* x, const void* w, float* out, const int* d_indices,
+                    const float* d_weights, int K, int N, int n_expert, int n_expert_used,
+                    int seq_len) {
+    KernelProblem problem;
+    problem.domain = KernelDomain::MoE;
+    problem.dtype = dt;
+    problem.M = seq_len;
+    problem.N = N;
+    problem.K = K;
+    if (select_kernel(problem) == KernelVariant::UNSUPPORTED)
+        return;
+    switch (dt) {
+    case DataType::Q4_0:
+        cuda::launch_moe_expert_down_slots<DataType::Q4_0>(x, w, out, d_indices, d_weights, K, N,
+                                                           n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q4_K:
+        cuda::launch_moe_expert_down_slots<DataType::Q4_K>(x, w, out, d_indices, d_weights, K, N,
+                                                           n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q5_0:
+        cuda::launch_moe_expert_down_slots<DataType::Q5_0>(x, w, out, d_indices, d_weights, K, N,
+                                                           n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q6_K:
+        cuda::launch_moe_expert_down_slots<DataType::Q6_K>(x, w, out, d_indices, d_weights, K, N,
+                                                           n_expert, n_expert_used, seq_len, 0);
+        break;
+    case DataType::Q8_0:
+        cuda::launch_moe_expert_down_slots<DataType::Q8_0>(x, w, out, d_indices, d_weights, K, N,
+                                                           n_expert, n_expert_used, seq_len, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+// 量化权重一行的字节数 (= K 方向块数 × 块大小), 用于在融合 gate_up 张量里
+// 定位 up 半段的基址。
+template <DataType DT>
+size_t expert_row_bytes_t(int K) {
+    return (size_t)((K + QuantTraits<DT>::block_elements - 1) / QuantTraits<DT>::block_elements) *
+           QuantTraits<DT>::block_size;
+}
+
+size_t expert_row_bytes(DataType dt, int K) {
+    switch (dt) {
+    case DataType::Q4_0:
+        return expert_row_bytes_t<DataType::Q4_0>(K);
+    case DataType::Q8_0:
+        return expert_row_bytes_t<DataType::Q8_0>(K);
+    case DataType::Q5_0:
+        return expert_row_bytes_t<DataType::Q5_0>(K);
+    case DataType::Q4_K:
+        return expert_row_bytes_t<DataType::Q4_K>(K);
+    case DataType::Q6_K:
+        return expert_row_bytes_t<DataType::Q6_K>(K);
+    default:
+        return 0;
     }
 }
 #endif
@@ -101,7 +170,7 @@ void moe_gemv(DataType dt, const float* x, const void* w, float* out, const int*
 }  // namespace
 
 TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionContext& lctx,
-                             TransformerEngine* engine) {
+                           TransformerEngine* engine) {
     PERF_SCOPE("layer/moe");
     const auto& cfg = lctx.config;
     const auto& lw = lctx.weights;
@@ -130,96 +199,95 @@ TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionC
     const int n_expert_used = cfg.n_expert_used > 0 ? cfg.n_expert_used : 1;
 
     auto expert_out = std::make_shared<Tensor>(DataType::FP32,
-                                              std::vector<int64_t>{seq_len, cfg.hidden_dim}, dev);
+                                               std::vector<int64_t>{seq_len, cfg.hidden_dim}, dev);
     std::fill_n(static_cast<float*>(expert_out->data()), seq_len * cfg.hidden_dim, 0.0f);
 
-    if (router_logits->device() == DeviceType::CUDA && dev == DeviceType::CUDA) {
+#ifdef USE_CUDA
+    // 融合路径的前提: dtype 有可用 kernel, 且 expert 轴布局符合 slot kernel 的
+    // 字节布局假设 (expert 最外层)。任一条不满足都走 CPU 路径 —— 旧实现在这里
+    // 只是"什么都不算", 会把全零的 expert_out 当结果返回。
+    const bool fused_ok =
+        lw.ffn_down_exps() && moe_kernel_supported(lw.ffn_down_exps()->dtype(), seq_len) &&
+        ((lw.ffn_gate_up_exps() && is_quantized_type(lw.ffn_gate_up_exps()->dtype()) &&
+          moe_kernel_supported(lw.ffn_gate_up_exps()->dtype(), seq_len) &&
+          expert_axis_outermost(lw.ffn_gate_up_exps(), n_expert) &&
+          expert_axis_outermost(lw.ffn_down_exps(), n_expert)) ||
+         (lw.ffn_gate_exps() && lw.ffn_up_exps() &&
+          moe_kernel_supported(lw.ffn_gate_exps()->dtype(), seq_len) &&
+          moe_kernel_supported(lw.ffn_up_exps()->dtype(), seq_len) &&
+          expert_axis_outermost(lw.ffn_gate_exps(), n_expert) &&
+          expert_axis_outermost(lw.ffn_up_exps(), n_expert) &&
+          expert_axis_outermost(lw.ffn_down_exps(), n_expert)));
+    const bool gpu_fused = fused_ok && std::getenv("FORGE_FORCE_MOE_FALLBACK") == nullptr;
+#else
+    const bool gpu_fused = false;
+#endif
+
+    if (gpu_fused && router_logits->device() == DeviceType::CUDA && dev == DeviceType::CUDA) {
 #ifdef USE_CUDA
         // 全 GPU 路径, 无 CPU 往返。
-        auto indices_tensor = std::make_shared<Tensor>(
-            DataType::INT32, std::vector<int64_t>{seq_len * n_expert_used}, DeviceType::CUDA);
-        auto weights_tensor = std::make_shared<Tensor>(
-            DataType::FP32, std::vector<int64_t>{seq_len * n_expert_used}, DeviceType::CUDA);
-        auto softmax_buf = std::make_shared<Tensor>(
-            DataType::FP32, std::vector<int64_t>{seq_len * n_expert}, DeviceType::CUDA);
-
-        cuda::launch_moe_router(static_cast<const float*>(router_logits->data()),
-                                static_cast<int*>(indices_tensor->data()),
-                                static_cast<float*>(weights_tensor->data()),
-                                static_cast<float*>(softmax_buf->data()), n_expert, n_expert_used,
-                                seq_len);
+        auto router = run_moe_router_gpu(static_cast<const float*>(router_logits->data()),
+                                         n_expert, n_expert_used, seq_len);
+        auto indices_tensor = router.indices;
+        auto weights_tensor = router.weights;
 
         const int* d_indices = static_cast<const int*>(indices_tensor->data());
         const float* d_weights = static_cast<const float*>(weights_tensor->data());
-        auto w_dtype = lw.ffn_gate_up_exps()
-                           ? lw.ffn_gate_up_exps()->dtype()
-                           : (lw.ffn_gate_exps() ? lw.ffn_gate_exps()->dtype() : DataType::FP32);
+        // slot = t*n_expert_used + k: gate/up 逐 expert 存放 → 逐 expert 激活 →
+        // down 加权累加。语义 = Σ_k w_k·down_{e_k}(gelu(gate_{e_k})⊙up_{e_k})。
+        // 路由权重只在 down 步乘一次: 旧路径 gate/up/down 三次都乘了 w, 且激活
+        // 作用在跨 expert 的和上, n_expert_used > 1 时结果错误。
+        const int n_slots = seq_len * n_expert_used;
+        const int K = cfg.hidden_dim;
+        const int n_ff = lw.ffn_gate_up_exps()
+                             ? static_cast<int>(lw.ffn_gate_up_exps()->shape()[1]) / 2
+                             : static_cast<int>(lw.ffn_gate_exps()->shape()[1]);
 
-        if (lw.ffn_gate_up_exps() && is_quantized_type(w_dtype)) {
-            // 融合 gate_up: GEMV -> GeGLU split -> down GEMV
-            int K_gate = cfg.hidden_dim;
-            int N_gate = static_cast<int>(lw.ffn_gate_up_exps()->shape()[1]);
-            int n_ff = N_gate / 2;
+        auto gate_buf = std::make_shared<Tensor>(
+            DataType::FP32, std::vector<int64_t>{n_slots, n_ff}, DeviceType::CUDA);
+        auto up_buf = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{n_slots, n_ff},
+                                               DeviceType::CUDA);
 
-            auto gate_up_out = std::make_shared<Tensor>(
-                DataType::FP32, std::vector<int64_t>{seq_len, N_gate}, DeviceType::CUDA);
-            cudaMemset(static_cast<float*>(gate_up_out->data()), 0,
-                       seq_len * N_gate * sizeof(float));
-
-            moe_gemv(w_dtype, static_cast<const float*>(cur_moe->data()),
-                     lw.ffn_gate_up_exps()->data(), static_cast<float*>(gate_up_out->data()),
-                     d_indices, d_weights, K_gate, N_gate, n_expert, n_expert_used, seq_len);
-
-            auto gated = std::make_shared<Tensor>(DataType::FP32,
-                                                 std::vector<int64_t>{seq_len, n_ff},
-                                                 DeviceType::CUDA);
-            cuda::launch_gelu_tanh_multiply_split(static_cast<const float*>(gate_up_out->data()),
-                                                 static_cast<float*>(gated->data()), n_ff, seq_len);
-
-            moe_gemv(lw.ffn_down_exps()->dtype(), static_cast<const float*>(gated->data()),
-                     lw.ffn_down_exps()->data(), static_cast<float*>(expert_out->data()), d_indices,
-                     d_weights, n_ff, cfg.hidden_dim, n_expert, n_expert_used, seq_len);
-
-        } else if (lw.ffn_gate_exps() && lw.ffn_up_exps()) {
+        if (lw.ffn_gate_up_exps()) {
+            // 融合 gate_up 张量: 每个 expert 是 [gate(n_ff); up(n_ff)] 两段行。
+            // gateup 融合 kernel 收两个基址, 传 (tensor, tensor + up 半段偏移)
+            // 即可分别算两段, 不需要额外的 split kernel。
+            const DataType gu_dtype = lw.ffn_gate_up_exps()->dtype();
+            const uint8_t* gu_base = static_cast<const uint8_t*>(lw.ffn_gate_up_exps()->data());
+            const size_t up_row_offset = expert_row_bytes(gu_dtype, K) * (size_t)n_ff;
+            moe_gateup_slots(gu_dtype, static_cast<const float*>(cur_moe->data()), gu_base,
+                             gu_base + up_row_offset, static_cast<float*>(gate_buf->data()),
+                             static_cast<float*>(up_buf->data()), d_indices, K, n_ff, n_expert,
+                             n_expert_used, seq_len);
+        } else {
             // 分离的 gate + up
-            int K_gu = cfg.hidden_dim;
-            int N_gate = static_cast<int>(lw.ffn_gate_exps()->shape()[1]);
-            int N_up = static_cast<int>(lw.ffn_up_exps()->shape()[1]);
+            moe_gateup_slots(lw.ffn_gate_exps()->dtype(),
+                             static_cast<const float*>(cur_moe->data()), lw.ffn_gate_exps()->data(),
+                             lw.ffn_up_exps()->data(), static_cast<float*>(gate_buf->data()),
+                             static_cast<float*>(up_buf->data()), d_indices, K, n_ff, n_expert,
+                             n_expert_used, seq_len);
+        }
 
-            auto gate_out = std::make_shared<Tensor>(
-                DataType::FP32, std::vector<int64_t>{seq_len, N_gate}, DeviceType::CUDA);
-            cudaMemset(static_cast<float*>(gate_out->data()), 0, seq_len * N_gate * sizeof(float));
-            moe_gemv(lw.ffn_gate_exps()->dtype(), static_cast<const float*>(cur_moe->data()),
-                     lw.ffn_gate_exps()->data(), static_cast<float*>(gate_out->data()), d_indices,
-                     d_weights, K_gu, N_gate, n_expert, n_expert_used, seq_len);
+        auto gated = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{n_slots, n_ff},
+                                              DeviceType::CUDA);
+        // exact-erf gelu, 与 CPU 路径的 ops::gelu_multiply 一致 (旧融合路径用的
+        // 是 gelu_tanh 近似, 同样与 CPU 路径不一致)。
+        cuda::launch_gelu_multiply(static_cast<const float*>(gate_buf->data()),
+                                   static_cast<const float*>(up_buf->data()),
+                                   static_cast<float*>(gated->data()), n_slots * n_ff);
 
-            auto up_out = std::make_shared<Tensor>(DataType::FP32,
-                                                  std::vector<int64_t>{seq_len, N_up},
-                                                  DeviceType::CUDA);
-            cudaMemset(static_cast<float*>(up_out->data()), 0, seq_len * N_up * sizeof(float));
-            moe_gemv(lw.ffn_up_exps()->dtype(), static_cast<const float*>(cur_moe->data()),
-                     lw.ffn_up_exps()->data(), static_cast<float*>(up_out->data()), d_indices,
-                     d_weights, K_gu, N_up, n_expert, n_expert_used, seq_len);
+        moe_down_slots(lw.ffn_down_exps()->dtype(), static_cast<const float*>(gated->data()),
+                       lw.ffn_down_exps()->data(), static_cast<float*>(expert_out->data()),
+                       d_indices, d_weights, n_ff, cfg.hidden_dim, n_expert, n_expert_used,
+                       seq_len);
 
-            auto gated = std::make_shared<Tensor>(DataType::FP32,
-                                                 std::vector<int64_t>{seq_len, N_gate},
-                                                 DeviceType::CUDA);
-            cuda::launch_gelu_multiply(static_cast<const float*>(gate_out->data()),
-                                       static_cast<const float*>(up_out->data()),
-                                       static_cast<float*>(gated->data()), seq_len * N_gate);
-
-            moe_gemv(lw.ffn_down_exps()->dtype(), static_cast<const float*>(gated->data()),
-                     lw.ffn_down_exps()->data(), static_cast<float*>(expert_out->data()), d_indices,
-                     d_weights, N_gate, cfg.hidden_dim, n_expert, n_expert_used, seq_len);
-
-            // Phase P0 hook (CUDA): router decisions live on device; mirror the
-            // top-k indices to host and report them. P0: empty sync_experts_resident.
-            if (engine) {
-                auto idx_h = ensure_cpu(indices_tensor);
-                const int* id = static_cast<const int*>(idx_h->data());
-                std::vector<int> active(id, id + seq_len * n_expert_used);
-                engine->sync_experts_resident(lctx.layer_idx, active);
-            }
+        // Router decisions live on device; mirror the top-k indices to host and
+        // report them (router statistics / expert paging hook).
+        if (engine) {
+            auto idx_h = ensure_cpu(indices_tensor);
+            const int* id = static_cast<const int*>(idx_h->data());
+            std::vector<int> active(id, id + seq_len * n_expert_used);
+            engine->sync_experts_resident(lctx.layer_idx, active);
         }
 #endif
     } else {
@@ -278,13 +346,24 @@ TensorPtr Gemma4Moe::apply(const TensorPtr& attn_residual, const LayerExecutionC
 
                 // 零拷贝 expert 抽取: 沿 expert 维切片再 view 成 2D, 避免反量化
                 // 整个 3D 权重 (n_expert_used << n_expert 时浪费 99%+ 算力)。
+                // expert 轴动态定位 (按 size == n_expert), 不硬编码 axis 2 ——
+                // 不同的 gemma 变体把 expert 轴放在不同位置。
                 auto extract_expert_2d = [&](const TensorPtr& w3d) -> TensorPtr {
                     if (!w3d) return nullptr;
                     auto& shp = w3d->shape();
                     if (shp.size() < 2) return w3d;
-                    if (shp.size() == 3 && expert_idx < shp[2]) {
-                        auto expert_slice = w3d->slice(2, expert_idx, expert_idx + 1);
-                        return std::make_shared<Tensor>(expert_slice.view({shp[0], shp[1]}));
+                    if (shp.size() == 3) {
+                        int axis = -1;
+                        for (int a = 0; a < 3; ++a) {
+                            if (shp[a] == n_expert) { axis = a; break; }
+                        }
+                        if (axis < 0 || expert_idx >= shp[axis]) return w3d;
+                        auto expert_slice = w3d->slice(axis, expert_idx, expert_idx + 1);
+                        std::vector<int64_t> d2;
+                        for (int a = 0; a < 3; ++a) {
+                            if (a != axis) d2.push_back(expert_slice.shape()[a]);
+                        }
+                        return std::make_shared<Tensor>(expert_slice.view(d2));
                     }
                     return w3d;
                 };

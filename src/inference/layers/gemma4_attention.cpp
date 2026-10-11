@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "forge/cuda_kernels.h"
+#include "forge/inference/layers/per_head_norm.h"
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
@@ -10,25 +11,6 @@
 namespace forge {
 
 namespace {
-
-// per-head RMSNorm, 带可选的 learned weight。weight 为空时退化为 unweighted
-// (对应 llama.cpp 的 ggml_rms_norm, Gemma4 的 V-norm)。
-void per_head_rms_norm_cpu(float* data, const float* weight, int seq_len, int num_heads,
-                           int head_dim, float eps) {
-    for (int s = 0; s < seq_len; ++s) {
-        for (int h = 0; h < num_heads; ++h) {
-            float* head = data + s * num_heads * head_dim + h * head_dim;
-            float ss = 0.0f;
-            for (int d = 0; d < head_dim; ++d) ss += head[d] * head[d];
-            float inv_rms = 1.0f / (std::sqrt(ss / head_dim + eps));
-            if (weight) {
-                for (int d = 0; d < head_dim; ++d) head[d] = head[d] * inv_rms * weight[d];
-            } else {
-                for (int d = 0; d < head_dim; ++d) head[d] *= inv_rms;
-            }
-        }
-    }
-}
 
 // Gemma4 RoPE: NeoX 风格 split-half + Q 的 sqrt(head_dim) 预缩放。
 // freq_factors 非空时对每个维度做频率缩放 (Proportional RoPE)。
@@ -211,11 +193,15 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
         {
             PERF_SCOPE("layer/kv_cache_update");
             if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {
-                throw std::runtime_error(
-                    "KV cache overflow at layer " + std::to_string(layer_idx) +
-                    ": write_pos=" + std::to_string(start_pos) +
-                    " seq_len=" + std::to_string(seq_len) +
-                    " exceeds max_seq_len=" + std::to_string(kv_cache_.max_seq_len()));
+                // KVOverflowError, not a bare runtime_error: the entry points
+                // catch this type and print an actionable message, whereas an
+                // uncaught std::runtime_error here aborted the process with a
+                // core dump.
+                throw KVOverflowError("context too long for the KV cache at layer " +
+                                      std::to_string(layer_idx) + ": writing " +
+                                      std::to_string(seq_len) + " token(s) at position " +
+                                      std::to_string(start_pos) + ", which exceeds the " +
+                                      std::to_string(kv_cache_.max_seq_len()) + "-token context");
             }
         }
     } else {

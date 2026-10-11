@@ -63,6 +63,54 @@ void launch_rope_gqa(const float* q, const float* k, float* q_out, float* k_out,
                                                     theta);
 }
 
+// YaRN: theta = pos * inv_freq * pair_scale[d], cos/sin 乘 mscale。
+// 逐位镜像 ggml rope_yarn() 的角度与幅值 (pair_scale 来自 host 侧 corr-dims 表)。
+__global__ void rope_yarn_kernel(const float* x, float* x_out, int seq_len, int num_heads,
+                                 int head_dim, int64_t pos, float theta,
+                                 const float* __restrict__ pair_scale, float mscale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * num_heads * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int half_dim = head_dim / 2;
+    if (d >= half_dim)
+        return;
+
+    int h = (idx / head_dim) % num_heads;
+    int s = idx / (num_heads * head_dim);
+
+    float inv_freq = 1.0f / powf(theta, (2.0f * d) / head_dim);
+    float angle = (pos + s) * inv_freq * pair_scale[d];
+    float cos_a = cosf(angle) * mscale;
+    float sin_a = sinf(angle) * mscale;
+
+    int i0 = idx;
+    int i1 = s * num_heads * head_dim + h * head_dim + d + half_dim;
+
+    float x0 = x[i0], x1 = x[i1];
+    x_out[i0] = x0 * cos_a - x1 * sin_a;
+    x_out[i1] = x0 * sin_a + x1 * cos_a;
+}
+
+void launch_rope_gqa_yarn(const float* q, const float* k, float* q_out, float* k_out,
+                          int num_q_heads, int num_kv_heads, int head_dim, int seq_len, int64_t pos,
+                          float theta, const float* pair_scale, float mscale,
+                          cudaStream_t stream) {
+    int threads = 256;
+
+    int q_total = seq_len * num_q_heads * head_dim;
+    int q_blocks = (q_total + threads - 1) / threads;
+    rope_yarn_kernel<<<q_blocks, threads, 0, stream>>>(q, q_out, seq_len, num_q_heads, head_dim,
+                                                       pos, theta, pair_scale, mscale);
+
+    int k_total = seq_len * num_kv_heads * head_dim;
+    int k_blocks = (k_total + threads - 1) / threads;
+    rope_yarn_kernel<<<k_blocks, threads, 0, stream>>>(k, k_out, seq_len, num_kv_heads, head_dim,
+                                                       pos, theta, pair_scale, mscale);
+}
+
 __global__ void expand_kv_kernel(const float* kv, float* out, int seq_len, int num_heads,
                                  int num_kv_heads, int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

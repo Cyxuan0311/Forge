@@ -163,6 +163,30 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return d * d8 * (float)sumi;
 }
 
+// Q5_0 block (32 elems, 22 bytes) × one Q8_1 block — 1:1 mapping.
+// Layout: d(f16, 2B) + qh[4] (bit5 high bits) + qs[16] (4-bit nibbles).
+// value = (5-bit - 16) * d, 5-bit = nibble | (bit5 << 4).
+static __device__ __forceinline__ float vec_dot_q5_0_q8_1(
+    const uint8_t* __restrict__ block_ptr,
+    const block_q8_1_gemv* __restrict__ q8_blk)
+{
+    float d = __half2float(reinterpret_cast<const __half&>(*(const uint16_t*)block_ptr));
+    float d8 = q8_blk->ds.x;
+
+    uint32_t qh;
+    memcpy(&qh, block_ptr + 2, 4);
+    const uint8_t* qs = block_ptr + 6;
+    const int8_t* q8 = reinterpret_cast<const int8_t*>(q8_blk->qs);
+
+    float sum = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        int x0 = ((qs[i] & 0x0F) | (((qh >> i) & 1) << 4)) - 16;
+        int x1 = ((qs[i] >> 4) | (((qh >> (i + 16)) & 1) << 4)) - 16;
+        sum += (float)x0 * (float)q8[i] + (float)x1 * (float)q8[i + 16];
+    }
+    return d * d8 * sum;
+}
+
 // Q4_K block (256 elems, 144 bytes) × 8 Q8_1 blocks. One call covers one iqs
 // step (iqs in 0,2,..,30); the caller iterates the iqs steps within a block.
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(

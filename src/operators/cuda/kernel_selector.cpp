@@ -18,8 +18,8 @@
 //     block/scale dequant is slower than dp4a MMQ on shipping GPUs (RTX 4050
 //     measured ~2.6x slower prefill), so it stays on MMQ; FORGE_AUTOTUNE=1 can
 //     still opt it into TC per-signature.
-//   * MoE: only Q4_0/Q4_K/Q6_K/Q8_0 experts are launchable; anything else is
-//     UNSUPPORTED and the caller skips silently (as before).
+//   * MoE: only Q4_0/Q4_K/Q5_0/Q6_K/Q8_0 experts are launchable; anything else
+//     is UNSUPPORTED and the caller skips silently (as before).
 //
 // Policy layers (lowest to highest priority):
 //   1. per-dtype conservative static heuristic (Phase 5-C);
@@ -361,6 +361,7 @@ KernelVariant select_moe(const KernelProblem& p) {
     switch (p.dtype) {
     case DataType::Q4_0:
     case DataType::Q4_K:
+    case DataType::Q5_0:
     case DataType::Q6_K:
     case DataType::Q8_0:
         return KernelVariant::MOE_EXPERT_GEMV;

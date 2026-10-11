@@ -191,6 +191,14 @@ void launch_rope_gqa(const float* q, const float* k, float* q_out, float* k_out,
                      int num_kv_heads, int head_dim, int seq_len, int64_t pos, float theta,
                      cudaStream_t stream = 0);
 
+// YaRN GQA rope (mellum full-attention layers): theta_i = pos * inv_freq_i *
+// pair_scale[i], cos/sin scaled by mscale. pair_scale is a [head_dim/2] per-pair
+// frequency table exported from the host-side ggml corr-dims computation.
+void launch_rope_gqa_yarn(const float* q, const float* k, float* q_out, float* k_out,
+                          int num_q_heads, int num_kv_heads, int head_dim, int seq_len, int64_t pos,
+                          float theta, const float* pair_scale, float mscale,
+                          cudaStream_t stream = 0);
+
 void launch_rope_gemma4_gqa(const float* q, const float* k, float* q_out, float* k_out,
                             int num_q_heads, int num_kv_heads, int head_dim, int seq_len,
                             int64_t pos, float theta, const float* freq_factors,
@@ -893,10 +901,34 @@ void launch_moe_router_scale(const float* x, const float* scale, float* out, int
                              float inv_sqrt, float eps, int seq_len, cudaStream_t stream = 0);
 
 // ---- MoE Expert GEMV ----
+// apply_weight=false skips the routing-weight multiply (used for gate/up
+// projections, where the weight must only be applied at the down step).
 template <DataType DT>
 void launch_moe_expert_gemv(const float* x, const void* q_w_3d, float* out,
                             const int* expert_indices, const float* expert_weights, int K, int N,
-                            int n_expert, int n_expert_used, int n_tokens, cudaStream_t stream = 0);
+                            int n_expert, int n_expert_used, int n_tokens, cudaStream_t stream = 0,
+                            bool apply_weight = true);
+
+// ---- Slot-Indexed Fused MoE GEMV (per-expert activation) ----
+// Reference semantics:
+//   out[t] = Σ_k w[t,k] · down_{e[t,k]}( silu(gate_{e[t,k]}(x[t])) ⊙ up_{e[t,k]}(x[t]) )
+// The nonlinearity must be applied per expert, so gate/up results are stored per
+// slot (slot = t*n_expert_used + k) instead of being atomically accumulated
+// across experts like launch_moe_expert_gemv does. Slots match the layout
+// launch_moe_router writes for indices/weights — no repacking needed.
+template <DataType DT>
+void launch_moe_expert_gateup_slots(const float* x, const void* q_gate, const void* q_up,
+                                    float* out_gate, float* out_up, const int* expert_indices,
+                                    int K, int N, int n_expert, int n_expert_used, int n_tokens,
+                                    cudaStream_t stream = 0);
+
+// down: weighted per-slot accumulate into per-token output (deterministic slot
+// order, no atomics). x is the gated activation [n_tokens*n_expert_used, K].
+template <DataType DT>
+void launch_moe_expert_down_slots(const float* x, const void* q_down, float* out,
+                                  const int* expert_indices, const float* expert_weights, int K,
+                                  int N, int n_expert, int n_expert_used, int n_tokens,
+                                  cudaStream_t stream = 0);
 
 // ---- GeGLU Split ----
 void launch_gelu_tanh_multiply_split(const float* gate_up, float* out, int half_dim, int n_tokens,

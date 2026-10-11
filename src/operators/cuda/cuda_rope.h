@@ -15,6 +15,15 @@ void launch_rope_gqa(const float* q, const float* k, float* q_out, float* k_out,
                      int num_kv_heads, int head_dim, int seq_len, int64_t pos, float theta,
                      cudaStream_t stream = 0);
 
+// YaRN GQA rope (mellum 全注意力层): theta_i = pos * inv_freq_i * pair_scale[i],
+// cos/sin 再乘 mscale。pair_scale 是 [head_dim/2] 的每对频率 scale 表
+// (ggml rope_yarn 的 s_i, 由 host 侧 build_yarn_table 导出), mscale 是
+// attn_factor*(1+0.1*ln(1/freq_scale))。
+void launch_rope_gqa_yarn(const float* q, const float* k, float* q_out, float* k_out,
+                          int num_q_heads, int num_kv_heads, int head_dim, int seq_len, int64_t pos,
+                          float theta, const float* pair_scale, float mscale,
+                          cudaStream_t stream = 0);
+
 void launch_rope_gemma4_gqa(const float* q, const float* k, float* q_out, float* k_out,
                              int num_q_heads, int num_kv_heads, int head_dim,
                              int seq_len, int64_t pos, float theta,

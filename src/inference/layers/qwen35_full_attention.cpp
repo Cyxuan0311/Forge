@@ -7,6 +7,7 @@
 
 #include "forge/cuda_kernels.h"  // fused + paged decode launches (F16/Q8_0/Q4_0/FP8)
 #include "forge/inference/layers/attention_executor.h"
+#include "forge/inference/layers/per_head_norm.h"
 #include "forge/inference/layers/qwen35_rope.h"
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/logger.h"
@@ -17,34 +18,6 @@
 #endif
 
 namespace forge {
-
-namespace {
-
-// 读取 per-head norm 权重到 CPU vector。非 FP32 权重退化为全 1,
-// 与重构前的行为一致。
-std::vector<float> load_head_norm_weight(const TensorPtr& w, int head_dim) {
-    std::vector<float> out(head_dim, 1.0f);
-    if (!w || w->dtype() != DataType::FP32)
-        return out;
-    auto cpu = ensure_cpu(w);
-    std::memcpy(out.data(), cpu->data(), head_dim * sizeof(float));
-    return out;
-}
-
-void per_head_rms_norm_cpu(float* data, const std::vector<float>& weight, int seq_len,
-                           int num_heads, int head_dim, float eps) {
-    cpu::parallel_for2(seq_len, num_heads, [&](int s, int h) {
-            float* head_ptr = data + s * num_heads * head_dim + h * head_dim;
-            float norm_sq = 0.0f;
-            for (int d = 0; d < head_dim; ++d)
-                norm_sq += head_ptr[d] * head_ptr[d];
-            float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + eps);
-            for (int d = 0; d < head_dim; ++d)
-                head_ptr[d] *= inv_rms * weight[d];
-        });
-}
-
-}  // namespace
 
 TensorPtr Qwen35FullAttention::attend(const TensorPtr& normed, const LayerExecutionContext& lctx) {
     const auto& lw = lctx.weights;
