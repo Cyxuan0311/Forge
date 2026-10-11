@@ -14,11 +14,19 @@ import os
 
 import pytest
 
-# Ensure paged mode for this test module.
-# The scheduler reads FORGE_KV_STORAGE_MODE in its constructor.
-os.environ["FORGE_KV_STORAGE_MODE"] = "paged"
-
 import forge
+
+
+@pytest.fixture(autouse=True)
+def _paged_kv_storage(monkeypatch):
+    """Pin FORGE_KV_STORAGE_MODE=paged for this module's tests only.
+
+    The scheduler reads the env var in its constructor. Setting it at import
+    time leaks it to every other test module (pytest imports all modules
+    before running any test); monkeypatch restores the original value after
+    each test.
+    """
+    monkeypatch.setenv("FORGE_KV_STORAGE_MODE", "paged")
 
 
 def _run_scheduler(scheduler, max_steps=200):
