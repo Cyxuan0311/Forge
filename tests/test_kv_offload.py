@@ -21,9 +21,6 @@ import sys
 
 import pytest
 
-# Paged storage must be selected before the scheduler builds its KV memory.
-os.environ.setdefault("FORGE_KV_STORAGE_MODE", "paged")
-
 build_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "build")
 if os.path.exists(build_dir):
     sys.path.insert(0, build_dir)
@@ -31,6 +28,19 @@ if os.path.exists(build_dir):
 import forge  # noqa: E402
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "test_model_small.ninf")
+
+
+@pytest.fixture(autouse=True)
+def _paged_kv_storage(monkeypatch):
+    """Pin FORGE_KV_STORAGE_MODE=paged for this module's tests only.
+
+    Setting the env var at import time leaks it to every other test module
+    (pytest imports all modules before running any test), silently switching
+    the whole session to paged KV storage. monkeypatch restores the original
+    value after each test.
+    """
+    monkeypatch.setenv("FORGE_KV_STORAGE_MODE", "paged")
+
 
 MODEL_CONFIG = {
     "vocab_size": 100,

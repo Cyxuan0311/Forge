@@ -210,6 +210,67 @@ static void run_kvcache_swa_test() {
     for (int p = 0; p < 20; ++p)
         plain.update(0, dummy, dummy, 1);
     CHECK(plain.filled(0) == 20, "kvcache: no policy -> no eviction (baseline)");
+
+    // Ring wrap crossing: a block update whose [cursor, cursor+seq_len) range
+    // crosses the window boundary must wrap into segments, so the reorder in
+    // get_key_filled() yields the correct logical order. Rows are tagged with
+    // their logical position to make any misalignment visible (a linear write
+    // lands the block tail past the window, where the reorder never reads it).
+    {
+        KVCache wc;
+        wc.init_quantized(kLayers, kKVHeads, kHeadDim, kMaxSeq, DeviceType::CPU,
+                          KVCacheDType::FP32);
+        std::vector<KVLayerPolicy> wp(kLayers, KVLayerPolicy::Full);
+        wp[0] = KVLayerPolicy::SlidingWindow;
+        wc.set_layer_policies(wp, kWindow);
+
+        auto tagged = [&](float tag) {
+            auto t = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{1, kKVdim},
+                                              DeviceType::CPU);
+            float* d = static_cast<float*>(t->data());
+            for (int i = 0; i < kKVdim; ++i)
+                d[i] = tag;
+            return t;
+        };
+        auto block = [&](float base, int rows) {
+            auto t = std::make_shared<Tensor>(DataType::FP32,
+                                              std::vector<int64_t>{rows, kKVdim},
+                                              DeviceType::CPU);
+            float* d = static_cast<float*>(t->data());
+            for (int r = 0; r < rows; ++r)
+                for (int i = 0; i < kKVdim; ++i)
+                    d[r * kKVdim + i] = base + r;
+            return t;
+        };
+        auto row_tags_match = [&](const TensorPtr& k, int base) {
+            const float* d = static_cast<const float*>(k->data());
+            for (int r = 0; r < kWindow; ++r)
+                for (int i = 0; i < kKVdim; ++i)
+                    if (d[r * kKVdim + i] != static_cast<float>(base + r))
+                        return false;
+            return true;
+        };
+
+        // Logical positions 0..2, one token each (cursor=3, logical=3).
+        for (int p = 0; p < 3; ++p)
+            wc.update(0, tagged(static_cast<float>(p)), tagged(static_cast<float>(p)), 1);
+        // A 9-token block at logical 3..11: [cursor=3, 3+9=12) crosses the
+        // 8-slot window. After the wrap: rows [3..8) hold tags 3..7, rows
+        // [0..4) hold tags 8..11, cursor=4, logical=12.
+        wc.update(0, block(3, 9), block(3, 9), 9);
+        auto kw = wc.get_key_filled(0);
+        CHECK(kw && kw->shape()[0] == kWindow, "kvcache: wrapped block yields window rows");
+        CHECK(kw && row_tags_match(kw, 4),
+              "kvcache: block crossing the window wraps into logical order [4..11]");
+        CHECK(wc.filled(0) == kWindow, "kvcache: wrapped block caps filled() at window");
+
+        // Post-wrap single write: logical 12 at cursor=4. Window becomes
+        // [5..12] in logical order.
+        wc.update(0, tagged(12), tagged(12), 1);
+        auto kw2 = wc.get_key_filled(0);
+        CHECK(kw2 && row_tags_match(kw2, 5),
+              "kvcache: post-wrap decode keeps logical order [5..12]");
+    }
 }
 
 // =========================================================================

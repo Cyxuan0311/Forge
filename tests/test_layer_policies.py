@@ -12,10 +12,19 @@ import os
 
 import pytest
 
-# Ensure paged mode for this test module.
-os.environ["FORGE_KV_STORAGE_MODE"] = "paged"
-
 import forge
+
+
+@pytest.fixture(autouse=True)
+def _paged_kv_storage(monkeypatch):
+    """Pin FORGE_KV_STORAGE_MODE=paged for this module's tests only.
+
+    Setting the env var at import time leaks it to every other test module
+    (pytest imports all modules before running any test); monkeypatch restores
+    the original value after each test. The contiguous-mode test below removes
+    the variable inside the test body.
+    """
+    monkeypatch.setenv("FORGE_KV_STORAGE_MODE", "paged")
 
 
 def _run_scheduler(scheduler, max_steps=200):
@@ -57,7 +66,8 @@ class TestSWAPagePoolIsolation:
 
     With n_swa=1024 and page_size=16:
       - SWA layer pool:  ceil(1024/16) + 1 = 65 pages
-      - Full layer pool: min(4*4096/16, 256) = 256 pages
+      - Full layer pool: 4 * 2048 / 16 = 512 pages (max_num_seqs=4 default,
+        no cap — vLLM-style budget sizing)
 
     This test verifies the per-layer pool sizing logic in PagedKVStorage.
     """
@@ -104,9 +114,13 @@ class TestSWAPagePoolIsolation:
         pool_sizes = list(stats["layer_pool_max_pages"])
         assert len(pool_sizes) == 1
 
-        # Full pool: min(4*4096/16, 256) = 256
-        assert pool_sizes[0] == 256, \
-            f"Full layer pool should be 256 pages (capped), got {pool_sizes[0]}"
+        # Full pool: ceil(max_num_seqs(4, ContextParams default) *
+        # max_seq_len(2048, ModelConfig default) / page_size(16)) = 512 pages.
+        # CPU pools hold every admitted sequence at full length; the
+        # historical 256-page cap was removed with vLLM-style budget sizing
+        # (PagedKVStorage::init — "no artificial floor").
+        assert pool_sizes[0] == 512, \
+            f"Full layer pool should be 512 pages, got {pool_sizes[0]}"
 
     def test_swa_pool_is_smaller_than_full(self, model_path):
         """Direct comparison: SWA pool < Full pool."""
