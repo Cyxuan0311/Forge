@@ -110,7 +110,8 @@ bool copy_src_to_host(void* host_dst, const void* src, size_t bytes,
 }  // namespace
 
 bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k_bytes,
-                             const void* v_src, size_t v_bytes, CopyKind kind) {
+                             const void* v_src, size_t v_bytes, CopyKind kind, bool force) {
+    std::lock_guard<std::mutex> lock(mtx_);
     if ((!k_src && k_bytes) || (!v_src && v_bytes)) {
         LOG_ERROR("KVBlockSwapper::offload: null source with non-zero size");
         return false;
@@ -118,7 +119,7 @@ bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k
     PageKey key{layer, page_id};
     auto it = pool_.find(key);
     if (it != pool_.end()) {
-        // Slot already exists (grow-only): reject size mismatch.
+        // Slot already exists: reject size mismatch.
         if (it->second.k_size != k_bytes || it->second.v_size != v_bytes) {
             LOG_ERROR("KVBlockSwapper::offload: size mismatch for existing page (" +
                       std::to_string(layer) + "," + std::to_string(page_id) + ")");
@@ -128,7 +129,16 @@ bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k
             return false;
         if (!copy_src_to_host(it->second.v, v_src, v_bytes, kind))
             return false;
+        lru_.splice(lru_.end(), lru_, it->second.lru_it);  // refresh LRU
         return true;
+    }
+
+    const size_t blob_bytes = k_bytes + v_bytes;
+    if (!force && max_bytes_ && total_bytes_ + blob_bytes > max_bytes_) {
+        LOG_DEBUG("KVBlockSwapper::offload: host pool full (" + std::to_string(total_bytes_) + "/" +
+                  std::to_string(max_bytes_) + " bytes), rejecting page (" + std::to_string(layer) +
+                  "," + std::to_string(page_id) + ")");
+        return false;
     }
 
     HostBlob blob;
@@ -160,13 +170,16 @@ bool KVBlockSwapper::offload(int layer, int page_id, const void* k_src, size_t k
         }
         blob.v_size = v_bytes;
     }
-    pool_.emplace(key, blob);
-    total_bytes_ += k_bytes + v_bytes;
+    auto res = pool_.emplace(key, blob);
+    lru_.push_back(key);
+    res.first->second.lru_it = std::prev(lru_.end());
+    total_bytes_ += blob_bytes;
     return true;
 }
 
 bool KVBlockSwapper::bring_back(int layer, int page_id, void* k_dst, size_t k_bytes, void* v_dst,
-                                size_t v_bytes, CopyKind kind) const {
+                                size_t v_bytes, CopyKind kind) {
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = pool_.find(PageKey{layer, page_id});
     if (it == pool_.end())
         return false;
@@ -181,14 +194,17 @@ bool KVBlockSwapper::bring_back(int layer, int page_id, void* k_dst, size_t k_by
         return false;
     if (!copy_host_to_dst(v_dst, blob.v, v_bytes, kind))
         return false;
+    lru_.splice(lru_.end(), lru_, it->second.lru_it);  // refresh LRU
     return true;
 }
 
 bool KVBlockSwapper::has(int layer, int page_id) const {
+    std::lock_guard<std::mutex> lock(mtx_);
     return pool_.find(PageKey{layer, page_id}) != pool_.end();
 }
 
 bool KVBlockSwapper::size(int layer, int page_id, size_t* k_bytes, size_t* v_bytes) const {
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = pool_.find(PageKey{layer, page_id});
     if (it == pool_.end())
         return false;
@@ -199,10 +215,29 @@ bool KVBlockSwapper::size(int layer, int page_id, size_t* k_bytes, size_t* v_byt
     return true;
 }
 
+bool KVBlockSwapper::peek(int layer, int page_id, const uint8_t** k, const uint8_t** v,
+                          size_t* k_bytes, size_t* v_bytes) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = pool_.find(PageKey{layer, page_id});
+    if (it == pool_.end())
+        return false;
+    if (k)
+        *k = it->second.k;
+    if (v)
+        *v = it->second.v;
+    if (k_bytes)
+        *k_bytes = it->second.k_size;
+    if (v_bytes)
+        *v_bytes = it->second.v_size;
+    return true;
+}
+
 void KVBlockSwapper::drop(int layer, int page_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = pool_.find(PageKey{layer, page_id});
     if (it == pool_.end())
         return;
+    lru_.erase(it->second.lru_it);
     total_bytes_ -= (it->second.k_size + it->second.v_size);
     if (it->second.k)
         free_host(it->second.k);
@@ -213,6 +248,7 @@ void KVBlockSwapper::drop(int layer, int page_id) {
 }
 
 void KVBlockSwapper::reset() {
+    std::lock_guard<std::mutex> lock(mtx_);
     for (auto& kv : pool_) {
         if (kv.second.k)
             free_host(kv.second.k);
@@ -221,8 +257,30 @@ void KVBlockSwapper::reset() {
         kv.second.reset();
     }
     pool_.clear();
+    lru_.clear();
     total_bytes_ = 0;
     pinned_ = false;
+}
+
+bool KVBlockSwapper::touch(int layer, int page_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = pool_.find(PageKey{layer, page_id});
+    if (it == pool_.end())
+        return false;
+    lru_.splice(lru_.end(), lru_, it->second.lru_it);
+    return true;
+}
+
+bool KVBlockSwapper::lru_oldest(int* layer, int* page_id) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (lru_.empty())
+        return false;
+    const PageKey& oldest = lru_.front();
+    if (layer)
+        *layer = oldest.first;
+    if (page_id)
+        *page_id = oldest.second;
+    return true;
 }
 
 }  // namespace forge

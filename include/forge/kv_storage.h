@@ -17,6 +17,7 @@
 
 #include "kv_block_swapper.h"
 #include "kv_cache.h"
+#include "kv_l3_backend.h"
 #include "tensor.h"
 
 namespace forge {
@@ -130,6 +131,70 @@ public:
     // Pages referenced by sequences and present in primary memory (evicted
     // pages are off the device and therefore not counted).
     virtual int num_device_pages_in_use() const { return 0; }
+
+    // ---- Multi-level prefix cache: node-seg backup/restore blobs ----
+    // The radix tree backs up a node's page-aligned seg [p0, p1) into a
+    // dedicated prefix blob pool (separate from the request-swap pool), then
+    // releases the device pages. blob_keys is indexed [layer][page-in-range];
+    // on backup, entries < 0 allocate a fresh blob id and are written back,
+    // entries >= 0 overwrite that blob in place (re-backup after restore).
+    // blob keys are (layer, monotonic id) — never reused, so a stale id can
+    // never alias a live blob.
+    //
+    // Both sides are all-or-nothing from the caller's perspective: on failure
+    // the node stays device-resident (backup) or the destination sequence's
+    // page table may be partially populated and must be released (restore).
+    virtual bool backup_prefix_pages(int seq_id, int64_t p0, int64_t p1,
+                                     std::vector<std::vector<int32_t>>* blob_keys) {
+        (void)seq_id;
+        (void)p0;
+        (void)p1;
+        (void)blob_keys;
+        return false;
+    }
+    // Copy blobs back into the page range [p0, p0 + n) of `seq_id`, appending
+    // freshly allocated device pages as needed (n = blob_keys[layer].size()).
+    // Restored pages are marked fully filled; row mirrors below p0*page_size
+    // are considered intact.
+    virtual bool restore_prefix_pages(int seq_id, int64_t p0,
+                                      const std::vector<std::vector<int32_t>>& blob_keys) {
+        (void)seq_id;
+        (void)p0;
+        (void)blob_keys;
+        return false;
+    }
+    // Drop one blob from the prefix pool (the tree drops a node's blobs when
+    // the node leaves the host tier). False when the blob does not exist.
+    virtual bool drop_prefix_blob(int layer, int32_t blob_id) {
+        (void)layer;
+        (void)blob_id;
+        return false;
+    }
+    // Prefix pool usage / LRU head / budget (0 = grow-only).
+    virtual size_t prefix_pool_bytes() const { return 0; }
+    virtual bool prefix_pool_lru_oldest(int* layer, int32_t* blob_id) const {
+        (void)layer;
+        (void)blob_id;
+        return false;
+    }
+    virtual void set_prefix_pool_max_bytes(size_t bytes) { (void)bytes; }
+    // Current byte budget of the prefix pool (0 = grow-only, no cap).
+    virtual size_t prefix_pool_max_bytes() const { return 0; }
+
+    // ---- Phase 3: L3 tier behind the host pool ----
+    //
+    // The L3 backend is owned by the caller and shared; nullptr means "host
+    // pool only" (a spilled blob is simply dropped, as in Phase 1/2).
+    virtual void set_l3_backend(std::shared_ptr<KVStorageBackend> backend) { (void)backend; }
+    virtual KVStorageBackend* l3_backend() const { return nullptr; }
+    virtual bool l3_enabled() const { return false; }
+    // Move the given blobs ([layer][page]) from the host pool down to L3,
+    // dropping the pool copies. The blob ids stay valid, so a later restore
+    // fetches them back up. False when L3 is off or the write fails.
+    virtual bool spill_prefix_blobs(const std::vector<std::vector<int32_t>>& blob_keys) {
+        (void)blob_keys;
+        return false;
+    }
 
     // ---- Underlying KVCache (nullptr for paged mode) ----
     virtual KVCache* cache() = 0;
@@ -465,6 +530,25 @@ public:
     // Total page capacity across all per-layer pools.
     int total_page_capacity() const;
 
+    // ---- Multi-level prefix cache: node-seg backup/restore blobs ----
+    bool backup_prefix_pages(int seq_id, int64_t p0, int64_t p1,
+                             std::vector<std::vector<int32_t>>* blob_keys) override;
+    bool restore_prefix_pages(int seq_id, int64_t p0,
+                              const std::vector<std::vector<int32_t>>& blob_keys) override;
+    bool drop_prefix_blob(int layer, int32_t blob_id) override;
+    size_t prefix_pool_bytes() const override;
+    bool prefix_pool_lru_oldest(int* layer, int32_t* blob_id) const override;
+    void set_prefix_pool_max_bytes(size_t bytes) override;
+    size_t prefix_pool_max_bytes() const override { return prefix_swapper_.max_bytes(); }
+
+    // ---- Phase 3: L3 tier ----
+    void set_l3_backend(std::shared_ptr<KVStorageBackend> backend) override {
+        l3_ = std::move(backend);
+    }
+    KVStorageBackend* l3_backend() const override { return l3_.get(); }
+    bool l3_enabled() const override { return l3_ != nullptr; }
+    bool spill_prefix_blobs(const std::vector<std::vector<int32_t>>& blob_keys) override;
+
     // ---- KVMem tiered window ----
     bool kvmem_supported() const override;
     void set_pool_token_cap(int tokens) override { pool_cap_tokens_ = tokens; }
@@ -502,6 +586,16 @@ public:
     bool offload_to_host_unlocked(int layer, int page_id);
     bool bring_back_unlocked(int layer, int page_id);
     void refresh_cuda_ptr_tables_unlocked(int layer);
+    bool backup_prefix_pages_unlocked(int seq_id, int64_t p0, int64_t p1,
+                                      std::vector<std::vector<int32_t>>* blob_keys);
+    bool restore_prefix_pages_unlocked(int seq_id, int64_t p0,
+                                       const std::vector<std::vector<int32_t>>& blob_keys);
+    // Make sure blob (layer, blob_id) is present in the prefix pool, pulling it
+    // back up from L3 when the host copy was spilled. False when it is nowhere.
+    bool ensure_prefix_blob_unlocked(int layer, int32_t blob_id, size_t k_bytes, size_t v_bytes);
+    // Demote the coldest prefix blobs to L3 until `need` bytes fit in the pool.
+    // False when L3 is off (or refuses) and the room cannot be made.
+    bool spill_prefix_pool_unlocked(size_t need);
 
     KVCache* cache() override { return nullptr; }
     const KVCache* cache() const override { return nullptr; }
@@ -569,6 +663,19 @@ private:
     KVBlockSwapper swapper_;
     int offloaded_pages_ = 0;
     int brought_back_pages_ = 0;
+
+    // ---- Multi-level prefix cache: dedicated prefix blob pool ----
+    // Independent from swapper_ (request-swap pool) so the two LRU domains and
+    // budgets never interfere. Blob keys are (layer, next_prefix_blob_id_++).
+    // The counter is deliberately NOT reset by reset(): a tree that survives a
+    // storage reset must not see its blob ids reallocated to other data.
+    KVBlockSwapper prefix_swapper_;
+    int32_t next_prefix_blob_id_ = 0;
+    // Phase 3: optional third tier behind the prefix pool. Spilled blobs live
+    // here under key (layer << 32) | blob_id while the pool copy is dropped.
+    std::shared_ptr<KVStorageBackend> l3_;
+    int l3_spills_ = 0;   // blobs moved down to L3
+    int l3_fetches_ = 0;  // blobs pulled back up from L3
 
     // Pages: layer_pages_[layer][page_id] -> KVPage
     std::vector<std::vector<KVPage>> layer_pages_;

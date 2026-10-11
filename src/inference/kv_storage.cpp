@@ -1401,6 +1401,10 @@ void PagedKVStorage::reset() {
     }
     offloaded_pages_ = 0;
     brought_back_pages_ = 0;
+    // Prefix blob pool: blobs are unreachable after the sequence tables are
+    // cleared (every cache seq is gone), so the pool is dropped too. The blob
+    // id counter is intentionally NOT reset — see the member comment.
+    prefix_swapper_.reset();
     // Note: device page pointer tables are stable across reset() (the page
     // pool itself is not freed); only the per-sequence page_ids are cleared.
     // d_seq_page_ids_ is reused as-is (overwritten on next upload).
@@ -1444,6 +1448,12 @@ const uint8_t* storage_raw_ptr(const KVCacheStorage& s) {
 #else
     return nullptr;
 #endif
+}
+
+// Mutable raw data pointer (destination for a blob restore into the page's
+// own already-allocated buffers).
+uint8_t* storage_raw_ptr(KVCacheStorage& s) {
+    return const_cast<uint8_t*>(storage_raw_ptr(const_cast<const KVCacheStorage&>(s)));
 }
 
 // Release the page's primary-memory data (keeps dtype/device/rows/row_bytes so
@@ -1650,6 +1660,308 @@ bool PagedKVStorage::bring_back_unlocked(int layer, int page_id) {
     brought_back_pages_++;
     refresh_cuda_ptr_tables_unlocked(layer);
     return true;
+}
+
+// =========================================================================
+// Multi-level prefix cache: node-seg backup/restore blob pool
+// =========================================================================
+
+bool PagedKVStorage::backup_prefix_pages(int seq_id, int64_t p0, int64_t p1,
+                                         std::vector<std::vector<int32_t>>* blob_keys) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return backup_prefix_pages_unlocked(seq_id, p0, p1, blob_keys);
+}
+
+bool PagedKVStorage::backup_prefix_pages_unlocked(int seq_id, int64_t p0, int64_t p1,
+                                                  std::vector<std::vector<int32_t>>* blob_keys) {
+    auto it = seq_tables_.find(seq_id);
+    if (it == seq_tables_.end()) {
+        LOG_ERROR("backup_prefix_pages: seq " + std::to_string(seq_id) + " not found");
+        return false;
+    }
+    if (!blob_keys || p0 < 0 || p1 <= p0) {
+        LOG_ERROR("backup_prefix_pages: invalid arguments (p0=" + std::to_string(p0) +
+                  ", p1=" + std::to_string(p1) + ")");
+        return false;
+    }
+    const int64_t n = p1 - p0;
+    if ((int)blob_keys->size() != num_layers_) {
+        LOG_ERROR("backup_prefix_pages: blob_keys has " + std::to_string(blob_keys->size()) +
+                  " layer rows, expected " + std::to_string(num_layers_));
+        return false;
+    }
+
+    const KVBlockSwapper::CopyKind kind = (device_ == DeviceType::CUDA)
+                                              ? KVBlockSwapper::CopyKind::Device
+                                              : KVBlockSwapper::CopyKind::Host;
+
+    for (int l = 0; l < num_layers_; ++l) {
+        auto& keys = (*blob_keys)[l];
+        if ((int64_t)keys.size() != n) {
+            LOG_ERROR("backup_prefix_pages: blob_keys[layer=" + std::to_string(l) +
+                      "] has " + std::to_string(keys.size()) + " entries, expected " +
+                      std::to_string(n));
+            return false;
+        }
+        const auto& table = it->second[l];
+        if (p1 > (int64_t)table.page_ids.size()) {
+            LOG_ERROR("backup_prefix_pages: page range [" + std::to_string(p0) + ", " +
+                      std::to_string(p1) + ") exceeds seq " + std::to_string(seq_id) + " layer " +
+                      std::to_string(l) + " table (" + std::to_string(table.page_ids.size()) +
+                      " pages)");
+            return false;
+        }
+        for (int64_t i = 0; i < n; ++i) {
+            const int page_id = table.page_ids[p0 + i];
+            const auto& page = layer_pages_[l][page_id];
+            // A prefix seg page must be complete and resident. A released
+            // buffer (raw ptr nullptr) covers KVMem-archived pages defensively.
+            if (page.evicted || page.filled != (uint32_t)page_size_) {
+                LOG_ERROR("backup_prefix_pages: page " + std::to_string(page_id) + " not usable " +
+                          "(evicted=" + std::to_string(page.evicted ? 1 : 0) + ", filled=" +
+                          std::to_string(page.filled) + "/" + std::to_string(page_size_) + ")");
+                return false;
+            }
+            const size_t k_bytes = page.key.capacity_bytes();
+            const size_t v_bytes = page.value.capacity_bytes();
+            const uint8_t* k_src = storage_raw_ptr(page.key);
+            const uint8_t* v_src = storage_raw_ptr(page.value);
+            if (!k_src || !v_src || (k_bytes == 0 && v_bytes == 0)) {
+                LOG_ERROR("backup_prefix_pages: page " + std::to_string(page_id) +
+                          " has no resident data");
+                return false;
+            }
+            int32_t blob_id = keys[i];
+            if (blob_id < 0)
+                blob_id = next_prefix_blob_id_++;
+            // Phase 3: a full host pool is not a dead end when L3 is backing it
+            // — demote the coldest blobs and retry instead of losing the prefix.
+            const size_t need = k_bytes + v_bytes;
+            if (prefix_swapper_.max_bytes() && !prefix_swapper_.has(l, blob_id) &&
+                prefix_swapper_.nbytes() + need > prefix_swapper_.max_bytes()) {
+                spill_prefix_pool_unlocked(need);
+            }
+            if (!prefix_swapper_.offload(l, blob_id, k_src, k_bytes, v_src, v_bytes, kind))
+                return false;  // e.g. host pool over budget — caller keeps the node on device
+            keys[i] = blob_id;
+        }
+    }
+    return true;
+}
+
+bool PagedKVStorage::restore_prefix_pages(int seq_id, int64_t p0,
+                                          const std::vector<std::vector<int32_t>>& blob_keys) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return restore_prefix_pages_unlocked(seq_id, p0, blob_keys);
+}
+
+bool PagedKVStorage::restore_prefix_pages_unlocked(
+    int seq_id, int64_t p0, const std::vector<std::vector<int32_t>>& blob_keys) {
+    if (seq_id < 0 || p0 < 0 || (int)blob_keys.size() != num_layers_) {
+        LOG_ERROR("restore_prefix_pages: invalid arguments (seq=" + std::to_string(seq_id) +
+                  ", p0=" + std::to_string(p0) + ", layers=" + std::to_string(blob_keys.size()) +
+                  "/" + std::to_string(num_layers_) + ")");
+        return false;
+    }
+    int64_t n = -1;
+    for (int l = 0; l < num_layers_; ++l) {
+        if (n < 0)
+            n = (int64_t)blob_keys[l].size();
+        else if ((int64_t)blob_keys[l].size() != n) {
+            LOG_ERROR("restore_prefix_pages: ragged blob_keys (layer 0 has " + std::to_string(n) +
+                      ", layer " + std::to_string(l) + " has " +
+                      std::to_string(blob_keys[l].size()) + ")");
+            return false;
+        }
+    }
+    if (n <= 0) {
+        LOG_ERROR("restore_prefix_pages: empty page range");
+        return false;
+    }
+
+    const KVBlockSwapper::CopyKind kind = (device_ == DeviceType::CUDA)
+                                              ? KVBlockSwapper::CopyKind::Device
+                                              : KVBlockSwapper::CopyKind::Host;
+    const int64_t first_row = p0 * page_size_;
+
+    for (int l = 0; l < num_layers_; ++l) {
+        auto& keys = blob_keys[l];
+        // Appends the [p0, p0+n) page slots. On alloc failure the pages taken
+        // so far are rolled back inside ensure_seq_capacity for this layer;
+        // the caller must release the half-built sequence.
+        if (!ensure_seq_capacity(seq_id, l, (int)(first_row + n * page_size_)))
+            return false;
+        auto& table = seq_tables_[seq_id][l];
+        if (p0 + n > (int64_t)table.page_ids.size()) {
+            LOG_ERROR("restore_prefix_pages: page table too small after capacity ensure");
+            return false;
+        }
+        // The restored rows were never in this sequence's mirrors: force
+        // re-upload (device page table) and re-dequantize (host row mirror).
+        table.d_dirty = true;
+        if (table.cuda_mirror_synced > first_row)
+            table.cuda_mirror_synced = (int)first_row;
+        if (table.host_mirror_synced > first_row)
+            table.host_mirror_synced = (int)first_row;
+
+        for (int64_t i = 0; i < n; ++i) {
+            const int page_id = table.page_ids[p0 + i];
+            auto& page = layer_pages_[l][page_id];
+            if (page.evicted && !bring_back_unlocked(l, page_id)) {
+                LOG_ERROR("restore_prefix_pages: failed to bring back page " +
+                          std::to_string(page_id));
+                return false;
+            }
+            const int32_t blob_id = keys[i];
+            if (blob_id < 0) {
+                LOG_ERROR("restore_prefix_pages: invalid blob id at layer " + std::to_string(l) +
+                          " page " + std::to_string(p0 + i));
+                return false;
+            }
+            const size_t k_bytes = page.key.capacity_bytes();
+            const size_t v_bytes = page.value.capacity_bytes();
+            // Phase 3: the host copy may have been spilled to L3 — pull it back
+            // into the pool so the (host -> device) copy below can proceed.
+            if (!ensure_prefix_blob_unlocked(l, blob_id, k_bytes, v_bytes)) {
+                LOG_ERROR("restore_prefix_pages: blob (" + std::to_string(l) + "," +
+                          std::to_string(blob_id) + ") not found in host pool or L3");
+                return false;
+            }
+            // Copy straight into the page's own buffers: they were just
+            // allocated (or brought back) with the right layout, so no host
+            // staging is needed. A mid-way failure leaves this sequence's
+            // fresh pages inconsistent — the caller releases the sequence.
+            if (!prefix_swapper_.bring_back(l, blob_id, storage_raw_ptr(page.key), k_bytes,
+                                            storage_raw_ptr(page.value), v_bytes, kind)) {
+                LOG_ERROR("restore_prefix_pages: blob (" + std::to_string(l) + "," +
+                          std::to_string(blob_id) + ") missing or size mismatch");
+                return false;
+            }
+            page.filled = (uint32_t)page_size_;
+
+        }
+
+        table.logical_len = std::max<int64_t>(table.logical_len, first_row + n * page_size_);
+        if (p0 + n == (int64_t)table.page_ids.size())
+            table.filled_in_last = page_size_;  // restored pages are always complete
+    }
+    return true;
+}
+
+bool PagedKVStorage::drop_prefix_blob(int layer, int32_t blob_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (layer < 0 || layer >= num_layers_)
+        return false;
+    if (!prefix_swapper_.has(layer, blob_id))
+        return false;
+    prefix_swapper_.drop(layer, blob_id);
+    return true;
+}
+
+bool PagedKVStorage::spill_prefix_pool_unlocked(size_t need) {
+    if (!l3_)
+        return false;
+
+    const size_t cap = prefix_swapper_.max_bytes();
+    int guard = 0;
+    while ((!cap || prefix_swapper_.nbytes() + need > cap) && guard++ < 100000) {
+        int l = -1;
+        int32_t id = -1;
+        if (!prefix_swapper_.lru_oldest(&l, &id))
+            return false;  // pool is empty and `need` still does not fit
+        const uint8_t* k = nullptr;
+        const uint8_t* v = nullptr;
+        size_t k_bytes = 0;
+        size_t v_bytes = 0;
+        if (!prefix_swapper_.peek(l, id, &k, &v, &k_bytes, &v_bytes)) {
+            prefix_swapper_.drop(l, id);  // entry without data: just drop it
+            continue;
+        }
+        if (!l3_->put(SwapperKVBackend::make_key(l, id), k, k_bytes, v, v_bytes))
+            return false;
+        prefix_swapper_.drop(l, id);
+        ++l3_spills_;
+    }
+    return true;
+}
+
+bool PagedKVStorage::ensure_prefix_blob_unlocked(int layer, int32_t blob_id, size_t k_bytes,
+                                                  size_t v_bytes) {
+    if (prefix_swapper_.has(layer, blob_id))
+        return true;
+    if (!l3_)
+        return false;
+
+    const uint64_t key = SwapperKVBackend::make_key(layer, blob_id);
+    std::vector<uint8_t> k_buf(k_bytes);
+    std::vector<uint8_t> v_buf(v_bytes);
+    if (!l3_->get(key, k_buf.data(), k_bytes, v_buf.data(), v_bytes))
+        return false;
+    // Park the blob back in the host pool: the restore path copies from there
+    // (host -> device), which keeps a single copy path for both tiers. The re-park
+    // is transient (consumed by bring_back immediately below), so it bypasses the
+    // host-pool cap — a momentary over-budget park is re-balanced on the next
+    // host-tier eviction.
+    if (!prefix_swapper_.offload(layer, blob_id, k_buf.data(), k_bytes, v_buf.data(), v_bytes,
+                                 KVBlockSwapper::CopyKind::Host, /*force=*/true))
+        return false;
+    ++l3_fetches_;
+    return true;
+}
+
+bool PagedKVStorage::spill_prefix_blobs(const std::vector<std::vector<int32_t>>& blob_keys) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!l3_)
+        return false;
+
+    bool ok = true;
+    size_t spilled = 0;
+    for (int l = 0; l < num_layers_ && ok; ++l) {
+        if (l >= static_cast<int>(blob_keys.size()))
+            break;
+        for (int32_t id : blob_keys[l]) {
+            if (id < 0)
+                continue;
+            const uint8_t* k = nullptr;
+            const uint8_t* v = nullptr;
+            size_t k_bytes = 0;
+            size_t v_bytes = 0;
+            if (!prefix_swapper_.peek(l, id, &k, &v, &k_bytes, &v_bytes))
+                continue;  // already spilled (or dropped) — nothing to move
+            if (!l3_->put(SwapperKVBackend::make_key(l, id), k, k_bytes, v, v_bytes)) {
+                ok = false;
+                break;
+            }
+            prefix_swapper_.drop(l, id);
+            ++spilled;
+        }
+    }
+    // A partial spill is still progress (the pool shrank), but the caller needs
+    // to know it is incomplete so it can decide whether to keep the node.
+    l3_spills_ += static_cast<int>(spilled);
+    return ok && spilled > 0;
+}
+
+size_t PagedKVStorage::prefix_pool_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return prefix_swapper_.nbytes();
+}
+
+bool PagedKVStorage::prefix_pool_lru_oldest(int* layer, int32_t* blob_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int l = -1, id = -1;
+    if (!prefix_swapper_.lru_oldest(&l, &id))
+        return false;
+    if (layer)
+        *layer = l;
+    if (blob_id)
+        *blob_id = id;
+    return true;
+}
+
+void PagedKVStorage::set_prefix_pool_max_bytes(size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prefix_swapper_.set_max_bytes(bytes);
 }
 
 int PagedKVStorage::seq_num_pages(int seq_id) const {

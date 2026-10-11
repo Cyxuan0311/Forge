@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "tensor.h"
@@ -40,6 +42,16 @@ enum class KVLayerPolicy : int {
 struct KVCacheTypeConfig {
     KVCacheDType type_k = KVCacheDType::FP32;
     KVCacheDType type_v = KVCacheDType::FP32;
+};
+
+// Thrown when a prompt plus its generation exceeds the KV cache allocation.
+// A distinct type so the entry points can report it as a normal, actionable
+// error: raised deep inside the attention layer, it used to reach an uncaught
+// boundary and terminate the process (SIGABRT, core dump) with a raw
+// "terminate called after throwing..." line that read like a crash rather than
+// a context that was too long for the requested -c.
+struct KVOverflowError : public std::runtime_error {
+    explicit KVOverflowError(const std::string& what) : std::runtime_error(what) {}
 };
 
 // Per-cell metadata for sequence-aware KV cache.
@@ -183,8 +195,16 @@ public:
                         DeviceType device, const KVCacheTypeConfig& kv_config);
 
     // Per-layer KV cache init (for mixed-attention architectures like Gemma 4)
+    //
+    // `rows_per_layer` is optional: when non-empty it overrides `max_seq_len` as
+    // the row count for each layer. A SlidingWindow layer only ever holds its
+    // last `window_size` positions (it recycles in place), so sizing it to the
+    // full context allocates rows that can never be read. Pass
+    // min(max_seq_len, swa_window) for those layers and the Full layers keep the
+    // full length; the per-token cost then drops from "every layer" to "Full layers
+    // only". Cells metadata follows the same per-layer count.
     bool init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
-                        DeviceType device);
+                        DeviceType device, const std::vector<int>& rows_per_layer = {});
 
     // Per-layer device init: call after init_quantized/init_per_layer to place
     // each layer's KV cache on its target device (CPU or CUDA).
@@ -312,6 +332,14 @@ public:
         return num_kv_heads_ * head_dim_;
     }
 
+    // Rows allocated for `layer`. Equals max_seq_len() for every layer unless
+    // init_per_layer() was given a shorter per-layer count (SWA ring layers).
+    int layer_rows(int layer) const {
+        if (!rows_per_layer_.empty() && layer >= 0 && layer < (int)rows_per_layer_.size())
+            return rows_per_layer_[layer];
+        return max_seq_len_;
+    }
+
     size_t nbytes() const;
 
     // Number of bytes actively occupied by filled cells (sum across all layers, K+V).
@@ -362,6 +390,10 @@ private:
     int num_kv_heads_ = 0;
     int head_dim_ = 0;
     std::vector<int> kv_dim_per_layer_;  // per-layer kv_dim for mixed-attention archs
+    // Per-layer allocated row count. Empty = every layer gets max_seq_len_.
+    // Only populated by init_per_layer(); a SWA ring layer is sized to its
+    // window rather than the full context (see init_per_layer's doc comment).
+    std::vector<int> rows_per_layer_;
     int max_seq_len_ = 0;
     DeviceType device_ = DeviceType::CPU;         // fallback / primary device
     std::vector<DeviceType> layer_devices_;       // per-layer device (empty = all on device_)

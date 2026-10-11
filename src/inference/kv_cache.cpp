@@ -846,7 +846,9 @@ KVCache::~KVCache() {
 // =========================================================================
 
 void KVCache::init_cells(int layer) {
-    layers_[layer].cells.assign(max_seq_len_, KVCellMeta{});
+    // Sized to this layer's row count, not the global context length: a SWA ring
+    // layer is indexed modulo its window, so cells beyond that are unreachable.
+    layers_[layer].cells.assign(layer_rows(layer), KVCellMeta{});
 }
 
 bool KVCache::init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len,
@@ -958,7 +960,7 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
 // =========================================================================
 
 bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
-                             DeviceType device) {
+                             DeviceType device, const std::vector<int>& rows_per_layer) {
     kv_dim_per_layer_ = kv_dims;
     num_kv_heads_ = 0;
     head_dim_ = 0;
@@ -967,8 +969,24 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
     kv_dtype_ = KVCacheDType::FP32;
     kv_config_ = {};
 
+    // Per-layer row counts. Default (empty) = every layer spans the full context.
+    // A caller that passes a shorter count for SlidingWindow layers gets a
+    // proportionally smaller allocation AND a smaller cells array, which is
+    // where the bulk of the metadata lives (16 bytes x rows x layers).
+    rows_per_layer_.clear();
+    if (!rows_per_layer.empty()) {
+        rows_per_layer_.resize(num_layers, max_seq_len);
+        for (int i = 0; i < num_layers && i < (int)rows_per_layer.size(); ++i) {
+            // Never exceed the global length, and never allocate zero rows: a
+            // zero-row store would make fp32_row()/q_row() return a null-ish
+            // pointer that the write paths dereference without checking.
+            rows_per_layer_[i] = std::clamp(rows_per_layer[i], 1, max_seq_len);
+        }
+    }
+
     layers_.resize(num_layers);
 
+    int64_t total_rows = 0;
     for (int i = 0; i < num_layers; ++i) {
         int dim = (i < (int)kv_dims.size()) ? kv_dims[i] : kv_dims.back();
         DeviceType layer_dev = layer_device(i);
@@ -979,17 +997,22 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
             init_cells(i);
             continue;
         }
+        const int rows = layer_rows(i);
         if (dim > 0) {
             size_t row_bytes = dim * sizeof(float);
-            layers_[i].key_store.alloc(KVCacheDType::FP32, layer_dev, max_seq_len, row_bytes);
-            layers_[i].value_store.alloc(KVCacheDType::FP32, layer_dev, max_seq_len, row_bytes);
+            layers_[i].key_store.alloc(KVCacheDType::FP32, layer_dev, rows, row_bytes);
+            layers_[i].value_store.alloc(KVCacheDType::FP32, layer_dev, rows, row_bytes);
+            total_rows += rows;
         }
         layers_[i].filled = 0;
         init_cells(i);
     }
 
     LOG_INFO("KVCache init_per_layer: " + std::to_string(num_layers) + " layers, max_seq_len=" +
-             std::to_string(max_seq_len) + ", " + (device == DeviceType::CUDA ? "CUDA" : "CPU"));
+             std::to_string(max_seq_len) + ", " + (device == DeviceType::CUDA ? "CUDA" : "CPU") +
+             (rows_per_layer_.empty() ? ""
+                                      : ", allocated rows=" + std::to_string(total_rows) +
+                                            " (SWA layers sized to window)"));
     return true;
 }
 
@@ -1292,8 +1315,35 @@ int KVCache::update(int layer, const TensorPtr& new_key, const TensorPtr& new_va
         // Recurrent (SSM) layer: state is maintained by the recurrent memory, not the KV cache.
         return static_cast<int>(layers_[layer].filled + seq_len);
     }
-    int64_t start_pos = static_cast<int64_t>(layers_[layer].filled);
+    // Ring layers cap `filled` at the window, so once the ring has wrapped
+    // `filled` stops tracking the logical position. pos must be the LOGICAL
+    // position or logical_filled stalls at window+1 and cell ownership metadata
+    // records stale positions.
+    int64_t start_pos = use_ring_buffer(layer)
+                            ? static_cast<int64_t>(layers_[layer].logical_filled)
+                            : static_cast<int64_t>(layers_[layer].filled);
     return update(layer, 0, start_pos, new_key, new_value, seq_len);
+}
+
+// Device-aware contiguous row slice of an FP32 [N, D] tensor. Used by
+// KVCache::update to split a ring write that crosses the window boundary.
+static TensorPtr slice_kv_rows(const TensorPtr& t, int64_t row0, int64_t rows) {
+    const int64_t d = t->shape()[1];
+    auto out =
+        std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{rows, d}, t->device());
+    const size_t row_bytes = static_cast<size_t>(d) * sizeof(float);
+    uint8_t* dst = static_cast<uint8_t*>(out->data());
+    const uint8_t* src = static_cast<const uint8_t*>(t->data()) + row0 * row_bytes;
+    const size_t bytes = static_cast<size_t>(rows) * row_bytes;
+#ifdef USE_CUDA
+    if (t->device() == DeviceType::CUDA) {
+        cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+    } else
+#endif
+    {
+        std::memcpy(dst, src, bytes);
+    }
+    return out;
 }
 
 // =========================================================================
@@ -1336,24 +1386,66 @@ int KVCache::update(int layer, int seq_id, int64_t pos, const TensorPtr& new_key
         }
     }
 
-    if (write_pos + seq_len > max_seq_len_) {
+    // Bounds must be checked against THIS layer's allocated rows, not the global
+    // context length: a SlidingWindow layer is sized to its window, so
+    // write_pos + seq_len routinely exceeds max_seq_len_ there while every slot
+    // it touches ((write_pos + s) % window_size_) is still in range.
+    const int layer_rows_cap = layer_rows(layer);
+    if (layer_uses_ring) {
+        // A ring layer needs at least window_size_ slots to wrap into. Anything
+        // less would index cells past its allocation.
+        if (window_size_ > layer_rows_cap) {
+            LOG_ERROR("KVCache::update: ring window " + std::to_string(window_size_) +
+                      " exceeds layer " + std::to_string(layer) + " allocation of " +
+                      std::to_string(layer_rows_cap) + " rows");
+            return -1;
+        }
+    } else if (write_pos + seq_len > layer_rows_cap) {
         LOG_ERROR("KVCache::update: cache overflow, write_pos=" + std::to_string(write_pos) +
-                  " seq_len=" + std::to_string(seq_len) + " max=" + std::to_string(max_seq_len_));
+                  " seq_len=" + std::to_string(seq_len) + " max=" + std::to_string(layer_rows_cap));
         return -1;
     }
 
+    // Write the block. A ring write that crosses the window's physical
+    // boundary is split into wrapping segments so every row lands inside
+    // [0, window): rows [write_pos, window) take the block's head, rows
+    // [0, ...) take its tail -- exactly the layout get_key_filled()'s
+    // two-segment reorder expects. A single linear write would land the tail
+    // past the window where the reorder never reads it, silently misaligning
+    // K/V with their positions (garbled output from that point on).
+    auto write_block = [&](int64_t dst_pos, int64_t src_off, int len) -> int {
+        if (len <= 0)
+            return 0;
+        auto k_part = slice_kv_rows(new_key, src_off, len);
+        auto v_part = slice_kv_rows(new_value, src_off, len);
+        if (kv_config_.type_k == KVCacheDType::FP32 && kv_config_.type_v == KVCacheDType::FP32)
+            return update_fp32(layer, dst_pos, k_part, v_part, len);
+        return update_quantized(layer, dst_pos, k_part, v_part, len);
+    };
+
     int result;
-    if (kv_config_.type_k == KVCacheDType::FP32 && kv_config_.type_v == KVCacheDType::FP32) {
-        result = update_fp32(layer, write_pos, new_key, new_value, seq_len);
+    if (layer_uses_ring && write_pos + seq_len > window_size_) {
+        int64_t dst = write_pos;
+        int64_t src_off = 0;
+        int remain = seq_len;
+        result = 0;
+        while (remain > 0 && result >= 0) {
+            int len = static_cast<int>(std::min<int64_t>(remain, window_size_ - dst));
+            result = write_block(dst, src_off, len);
+            dst = (dst + len) % window_size_;
+            src_off += len;
+            remain -= len;
+        }
     } else {
-        result = update_quantized(layer, write_pos, new_key, new_value, seq_len);
+        result = write_block(write_pos, 0, seq_len);
     }
     if (result < 0)
         return result;
 
-    // Update cell metadata
+    // Update cell metadata (ring slots wrap at the window boundary)
     for (int s = 0; s < seq_len; ++s) {
-        int slot = static_cast<int>(write_pos + s);
+        int slot = layer_uses_ring ? static_cast<int>((write_pos + s) % window_size_)
+                                   : static_cast<int>(write_pos + s);
         kv.cells[slot].pos = pos + s;
         kv.cells[slot].add_seq(seq_id);
     }
@@ -1371,7 +1463,11 @@ int KVCache::update(int layer, int seq_id, int64_t pos, const TensorPtr& new_key
     }
 
     // Physical write cursor: for non-ring, same as logical; for ring, wraps.
+    // After a wrapping ring write every row in [0, window) is live, so the
+    // physical high-water mark caps at the window.
     int new_end = static_cast<int>(write_pos + seq_len);
+    if (layer_uses_ring && new_end > window_size_)
+        new_end = window_size_;
     if (new_end > kv.filled) {
         kv.filled = new_end;
     }
@@ -1393,7 +1489,7 @@ int KVCache::update(int layer, int seq_id, int64_t pos, const TensorPtr& new_key
 int KVCache::update_fp32(int layer, int64_t start_pos, const TensorPtr& new_key,
                          const TensorPtr& new_value, int seq_len) {
     auto& kv = layers_[layer];
-    int kv_dim = this->kv_dim(layer);
+    int kv_dim = this->kv_dim(layer);  // per-layer aware; falls back to the uniform product
     int filled = static_cast<int>(start_pos);
     DeviceType layer_dev = kv.key_store.device;
 
@@ -1459,10 +1555,13 @@ int KVCache::update_quantized(int layer, int64_t start_pos, const TensorPtr& new
 
     auto& kv = layers_[layer];
     int filled = static_cast<int>(start_pos);
-    if (filled + seq_len > max_seq_len_)
+    if (filled + seq_len > layer_rows(layer))
         return -1;
 
-    int kv_dim = num_kv_heads_ * head_dim_;
+    // Per-layer width. num_kv_heads_/head_dim_ are 0 after init_per_layer(), so
+    // the old num_kv_heads_ * head_dim_ product silently yielded a zero-width
+    // row and corrupted every quantized write on mixed-attention models.
+    int kv_dim = this->kv_dim(layer);
 
     std::vector<float> h_key(seq_len * kv_dim), h_value(seq_len * kv_dim);
 
@@ -1519,16 +1618,17 @@ void KVCache::dequantize_layer(int layer) {
     if (start >= filled || filled <= 0)
         return;
 
-    int kv_dim = num_kv_heads_ * head_dim_;
+    int kv_dim = this->kv_dim(layer);  // per-layer: num_kv_heads_/head_dim_ are 0 in per-layer mode
     int new_rows = filled - start;
 
     // Ensure FP32 tensors exist
+    const int64_t rows = layer_rows(layer);
     if (need_k && !kv.key_store.tensor) {
-        auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+        auto shape = std::vector<int64_t>{rows, kv_dim};
         kv.key_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, kv.key_store.device);
     }
     if (need_v && !kv.value_store.tensor) {
-        auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+        auto shape = std::vector<int64_t>{rows, kv_dim};
         kv.value_store.tensor =
             std::make_shared<Tensor>(DataType::FP32, shape, kv.value_store.device);
     }
@@ -1651,7 +1751,10 @@ TensorPtr KVCache::get_key_filled(int layer) const {
     }
 
     int eff = ring ? std::min(logical, window_size_) : logical;
-    if (eff == max_seq_len_)
+    // Compare against THIS layer's allocation. For a SWA ring layer the store is
+    // shorter than the global context length, so `eff == max_seq_len_` never held
+    // and the whole buffer was handed to attention even once fully populated.
+    if (eff == layer_rows(layer))
         return store.tensor;
     return std::make_shared<Tensor>(store.tensor->slice(0, 0, eff));
 }
@@ -1696,7 +1799,10 @@ TensorPtr KVCache::get_value_filled(int layer) const {
     }
 
     int eff = ring ? std::min(logical, window_size_) : logical;
-    if (eff == max_seq_len_)
+    // Compare against THIS layer's allocation. For a SWA ring layer the store is
+    // shorter than the global context length, so `eff == max_seq_len_` never held
+    // and the whole buffer was handed to attention even once fully populated.
+    if (eff == layer_rows(layer))
         return store.tensor;
     return std::make_shared<Tensor>(store.tensor->slice(0, 0, eff));
 }
@@ -1712,16 +1818,22 @@ int KVCache::filled(int layer) const {
 
 size_t KVCache::nbytes() const {
     if (!kv_dim_per_layer_.empty()) {
+        // Per-layer rows, not max_seq_len_ for every layer: a SWA layer sized to
+        // its window must not be reported at full-context cost, or the startup
+        // figure overstates the real footprint (and TransformerEngine's
+        // buffer-reuse check reads this to decide whether a cache is resident).
         size_t total = 0;
         for (int i = 0; i < (int)layers_.size(); ++i) {
-            int dim = (i < (int)kv_dim_per_layer_.size()) ? kv_dim_per_layer_[i] : 0;
+            int dim = kv_dim(i);
             if (dim > 0) {
-                total += max_seq_len_ * dim * sizeof(float) * 2;
+                total += static_cast<size_t>(layer_rows(i)) * dim * sizeof(float) * 2;
             }
         }
         return total;
     }
-    int kv_dim = num_kv_heads_ * head_dim_;
+    // Uniform-KV path (no per-layer dims): kv_dim(layer) falls back to the
+    // num_kv_heads_ * head_dim_ product, which is the intended value here.
+    int kv_dim = this->kv_dim(0);
     size_t per_layer = 0;
     per_layer += max_seq_len_ * block_nbytes(kv_config_.type_k, kv_dim);
     per_layer += max_seq_len_ * block_nbytes(kv_config_.type_v, kv_dim);
@@ -1799,18 +1911,18 @@ int KVCache::update_quantized_cuda(int layer, int64_t start_pos, const TensorPtr
 
     auto& kv = layers_[layer];
     int filled = static_cast<int>(start_pos);
-    if (filled + seq_len > max_seq_len_)
+    if (filled + seq_len > layer_rows(layer))
         return -1;
 
-    int kv_dim = num_kv_heads_ * head_dim_;
+    int kv_dim = this->kv_dim(layer);  // per-layer: num_kv_heads_/head_dim_ are 0 in per-layer mode
     size_t k_row_size = kv.key_store.row_bytes;
     size_t v_row_size = kv.value_store.row_bytes;
 
     cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream());
 
     // Ensure CUDA quantized buffers exist and are large enough
-    size_t total_k_bytes = static_cast<size_t>(max_seq_len_) * k_row_size;
-    size_t total_v_bytes = static_cast<size_t>(max_seq_len_) * v_row_size;
+    size_t total_k_bytes = static_cast<size_t>(layer_rows(layer)) * k_row_size;
+    size_t total_v_bytes = static_cast<size_t>(layer_rows(layer)) * v_row_size;
 
     if (!kv.key_store.d_q_data() || kv.key_store.d_bytes < total_k_bytes) {
         // Need to allocate/reallocate
@@ -1954,16 +2066,17 @@ void KVCache::dequantize_layer_cuda(int layer) {
     if (!kv.key_store.d_q_data() || start >= filled || filled <= 0)
         return;
 
-    int kv_dim = num_kv_heads_ * head_dim_;
+    int kv_dim = this->kv_dim(layer);  // per-layer: num_kv_heads_/head_dim_ are 0 in per-layer mode
     int new_rows = filled - start;
 
     // Ensure FP32 tensors exist for output
+    const int64_t rows = layer_rows(layer);
     if (!kv.key_store.tensor) {
-        auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+        auto shape = std::vector<int64_t>{rows, kv_dim};
         kv.key_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, DeviceType::CUDA);
     }
     if (!kv.value_store.tensor) {
-        auto shape = std::vector<int64_t>{max_seq_len_, kv_dim};
+        auto shape = std::vector<int64_t>{rows, kv_dim};
         kv.value_store.tensor = std::make_shared<Tensor>(DataType::FP32, shape, DeviceType::CUDA);
     }
 
