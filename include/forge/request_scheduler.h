@@ -116,9 +116,21 @@ public:
     int prefix_cache_hits() const {
         return paged_mode_ ? prefix_cache_.hits() : prefix_cache_hits_;
     }
+    // Hits served by restoring pages from the host blob pool (paged mode only).
+    int prefix_cache_host_hits() const {
+        return paged_mode_ ? prefix_cache_.host_hits() : 0;
+    }
     int prefix_cache_misses() const {
         return paged_mode_ ? prefix_cache_.misses() : prefix_cache_misses_;
     }
+    // In-flight async backup/restore jobs (paged mode only). 0 means the worker
+    // is idle; a non-zero value after operations settle indicates a leak.
+    int prefix_cache_pending_jobs() const {
+        return paged_mode_ ? prefix_cache_.pending_jobs() : 0;
+    }
+    // Block until the background backup/restore worker has drained all queued
+    // jobs (async backup only; no-op for non-paged mode).
+    void prefix_cache_flush();
 
     // ---- Roadmap 1.1: KV host offload (swap) ----
     //
@@ -182,6 +194,11 @@ private:
     // Page-level prefix cache (paged mode only)
     PrefixCache prefix_cache_;
     bool paged_mode_ = false;
+
+    // False when the engine keeps per-sequence state outside the KV storage
+    // (hybrid architectures): all prefix-cache lookup/register/prefetch paths
+    // are gated off. See InferenceEngine::prefix_cache_supported().
+    bool prefix_cache_enabled_ = true;
 
     // Roadmap 1.3: chunked prefill state and metrics.
     int prefill_chunk_size_ = 0;  // 0 => follow ContextParams::n_ubatch

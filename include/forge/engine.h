@@ -80,6 +80,16 @@ public:
     virtual KVMemory* kv_memory() { return nullptr; }
     virtual const KVMemory* kv_memory() const { return nullptr; }
 
+    // Whether radix prefix-cache hits are SAFE for this architecture. False
+    // when any layer keeps per-sequence state OUTSIDE the (paged) KV storage —
+    // shortconv windows (lfm2), gated delta-net state (qwen3.5, xing4,
+    // bailingmoe3), or engine-managed latent history. A prefix hit resumes the
+    // suffix at start_pos = prefix_len with that state still empty/zeroed, so
+    // the output would be silently wrong even though the attention layers read
+    // perfectly valid shared KV pages. Caching must stay disabled until state
+    // snapshots at prefix boundaries are implemented.
+    virtual bool prefix_cache_supported() const { return true; }
+
     // Allocate the engine's runtime memory (KV cache and, later, recurrent
     // state) if it has not been allocated yet. InferenceContext calls this so
     // that callers can query cache stats before the first forward.

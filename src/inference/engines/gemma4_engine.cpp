@@ -1,7 +1,9 @@
 #include "forge/engines/gemma4_engine.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 
 #include "forge/cuda_kernels.h"
@@ -13,7 +15,40 @@
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 
+#ifdef USE_CUDA
+#    include "forge/backend.h"
+#endif
+
 namespace forge {
+
+namespace {
+
+// Available host RAM in bytes (Linux: /proc/meminfo "MemAvailable").
+// Returns 0 when it cannot be determined, so the caller keeps the requested
+// context rather than guessing: a wrong guess means either a needlessly short
+// context or an OOM kill of the whole process. Mirrors the identically named
+// helper in transformer_engine.cpp.
+size_t available_system_memory_bytes() {
+#if defined(__linux__)
+    std::ifstream in("/proc/meminfo");
+    if (!in)
+        return 0;
+    std::string key;
+    unsigned long long kb = 0;
+    std::string unit;
+    while (in >> key >> kb >> unit) {
+        if (key == "MemAvailable:")
+            return static_cast<size_t>(kb) * 1024ull;
+        std::string rest;
+        std::getline(in, rest);  // consume the remainder of this line
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+}  // namespace
 
 Gemma4Engine::Gemma4Engine(Model& model, InferenceContext& ctx)
     : TransformerEngine(model, ctx), attention_(kv_cache_) {
@@ -58,19 +93,57 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
     if (kv_cache_initialized())
         return;
 
-    int kv_max_seq = cfg.max_seq_len;
-    const int KV_MAX_SEQ_CAP = 4096;
-    if (kv_max_seq > KV_MAX_SEQ_CAP) {
-        LOG_INFO("Capping KV cache max_seq_len from " + std::to_string(kv_max_seq) + " to " +
-                 std::to_string(KV_MAX_SEQ_CAP) + " to avoid OOM");
-        kv_max_seq = KV_MAX_SEQ_CAP;
+    // reset() clears the "initialized" flag but deliberately KEEPS the buffers
+    // allocated (KVCache::reset only zeroes contents), so the next turn must
+    // reuse them rather than size and allocate a second set. This matters more
+    // now that sizing is VRAM-derived: re-running the fit after warmup -- when
+    // activations, workspaces and kernel caches have already claimed their VRAM
+    // -- measured 124 MB free against a 278 MB reservation and collapsed the
+    // context to 256 tokens, discarding the 116736-token cache just built.
+    // TransformerEngine::init_kv_cache has the equivalent guard; it was missing
+    // here, and the old fixed 4096 cap hid the symptom (re-allocating 144 MB
+    // looked like harmless noise).
+    if (kv_cache_.nbytes() > 0 && kv_cache_.max_seq_len() > 0) {
+        LOG_INFO("KV cache reusing resident buffers: max_seq_len=" +
+                 std::to_string(kv_cache_.max_seq_len()) + ", " +
+                 std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
+        set_kv_cache_initialized(true);
+        return;
     }
 
-    DeviceType kv_dev;
+    // ---- Context length: explicit -c wins, else the model's trained length ----
+    // This used to be hard-capped at 4096 regardless of both, so a 128K-native
+    // model silently ran at 1/32 of its context and -c was ignored entirely.
+    // The cap was there to stop an OOM on a big card, which the memory fit below
+    // now handles properly instead of a fixed number.
+    int kv_max_seq = cfg.max_seq_len;
+    if (kv_cache_max_seq_len_ > 0) {
+        kv_max_seq = kv_cache_max_seq_len_;
+        if (kv_max_seq > cfg.max_seq_len) {
+            LOG_WARN("Requested context " + std::to_string(kv_max_seq) +
+                     " exceeds the model trained context " + std::to_string(cfg.max_seq_len) +
+                     " -- possible training context overflow (needs RoPE scaling)");
+        }
+        LOG_INFO("KV cache max_seq_len set to " + std::to_string(kv_max_seq) +
+                 " (user --ctx-size)");
+    }
+
+    // ---- KV device ----
+    // layer_devices_ is the source of truth, not gpu_layers_: -1 means "auto =
+    // all layers on GPU", and comparing that against num_layers made the KV
+    // cache land on the CPU, get allocated there, and then be copied to the GPU
+    // by set_layer_devices() below. Mixed placement keeps KV on the CPU, since
+    // attention for CPU-resident layers would otherwise fault on device pointers.
+    DeviceType kv_dev = DeviceType::CPU;
     if (ctx_.params().offload_kqv) {
-        kv_dev = (gpu_layers_ >= cfg.num_layers) ? DeviceType::CUDA : DeviceType::CPU;
-    } else {
-        kv_dev = DeviceType::CPU;
+        bool all_layers_cuda = !layer_devices_.empty();
+        for (const auto& t : layer_devices_) {
+            if (!t.is_cuda()) {
+                all_layers_cuda = false;
+                break;
+            }
+        }
+        kv_dev = all_layers_cuda ? DeviceType::CUDA : DeviceType::CPU;
     }
 
     // Gemma4: per-layer KV cache with different head dimensions
@@ -87,23 +160,140 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
         // else: no own KV, will reuse from another layer; kv_dims[i] stays 0
     }
 
+    // Phase 6 policy: SlidingWindow layers (swa_layers[i] == 1) use ring buffer
+    // eviction; full-attention layers grow linearly. Decided BEFORE sizing so a
+    // SWA layer can be allocated only window_size rows.
+    // Diagnostic A/B (FORGE_NO_SWA_RING=1): keep SWA layers on the growing
+    // (non-evicting) store so the ring-buffer wrap path can be isolated.
+    const bool swa_ring = cfg.n_swa > 0 && !std::getenv("FORGE_NO_SWA_RING");
+
+    // ---- Memory-aware fit (the reason the old fixed cap existed) ----
+    // Per-token cost is NOT uniform: a ring-buffered SWA layer holds at most
+    // window_size rows no matter how long the context is, so only the
+    // full-attention layers scale with -c. Sizing those by the requested context
+    // and letting VRAM decide is what lets -c reach the model's real length
+    // instead of stopping at the first number that did not OOM.
+    size_t per_token_bytes = 0;
+    for (int i = 0; i < cfg.num_layers; ++i) {
+        if (kv_dims[i] <= 0)
+            continue;
+        // Only Full layers grow with the context; a ring layer is bounded.
+        const bool is_swa = (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1);
+        if (swa_ring && is_swa)
+            continue;
+        per_token_bytes += 2ull * kv_dims[i] * sizeof(float);  // K and V
+    }
+    if (swa_ring) {
+        // Ring layers contribute a fixed cost, independent of the context.
+        const int64_t window_rows = std::min<int64_t>(kv_max_seq, cfg.n_swa);
+        for (int i = 0; i < cfg.num_layers; ++i) {
+            if (kv_dims[i] <= 0)
+                continue;
+            const bool is_swa = (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1);
+            if (is_swa)
+                per_token_bytes += 2ull * kv_dims[i] * sizeof(float) * window_rows;
+        }
+    }
+
+    if (per_token_bytes > 0) {
+        // A fixed margin plus one micro-batch of prefill activations, so a long
+        // prefill cannot OOM on top of the KV cache. Mirrors TransformerEngine.
+        const int n_ubatch = ctx_.params().n_ubatch > 0 ? ctx_.params().n_ubatch : 256;
+        const size_t activation_bytes =
+            static_cast<size_t>(n_ubatch) *
+            (static_cast<size_t>(cfg.hidden_dim) +
+             static_cast<size_t>(cfg.num_heads) * static_cast<size_t>(cfg.head_dim)) *
+            sizeof(float) * 4;
+        size_t headroom = 256ull * 1024 * 1024 + activation_bytes;
+
+        size_t usable_mem = 0;
+        if (kv_dev == DeviceType::CUDA) {
+#ifdef USE_CUDA
+            auto backend = BackendManager::instance().get_cuda_backend();
+            if (backend)
+                usable_mem = backend->device_memory_free();
+#endif
+        } else {
+            // Host KV competes with the page cache and every other process.
+            const size_t host_ram = available_system_memory_bytes();
+            if (host_ram > 0)
+                usable_mem = host_ram / 2;
+        }
+
+        if (usable_mem > 0) {
+            const size_t available = usable_mem > headroom ? usable_mem - headroom : 0;
+            // Ring layers shrink as the context grows (they cap at the window),
+            // so the request is re-costed per candidate rather than scaled.
+            size_t fixed_bytes = 0;
+            if (swa_ring) {
+                const int64_t window_rows = std::min<int64_t>(kv_max_seq, cfg.n_swa);
+                for (int i = 0; i < cfg.num_layers; ++i) {
+                    if (kv_dims[i] <= 0)
+                        continue;
+                    const bool is_swa = (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1);
+                    if (is_swa)
+                        fixed_bytes += 2ull * kv_dims[i] * sizeof(float) * window_rows;
+                }
+            }
+            const size_t growing_bytes = per_token_bytes - fixed_bytes;
+
+            // Largest context that fits, honouring the fixed ring cost.
+            int64_t max_by_mem = kv_max_seq;
+            if (growing_bytes > 0) {
+                const size_t budget = available > fixed_bytes ? available - fixed_bytes : 0;
+                max_by_mem = static_cast<int64_t>(budget / growing_bytes) + 1;  // + window rows
+            } else {
+                max_by_mem = available >= fixed_bytes ? kv_max_seq : 0;
+            }
+
+            if (max_by_mem < kv_max_seq) {
+                int reduced = static_cast<int>((max_by_mem / 256) * 256);  // 256-align
+                if (reduced < 256)
+                    reduced = 256;
+                LOG_WARN("Memory fits " + std::to_string(max_by_mem) + " tokens of KV cache but " +
+                         std::to_string(kv_max_seq) + " was requested (" +
+                         std::to_string(usable_mem / (1024 * 1024)) + "MB usable, " +
+                         std::to_string(headroom / (1024 * 1024)) +
+                         "MB reserved, dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU") +
+                         ") -- reducing to " + std::to_string(reduced));
+                kv_max_seq = reduced;
+            }
+        }
+    }
+
+    // Per-layer allocation: ring layers only ever hold their window, so they are
+    // sized to that instead of the full context. Both the KV rows and the cells
+    // metadata scale with this, and the metadata is not trivial -- 16 bytes per
+    // cell per layer, which at 128K x 35 layers is 73 MB on its own.
+    // The effective sliding window is min(window, context): a context shorter
+    // than the window can never fill it, and a ring sized to the window would
+    // then be larger than the whole cache allocation. This is reachable --
+    // the memory fit above can reduce the context below the window on a tight
+    // card, which is exactly when update() rejected the layer with "ring
+    // window 512 exceeds layer 0 allocation of 256 rows".
+    const int effective_window = swa_ring ? std::max(1, std::min(kv_max_seq, cfg.n_swa)) : 0;
+    std::vector<int> rows_per_layer(cfg.num_layers, kv_max_seq);
+    if (swa_ring) {
+        for (int i = 0; i < cfg.num_layers; ++i) {
+            if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1)
+                rows_per_layer[i] = effective_window;
+        }
+    }
+
     LOG_INFO("KV cache init (Gemma4 per-layer): layers=" + std::to_string(cfg.num_layers) +
              ", max_seq_len=" + std::to_string(kv_max_seq) +
-             ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU") +
-             ", head_dim=" + std::to_string(cfg.head_dim) +
-             ", head_dim_swa=" + std::to_string(cfg.head_dim_swa));
+             ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU") + ", head_dim=" +
+             std::to_string(cfg.head_dim) + ", head_dim_swa=" + std::to_string(cfg.head_dim_swa) +
+             (swa_ring ? ", swa_window=" + std::to_string(effective_window) : ""));
 
-    kv_cache_.init_per_layer(cfg.num_layers, kv_dims, kv_max_seq, kv_dev);
-    // Phase 6: set per-layer policies (replaces set_ring_buffer calls).
-    // SlidingWindow layers (swa_layers[i] == 1) use ring buffer eviction;
-    // full-attention layers grow linearly without windowing.
-    if (cfg.n_swa > 0) {
+    kv_cache_.init_per_layer(cfg.num_layers, kv_dims, kv_max_seq, kv_dev, rows_per_layer);
+    if (swa_ring) {
         std::vector<KVLayerPolicy> policies(cfg.num_layers, KVLayerPolicy::Full);
         for (int i = 0; i < cfg.num_layers; ++i) {
             if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1)
                 policies[i] = KVLayerPolicy::SlidingWindow;
         }
-        kv_cache_.set_layer_policies(policies, cfg.n_swa);
+        kv_cache_.set_layer_policies(policies, effective_window);
     }
     // Place each layer's KV cache on the corresponding device
     if (!layer_devices_.empty()) {

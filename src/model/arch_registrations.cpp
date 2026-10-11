@@ -24,6 +24,7 @@
 #include "forge/engines/gemma_embedding2_engine.h"
 #include "forge/engines/generic_engine.h"
 #include "forge/engines/lfm2_engine.h"
+#include "forge/engines/mellum_engine.h"
 #include "forge/engines/phimoe_engine.h"
 #include "forge/engines/qwen35_engine.h"
 #include "forge/engines/spark25_engine.h"
@@ -296,6 +297,22 @@ static ConfigParserAutoRegister _cfg_xing4_0("xing4_0", parse_xing4_0_config);
 static WeightInitAutoRegister _winit_xing4_0("xing4_0", init_xing4_0_layer_weights);
 static ArchCapabilityAutoRegister _cap_xing4_0("xing4_0",
                                                ArchCapability{.use_mla = true, .use_ssm = false});
+
+// ============================================================================
+// Mellum (Mellum2.1: GQA + per-head QK-norm + SWA/full 交错 + 路由-only SiLU MoE,
+// 全注意力层 yarn)。张量名与 gemma4 兼容 → 权重 init 直接复用 init_gemma4_layer_weights。
+// ============================================================================
+
+static EngineAutoRegister _eng_mellum(
+    "mellum", [](Model& m, InferenceContext& c) -> std::unique_ptr<InferenceEngine> {
+        return std::make_unique<MellumEngine>(m, c);
+    });
+static ConfigParserAutoRegister _cfg_mellum("mellum", parse_mellum_config);
+static WeightInitAutoRegister _winit_mellum("mellum", init_gemma4_layer_weights);
+static ArchCapabilityAutoRegister _cap_mellum("mellum",
+                                              ArchCapability{.use_gqa = true,
+                                                             .ffn_activation = ActivationType::SiLU_GELU,
+                                                             .use_qk_norm = true});
 
 // ============================================================================
 // DFlash / DSPark (standalone lightweight drafter for speculative decoding)

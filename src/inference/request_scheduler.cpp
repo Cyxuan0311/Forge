@@ -10,6 +10,8 @@
 #include "forge/engines/transformer_engine.h"
 #include "forge/kv_cache.h"
 #include "forge/kv_memory.h"
+#include "forge/kv_l3_backend.h"
+#include "forge/kv_policy.h"
 #include "forge/logger.h"
 
 #ifdef USE_CUDA
@@ -33,7 +35,8 @@ size_t RequestScheduler::hash_prompt(const std::vector<int32_t>& tokens) {
 // ---- Prefix cache: try to find a cached prompt ----
 
 bool RequestScheduler::try_prefix_cache(GenerateRequest& req) {
-    if (static_cast<int>(req.prompt_tokens.size()) < MIN_CACHE_PROMPT_LEN)
+    if (!prefix_cache_enabled_ ||
+        static_cast<int>(req.prompt_tokens.size()) < MIN_CACHE_PROMPT_LEN)
         return false;
 
     auto* engine = ctx_.engine();
@@ -128,14 +131,21 @@ void RequestScheduler::preserve_prefix_cache(int seq_id, int prompt_len) {
 
 bool RequestScheduler::try_prefix_cache_paged(GenerateRequest& req) {
     auto* engine = ctx_.engine();
-    if (!engine)
+    if (!engine || !prefix_cache_enabled_)
         return false;
 
     KVMemory* memory = engine->kv_memory();
     if (!memory || !memory->is_paged())
         return false;
 
-    int prefix_len = prefix_cache_.try_lookup(req.prompt_tokens, req.request_id, memory->storage());
+    int prefix_len = 0;
+    PrefixHitKind hit_kind = PrefixHitKind::Miss;
+    prefix_len = prefix_cache_.try_lookup(req.prompt_tokens, req.request_id, memory->storage(),
+                                          &hit_kind);
+    if (prefix_len > 0 && hit_kind == PrefixHitKind::Host) {
+        LOG_DEBUG("PrefixCache: HOST hit restored " + std::to_string(prefix_len) +
+                  " tokens for req=" + std::to_string(req.request_id));
+    }
 
     if (prefix_len > 0) {
         req.prefix_len = prefix_len;
@@ -165,7 +175,8 @@ void RequestScheduler::finish_request_paged(GenerateRequest& req) {
         // Request used a cached prefix: release its prefix reference.
         // Suffix pages (beyond prefix) are released by release_seq_kv below.
         prefix_cache_.release_prefix(req.request_id, memory->storage());
-    } else if (static_cast<int>(req.prompt_tokens.size()) >= MIN_CACHE_PROMPT_LEN) {
+    } else if (prefix_cache_enabled_ &&
+               static_cast<int>(req.prompt_tokens.size()) >= MIN_CACHE_PROMPT_LEN) {
         // Request owns a new prefix: register it in the page-level cache.
         // register_prefix transfers prefix page ownership to a cache seq_id
         // and removes them from the request's page table.
@@ -182,6 +193,15 @@ RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seq
     : model_(model), ctx_(model), sampler_(SamplerConfig{}), max_num_seqs_(max_num_seqs) {
     (void)block_size;  // block_size no longer needed with engine KVCache
 
+    // Honor FORGE_KV_STORAGE_MODE=paged (same env var as PyModel::create_context):
+    // the scheduler builds its own InferenceContext, so the param cannot be set
+    // through the Python create_context() path. Must happen before engine
+    // creation, which sizes and allocates the KV storage.
+    const char* storage_mode_env = std::getenv("FORGE_KV_STORAGE_MODE");
+    if (storage_mode_env && std::string(storage_mode_env) == "paged") {
+        ctx_.params_mut().kv_storage_mode = KVStorageMode::Paged;
+    }
+
     // Paged mode is selected via the InferenceContext param, set from the
     // --paged-kv CLI flag (or Python API) before the scheduler is constructed.
     paged_mode_ = (ctx_.params().kv_storage_mode == KVStorageMode::Paged);
@@ -197,9 +217,40 @@ RequestScheduler::RequestScheduler(Model& model, int block_size, int max_num_seq
         }
         ctx_.set_engine(std::move(engine));
     }
+
+    // Hybrid architectures (lfm2 shortconv, qwen35/xing4/bailingmoe3 GDN/MLA
+    // state) cannot answer prefix hits correctly: gate every cache path off.
+    if (auto* engine = ctx_.engine())
+        prefix_cache_enabled_ = engine->prefix_cache_supported();
+
+    // Multi-level prefix residency knobs (paged mode only): the write policy
+    // selects between write-back (backup on eviction), write-through (backup
+    // at registration) and off (legacy hard eviction), and the host blob pool
+    // budget bounds the swapper's prefix pool (0 = grow-only).
+    if (paged_mode_) {
+        prefix_cache_.set_policy(kv_write_policy_from_env());
+        prefix_cache_.set_async_backup(kv_async_backup_from_env());
+        prefix_cache_.set_prefetch(kv_prefetch_from_env());
+        prefix_cache_.set_restore_wait_ms(kv_restore_wait_ms_from_env());
+        if (auto* engine = ctx_.engine()) {
+            if (auto* memory = engine->kv_memory()) {
+                memory->storage().set_prefix_pool_max_bytes(kv_host_pool_bytes_from_env());
+                memory->storage().set_l3_backend(make_l3_backend_from_env());
+            }
+        }
+    }
 }
 
 // ---- KV cache cleanup ----
+
+void RequestScheduler::prefix_cache_flush() {
+    if (!paged_mode_)
+        return;
+    if (auto* engine = ctx_.engine()) {
+        if (auto* memory = engine->kv_memory())
+            prefix_cache_.flush(memory->storage());
+    }
+}
 
 void RequestScheduler::release_seq_kv(int seq_id, int prompt_len) {
     auto* engine = ctx_.engine();
@@ -236,6 +287,15 @@ int RequestScheduler::submit(const std::vector<int32_t>& prompt_tokens, int max_
 
     requests_[req_id] = std::move(req);
     waiting_queue_.push(req_id);
+
+    // Multi-level KV: warm a host-resident prefix while this request waits for
+    // its turn, so the lookup at prefill time is already a device hit.
+    if (paged_mode_ && prefix_cache_enabled_) {
+        if (auto* eng = ctx_.engine()) {
+            if (auto* km = eng->kv_memory(); km && km->is_paged())
+                prefix_cache_.prefetch_prefix(prompt_tokens, km->storage());
+        }
+    }
 
     LOG_DEBUG("RequestScheduler: submitted request " + std::to_string(req_id) + " with " +
               std::to_string(prompt_tokens.size()) + " prompt tokens");
@@ -467,7 +527,7 @@ bool RequestScheduler::step() {
 
             // Register this prompt in the legacy prefix cache (contiguous mode only).
             // Paged mode registers on request finish via finish_request_paged().
-            if (!paged_mode_ && !req.from_cache &&
+            if (!paged_mode_ && prefix_cache_enabled_ && !req.from_cache &&
                 static_cast<int>(req.prompt_tokens.size()) >= MIN_CACHE_PROMPT_LEN && memory) {
                 size_t h = hash_prompt(req.prompt_tokens);
                 // Only register if not already cached

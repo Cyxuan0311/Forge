@@ -79,16 +79,6 @@ size_t available_system_memory_bytes() {
 #endif
 }
 
-// 调试开关 (FORGE_DEBUG_SPARK=1)
-static bool txe_dbg_on() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = std::getenv("FORGE_DEBUG_SPARK");
-        v = (e && std::atoi(e) != 0) ? 1 : 0;
-    }
-    return v == 1;
-}
-
 }  // namespace
 
 TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
@@ -225,9 +215,16 @@ TensorPtr TransformerEngine::take_layer_hiddens(const std::vector<int>& layers) 
 }
 
 void TransformerEngine::set_gpu_layers(int gpu_layers) {
-    // Default: all layers on GPU 0
-    std::vector<int> per_dev = {gpu_layers};
-    set_gpu_layers(gpu_layers, per_dev);
+    if (gpu_layers < 0) {
+        // 负值 (-1=auto/all) 必须走空 per_dev 分支: 双参版本的 per-GPU 分配用
+        // min(per_dev[i], remaining) 计算层数, 负数会得到 0 层, 导致 layer_devices_
+        // 全部落回 CPU 并把已加载到 GPU 的权重逐个搬回 (361 条 WARN 刷屏)。
+        set_gpu_layers(gpu_layers, {});
+    } else {
+        // Default: all layers on GPU 0
+        std::vector<int> per_dev = {gpu_layers};
+        set_gpu_layers(gpu_layers, per_dev);
+    }
 }
 
 void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& gpu_layers_per_dev) {
@@ -239,31 +236,30 @@ void TransformerEngine::set_gpu_layers(int gpu_layers, const std::vector<int>& g
     // Build per-layer DeviceTarget vector from per-GPU layer counts.
     // gpu_layers_per_dev[0] = layers on GPU 0, gpu_layers_per_dev[1] = layers on GPU 1, etc.
     // If gpu_layers_per_dev is empty, fall back to single-GPU behavior (all on GPU 0).
-    layer_devices_.resize(num_layers);
+    int requested_total = 0;
     if (gpu_layers_per_dev.empty()) {
-        for (int i = 0; i < num_layers; ++i) {
-            layer_devices_[i] = (gpu_layers_ < 0)   ? DeviceTarget::cuda(0)
-                                : (i < gpu_layers_) ? DeviceTarget::cuda(0)
-                                                    : DeviceTarget::cpu();
+        requested_total = (gpu_layers_ < 0) ? num_layers : std::min(gpu_layers_, num_layers);
+    } else {
+        for (int n : gpu_layers_per_dev)
+            requested_total += n;
+        if (gpu_layers_ < 0)
+            requested_total = num_layers;
+    }
+
+    layer_devices_.assign(num_layers, DeviceTarget::cpu());
+    int placed = 0;
+    if (gpu_layers_per_dev.empty()) {
+        for (int i = 0; i < requested_total && i < num_layers; ++i) {
+            layer_devices_[i] = DeviceTarget::cuda(0);
+            ++placed;
         }
     } else {
         int offset = 0;
-        for (size_t dev_id = 0; dev_id < gpu_layers_per_dev.size() && offset < num_layers;
-             ++dev_id) {
-            int n = gpu_layers_per_dev[dev_id];
-            for (int i = 0; i < n && offset < num_layers; ++i, ++offset) {
-                layer_devices_[offset] =
-                    n > 0 ? DeviceTarget::cuda(static_cast<int>(dev_id)) : DeviceTarget::cpu();
-            }
-        }
-        // Remaining layers (if any) go to CPU
-        for (int i = offset; i < num_layers; ++i) {
-            layer_devices_[i] = DeviceTarget::cpu();
-        }
-        // If gpu_layers < 0 (auto), mark all remaining as GPU 0
-        if (gpu_layers_ < 0) {
-            for (int i = offset; i < num_layers; ++i) {
-                layer_devices_[i] = DeviceTarget::cuda(0);
+        for (size_t dev_id = 0;
+             dev_id < gpu_layers_per_dev.size() && placed < requested_total; ++dev_id) {
+            int n = std::min(gpu_layers_per_dev[dev_id], requested_total - placed);
+            for (int i = 0; i < n && offset < num_layers; ++i, ++offset, ++placed) {
+                layer_devices_[offset] = DeviceTarget::cuda(static_cast<int>(dev_id));
             }
         }
     }
@@ -608,6 +604,54 @@ TensorPtr gather_rows(const TensorPtr& hidden, const std::vector<int64_t>& rows)
     }
     return out;
 }
+
+// Contiguous row slice of an FP32 [N, H] tensor (device-aware). Used by the
+// chunked-prefill path in forward_layers to feed one ubatch-sized slice at a
+// time while keeping the full-sequence input alive for the remaining chunks.
+TensorPtr slice_rows(const TensorPtr& hidden, int64_t row_start, int64_t row_count) {
+    const int64_t H = hidden->shape()[1];
+    auto out = std::make_shared<Tensor>(hidden->dtype(),
+                                        std::vector<int64_t>{row_count, H}, hidden->device());
+    const size_t row_bytes = static_cast<size_t>(H) * sizeof(float);
+    uint8_t* dst = static_cast<uint8_t*>(out->data());
+    const uint8_t* src = static_cast<const uint8_t*>(hidden->data()) + row_start * row_bytes;
+    const size_t bytes = static_cast<size_t>(row_count) * row_bytes;
+#ifdef USE_CUDA
+    if (hidden->device() == DeviceType::CUDA) {
+        cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+    } else
+#endif
+    {
+        std::memcpy(dst, src, bytes);
+    }
+    return out;
+}
+
+// Row concatenation of same-shape [len_i, H] tensors (device-aware). All parts
+// are expected on the same device (the last layer's device after offload).
+TensorPtr concat_rows(const std::vector<TensorPtr>& parts) {
+    const int64_t H = parts.front()->shape()[1];
+    int64_t total = 0;
+    for (const auto& p : parts)
+        total += p->shape()[0];
+    auto out = std::make_shared<Tensor>(parts.front()->dtype(),
+                                        std::vector<int64_t>{total, H}, parts.front()->device());
+    const size_t row_bytes = static_cast<size_t>(H) * sizeof(float);
+    uint8_t* dst = static_cast<uint8_t*>(out->data());
+    for (const auto& p : parts) {
+        const size_t bytes = static_cast<size_t>(p->shape()[0]) * row_bytes;
+#ifdef USE_CUDA
+        if (p->device() == DeviceType::CUDA) {
+            cudaMemcpy(dst, p->data(), bytes, cudaMemcpyDeviceToDevice);
+        } else
+#endif
+        {
+            std::memcpy(dst, p->data(), bytes);
+        }
+        dst += bytes;
+    }
+    return out;
+}
 }  // namespace
 
 TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
@@ -642,20 +686,6 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         int total_tokens = ubatch.n_tokens();
         if (total_tokens == 0)
             continue;
-
-        // 调试：打印实际喂入模型的 token id 序列 (仅首帧)
-        if (txe_dbg_on()) {
-            static bool dumped = false;
-            if (!dumped) {
-                dumped = true;
-                for (const auto& item : ubatch.items) {
-                    fprintf(stderr, "[SPARK-DBG] tokens(%zu):", item.tokens.size());
-                    for (int tid : item.tokens)
-                        fprintf(stderr, " %d", tid);
-                    fprintf(stderr, "\n");
-                }
-            }
-        }
 
         // ==== Step 1: Fused embedding for all tokens ====
         DeviceTarget first_dev = layer_device_target(0);
@@ -831,25 +861,6 @@ TensorPtr TransformerEngine::forward_batch(const InferenceBatch& batch) {
         if (logits->device() == DeviceType::CUDA) {
             logits_cpu = std::make_shared<Tensor>(DataType::FP32, logits->shape(), DeviceType::CPU);
             logits_cpu->copy_from(*logits);
-        }
-
-        // 调试：打印最终 logits 的 top-5 候选 (token id:logit)
-        if (txe_dbg_on()) {
-            int64_t vs = logits_cpu->shape().back();
-            int64_t rows = logits_cpu->shape()[0];
-            const float* ld = static_cast<const float*>(logits_cpu->data());
-            for (int r = 0; r < rows; ++r) {
-                const float* row = ld + (int64_t)r * vs;
-                std::vector<int> idx(vs);
-                std::iota(idx.begin(), idx.end(), 0);
-                int k = std::min(5, (int)vs);
-                std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                                 [&](int a, int b) { return row[a] > row[b]; });
-                fprintf(stderr, "[SPARK-DBG] logits row%d top5:", r);
-                for (int i = 0; i < k; ++i)
-                    fprintf(stderr, " %d:%.3f", idx[i], row[idx[i]]);
-                fprintf(stderr, "\n");
-            }
         }
 
         // all_logits 模式：直接返回完整 [total_tokens, vocab] 张量
@@ -1182,6 +1193,11 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         // Phase 6: set per-layer memory policies from arch config.
         // SlidingWindow layers use ring buffer eviction; Full layers grow linearly.
         if (cfg.n_swa > 0) {
+            // The ring window can never exceed the per-layer KV allocation
+            // (kv_max_seq); otherwise KVCache::update rejects the write. Clamp so
+            // a small --ctx-size (below the model's n_swa) still runs instead of
+            // throwing. When ctx >= n_swa this is a no-op.
+            const int swa_window = std::min(cfg.n_swa, kv_max_seq);
             std::vector<KVLayerPolicy> policies(kv_num_layers, KVLayerPolicy::Full);
             bool has_swa_layers = false;
             for (int i = 0; i < cfg.num_layers; ++i) {
@@ -1194,7 +1210,7 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
             if (!has_swa_layers) {
                 policies.assign(cfg.num_layers, KVLayerPolicy::SlidingWindow);
             }
-            kv_cache_.set_layer_policies(policies, cfg.n_swa);
+            kv_cache_.set_layer_policies(policies, swa_window);
         }
 
         // Place each layer's KV cache on the corresponding device.
@@ -1219,12 +1235,14 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
         KVCacheTypeConfig kv_config = kv_cache_type_config_;
         // Phase 6: set layer policies before init so SWA pools are sized correctly
         if (cfg.n_swa > 0) {
+            // Same clamp as the contiguous path: window can't exceed kv_max_seq.
+            const int swa_window = std::min(cfg.n_swa, kv_max_seq);
             std::vector<KVLayerPolicy> policies(kv_num_layers, KVLayerPolicy::Full);
             for (int i = 0; i < cfg.num_layers; ++i) {
                 if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1)
                     policies[i] = KVLayerPolicy::SlidingWindow;
             }
-            kv_memory_->set_layer_policies(policies, cfg.n_swa);
+            kv_memory_->set_layer_policies(policies, swa_window);
         }
         // Paged storage follows the KV cache device: CUDA engine → CUDA pages,
         // CPU engine → CPU pages (Phase 3 behavior).
@@ -1346,27 +1364,19 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
     const int seq_len = req.n_tokens;
     const int64_t start_pos = req.start_pos;
 
-    // 调试：打印实际喂入的 token id 序列 (仅首帧)
-    if (txe_dbg_on()) {
-        static bool dumped = false;
-        if (!dumped) {
-            dumped = true;
-            fprintf(stderr, "[SPARK-DBG] input_ids(%d):", (int)req.n_tokens);
-            auto ids = ensure_cpu(req.input_ids);
-            const int32_t* p = static_cast<const int32_t*>(ids->data());
-            for (int i = 0; i < (int)req.n_tokens; ++i)
-                fprintf(stderr, " %d", p[i]);
-            fprintf(stderr, "\n");
-        }
-    }
-
     // DFlash/DSPark: when capturing per-layer hiddens, drop the graph path (it
     // packs the whole forward into one kernel) and reset the cache so only this
     // forward's layers are retained.
     if (captures_layer_hiddens()) {
         layer_hiddens_.clear();
     }
-    const bool use_graph = use_graph_ && !captures_layer_hiddens();
+    // Paged KV storage keeps K/V in per-sequence pages, so the whole-layer
+    // tensors behind KVCache::get_key_filled()/get_value_filled() are null and
+    // the graph's get_k/get_v ops would dereference them. Fall back to the
+    // imperative path, which resolves K/V through KVMemory and handles paging.
+    auto* kv_mem = kv_memory();
+    const bool paged_kv = kv_mem && kv_mem->is_paged();
+    const bool use_graph = use_graph_ && !captures_layer_hiddens() && !paged_kv;
 
     // Graph 执行。builder 由 ExecutionPlan 在构造时决定, 执行期不再按架构名查表。
     // 不支持 graph 的架构直接退回 imperative, 不使用 placeholder builder。
@@ -1398,46 +1408,104 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
         layer_hiddens_.reserve(cfg.num_layers + 1);
         layer_hiddens_.push_back(cur_hidden);
     }
-    for (int layer = 0; layer < cfg.num_layers; ++layer) {
-        DeviceTarget layer_dev = layer_device_target(layer);
-#ifdef USE_CUDA
-        if (layer_dev.is_cuda())
-            cudaSetDevice(layer_dev.device_id);
-#endif
-        cur_hidden = transfer_hidden(cur_hidden, layer_dev);
-        {
-            PERF_SCOPE_FMT("forward/layer_%d", layer);
-            SET_PERF_CONTEXT(req.seq_id, "layer", layer, layer_dev.is_cuda() ? "cuda" : "cpu",
-                             req.n_tokens);
-            // No sync-scope probe here on purpose: it would wrap the per-phase
-            // probes inside DflashEngine::forward_layer, and a leaf timer that
-            // contains other leaf timers double counts.
-            cur_hidden = forward_layer(cur_hidden, make_layer_context(layer, req, layer_dev));
-        }
-        if (!cur_hidden) {
-            fprintf(stderr, "[FATAL] Layer %d returned NULL!\n", layer);
-            fflush(stderr);
-            return nullptr;
-        }
-        if (captures_layer_hiddens()) {
-            // Index layer+1 is this layer's OUTPUT. That is what a DFlash/DSpark
-            // `target_layers = [k, ...]` entry denotes upstream: vLLM calls
-            // `_maybe_add_hidden_state` AFTER `layer(...)` returns and records
-            // `hidden_states + residual` under `idx + 1`, so index k is layer k's
-            // output, and concatenates the selected layers in that order.
-            //
-            // This used to capture the layer INPUT (the HF `hidden_states[i]`
-            // reading), which makes index k the output of layer k-1 and puts
-            // every encoder feature one whole layer early. Measured on
-            // MiniCPM5-2B + DSpark, shifting to the output convention moved
-            // position-0 acceptance 24.7% -> 21.3%, i.e. within noise, so it was
-            // not the cause of the low acceptance on this pair. It is still fixed:
-            // the checkpoints were trained against the output convention, and a
-            // one-layer shift on the deeper entries of the list is exactly where
-            // it would start to matter.
-            layer_hiddens_.push_back(cur_hidden);
+
+    // ---- Chunked prefill (SWA ring-buffer overflow guard) ----
+    // A single forward whose seq_len exceeds the SWA window makes
+    // KVCache::update() write the whole block linearly past the ring's
+    // physical boundary: rows [window, seq_len) overwrite the oldest slots
+    // while ring_cursor_ advances to seq_len % window, so get_key_filled()'s
+    // two-segment reorder returns a window whose tail is the sequence's OLDEST
+    // tokens instead of its newest -- attention reads K/V misaligned with
+    // their positions and output turns to garbage from the turn whose prompt
+    // first crosses the window. Splitting the imperative pass into chunks of
+    // at most min(n_ubatch, window) keeps every ring update inside the window
+    // and mirrors forward_batch's split_batch semantics: each chunk runs all
+    // layers with causal masking against the KV written so far, and only the
+    // last chunk's row is ever sampled. Skipped when capturing layer hiddens
+    // (DFlash needs the whole sequence in one pass) and on the paged-KV path
+    // (no ring buffers there; it bypasses KVCache::update entirely).
+    int chunk_len = seq_len;
+    if (seq_len > 1 && !captures_layer_hiddens() && !paged_kv) {
+        bool has_ring = false;
+        for (int l = 0; l < cfg.num_layers && !has_ring; ++l)
+            has_ring = kv_cache_.use_ring_buffer(l);
+        if (has_ring) {
+            int ub = ctx_.params().n_ubatch > 0 ? ctx_.params().n_ubatch : 256;
+            if (kv_cache_.window_size() > 0)
+                ub = std::min(ub, kv_cache_.window_size());
+            chunk_len = std::min(seq_len, ub);
         }
     }
+    const int n_chunks =
+        chunk_len > 0 ? static_cast<int>((seq_len + chunk_len - 1) / chunk_len) : 1;
+    std::vector<ForwardRequest> chunk_reqs;
+    chunk_reqs.reserve(n_chunks);
+    if (n_chunks > 1) {
+        for (int off = 0; off < seq_len; off += chunk_len) {
+            ForwardRequest creq = req;
+            creq.n_tokens = std::min(chunk_len, seq_len - off);
+            creq.start_pos = req.start_pos + off;
+            chunk_reqs.push_back(std::move(creq));
+        }
+    } else {
+        chunk_reqs.push_back(req);
+    }
+
+    std::vector<TensorPtr> chunk_outs;
+    chunk_outs.reserve(n_chunks);
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const ForwardRequest& creq = chunk_reqs[ci];
+        auto c_hidden = n_chunks > 1
+                            ? slice_rows(hidden, static_cast<int64_t>(ci) * chunk_len,
+                                         creq.n_tokens)
+                            : hidden;
+        for (int layer = 0; layer < cfg.num_layers; ++layer) {
+            DeviceTarget layer_dev = layer_device_target(layer);
+#ifdef USE_CUDA
+            if (layer_dev.is_cuda())
+                cudaSetDevice(layer_dev.device_id);
+#endif
+            c_hidden = transfer_hidden(c_hidden, layer_dev);
+            {
+                PERF_SCOPE_FMT("forward/layer_%d", layer);
+                SET_PERF_CONTEXT(creq.seq_id, "layer", layer,
+                                 layer_dev.is_cuda() ? "cuda" : "cpu", creq.n_tokens);
+                // No sync-scope probe here on purpose: it would wrap the per-phase
+                // probes inside DflashEngine::forward_layer, and a leaf timer that
+                // contains other leaf timers double counts.
+                c_hidden = forward_layer(c_hidden, make_layer_context(layer, creq, layer_dev));
+            }
+            if (!c_hidden) {
+                fprintf(stderr, "[FATAL] Layer %d returned NULL!\n", layer);
+                fflush(stderr);
+                return nullptr;
+            }
+            if (captures_layer_hiddens()) {
+                // Index layer+1 is this layer's OUTPUT. That is what a DFlash/DSpark
+                // `target_layers = [k, ...]` entry denotes upstream: vLLM calls
+                // `_maybe_add_hidden_state` AFTER `layer(...)` returns and records
+                // `hidden_states + residual` under `idx + 1`, so index k is layer k's
+                // output, and concatenates the selected layers in that order.
+                //
+                // This used to capture the layer INPUT (the HF `hidden_states[i]`
+                // reading), which makes index k the output of layer k-1 and puts
+                // every encoder feature one whole layer early. Measured on
+                // MiniCPM5-2B + DSpark, shifting to the output convention moved
+                // position-0 acceptance 24.7% -> 21.3%, i.e. within noise, so it was
+                // not the cause of the low acceptance on this pair. It is still fixed:
+                // the checkpoints were trained against the output convention, and a
+                // one-layer shift on the deeper entries of the list is exactly where
+                // it would start to matter.
+                layer_hiddens_.push_back(c_hidden);
+            }
+        }
+        if (n_chunks > 1)
+            chunk_outs.push_back(c_hidden);
+        else
+            cur_hidden = c_hidden;
+    }
+    if (n_chunks > 1)
+        cur_hidden = concat_rows(chunk_outs);
 
     // Use unified weights for output norm and projection
     auto output_norm = weights_.output_norm;
@@ -1509,26 +1577,6 @@ TensorPtr TransformerEngine::forward_layers(const TensorPtr& hidden, const Forwa
             logits = ops::matmul_transB(last_row, output_weight);
         } else {
             logits = ops::matmul_transB(cur_hidden, output_weight);
-        }
-    }
-
-    // 调试：打印最终 logits 的 top-5 候选 (token id:logit)
-    if (txe_dbg_on()) {
-        auto lc = ensure_cpu(logits);
-        int64_t vs = lc->shape().back();
-        int64_t rows = lc->shape()[0];
-        const float* ld = static_cast<const float*>(lc->data());
-        for (int r = 0; r < rows; ++r) {
-            const float* row = ld + (int64_t)r * vs;
-            std::vector<int> idx(vs);
-            std::iota(idx.begin(), idx.end(), 0);
-            int k = std::min(5, (int)vs);
-            std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                             [&](int a, int b) { return row[a] > row[b]; });
-            fprintf(stderr, "[SPARK-DBG] logits row%d top5:", r);
-            for (int i = 0; i < k; ++i)
-                fprintf(stderr, " %d:%.3f", idx[i], row[idx[i]]);
-            fprintf(stderr, "\n");
         }
     }
 

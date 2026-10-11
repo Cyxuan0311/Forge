@@ -641,7 +641,11 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
             set_if(base + ".up_proj", blk + ".ffn_up.weight");
 
             // Architecture-specific attention weights
-            if (config_.arch_type == "gemma4" || config_.arch_type == "gemma-embedding2") {
+            // gemma4 / mellum attention weights with QK-norm (mellum 张量名与
+            // gemma4 完全兼容: attn_q/k/v/output + qk_norm + MoE 三元组, 多余
+            // set_if 是 no-op)
+            if (config_.arch_type == "gemma4" || config_.arch_type == "gemma-embedding2" ||
+                config_.arch_type == "mellum") {
                 // Gemma4 attention weights with QK-norm
                 set_if(base + ".wq", blk + ".attn_q.weight");
                 set_if(base + ".wk", blk + ".attn_k.weight");

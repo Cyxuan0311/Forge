@@ -7,6 +7,7 @@
 #include "cpu/common/thread_pool.h"
 #include "forge/cuda_kernels.h"
 #include "forge/inference/layers/ffn_executor.h"
+#include "forge/inference/layers/per_head_norm.h"
 #include "forge/inference/layers/qwen35_linear_attention.h"  // conv1d_cpu (shared static)
 #include "forge/inference/layers/qwen35_rope.h"
 #include "forge/inference/tensor_device_utils.h"
@@ -19,34 +20,6 @@
 #endif
 
 namespace forge {
-
-namespace {
-
-// Per-head RMS norm over [seq, heads, head_dim] (same math as the qwen35
-// attention layer; duplicated here to keep that file's helpers private).
-std::vector<float> load_head_norm_weight(const TensorPtr& w, int head_dim) {
-    std::vector<float> out(head_dim, 1.0f);
-    if (!w || w->dtype() != DataType::FP32)
-        return out;
-    auto cpu = ensure_cpu(w);
-    std::memcpy(out.data(), cpu->data(), head_dim * sizeof(float));
-    return out;
-}
-
-void per_head_rms_norm_cpu(float* data, const std::vector<float>& weight, int seq_len,
-                           int num_heads, int head_dim, float eps) {
-    cpu::parallel_for2(seq_len, num_heads, [&](int s, int h) {
-        float* head_ptr = data + s * num_heads * head_dim + h * head_dim;
-        float norm_sq = 0.0f;
-        for (int d = 0; d < head_dim; ++d)
-            norm_sq += head_ptr[d] * head_ptr[d];
-        float inv_rms = 1.0f / std::sqrt(norm_sq / head_dim + eps);
-        for (int d = 0; d < head_dim; ++d)
-            head_ptr[d] *= inv_rms * weight[d];
-    });
-}
-
-}  // namespace
 
 // =========================================================================
 // Construction / lifecycle

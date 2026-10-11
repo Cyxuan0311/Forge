@@ -28,6 +28,11 @@ public:
 
     void reset() override;
 
+    // Shortconv state lives in conv_states_ (per-seq rolling window), outside
+    // the paged KV storage. A prefix hit would resume the suffix with a zeroed
+    // conv window and silently corrupt the output, so radix caching is off.
+    bool prefix_cache_supported() const override { return false; }
+
 protected:
     TensorPtr forward_layer(const TensorPtr& hidden, const LayerExecutionContext& lctx) override;
     bool init_weights() override;

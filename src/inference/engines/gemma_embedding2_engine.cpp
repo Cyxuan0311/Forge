@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "forge/cuda_kernels.h"
+#include "forge/inference/layers/per_head_norm.h"
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/inference_batch.h"
 #include "forge/logger.h"
@@ -14,25 +15,6 @@
 namespace forge {
 
 namespace {
-
-// per-head RMSNorm with optional learned weight (weight == nullptr -> plain
-// RMSNorm, used for the V-norm). Same helper as gemma4_attention.cpp.
-void per_head_rms_norm_cpu(float* data, const float* weight, int seq_len, int num_heads,
-                           int head_dim, float eps) {
-    for (int s = 0; s < seq_len; ++s) {
-        for (int h = 0; h < num_heads; ++h) {
-            float* head = data + s * num_heads * head_dim + h * head_dim;
-            float ss = 0.0f;
-            for (int d = 0; d < head_dim; ++d) ss += head[d] * head[d];
-            float inv_rms = 1.0f / (std::sqrt(ss / head_dim + eps));
-            if (weight) {
-                for (int d = 0; d < head_dim; ++d) head[d] = head[d] * inv_rms * weight[d];
-            } else {
-                for (int d = 0; d < head_dim; ++d) head[d] *= inv_rms;
-            }
-        }
-    }
-}
 
 // Gemma4 RoPE: half-split rotation + sqrt(head_dim) Q pre-scaling. The SDPA
 // applies 1/sqrt(head_dim) internally, so the net attention scale is 1.0 --

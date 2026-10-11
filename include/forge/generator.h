@@ -17,6 +17,10 @@ namespace forge {
 class SpeculativeExecutor;
 
 struct GenerationConfig {
+    // Max tokens to generate. <= 0 means unlimited: generation then runs until
+    // EOS, a stop token, an abort, or the KV context is exhausted (which is
+    // reported, not a crash). The decode loop compares against this directly,
+    // so a 0 here used to mean "generate nothing".
     int max_new_tokens = 256;
     float temperature = 1.0f;
     int top_k = 0;

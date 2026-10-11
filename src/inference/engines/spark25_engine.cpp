@@ -1,8 +1,6 @@
 #include "forge/engines/spark25_engine.h"
 
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -61,61 +59,6 @@ void headwise_sigmoid_gate_mul_cpu(float* attn, const float* gate, int seq_len, 
                 head[d] *= g;
         }
     }
-}
-
-// ---- 调试插桩 (FORGE_DEBUG_SPARK=1; FORGE_DEBUG_SPARK_LAYER=N 选层, -1=全部) ----
-static int g_spark_dbg = -1;
-static bool spark_dbg_on() {
-    if (g_spark_dbg < 0) {
-        const char* e = std::getenv("FORGE_DEBUG_SPARK");
-        g_spark_dbg = (e && std::atoi(e) != 0) ? 1 : 0;
-    }
-    return g_spark_dbg == 1;
-}
-static int spark_dbg_layer() {
-    static int l = -2;
-    if (l == -2) {
-        const char* e = std::getenv("FORGE_DEBUG_SPARK_LAYER");
-        l = e ? std::atoi(e) : 0;  // 默认只打第 0 层
-    }
-    return l;
-}
-
-static void spark_dump(const char* name, int layer, const TensorPtr& t) {
-    if (!spark_dbg_on())
-        return;
-    int want = spark_dbg_layer();
-    if (want >= 0 && layer != want && layer != -99)
-        return;  // -99 用于 "始终打印最后一层"
-    auto cpu = ensure_cpu(t);
-    if (cpu->dtype() != DataType::FP32)
-        return;
-    const float* d = static_cast<const float*>(cpu->data());
-    int64_t n = 1;
-    for (auto s : cpu->shape())
-        n *= s;
-    if (n == 0)
-        return;
-    double mn = 1e30, mx = -1e30, sum = 0, sum2 = 0;
-    long nan = 0;
-    for (int64_t i = 0; i < n; ++i) {
-        float v = d[i];
-        if (std::isnan(v) || std::isinf(v)) {
-            nan++;
-            continue;
-        }
-        if (v < mn)
-            mn = v;
-        if (v > mx)
-            mx = v;
-        sum += v;
-        sum2 += v * v;
-    }
-    double mean = sum / n;
-    double std = std::sqrt(std::max(0.0, sum2 / n - mean * mean));
-    fprintf(stderr,
-            "[SPARK-DBG] %-16s L%2d n=%lld min=%.4g max=%.4g mean=%.4g std=%.4g nan=%ld\n",
-            name, layer, (long long)n, mn, mx, mean, std, nan);
 }
 
 }  // namespace
@@ -213,33 +156,12 @@ TensorPtr Spark25Engine::forward_layer(const TensorPtr& hidden, const LayerExecu
                        : (cfg.rope_dim_count > 0 ? cfg.rope_dim_count : cfg.head_dim);
     float theta = is_swa ? cfg.rope_theta_swa : cfg.rope_theta;
 
-    // ---- 调试插桩：本层是否需要 dump ----
-    auto dbg_want = [&]() -> bool {
-        if (!spark_dbg_on())
-            return false;
-        int want = spark_dbg_layer();
-        return want < 0 || layer_idx == want || layer_idx == cfg.num_layers - 1;
-    };
-    auto D = [&](const char* name, const TensorPtr& t) {
-        if (dbg_want())
-            spark_dump(name, layer_idx, t);
-    };
-    if (dbg_want()) {
-        fprintf(stderr,
-                "[SPARK-DBG] === L%2d is_swa=%d n_rot=%d theta=%.4g rope_pos=%lld seq_len=%d "
-                "heads=%d kv=%d hd=%d ===\n",
-                layer_idx, is_swa, n_rot, theta, (long long)rope_pos, seq_len, num_heads,
-                num_kv_heads, head_dim);
-        D("hidden_in", hidden);
-    }
-
     // ---- 1. Pre-attention norm (门控输入也用它) ----
     TensorPtr normed;
     {
         PERF_SCOPE("layer/attn_norm");
         normed = ops::rms_norm(hidden, lw.attn_norm(), cfg.rms_norm_eps);
     }
-    D("normed", normed);
 
     // ---- 2. QKV projection (loader 已把 fused attn_qkv 切分为 wq/wk/wv) ----
     TensorPtr q, k, v;
@@ -249,9 +171,6 @@ TensorPtr Spark25Engine::forward_layer(const TensorPtr& hidden, const LayerExecu
         k = ops::matmul_transB(normed, lw.wk());
         v = ops::matmul_transB(normed, lw.wv());
     }
-    D("q", q);
-    D("k", k);
-    D("v", v);
 
     // ---- 3. RoPE (每层 n_rot / theta 不同) ----
     TensorPtr q_rope, k_rope;
@@ -293,9 +212,6 @@ TensorPtr Spark25Engine::forward_layer(const TensorPtr& hidden, const LayerExecu
         }
     }
 
-    D("q_rope", q_rope);
-    D("k_rope", k_rope);
-
     // ---- 4. KV cache update ----
     {
         PERF_SCOPE("layer/kv_cache_update");
@@ -331,25 +247,11 @@ TensorPtr Spark25Engine::forward_layer(const TensorPtr& hidden, const LayerExecu
                                                             num_heads, num_kv_heads, head_dim,
                                                             nullptr, true);
     }
-    D("attn_out", attn_out);
 
     // ---- 6. Per-head sigmoid 输出门控 (门控输入 = 归一化后的输入) ----
     {
         PERF_SCOPE("layer/attn_gate");
         auto gate = ops::matmul_transB(normed, lw.attn_gate());  // [T, n_head] F32
-        D("gate_pre", gate);
-        if (dbg_want()) {
-            auto g = ensure_cpu(gate);
-            const float* gd = static_cast<const float*>(g->data());
-            int64_t gn = 1;
-            for (auto s : g->shape())
-                gn *= s;
-            double ssum = 0;
-            for (int64_t i = 0; i < gn; ++i)
-                ssum += 1.0 / (1.0 + std::exp(-gd[i]));
-            fprintf(stderr, "[SPARK-DBG] gate_sigmoid_mean=%.4g (n=%lld)\n", ssum / gn,
-                    (long long)gn);
-        }
 #ifdef USE_CUDA
         if (dev == DeviceType::CUDA && attn_out->device() == DeviceType::CUDA &&
             gate->device() == DeviceType::CUDA) {
@@ -373,17 +275,13 @@ TensorPtr Spark25Engine::forward_layer(const TensorPtr& hidden, const LayerExecu
         }
     }
 
-    D("attn_out_gated", attn_out);
-
     // ---- 7. Output projection + 残差 ----
     TensorPtr attn_proj;
     {
         PERF_SCOPE("layer/attn_proj");
         attn_proj = ops::matmul_transB(attn_out, lw.wo());
     }
-    D("attn_proj", attn_proj);
     auto ffn_inp = ops::add(hidden, attn_proj);
-    D("ffn_inp", ffn_inp);
 
     // ---- 8. FFN (gelu(gate)*up, PAR 结构 → 残差输入是 ffn_inp) ----
     TensorPtr ffn_normed;
@@ -391,21 +289,16 @@ TensorPtr Spark25Engine::forward_layer(const TensorPtr& hidden, const LayerExecu
         PERF_SCOPE("layer/ffn_norm");
         ffn_normed = ops::rms_norm(ffn_inp, lw.ffn_norm(), cfg.rms_norm_eps);
     }
-    D("ffn_normed", ffn_normed);
     TensorPtr ffn_out;
     {
         PERF_SCOPE("layer/ffn");
         ffn_out = FfnExecutor::apply(ffn_normed, ffn_inp, cfg, lw, seq_len, dev);
     }
-    D("ffn_out", ffn_out);
 
     if (FfnExecutor::residual_fused(cfg, lw, seq_len, dev)) {
-        D("layer_out", ffn_out);
         return ffn_out;  // 融合 kernel 已加残差
     }
-    auto out = ops::add(ffn_inp, ffn_out);
-    D("layer_out", out);
-    return out;
+    return ops::add(ffn_inp, ffn_out);
 }
 
 }  // namespace forge

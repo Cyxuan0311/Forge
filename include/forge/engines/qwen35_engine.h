@@ -16,6 +16,12 @@ public:
     Qwen35RecurrentMemory* recurrent_memory() override { return &recurrent_memory_; }
     const Qwen35RecurrentMemory* recurrent_memory() const override { return &recurrent_memory_; }
 
+    // Linear-attention (GDN) layers keep per-seq recurrent state in
+    // Qwen35RecurrentMemory, outside the paged KV storage; a prefix hit would
+    // resume the suffix with zeroed state. Radix caching is off until state
+    // snapshots at prefix boundaries exist.
+    bool prefix_cache_supported() const override { return false; }
+
     // ------------------------------------------------------------------
     // DeepSeek-MTP style nextn head (single trained MTP layer, qwen35).
     // ------------------------------------------------------------------

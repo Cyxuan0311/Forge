@@ -355,10 +355,29 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
     int64_t pos = tiered ? static_cast<int64_t>(ws_plan.new_window_len) : prompt_len;
 
     // Tiered: cap generation at the remaining window slots so the pool never
-    // overflows mid-reply. Non-tiered: unbounded.
-    const int64_t gen_cap_steps = tiered
-        ? std::max<int64_t>(0, ws_plan.max_generate)
-        : (std::numeric_limits<int64_t>::max)();
+    // overflows mid-reply.
+    int64_t gen_cap_steps =
+        tiered ? std::max<int64_t>(0, ws_plan.max_generate) : (std::numeric_limits<int64_t>::max)();
+
+    // Unlimited generation (-n -1 / <= 0) still has to stop somewhere, and the
+    // honest bound is the KV context: past it the cache overflows. Cap at the
+    // remaining context rather than letting the run die in the attention layer,
+    // so an unlimited request degrades into "filled the context" instead of an
+    // error. Only consulted when the caller asked for unlimited, so an explicit
+    // -n that happens to exceed the context keeps reporting the overflow.
+    const bool unlimited = config.max_new_tokens <= 0;
+    if (unlimited && !tiered) {
+        int kv_ctx = 0;
+        if (auto* km = engine->kv_memory())
+            kv_ctx = km->max_seq_len();
+        if (kv_ctx <= 0 && engine->kv_cache())
+            kv_ctx = engine->kv_cache()->max_seq_len();
+        if (kv_ctx > 0)
+            gen_cap_steps = std::max<int64_t>(0, static_cast<int64_t>(kv_ctx) - pos);
+        LOG_INFO("Unlimited generation: capping at " + std::to_string(gen_cap_steps) +
+                 " token(s) by the remaining context (" + std::to_string(kv_ctx) + " total, " +
+                 std::to_string(pos) + " used)");
+    }
     const auto decode_start = std::chrono::steady_clock::now();
 
     // ---- Decode-only profiler snapshot (FORGE_PERF_DECODE=1) ----
@@ -391,14 +410,26 @@ GenerationResult Generator::generate(const std::vector<int32_t>& prompt_tokens,
         spec_executor_->begin_generation(prompt_tokens);
     }
 
-    for (int step = 1; step < config.max_new_tokens && step <= gen_cap_steps;) {
+    // Prefill already sampled and emitted one token, so the decode loop supplies
+    // the REMAINING max_new_tokens - 1. An explicit -n bounds the loop;
+    // max_new_tokens <= 0 means unlimited, bounded by gen_cap_steps alone. (The
+    // old `step < config.max_new_tokens` read a non-positive budget as "generate
+    // nothing", so the documented -n -1 produced no output at all.)
+    const int64_t step_limit =
+        unlimited ? gen_cap_steps
+                  : std::min<int64_t>(std::max(0, config.max_new_tokens - 1), gen_cap_steps);
+    for (int step = 1; step <= step_limit;) {
         if (aborted(config)) {
             goto decode_done;
         }
         // Speculation round: draft -> verify -> accept
         if (spec_executor_ && spec_executor_->valid()) {
-            auto out = spec_executor_->step(
-                {result.token_ids.back(), pos, config.max_new_tokens - step});
+            // Remaining budget for the drafter, counted in steps left in this loop.
+            // With unlimited generation there is no token budget, so hand it the
+            // context-derived step cap; `config.max_new_tokens - step` would go
+            // negative and silently disable drafting.
+            const int budget_left = static_cast<int>(step_limit - step + 1);
+            auto out = spec_executor_->step({result.token_ids.back(), pos, budget_left});
             if (out.speculated) {
                 const int64_t step_start_pos = pos;
                 size_t consumed = 0;

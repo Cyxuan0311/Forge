@@ -8,6 +8,7 @@
 
 #include "cpu/common/thread_pool.h"
 #include "forge/engine.h"
+#include "forge/inference/layers/yarn_rope.h"
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/logger.h"
 #include "forge/operator_elementwise.h"
@@ -58,61 +59,15 @@ bool Xing4_0Engine::init_weights() {
 // Mirrors ggml rope_yarn() + ggml_rope_yarn_corr_dims().
 void Xing4_0Engine::build_yarn_table() {
     const auto& cfg = model_.config();
-    yarn_s_.clear();
-    yarn_mscale_ = 1.0f;
     yarn_s_dev_ = nullptr;
-    if (!cfg.rope_yarn_enabled)
-        return;
-
+    // xing4 不把 dim 回退到 head_dim: rope_dimension_count <= 0 即视为不启用
+    // (与 mellum 不同)。
     const int dim = cfg.rope_dimension_count > 0 ? cfg.rope_dimension_count : 0;
-    if (dim <= 0)
-        return;
-
-    auto corr_dim = [&](float n_rot) {
-        return static_cast<float>(dim) *
-               std::log(static_cast<float>(cfg.rope_yarn_orig_ctx) /
-                        (n_rot * 2.0f * 3.14159265358979323846f)) /
-               (2.0f * std::log(cfg.rope_theta));
-    };
-    const float low = std::max(0.0f, std::floor(corr_dim(cfg.rope_yarn_beta_fast)));
-    const float high =
-        std::min(static_cast<float>(dim - 1), std::ceil(corr_dim(cfg.rope_yarn_beta_slow)));
-    const float denom = std::max(0.001f, high - low);
-
-    yarn_mscale_ = (cfg.rope_yarn_ext_factor != 0.0f)
-                       ? cfg.rope_yarn_attn_factor *
-                             (1.0f + 0.1f * std::log(1.0f / cfg.rope_yarn_freq_scale))
-                       : cfg.rope_yarn_attn_factor;
-
-    yarn_s_.assign(static_cast<size_t>(dim), 1.0f);
-    for (int i0 = 0; i0 + 1 < dim; i0 += 2) {
-        const float yr = (static_cast<float>(i0 / 2) - low) / denom;
-        const float ramp = 1.0f - std::min(1.0f, std::max(0.0f, yr));
-        const float ramp_mix = ramp * cfg.rope_yarn_ext_factor;
-        const float s = cfg.rope_yarn_freq_scale * (1.0f - ramp_mix) + ramp_mix;
-        yarn_s_[static_cast<size_t>(i0)] = s;
-        yarn_s_[static_cast<size_t>(i0) + 1] = s;
-    }
-
+    build_yarn_freq_table(cfg, dim, yarn_s_, yarn_mscale_);
 }
 
 const float* Xing4_0Engine::yarn_s_dev_ptr() {
-    if (yarn_s_.empty())
-        return nullptr;
-#ifdef USE_CUDA
-    if (!yarn_s_dev_) {
-        const int dim = static_cast<int>(yarn_s_.size());
-        auto host = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{dim},
-                                             DeviceType::CPU);
-        std::memcpy(host->data(), yarn_s_.data(), sizeof(float) * dim);
-        yarn_s_dev_ = std::make_shared<Tensor>(DataType::FP32, std::vector<int64_t>{dim},
-                                               DeviceType::CUDA);
-        yarn_s_dev_->copy_from(*host);
-    }
-    return static_cast<const float*>(yarn_s_dev_->data());
-#else
-    return nullptr;
-#endif
+    return yarn_table_dev_ptr(yarn_s_, yarn_s_dev_);
 }
 
 void Xing4_0Engine::init_kv_cache(const ModelConfig& cfg) {

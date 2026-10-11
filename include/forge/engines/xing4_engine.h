@@ -34,6 +34,12 @@ public:
 
     void reset() override;
 
+    // MLA latent history (mla_derived_hist_) is engine-managed per sequence,
+    // outside the paged KV storage; a prefix hit would resume the suffix with
+    // an empty derived-history window. Radix caching is off until state
+    // snapshots at prefix boundaries exist.
+    bool prefix_cache_supported() const override { return false; }
+
     TensorPtr forward_request(const ForwardRequest& req) override;
     TensorPtr forward_batch(const InferenceBatch& batch) override;
 

@@ -710,6 +710,88 @@ ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch) {
 }
 
 // ============================================================================
+// Mellum (llama.cpp arch "mellum": GQA + per-head Q/K norm + SWA/full 交错
+// + 路由-only SiLU MoE + 全注意力层 yarn)。计算图对齐 src/models/mellum.cpp。
+// ============================================================================
+
+ModelConfig parse_mellum_config(ModelLoader& loader, const std::string& arch) {
+    auto cfg = parse_common_gguf_config(loader, arch);
+    cfg.use_neox_rope = false;
+    cfg.rope_type = RopeType::Standard;  // GGUF 权重已是 half-split 排布
+    cfg.ffn_type = FFNType::MoE;
+    cfg.ffn_activation = ActivationType::SiLU_GELU;  // 路由专家用 SiLU(gate)*up
+    cfg.use_qk_norm = true;                          // attn_q_norm / attn_k_norm (per-head)
+
+    // MoE 路由 (softmax-all + top-k + topk 归一, 无共享专家)
+    cfg.n_expert = static_cast<int>(loader.get_metadata_int(arch + ".expert_count", 0));
+    cfg.n_expert_used = static_cast<int>(loader.get_metadata_int(arch + ".expert_used_count", 0));
+    cfg.n_ff_exp =
+        static_cast<int>(loader.get_metadata_int(arch + ".expert_feed_forward_length", 0));
+    // mellum 的 feed_forward_length 是 8 专家激活总宽 (8*896=7168), 每专家宽度以
+    // expert_feed_forward_length 为准, 用它修正 activation 估算用的 intermediate_dim。
+    if (cfg.n_ff_exp > 0)
+        cfg.intermediate_dim = cfg.n_ff_exp;
+
+    // SWA: llama.cpp load_swa_pattern(ml, 4) — 周期 4, i%4!=3 为 SWA 层。
+    // GGUF 不带显式 pattern 数组时按该周期生成; 带了则以数组为准。
+    cfg.n_swa = static_cast<int>(loader.get_metadata_int(arch + ".attention.sliding_window", 0));
+    auto swa_pattern =
+        loader.get_metadata_int_array(arch + ".attention.sliding_window_pattern", {});
+    cfg.swa_layers.assign(cfg.num_layers, 0);
+    if (!swa_pattern.empty()) {
+        for (size_t i = 0; i < swa_pattern.size() && i < (size_t)cfg.num_layers; ++i)
+            cfg.swa_layers[i] = static_cast<int>(swa_pattern[i]);
+    } else if (cfg.n_swa > 0) {
+        for (int i = 0; i < cfg.num_layers; ++i)
+            cfg.swa_layers[i] = (i % 4 != 3) ? 1 : 0;
+    }
+
+    // 每层都有独立 KV (mellum 无 KV 共享), 与 gemma4 的 shared_kv_layers=0 语义一致
+    cfg.n_layer_kv_from_start = cfg.num_layers;
+
+    // SWA 层与全注意力层同 head 几何 (key_length_swa 缺省 → 同 head_dim)
+    cfg.head_dim_swa = cfg.head_dim;
+    cfg.num_heads_swa = cfg.num_heads;
+    cfg.num_kv_heads_swa = cfg.num_kv_heads;
+    cfg.rope_theta_swa =
+        static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base_swa", cfg.rope_theta));
+    cfg.rope_dim_count = cfg.head_dim;
+    cfg.rope_dim_count_swa = cfg.head_dim;
+
+    // YaRN 只作用于全注意力层 (i%4==3); SWA 层用 plain rope。字段按 xing4 的
+    // build_yarn_table 消费约定填: attn_factor=1.0 (GGUF 的旧式 yarn_attn_factor
+    // key llama.cpp 读不到, ctx 侧调整后 net mscale = 1+0.1*ln(factor), 由
+    // build_yarn_table 的 mscale 公式复原), log_mul=0。
+    const double yarn_factor = loader.get_metadata_float(arch + ".rope.scaling.factor", 0.0);
+    if (yarn_factor > 0.0) {
+        const float factor = static_cast<float>(yarn_factor);
+        cfg.rope_yarn_enabled = true;
+        cfg.rope_yarn_freq_scale = 1.0f / factor;
+        cfg.rope_yarn_orig_ctx = static_cast<int>(
+            loader.get_metadata_int(arch + ".rope.scaling.original_context_length", 0));
+        cfg.rope_yarn_beta_fast = static_cast<float>(
+            loader.get_metadata_float(arch + ".rope.scaling.yarn_beta_fast", 32.0));
+        cfg.rope_yarn_beta_slow = static_cast<float>(
+            loader.get_metadata_float(arch + ".rope.scaling.yarn_beta_slow", 1.0));
+        cfg.rope_yarn_ext_factor = 1.0f;  // llama.cpp: yarn 默认 ext_factor=1
+        cfg.rope_yarn_attn_factor =
+            static_cast<float>(loader.get_metadata_float(arch + ".rope.scaling.attn_factor", 1.0f));
+        cfg.rope_yarn_log_mul = static_cast<float>(
+            loader.get_metadata_float(arch + ".rope.scaling.yarn_log_multiplier", 0.0));
+        // build_yarn_table 需要 rope_dimension_count 作为 corr-dims 的 dim
+        cfg.rope_dimension_count = cfg.head_dim;
+        LOG_INFO("mellum: YaRN enabled (factor " + std::to_string(factor) + ", orig_ctx " +
+                 std::to_string(cfg.rope_yarn_orig_ctx) + ") — full-attention layers only");
+    }
+
+    LOG_INFO("mellum: MoE n_expert=" + std::to_string(cfg.n_expert) +
+             " n_expert_used=" + std::to_string(cfg.n_expert_used) +
+             " n_ff_exp=" + std::to_string(cfg.n_ff_exp) + " n_swa=" + std::to_string(cfg.n_swa));
+
+    return cfg;
+}
+
+// ============================================================================
 // gemma-embedding2 (EmbeddingGemma 2): embedding-only Gemma4 block stack
 // ============================================================================
 // Gemma4 blocks (QK-norm + SWA/global mix + per-layer embeddings + out_scale)

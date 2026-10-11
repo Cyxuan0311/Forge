@@ -115,6 +115,8 @@ struct EngineGauges {
     int active_requests = 0;
     int64_t prefix_cache_hits = 0;
     int64_t prefix_cache_misses = 0;
+    // Hits served by restoring pages from the host blob pool (paged mode only).
+    int64_t prefix_cache_host_hits = 0;
     bool tiered_kv = false;
     bool paged_kv = false;
 };

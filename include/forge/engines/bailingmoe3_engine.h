@@ -26,6 +26,10 @@ public:
 
     void reset() override;
 
+    // GDN/KDA 层状态在 Bailingmoe3RecurrentMemory, MLA latent 历史由引擎自管,
+    // 都不在 paged KV 里; prefix hit 会以零状态续算后缀。禁用 radix 前缀缓存。
+    bool prefix_cache_supported() const override { return false; }
+
     // gpu_layers == 0: all CPU. gpu_layers > 0: all CUDA (rejected until the
     // GDN/MLA CUDA path lands). Partial offload is intentionally rejected
     // because the recurrent/MLA paths have whole-model device state and cannot
