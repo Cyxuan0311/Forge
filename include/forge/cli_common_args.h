@@ -27,7 +27,9 @@
 namespace forge {
 
 class InferenceContext;
+class KVStorage;
 class Model;
+class PrefixCache;
 class TransformerEngine;
 
 // Which defaults a shared flag should start from. forge-server sizes its
@@ -56,6 +58,19 @@ struct CommonArgs {
     bool offload_kqv = true;  // KV follows the layers onto the GPU
     bool paged_kv = false;
     bool cuda_graph = false;
+
+    // ---- multi-level prefix residency (paged KV only) ----
+    // Flags override the FORGE_KV_* env vars; ""/-1 = flag absent, so the env
+    // var (then the built-in default) applies — same -1 sentinel convention as
+    // kv_cache_type_k above. No-ops on contiguous storage.
+    std::string kv_write_policy;         // "" | write_back | write_through | off
+    long long kv_host_pool_bytes = -1;   // host blob pool budget, 0 = grow-only
+    int kv_async_backup = -1;            // 1 = background device->host backup
+    int kv_prefetch = -1;                // 1 = restore prefetch
+    std::string kv_l3_backend;           // "" | file | off
+    std::string kv_l3_dir;               // L3 segment directory
+    long long kv_l3_bytes = -1;          // L3 capacity cap in bytes
+    long long kv_l3_segment_bytes = -1;  // L3 segment file size in bytes
 
     // ---- load / memory ----
     std::string load_mode;          // "" default, else mmap | mlock | mmap_mlock
@@ -139,5 +154,11 @@ bool validate_common_args(const CommonArgs& a, std::string* err);
 // which is the failure mode this shared layer exists to remove.
 bool apply_common_args(const CommonArgs& a, forge::Model* model, forge::InferenceContext& ctx,
                        forge::TransformerEngine* engine, std::string* err);
+
+// Apply the multi-level prefix residency knobs (the --kv-* flags over the
+// FORGE_KV_* env vars) to a PrefixCache and its backing storage. No-op when
+// `storage` is not paged. cli_interactive and server_state both call this so
+// the two entry points cannot drift.
+void apply_prefix_cache_args(const CommonArgs& a, PrefixCache& cache, KVStorage& storage);
 
 }  // namespace forge

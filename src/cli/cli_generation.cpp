@@ -92,6 +92,7 @@ void fill_cli_engine_gauges(InferenceContext& ctx, const PrefixCache* prefix_cac
     if (prefix_cache) {
         g.prefix_cache_hits = prefix_cache->hits();
         g.prefix_cache_misses = prefix_cache->misses();
+        g.prefix_cache_host_hits = prefix_cache->host_hits();
     }
     if (auto* eng = ctx.engine()) {
         if (auto* mem = eng->kv_memory()) {
@@ -163,7 +164,10 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     // forge-server's tiered branch (server_state.cpp).
     const bool tiered =
         paged && ctx.engine()->kv_memory() && ctx.engine()->kv_memory()->working_set() != nullptr;
-    if (paged && prefix_cache && !tiered) {
+    // Hybrid engines keep per-seq state outside the paged KV storage; radix
+    // hits would resume the suffix with zeroed state (see prefix_cache_supported).
+    const bool prefix_ok = prefix_cache && ctx.engine() && ctx.engine()->prefix_cache_supported();
+    if (paged && prefix_ok && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             km->storage().release(0);
             gen_cfg.prefix_len = prefix_cache->try_lookup(prompt_tokens, 0, km->storage());
@@ -229,7 +233,7 @@ GenerationStats generate_streaming(InferenceContext& ctx, const Tokenizer& token
     if (out_text && !result.token_ids.empty())
         *out_text = tokenizer.decode(result.token_ids, true, false);
 
-    if (paged && prefix_cache && !tiered) {
+    if (paged && prefix_ok && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             // Register prompt AND reply: decode wrote result.token_ids into seq 0
             // right after the prompt, and the next turn's prompt begins with
@@ -314,7 +318,8 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
     // See the streaming path above: under KVMem the tier owns seq 0's window.
     const bool tiered =
         paged && ctx.engine()->kv_memory() && ctx.engine()->kv_memory()->working_set() != nullptr;
-    if (paged && prefix_cache && !tiered) {
+    const bool prefix_ok = prefix_cache && ctx.engine() && ctx.engine()->prefix_cache_supported();
+    if (paged && prefix_ok && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             km->storage().release(0);
             gen_cfg.prefix_len = prefix_cache->try_lookup(prompt_tokens, 0, km->storage());
@@ -367,7 +372,7 @@ GenerationStats generate_batch(InferenceContext& ctx, const Tokenizer& tokenizer
         std::fprintf(stderr, "\n");
     }
 
-    if (paged && prefix_cache && !tiered) {
+    if (paged && prefix_ok && !tiered) {
         if (auto* km = ctx.engine()->kv_memory()) {
             std::vector<int32_t> resident(prompt_tokens);
             resident.insert(resident.end(), result.token_ids.begin(), result.token_ids.end());

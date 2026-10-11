@@ -723,6 +723,9 @@ public:
 
     int prefix_cache_hits() const { return scheduler_.prefix_cache_hits(); }
     int prefix_cache_misses() const { return scheduler_.prefix_cache_misses(); }
+    int prefix_cache_host_hits() const { return scheduler_.prefix_cache_host_hits(); }
+    int prefix_cache_pending_jobs() const { return scheduler_.prefix_cache_pending_jobs(); }
+    void prefix_cache_flush() { scheduler_.prefix_cache_flush(); }
 
     // Phase 6: expose per-layer page pool sizes for SWA isolation verification.
     py::dict memory_stats() const {
@@ -762,6 +765,7 @@ public:
         // Phase 5: prefix cache stats
         stats["prefix_cache_hits"] = prefix_cache_hits();
         stats["prefix_cache_misses"] = prefix_cache_misses();
+        stats["prefix_cache_host_hits"] = prefix_cache_host_hits();
         if (mem) {
             stats["prefix_cache_tokens"] = mem->prefix_tokens();
         } else {

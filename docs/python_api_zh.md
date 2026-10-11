@@ -436,6 +436,16 @@ print(profiler.summary())
 |----------|-----|------|----------|
 | `FORGE_KV_STORAGE_MODE` | `"paged"` / 不设置 | 启用分页 KV 存储（默认 contiguous）。paged 模式支持 prefix cache、页级内存管理和批量调度。 | Phase 5 |
 | `FORGE_KV_AUTO_POLICY` | `"1"` / 不设置 | 启用自动策略选择：CUDA decode → F16+paged，CPU decode → F16/Q8_0，长上下文 → paged。默认关闭，保持 FP32 contiguous。 | Phase 6 |
+| `FORGE_KV_WRITE_POLICY` | `write_back` / `write_through` / `off` | 多级 prefix cache 的写策略。`write_back`：驱逐时再备份到 host blob pool（默认）；`write_through`：注册时即镜像；`off`：传统硬驱逐（无 host 命中）。 | Phase 7 |
+| `FORGE_KV_BACKUP_ASYNC` | `"1"` / `"0"` | 设备页 → host blob 的拷贝是否在后台 worker 线程执行（默认 1）。关闭则同步拷贝。 | Phase 7 |
+| `FORGE_KV_PREFETCH` | `"1"` / `"0"` | 提交请求时预热其最长 host 命中前缀的 restore（默认 0，关闭则 restore 在查中同步完成）。 | Phase 7 |
+| `FORGE_KV_RESTORE_WAIT_MS` | 整数（默认 200） | 预取 restore 未完成时，查中等待的最长时间（毫秒）；超时则回退为整段重算。 | Phase 7 |
+| `FORGE_KV_HOST_POOL_BYTES` | 整数（默认 1 GiB） | host blob pool 的容量上限；`0` 表示只增不减（grow-only，不向 L3 溢出）。超过该上限时，最久未用的 blob 会被溢出到 L3（若已配置）。 | Phase 7 |
+| `FORGE_KV_L3_BACKEND` | `off` / `none` / `0` / `file` | L3 磁盘溢出后端（默认 off）。`file` 将溢出的 blob 写入本地目录。 | Phase 7 |
+| `FORGE_KV_L3_DIR` | 目录路径 | `file` 后端使用的目录（缓存性质，非用户数据）。 | Phase 7 |
+| `FORGE_KV_L3_BYTES` | 整数（默认 1 GiB） | L3 后端的总容量上限。 | Phase 7 |
+
+> 多级 prefix cache 的数据流：设备常驻（L1）→ host blob pool（L2，受 `FORGE_KV_HOST_POOL_BYTES` 约束）→ L3 文件后端（L3，受 `FORGE_KV_L3_BYTES` 约束）。L1 驱逐的命中被记录为 host 命中并通过 `prefix_cache_host_hits()` 暴露；L2/L3 的 blob 在再次命中时被取回并恢复，KV 内容与从头重算完全一致。
 
 **与后续 `ContextConfig` 的对冲规则**：
 - 环境变量仅在 `ContextConfig` 未显式指定对应字段时作为 fallback。

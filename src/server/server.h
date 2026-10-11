@@ -316,6 +316,10 @@ private:
     // working set is seq_id 0; cached prefixes live in dedicated cache seq_ids
     // whose KV pages are reference-counted. Guarded by inference_mutex_.
     PrefixCache prefix_cache_;
+    // False for hybrid architectures whose recurrent state lives outside the
+    // paged KV storage (see InferenceEngine::prefix_cache_supported()); gates
+    // the server's radix lookup/register paths below.
+    bool prefix_cache_enabled_ = true;
 };
 
 // CORS + OPTIONS preflight + optional Bearer api-key auth (server_routes.cpp).

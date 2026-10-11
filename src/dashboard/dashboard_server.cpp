@@ -124,6 +124,7 @@ std::string DashboardServer::snapshot_to_json(const MetricsSnapshot& s) {
                        {"active_requests", s.engine.active_requests},
                        {"prefix_cache_hits", s.engine.prefix_cache_hits},
                        {"prefix_cache_misses", s.engine.prefix_cache_misses},
+                       {"prefix_cache_host_hits", s.engine.prefix_cache_host_hits},
                        {"tiered_kv", s.engine.tiered_kv},
                        {"paged_kv", s.engine.paged_kv}};
 

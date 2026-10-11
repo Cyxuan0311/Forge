@@ -42,6 +42,20 @@ static void print_usage(const char* prog) {
            "       --cuda-graph          Enable CUDA Graph for decode (default: off)\n"
            "       --paged-kv            Use paged KV cache storage (default: off, contiguous)\n"
            "\n"
+           "Multi-level KV prefix cache (paged KV only; flags override FORGE_KV_* env):\n"
+           "       --kv-write-policy P  write_back (default) | write_through | off\n"
+           "       --kv-host-pool-bytes N  Host blob pool budget in bytes\n"
+           "                           (default: 1073741824, 0 = grow-only)\n"
+           "       --kv-async-backup B  Background device->host backup: 1 (default) | 0\n"
+           "       --kv-prefetch B      Restore prefetch of host-resident prefixes:\n"
+           "                           0 (default) | 1\n"
+           "       --kv-l3-backend B    L3 disk backend: file | off (default: off)\n"
+           "       --kv-l3-dir DIR      L3 segment directory\n"
+           "                           (default: <system tmp>/forge_kv_l3)\n"
+           "       --kv-l3-bytes N      L3 capacity cap in bytes (default: 1073741824)\n"
+           "       --kv-l3-segment-bytes N  L3 segment file size in bytes\n"
+           "                           (default: 67108864)\n"
+           "\n"
            "Tiered KV (KVMem, arXiv:2609.04852):\n"
            "       --kvmem               Enable the tiered KV working set: a bounded GPU\n"
            "                           resident window over host-archived history, so the\n"
@@ -641,9 +655,9 @@ CliArgs parse_args(int argc, char** argv) {
         }
     }
 
-    if (args.n_predict == -1) {
-        args.n_predict = 256;
-    }
+    // -n -1 means unlimited (as the help text says) and is passed through as <= 0
+    // for the Generator to interpret. It used to be rewritten to 256 here, so
+    // the documented flag silently behaved like the default.
 
     if (args.temperature == 0.0f) {
         args.no_sample = true;
@@ -659,7 +673,8 @@ CliArgs parse_args(int argc, char** argv) {
             std::exit(1);
         }
     }
-    // The KVMem reserve is sized for this run's generation budget.
+    // The KVMem reserve is sized for this run's generation budget. Unlimited
+    // (<= 0) has no budget to reserve against, so fall back to the default.
     args.common.generation_budget = args.n_predict > 0 ? args.n_predict : 256;
 
     if (args.prompt.empty() && !args.info_only && !args.bench) {

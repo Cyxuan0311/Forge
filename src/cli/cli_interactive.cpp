@@ -12,6 +12,7 @@
 #include "forge/engine.h"
 #include "forge/engines/transformer_engine.h"
 #include "forge/kv_cache.h"
+#include "forge/kv_memory.h"
 #include "forge/model.h"
 #include "forge/prefix_cache.h"
 #include "forge/tokenizer.h"
@@ -72,6 +73,15 @@ void interactive_chat(InferenceContext& ctx, Model& model, Tokenizer& tokenizer,
 
     // Persisted across turns; holds cached prefixes in dedicated cache seq_ids.
     PrefixCache prefix_cache;
+
+    // Multi-level prefix residency knobs (paged mode only): write policy, host
+    // blob pool budget and the L3 disk backend — --kv-* flags over the
+    // FORGE_KV_* env vars. The CLI never wired these at all before, so the L3
+    // backend was server-only. No-op on contiguous storage.
+    if (auto* eng = ctx.engine()) {
+        if (auto* mem = eng->kv_memory())
+            apply_prefix_cache_args(args.common, prefix_cache, mem->storage());
+    }
 
     while (!g_interrupted) {
         // Orange input prompt: open the SGR span before reading so the

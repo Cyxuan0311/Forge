@@ -4,8 +4,13 @@
 #include <cstdlib>
 
 #include "forge/engines/transformer_engine.h"
+#include "forge/kv_l3_backend.h"
+#include "forge/kv_memory.h"
+#include "forge/kv_policy.h"
+#include "forge/kv_storage.h"
 #include "forge/kv_working_set.h"
 #include "forge/logger.h"
+#include "forge/prefix_cache.h"
 #include "forge/threads.h"
 #include "forge/model.h"
 
@@ -105,6 +110,10 @@ bool common_arg_takes_value(const std::string& arg) {
         "--kv-cache-dtype",            "-ctk",           "--cache-type-k",
         "-ctv",     "--cache-type-v",   "--kvmem-budget", "--kvmem-sink",
         "--kvmem-gen-reserve",         "--kvmem-retrieval", "--load-mode",
+        "--kv-write-policy",           "--kv-host-pool-bytes",
+        "--kv-async-backup",           "--kv-prefetch",
+        "--kv-l3-backend",             "--kv-l3-dir",
+        "--kv-l3-bytes",               "--kv-l3-segment-bytes",
     };
     for (const char* v : kValued) {
         if (arg == v) return true;
@@ -119,7 +128,10 @@ std::vector<std::string> common_arg_names() {
             "--cuda-graph",       "--kvmem",                "--kvmem-budget",
             "-rkq/--rope-k-quant",  "-nrkq/--no-rope-k-quant",
             "--kvmem-sink",       "--kvmem-gen-reserve",    "--kvmem-retrieval",
-            "--load-mode",        "--offload-embedding",    "--no-prefetch"};
+            "--load-mode",        "--offload-embedding",    "--no-prefetch",
+            "--kv-write-policy",  "--kv-host-pool-bytes",   "--kv-async-backup",
+            "--kv-prefetch",      "--kv-l3-backend",        "--kv-l3-dir",
+            "--kv-l3-bytes",      "--kv-l3-segment-bytes"};
 }
 
 ParseResult parse_common_arg(const std::string& arg, int argc, char** argv, int& i,
@@ -233,6 +245,79 @@ ParseResult parse_common_arg(const std::string& arg, int argc, char** argv, int&
         }
         out.load_mode = m;
         return ParseResult::Ok;
+    }
+
+    // ---- multi-level prefix residency (paged KV only; flags over env) ----
+    if (arg == "--kv-write-policy") {
+        const char* v = need_value();
+        if (!v) return ParseResult::Error;
+        // Fail loudly on a typo instead of silently downgrading to the default,
+        // matching the strict-parse intent of kv_write_policy_from_string.
+        if (!kv_write_policy_from_string(v, nullptr)) {
+            *err = std::string("Error: --kv-write-policy must be 'write_back', "
+                               "'write_through' or 'off', got '") +
+                   v + "'";
+            return ParseResult::Error;
+        }
+        out.kv_write_policy = v;
+        return ParseResult::Ok;
+    }
+    if (arg == "--kv-host-pool-bytes" || arg == "--kv-l3-bytes" ||
+        arg == "--kv-l3-segment-bytes") {
+        const char* v = need_value();
+        if (!v) return ParseResult::Error;
+        long long n = 0;
+        try {
+            n = std::stoll(v);
+        } catch (const std::exception&) {
+            *err = std::string("Error: ") + arg + " '" + v + "' is not a number";
+            return ParseResult::Error;
+        }
+        if (n < 0) {
+            *err = std::string("Error: ") + arg + " must be >= 0";
+            return ParseResult::Error;
+        }
+        if (arg == "--kv-host-pool-bytes")
+            out.kv_host_pool_bytes = n;
+        else if (arg == "--kv-l3-bytes")
+            out.kv_l3_bytes = n;
+        else
+            out.kv_l3_segment_bytes = n;
+        return ParseResult::Ok;
+    }
+    if (arg == "--kv-async-backup" || arg == "--kv-prefetch") {
+        const char* v = need_value();
+        if (!v) return ParseResult::Error;
+        const std::string s = v;
+        int n;
+        if (s == "1" || s == "on" || s == "true" || s == "yes")
+            n = 1;
+        else if (s == "0" || s == "off" || s == "false" || s == "no")
+            n = 0;
+        else {
+            *err = "Error: " + arg + " must be 0 or 1, got '" + s + "'";
+            return ParseResult::Error;
+        }
+        if (arg == "--kv-async-backup")
+            out.kv_async_backup = n;
+        else
+            out.kv_prefetch = n;
+        return ParseResult::Ok;
+    }
+    if (arg == "--kv-l3-backend") {
+        const char* v = need_value();
+        if (!v) return ParseResult::Error;
+        const std::string s = v;
+        if (s != "file" && s != "off" && s != "none" && s != "0") {
+            *err = "Error: --kv-l3-backend must be 'file' or 'off', got '" + s + "'";
+            return ParseResult::Error;
+        }
+        out.kv_l3_backend = s;
+        return ParseResult::Ok;
+    }
+    if (arg == "--kv-l3-dir") {
+        const char* v = need_value();
+        return v ? (out.kv_l3_dir = v, ParseResult::Ok) : ParseResult::Error;
     }
 
     bool* b = nullptr;
@@ -357,6 +442,24 @@ bool apply_common_args(const CommonArgs& a, Model* model, InferenceContext& ctx,
     engine->set_use_graph(a.cuda_graph);
     engine->set_cuda_graph_enabled(a.cuda_graph);
     return true;
+}
+
+void apply_prefix_cache_args(const CommonArgs& a, PrefixCache& cache, KVStorage& storage) {
+    // Multi-level residency only exists on paged storage; on contiguous storage
+    // (the default) every --kv-* flag here would be meaningless.
+    if (!storage.is_paged()) return;
+    // Flag over env over default, per knob.
+    cache.set_policy(kv_write_policy_resolved(a.kv_write_policy));
+    cache.set_async_backup(a.kv_async_backup >= 0 ? a.kv_async_backup != 0
+                                                  : kv_async_backup_from_env());
+    cache.set_prefetch(a.kv_prefetch >= 0 ? a.kv_prefetch != 0 : kv_prefetch_from_env());
+    // FORGE_KV_RESTORE_WAIT_MS has no flag; the env var stays authoritative.
+    cache.set_restore_wait_ms(kv_restore_wait_ms_from_env());
+    storage.set_prefix_pool_max_bytes(a.kv_host_pool_bytes >= 0
+                                          ? static_cast<size_t>(a.kv_host_pool_bytes)
+                                          : kv_host_pool_bytes_from_env());
+    storage.set_l3_backend(make_l3_backend_resolved(a.kv_l3_backend, a.kv_l3_dir, a.kv_l3_bytes,
+                                                    a.kv_l3_segment_bytes));
 }
 
 }  // namespace forge

@@ -495,12 +495,12 @@ static void hold_for_dashboard() {
 // Main
 // ============================================================================
 
-int main(int argc, char** argv) {
-    auto args = parse_args(argc, argv);
-
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
+// The body of the CLI, split out from main() so main can wrap it. A prompt
+// longer than the KV cache is a user-facing condition, not a crash:
+// KVOverflowError is raised deep in the attention layer, and without a handler
+// here it reached an uncaught boundary and took the process down via
+// std::terminate with a core dump.
+int run_cli(const CliArgs& args) {
     if (args.common.model_path.empty()) {
         std::cerr << "Error: Please specify a model path (-m, --model)\n";
         std::cerr << "Use --help for usage information\n";
@@ -1012,4 +1012,25 @@ int main(int argc, char** argv) {
     interactive_chat(ctx, model, tokenizer, vision.get(), args);
 
     return 0;
+}
+
+int main(int argc, char** argv) {
+    auto args = parse_args(argc, argv);
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    // A prompt longer than the KV cache is a user-facing condition, not a crash.
+    // KVOverflowError is raised deep in the attention layer; without this handler
+    // it reached an uncaught boundary and took the process down via
+    // std::terminate, printing "terminate called after throwing..." and dumping
+    // core. Report it as a plain error that names the fix.
+    try {
+        return run_cli(args);
+    } catch (const KVOverflowError& e) {
+        std::cerr << "\nError: " << e.what() << "\n"
+                  << "Raise it with -c/--ctx-size, or shorten the prompt "
+                     "(and use -n to cap the output length).\n";
+        return 1;
+    }
 }

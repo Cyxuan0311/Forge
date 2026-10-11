@@ -308,6 +308,18 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
         return false;
     }
 
+    // Multi-level prefix residency knobs (paged mode only): write policy, host
+    // blob pool budget and the L3 disk backend — --kv-* flags over the
+    // FORGE_KV_* env vars. The server owns a separate PrefixCache instance from
+    // the RequestScheduler path, so both wiring points need this.
+    if (tfm_eng) {
+        prefix_cache_enabled_ = tfm_eng->prefix_cache_supported();
+        if (auto* kv_mem = tfm_eng->kv_memory()) {
+            if (kv_mem->storage().is_paged())
+                apply_prefix_cache_args(opt.common, prefix_cache_, kv_mem->storage());
+        }
+    }
+
     // Report the resolved KV geometry. With -ctk/-ctv the K and V types can
     // differ, and a line naming only one of them makes an asymmetric config
     // indistinguishable from a symmetric one -- which is how a silent dtype
@@ -1038,7 +1050,7 @@ ChatCompletionResult ServerState::chat_completion(
             // never be evicted.
             prefix_cache_.release_prefix(sess_seq, km->storage());
             km->storage().release(sess_seq);
-            prefix_len = multimodal
+            prefix_len = (multimodal || !prefix_cache_enabled_)
                              ? 0
                              : prefix_cache_.try_lookup(prompt_ids, sess_seq, km->storage());
             // vLLM-style on-demand eviction before prefill. Cached prefixes
@@ -1162,7 +1174,7 @@ ChatCompletionResult ServerState::chat_completion(
         // cached copy survives. Short prompts are handled internally (no-op).
         // Tiered: skipped — the pages must stay in seq 0's window, which is the
         // tier's resident state for the next turn.
-        if (!tiered) {
+        if (!tiered && prefix_cache_enabled_) {
             if (auto* km = ctx_->engine()->kv_memory()) {
                 // Register the prompt AND the reply, not just the prompt. Decode
                 // writes result.token_ids into seq 0 starting at prompt_ids.size(),
@@ -1511,6 +1523,7 @@ void ServerState::fill_engine_gauges(EngineGauges& g) {
     g.tiered_kv = tiered_kv_active();
     g.prefix_cache_hits = prefix_cache_.hits();
     g.prefix_cache_misses = prefix_cache_.misses();
+    g.prefix_cache_host_hits = prefix_cache_.host_hits();
     if (auto* eng = ctx_ ? ctx_->engine() : nullptr) {
         if (auto* mem = eng->kv_memory()) {
             g.paged_kv = mem->is_paged();
