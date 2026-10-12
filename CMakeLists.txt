@@ -245,7 +245,9 @@ target_link_libraries(forge_tokenizer PUBLIC forge_core)
 # Pure host logic (nlohmann/json + std); no engine or tokenizer dependency.
 add_library(
   forge_agent STATIC src/agent/tool_dialect.cpp src/agent/reasoning_filter.cpp
-                     src/agent/agent_pipeline.cpp)
+                     src/agent/agent_pipeline.cpp src/agent/tool_registry.cpp
+                     src/agent/tools/python_exec.cpp
+                     src/agent/tools/web_search.cpp)
 target_include_directories(
   forge_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
@@ -532,11 +534,15 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
       ${_forge_chat_dir}/src/main.ts
       ${_forge_chat_dir}/src/App.vue
       ${_forge_chat_dir}/src/api.ts
+      ${_forge_chat_dir}/src/icons.ts
       ${_forge_chat_dir}/src/markdown.ts
+      ${_forge_chat_dir}/src/modes.ts
       ${_forge_chat_dir}/src/store.ts
+      ${_forge_chat_dir}/src/tools.ts
       ${_forge_chat_dir}/src/types.ts
       ${_forge_chat_dir}/src/style.css
       ${_forge_chat_dir}/src/components/Composer.vue
+      ${_forge_chat_dir}/src/components/ComposerMenu.vue
       ${_forge_chat_dir}/src/components/ConnectionPanel.vue
       ${_forge_chat_dir}/src/components/ModalShell.vue
       ${_forge_chat_dir}/src/components/MessageItem.vue

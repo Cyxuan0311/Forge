@@ -117,9 +117,10 @@ function(in_list needle haystack out_var)
       PARENT_SCOPE)
 endfunction()
 
-# Escape into a C string body, then cut it into adjacent literals.
-function(escape_and_chunk content chunk_size out_var)
-  string(REPLACE "\\" "\\\\" body "${content}")
+# Escape a string into a C string body (no chunking). Must be applied to a slice
+# that is already self-contained so an escape sequence is never cut in half.
+function(escape_body body out_var)
+  string(REPLACE "\\" "\\\\" body "${body}")
   string(REPLACE "\"" "\\\"" body "${body}")
   string(REPLACE "\n" "\\n" body "${body}")
   string(REPLACE "\r" "" body "${body}")
@@ -129,12 +130,23 @@ function(escape_and_chunk content chunk_size out_var)
   # but every compiler still warns (-Wtrigraphs) and a warning on a 400 KB
   # single-line literal is noise that hides real ones.
   string(REPLACE "?" "\\?" body "${body}")
+  set(${out_var} "${body}" PARENT_SCOPE)
+endfunction()
 
-  string(LENGTH "${body}" len)
+# Escape the text asset and cut it into adjacent string literals. The raw content
+# is chunked FIRST (at raw_chunk bytes) and each chunk is escaped in isolation, so
+# a backslash in the source can never be split across a literal boundary. The old
+# code escaped the whole body then cut it, which left a dangling '\' at the start
+# of the next literal whenever a "\\" pair straddled a 4000-char cut -- a hard
+# compile error once the bundle grew large enough to land a cut on a backslash.
+#
+# raw_chunk is the SOURCE size; escaping can at most double length (each byte
+# becomes at most "\\"), so 2000 raw bytes stay under the 4095-char single-literal
+# limit (and MSVC's 16380) even fully escaped.
+function(escape_and_chunk content raw_chunk out_var)
+  string(LENGTH "${content}" len)
   if(len EQUAL 0)
-    set(${out_var}
-        "\"\""
-        PARENT_SCOPE)
+    set(${out_var} "\"\"" PARENT_SCOPE)
     return()
   endif()
 
@@ -142,18 +154,17 @@ function(escape_and_chunk content chunk_size out_var)
   set(pos 0)
   while(pos LESS len)
     math(EXPR remain "${len} - ${pos}")
-    if(remain GREATER chunk_size)
-      set(take ${chunk_size})
+    if(remain GREATER raw_chunk)
+      set(take ${raw_chunk})
     else()
       set(take ${remain})
     endif()
-    string(SUBSTRING "${body}" ${pos} ${take} piece)
-    string(APPEND parts "\"${piece}\" ")
+    string(SUBSTRING "${content}" ${pos} ${take} rawpiece)
+    escape_body("${rawpiece}" epiece)
+    string(APPEND parts "\"${epiece}\" ")
     math(EXPR pos "${pos} + ${take}")
   endwhile()
-  set(${out_var}
-      "${parts}"
-      PARENT_SCOPE)
+  set(${out_var} "${parts}" PARENT_SCOPE)
 endfunction()
 
 # Binary: read as HEX (CMake strings survive arbitrary bytes in hex form) and
@@ -164,6 +175,7 @@ function(bytes_array file out_var)
   math(EXPR nbytes "${hexlen} / 2")
   set(rows "")
   set(i 0)
+  set(_first TRUE)
   while(i LESS nbytes)
     math(EXPR remain "${nbytes} - ${i}")
     if(remain GREATER 16)
@@ -187,11 +199,19 @@ function(bytes_array file out_var)
       string(APPEND row " 0x${b},")
     endforeach()
     string(REGEX REPLACE ",$" "" row "${row}")
-    string(APPEND rows "${row}\n")
+    # Rows need a comma BETWEEN them, not at the end of each: stripping every
+    # trailing comma (the old behaviour) left "0x00 0x00" with no separator and
+    # failed to compile. Keep each row comma-free and join with ",\n".
+    if(_first)
+      string(APPEND rows "${row}")
+      set(_first FALSE)
+    else()
+      string(APPEND rows ",\n${row}")
+    endif()
     math(EXPR i "${i} + ${take}")
   endwhile()
   if(nbytes EQUAL 0)
-    set(rows "    0\n")
+    set(rows "    0")
   endif()
   set(${out_var}
       "${rows}"
@@ -213,6 +233,10 @@ string(APPEND _out "#include \"forge/dashboard.h\"\n\n")
 string(APPEND _out "namespace forge {\nnamespace {\n\n")
 
 set(_count 0)
+# Per-asset size expression for the table below: text assets are NUL-terminated
+# C strings (drop the terminator), binary assets are raw byte arrays (keep all
+# bytes). Binary assets define kRaw*, not kAsset*, so the two must not be mixed.
+set(_sizes "")
 foreach(_rel IN LISTS _assets)
   # GLOB_RECURSE can yield directories on some generators.
   if(IS_DIRECTORY "${INPUT_DIR}/${_rel}")
@@ -237,7 +261,7 @@ foreach(_rel IN LISTS _assets)
 
   if(_is_text)
     file(READ "${INPUT_DIR}/${_rel}" _content)
-    escape_and_chunk("${_content}" 4000 _body)
+    escape_and_chunk("${_content}" 2000 _body)
     string(APPEND _out "const char kAsset${_count}[] =\n    ${_body};\n")
     string(APPEND _out "const char* const kBody${_count} = kAsset${_count};\n")
   else()
@@ -248,6 +272,11 @@ foreach(_rel IN LISTS _assets)
       _out
       "const char* const kBody${_count} = reinterpret_cast<const char*>(kRaw${_count});\n"
     )
+  endif()
+  if(_is_text)
+    list(APPEND _sizes "sizeof(kAsset${_count}) - 1")
+  else()
+    list(APPEND _sizes "sizeof(kRaw${_count})")
   endif()
   string(APPEND _out "const char kMime${_count}[] = \"${_mime}\";\n")
   string(APPEND _out "const char kPath${_count}[] = \"${_rel}\";\n\n")
@@ -265,9 +294,11 @@ endif()
 string(APPEND _out "const DashboardAsset kAssets[] = {\n")
 if(_count GREATER 0)
   foreach(_i RANGE 1 ${_count})
+    math(EXPR _si "${_i} - 1")
+    list(GET _sizes ${_si} _sz)
     string(
       APPEND _out
-      "    {kPath${_i}, kMime${_i}, kBody${_i}, sizeof(kAsset${_i}) - 1},\n")
+      "    {kPath${_i}, kMime${_i}, kBody${_i}, ${_sz}},\n")
   endforeach()
 else()
   # A zero-length array is not valid C++; one placeholder keeps the type valid
