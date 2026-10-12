@@ -10,7 +10,7 @@
  * so a backgrounded tab costs the engine nothing and does not accumulate a
  * multi-hour backlog of ECharts updates.
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { pollMetrics, fmtBytes, fmtCount, fmtMs, fmtPercent, fmtTok, fmtUptime } from './api'
 import { providePalette } from './composables/palette'
 import { useTheme } from './composables/theme'
@@ -27,23 +27,27 @@ import ExportMenu from './components/ExportMenu.vue'
 
 const data = ref<Metrics | null>(null)
 const error = ref<string | null>(null)
-const paused = ref(false)
+// Two independent reasons the poll can be paused: the user froze it on purpose,
+// or the tab is hidden. Either one stops the poller; the watch below restarts it
+// the moment both clear, so resuming always does an immediate fetch.
+const manualPaused = ref(false)
+const tabHidden = ref(typeof document !== 'undefined' && document.visibilityState === 'hidden')
+const effectivePaused = computed(() => manualPaused.value || tabHidden.value)
 
 let poller: ReturnType<typeof pollMetrics> | null = null
+let genTimer: ReturnType<typeof setInterval> | undefined
+
+function startPoller() {
+  poller?.stop()
+  poller = pollMetrics(apply, fail)
+}
+function stopPoller() {
+  poller?.stop()
+  poller = null
+}
 
 function onVisibility() {
-  const hidden = document.visibilityState === 'hidden'
-  if (hidden === paused.value) return
-  paused.value = hidden
-  // Resume with an immediate fetch rather than waiting out the 1 s tick, so the
-  // page is current the moment it is looked at again.
-  if (!hidden) {
-    poller?.stop()
-    poller = pollMetrics(apply, fail)
-  } else {
-    poller?.stop()
-    poller = null
-  }
+  tabHidden.value = document.visibilityState === 'hidden'
 }
 
 function apply(m: Metrics) {
@@ -55,15 +59,29 @@ function fail(e: Error) {
   error.value = e.message
 }
 
+function togglePause() {
+  manualPaused.value = !manualPaused.value
+}
+
 onMounted(() => {
-  poller = pollMetrics(apply, fail)
+  if (!effectivePaused.value) startPoller()
   document.addEventListener('visibilitychange', onVisibility)
 })
 
 onBeforeUnmount(() => {
-  poller?.stop()
-  poller = null
+  stopPoller()
   document.removeEventListener('visibilitychange', onVisibility)
+  if (genTimer !== undefined) {
+    clearInterval(genTimer)
+    genTimer = undefined
+  }
+})
+
+// Restarting the poller is purely a function of the two pause reasons, so drive
+// it from a single computed instead of scattering start/stop calls.
+watch(effectivePaused, (paused) => {
+  if (paused) stopPoller()
+  else startPoller()
 })
 
 // ---- derived numbers -------------------------------------------------------
@@ -80,6 +98,24 @@ onBeforeUnmount(() => {
 const live = computed(() => data.value?.live ?? null)
 const isGenerating = computed(() => live.value?.active === true)
 
+/**
+ * Wall clock that advances ~4 Hz while a request is in flight, so the elapsed /
+ * progress readout moves smoothly instead of jumping once per poll (the
+ * `liveElapsed` counter is derived from it). It only ticks during generation;
+ * otherwise the counter is frozen at the last value.
+ */
+const now = ref(typeof Date.now === 'function' ? Date.now() : 0)
+
+watch(isGenerating, (active) => {
+  if (active) {
+    now.value = Date.now()
+    if (genTimer === undefined) genTimer = setInterval(() => { now.value = Date.now() }, 250)
+  } else if (genTimer !== undefined) {
+    clearInterval(genTimer)
+    genTimer = undefined
+  }
+})
+
 const lastTokPerS = computed(() => {
   const l = live.value
   if (l?.active) return l.tok_per_s
@@ -92,8 +128,8 @@ const lastTokPerS = computed(() => {
 const liveElapsed = computed(() => {
   const l = live.value
   if (!l?.active) return 0
-  // Re-derive from the wall clock so the counter ticks at 4 Hz between polls.
-  return Math.max(l.elapsed_ms, Date.now() - l.start_ms)
+  // Re-derive from the live wall clock so the counter ticks at 4 Hz between polls.
+  return Math.max(l.elapsed_ms, now.value - l.start_ms)
 })
 
 const kvKnown = computed(() => (data.value?.engine.kv_total_bytes ?? 0) > 0)
@@ -105,6 +141,29 @@ const kvKnown = computed(() => (data.value?.engine.kv_total_bytes ?? 0) > 0)
  */
 const { resolved } = useTheme()
 const palette = providePalette(resolved)
+
+/**
+ * Pick a gauge colour by utilisation: red past 90%, amber past 75%, else the
+ * baseline hue. Mirrors the tone logic the StatTiles already use, so a GPU or
+ * KV cache that is nearly full reads as an alarm instead of its calm baseline.
+ */
+function gaugeColor(pct: number, base: string): string {
+  if (pct >= 0.9) return palette.value.red
+  if (pct >= 0.75) return palette.value.amber
+  return base
+}
+
+const vramColor = computed(() => {
+  const h = data.value?.host
+  const pct = h && h.vram_total_bytes > 0 ? h.vram_used_bytes / h.vram_total_bytes : 0
+  return gaugeColor(pct, palette.value.magenta)
+})
+
+const kvColor = computed(() => {
+  const e = data.value?.engine
+  if (!e || e.kv_total_bytes <= 0) return palette.value.cyan
+  return gaugeColor(e.kv_active_bytes / e.kv_total_bytes, palette.value.cyan)
+})
 
 /** Rate at which the engine is turning VRAM into output, in bytes per second. */
 const memSeriesNote = computed(() => {
@@ -144,7 +203,8 @@ const memSeriesNote = computed(() => {
         >
       </template>
       <span class="spacer" />
-      <span v-if="paused" class="meta">paused (tab hidden)</span>
+      <span v-if="effectivePaused" class="meta">{{ manualPaused ? 'paused (manual)' : 'paused (tab hidden)' }}</span>
+      <button class="pause-btn" type="button" data-testid="pause-toggle" @click="togglePause">{{ manualPaused ? 'Resume' : 'Pause' }}</button>
       <ExportMenu :data="data" />
       <ThemeSlider />
     </div>
@@ -277,14 +337,14 @@ const memSeriesNote = computed(() => {
               label="VRAM"
               :used="data.host.vram_used_bytes"
               :total="data.host.vram_total_bytes"
-              :color="palette.magenta"
+              :color="vramColor"
               :detail="`${fmtBytes(data.host.vram_used_bytes)} / ${fmtBytes(data.host.vram_total_bytes)}`"
             />
             <GaugePanel
               label="KV cache"
               :used="data.engine.kv_active_bytes"
               :total="data.engine.kv_total_bytes"
-              :color="palette.cyan"
+              :color="kvColor"
               :detail="
                 kvKnown
                   ? `${fmtBytes(data.engine.kv_active_bytes)} / ${fmtBytes(data.engine.kv_total_bytes)}`
@@ -324,5 +384,18 @@ const memSeriesNote = computed(() => {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+.pause-btn {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pause-btn:hover {
+  border-color: var(--accent);
 }
 </style>

@@ -309,8 +309,10 @@ console.log('\n[controls]')
 const q = (sel) => dom.window.document.querySelector(sel)
 const themeBtn = q('[data-testid="theme-toggle"]')
 const exportBtn = q('[data-testid="export-toggle"]')
+const pauseBtn = q('[data-testid="pause-toggle"]')
 expect('header has a theme control', !!themeBtn)
 expect('header has an export control', !!exportBtn)
+expect('header has a pause control', !!pauseBtn)
 
 // ---- 5. theme switching is behavioural -------------------------------------
 
@@ -423,6 +425,41 @@ expect(
 )
 expect('the insecure-context fallback was not used on a secure origin', !copiedFallback)
 expect('the status confirms the copy', (status?.textContent ?? '').includes('copied'), status?.textContent)
+
+// ---- 7. manual pause is behavioural -----------------------------------------
+
+console.log('\n[pause]')
+expect(
+  'pause control starts as Pause',
+  (pauseBtn?.textContent ?? '').trim() === 'Pause',
+  pauseBtn?.textContent ?? 'missing',
+)
+expect(
+  'no manual-paused indicator before click',
+  !(app?.textContent ?? '').includes('paused (manual)'),
+)
+pauseBtn?.click()
+await new Promise((r) => setTimeout(r, 5))
+expect(
+  'pause control flips to Resume',
+  (pauseBtn?.textContent ?? '').trim() === 'Resume',
+  pauseBtn?.textContent ?? 'missing',
+)
+expect(
+  'manual-paused indicator appears',
+  (app?.textContent ?? '').includes('paused (manual)'),
+)
+pauseBtn?.click()
+await new Promise((r) => setTimeout(r, 5))
+expect(
+  'pause control flips back to Pause',
+  (pauseBtn?.textContent ?? '').trim() === 'Pause',
+  pauseBtn?.textContent ?? 'missing',
+)
+expect(
+  'manual-paused indicator clears',
+  !(app?.textContent ?? '').includes('paused (manual)'),
+)
 
 if (consoleErrors.length > 0) {
   for (const e of consoleErrors.slice(0, 8)) fail(`console during mount: ${e}`)

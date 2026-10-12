@@ -32,14 +32,14 @@ let ro: ResizeObserver | null = null
 onMounted(() => {
   if (!el.value) return
   chart.value = echarts.init(el.value, undefined, { renderer: 'canvas' })
-  chart.value.setOption(props.option, true)
+  chart.value.setOption(props.option, true, true)
   ro = new ResizeObserver(() => chart.value?.resize())
   ro.observe(el.value)
 })
 
 watch(
   () => props.option,
-  (o) => chart.value?.setOption(o, true),
+  (o) => chart.value?.setOption(o, true, true),
   { deep: false },
 )
 

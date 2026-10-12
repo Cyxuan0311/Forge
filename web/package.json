@@ -12,7 +12,8 @@
     "smoke": "vite build --ssr scripts/smoke.ts --outDir dist-smoke --emptyOutDir && node dist-smoke/smoke.js",
     "smoke:only": "node dist-smoke/smoke.js",
     "test:bundle": "node scripts/test-bundle.mjs",
-    "test": "npm run typecheck && npm run smoke && npm run build && npm run test:bundle"
+    "test": "node scripts/test-markdown.mjs && vite build && node scripts/test-smoke.mjs && node scripts/test-bundle.mjs && node scripts/test-theme.mjs",
+    "test:theme": "node scripts/test-theme.mjs"
   },
   "dependencies": {
     "echarts": "^6.1.0",
