@@ -6,11 +6,20 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { transformSync } from 'esbuild'
+import { build } from 'esbuild'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const src = readFileSync(join(here, '..', 'src', 'markdown.ts'), 'utf8')
-const js = transformSync(src, { loader: 'ts', format: 'esm' }).code
+// markdown.ts now pulls in highlight.js + katex, so transformSync (which leaves
+// bare imports unresolved) is not enough -- bundle them into the test module.
+const result = await build({
+  entryPoints: [join(here, '..', 'src', 'markdown.ts')],
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  write: false,
+  logLevel: 'silent',
+})
+const js = result.outputFiles[0].text
 const mod = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'))
 const renderMd = mod.renderMd
 
@@ -57,7 +66,7 @@ has(
   '<span class="codelang">python</span>',
   renderMd('```python\nx=1\n```'),
 )
-has('code body escaped', '&lt;div&gt;', renderMd('```html\n<div>\n```'))
+has('code body escaped', '&lt;', renderMd('```html\n<div>\n```'))
 has('copy button emitted', 'class="code-copy"', renderMd('```\nx\n```'))
 has('unclosed fence still closes', '</code></pre>', renderMd('```\nunfinished'))
 has('atx heading', '<h2>Title</h2>', renderMd('## Title'))
@@ -77,6 +86,37 @@ has(
   renderMd('- a\n\n- b'),
 )
 has('tight item has no <p>', '<li>plain</li>', renderMd('- plain'))
+
+console.log('=== code highlight ===')
+const hi = renderMd('```python\nfor x in range(3):\n    print(x)\n```')
+has('python keyword is highlighted', 'hljs-keyword', hi)
+has('highlighted code still escapes', '&lt;', renderMd('```html\n<div>\n```'))
+hasNot('highlighted output has no raw script tag', '<script', renderMd('```js\nx=1\n```'))
+
+console.log('=== math ===')
+const inl = renderMd('energy is $E = mc^2$ here')
+has('inline math rendered', 'katex', inl)
+hasNot('inline math not left as literal dollar', inl.indexOf('$E = mc^2$') >= 0, inl)
+const disp = renderMd('$$\n\\frac{a}{b}\n$$')
+has('display math rendered', 'katex-display', disp)
+hasNot('display math does not leak delimiters', '$$', disp)
+const disp1 = renderMd('the answer is $$x^2$$ done')
+has('single-line display math rendered', 'katex-display', disp1)
+hasNot('single-line display math does not leak delimiters', '$$', disp1)
+hasNot('currency is not mistaken for math', 'katex', renderMd('the cost is $5 and $10 total'))
+hasNot('escaped dollar stays literal', 'katex', renderMd('escape a \\$ sign'))
+hasNot('math cannot inject a <script> tag', '<script', renderMd('mix $<script>alert(1)</script>$ with text'))
+
+// LaTeX \( ... \) / \[ ... \] delimiters (what many models emit instead of $).
+const inlParen = renderMd('energy is \\(E = mc^2\\) here')
+has('inline \\(...\\) rendered', 'katex', inlParen)
+hasNot('inline \\(...\\) not left literal', inlParen.indexOf('\\(') >= 0, inlParen)
+const dispBracket = renderMd('\\[\n\\frac{a}{b}\n\\]')
+has('display \\[...\\] rendered', 'katex-display', dispBracket)
+hasNot('display \\[...\\] does not leak delimiters', dispBracket.indexOf('\\[') >= 0, dispBracket)
+const dispBracket1 = renderMd('the answer is \\[x^2\\] done')
+has('single-line \\[...\\] rendered', 'katex-display', dispBracket1)
+hasNot('single-line \\[...\\] does not leak delimiters', dispBracket1.indexOf('\\[') >= 0, dispBracket1)
 
 console.log('=== structure ===')
 hasNot('no empty paragraph for blank input', '<p>', renderMd(''))

@@ -6,11 +6,23 @@
  * content (capped at 200px). While a response is streaming the button turns
  * into Stop, which aborts the fetch and keeps the partial answer.
  */
-import { ref } from 'vue'
-import { addFiles, onDrop, removePending, send, stop, store } from '../store'
+import { onMounted, ref, watch } from 'vue'
+import { onDrop, removePending, send, stop, store } from '../store'
+import ComposerMenu from './ComposerMenu.vue'
+import { Icon } from '../icons'
 
 const draftEl = ref<HTMLTextAreaElement | null>(null)
-const fileInput = ref<HTMLInputElement | null>(null)
+
+// The page opens ready to type, and hands the caret back once a reply lands:
+// the next thing after reading an answer is nearly always asking again. Not
+// while a panel is open — those have their own inputs that own focus.
+onMounted(() => draftEl.value?.focus())
+watch(
+  () => store.streaming,
+  (streaming) => {
+    if (!streaming && store.panel === 'none') draftEl.value?.focus()
+  },
+)
 
 function autoGrow() {
   const el = draftEl.value
@@ -31,48 +43,46 @@ function onKeydown(e: KeyboardEvent) {
     autoGrow()
   }
 }
-
-function onFileChange(e: Event) {
-  const input = e.target as HTMLInputElement
-  if (input.files) addFiles(input.files)
-  input.value = ''
-}
 </script>
 
 <template>
   <div class="composer-wrap">
-    <div class="composer" @dragover.prevent @drop="onDrop($event)">
+    <form class="composer" @submit.prevent="send()" @dragover.prevent @drop="onDrop($event)">
       <div v-if="store.pending.length" class="attached">
         <div v-for="a in store.pending" :key="a.id" class="att">
           <img v-if="a.kind === 'image' && a.dataUrl" :src="a.dataUrl" :alt="a.name" />
-          <span v-else>[file]</span>
+          <Icon v-else name="file" :size="14" class="att-ico" />
           <span class="att-name">{{ a.name }}</span>
           <button class="att-x" title="Remove attachment" @click="removePending(a.id)">
-            &times;
+            <Icon name="close" :size="12" />
           </button>
         </div>
       </div>
       <div class="composer-row">
-        <button class="attach-btn" title="Attach image or file" @click="fileInput?.click()">
-          +
-        </button>
-        <input ref="fileInput" type="file" multiple hidden @change="onFileChange" />
+        <ComposerMenu />
         <textarea
           ref="draftEl"
           class="draft"
           rows="1"
-          placeholder="Send a message..."
+          placeholder="Message Forge Chat"
           :value="store.draft"
           @input="onInput"
           @keydown="onKeydown"
         />
-        <button v-if="!store.streaming" class="send" @click="send()">Send</button>
-        <button v-else class="send danger" @click="stop()">Stop</button>
+        <button
+          v-if="!store.streaming"
+          class="round"
+          type="submit"
+          title="Send message"
+          :disabled="!store.draft.trim() && !store.pending.length"
+          data-testid="send"
+        >
+          <Icon name="send" :size="18" />
+        </button>
+        <button v-else class="round stop" type="button" title="Stop generating" @click="stop()">
+          <Icon name="stop" :size="18" />
+        </button>
       </div>
-    </div>
-    <div class="hint">
-      Enter to send &middot; Shift+Enter for a new line &middot; attach images or text files by
-      clicking + or dropping them.
-    </div>
+    </form>
   </div>
 </template>

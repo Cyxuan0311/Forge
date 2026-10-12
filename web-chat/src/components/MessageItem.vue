@@ -14,6 +14,7 @@ import { computed, ref } from 'vue'
 import { renderMd } from '../markdown'
 import { activeConv, copyText, deleteMessage, regenerate, store } from '../store'
 import ThinkingIndicator from './ThinkingIndicator.vue'
+import { Icon } from '../icons'
 import type { ChatMessage, MessageStats } from '../types'
 
 const props = defineProps<{ message: ChatMessage }>()
@@ -96,12 +97,33 @@ async function onBodyClick(e: MouseEvent): Promise<void> {
 
 <template>
   <div class="msg" :class="message.role">
-    <div class="avatar" aria-hidden="true">{{ message.role === 'user' ? 'You' : 'AI' }}</div>
     <div class="content">
       <details v-if="message.reasoning" class="reasoning">
         <summary>Thinking</summary>
         <div>{{ message.reasoning }}</div>
       </details>
+      <div v-if="message.tools && message.tools.length" class="toolruns">
+        <details
+          v-for="(t, i) in message.tools"
+          :key="t.id || i"
+          class="toolrun"
+          :class="t.status"
+          :open="t.status === 'running' || t.status === 'error'"
+        >
+          <summary>
+            <span class="toolrun-name">{{ t.name }}</span>
+            <span class="toolrun-state">
+              {{ t.status === 'running' ? 'running…' : t.status === 'ok' ? 'done' : 'failed' }}
+              <span v-if="t.ms !== undefined" class="toolrun-ms">{{ Math.round(t.ms) }} ms</span>
+            </span>
+          </summary>
+          <div class="toolrun-body">
+            <pre v-if="t.args" class="toolrun-args">{{ t.args }}</pre>
+            <pre v-if="t.status === 'error'" class="toolrun-out err">{{ t.error }}</pre>
+            <pre v-else-if="t.result" class="toolrun-out">{{ t.result }}</pre>
+          </div>
+        </details>
+      </div>
       <ThinkingIndicator v-if="isStreaming && !message.text" :mode="thinkingMode" />
       <div class="body" v-html="body" @click="onBodyClick" />
       <div v-if="message.images && message.images.length" class="imgs">
@@ -114,12 +136,13 @@ async function onBodyClick(e: MouseEvent): Promise<void> {
         <span v-for="b in perfBits" :key="b" class="perf-bit">{{ b }}</span>
       </div>
       <div v-if="message.text" class="actions">
-        <button class="act" :title="copied ? 'Copied' : 'Copy message'" @click="onCopy">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M9 9V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-4" />
-            <rect x="5" y="9" width="12" height="12" rx="2" />
-          </svg>
-          <span>{{ copied ? 'Copied' : 'Copy' }}</span>
+        <button
+          class="act"
+          :class="{ done: copied }"
+          :title="copied ? 'Copied' : 'Copy message'"
+          @click="onCopy"
+        >
+          <Icon :name="copied ? 'check' : 'copy'" :size="16" />
         </button>
         <button
           v-if="canRegenerate"
@@ -128,19 +151,10 @@ async function onBodyClick(e: MouseEvent): Promise<void> {
           :disabled="store.streaming"
           @click="onRegenerate"
         >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M21 12a9 9 0 1 1-3-6.7" />
-            <path d="M21 4v5h-5" />
-          </svg>
-          <span>Retry</span>
+          <Icon name="retry" :size="16" />
         </button>
         <button class="act danger" title="Delete message" @click="onDelete">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4 7h16" />
-            <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-            <path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12" />
-          </svg>
-          <span>Delete</span>
+          <Icon name="trash" :size="16" />
         </button>
       </div>
     </div>

@@ -35,9 +35,12 @@
   --danger-soft: rgba(229, 72, 77, 0.1);
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
   --shadow-lg: 0 18px 48px rgba(24, 16, 8, 0.18);
-  /* Frosted glass */
-  --glass-bg: rgba(255, 255, 255, 0.72);
-  --glass-border: rgba(255, 255, 255, 0.65);
+  /* Frosted glass. Kept nearly opaque: the dialog sits over a thread of body
+     text, and at a lower alpha that text reads through the panel and muddles
+     the form. The blur still shows through just enough to place the dialog on
+     top of the page rather than in front of it. */
+  --glass-bg: rgba(255, 255, 255, 0.9);
+  --glass-border: rgba(12, 10, 8, 0.08);
   --glass-shadow: 0 18px 48px rgba(24, 16, 8, 0.18);
   --scrim: rgba(28, 20, 12, 0.28);
 }
@@ -62,7 +65,7 @@
   --danger-soft: rgba(255, 107, 107, 0.14);
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.55);
-  --glass-bg: rgba(38, 34, 30, 0.72);
+  --glass-bg: rgba(38, 34, 30, 0.9);
   --glass-border: rgba(255, 255, 255, 0.14);
   --glass-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
   --scrim: rgba(8, 6, 4, 0.5);
@@ -89,53 +92,140 @@ body {
   height: 100%;
 }
 
+/* The sidebar is a drawer at every width: on a wide screen the shell reserves a
+   gutter for it, so opening pushes the thread instead of covering it, and on a
+   narrow one it floats over the thread with a scrim. One flag, two layouts --
+   no second component, and the state survives a resize. */
 .app {
-  display: grid;
-  grid-template-columns: 260px 1fr;
+  position: relative;
   height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-left: 0;
+  transition: padding-left 0.2s ease;
+}
+.app.drawer-open {
+  padding-left: 260px;
 }
 
-/* ---- sidebar ---- */
+/* The scrim only exists for the drawer, and only while it is open. Keeping it
+   in the tree at all times means one click target and one transition, rather
+   than a second element the App has to mount and unmount. */
+.scrim {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: var(--scrim);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+
+/* ---- sidebar ----
+   A drawer at every width. On a wide screen the shell reserves a 260px gutter
+   (the `.app` padding-left), so opening pushes the thread instead of covering
+   it; on a narrow one it floats over the thread with a scrim. Same flag, two
+   layouts, no second component. */
 .sidebar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 260px;
+  z-index: 40;
+  transform: translateX(-100%);
+  transition: transform 0.2s ease;
   background: var(--bg-elev);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   min-height: 0;
 }
-.sidebar-head {
-  padding: 12px;
+.app.drawer-open .sidebar {
+  transform: none;
 }
-.new-chat {
-  width: 100%;
-  padding: 10px;
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 12px 8px;
+}
+.brand {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+/* Both controls live at all widths: a wide screen collapses the column by
+   clicking either, a narrow one opens the overlay with the hamburger and
+   closes it with the X inside the drawer. */
+.drawer-toggle,
+.drawer-x {
+  display: inline-flex;
+}
+/* With the list already open the hamburger is a no-op next to the brand. */
+@media (min-width: 901px) {
+  .app.drawer-open .drawer-toggle {
+    display: none;
+  }
+}
+.sidebar-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 7px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg);
+  color: var(--text-dim);
+}
+.sidebar-search input {
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+}
+.new-chat {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 12px 4px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
   color: var(--text);
   cursor: pointer;
   font: inherit;
+  font-size: 14px;
   font-weight: 600;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
+  text-align: left;
 }
 .new-chat:hover {
-  border-color: var(--accent-bright);
   background: var(--accent-soft);
   color: var(--accent-bright);
 }
 .conv-list {
   overflow-y: auto;
   flex: 1;
-  padding: 4px;
+  padding: 4px 8px;
+}
+.conv-group {
+  padding: 12px 4px 4px;
+  font-size: 11px;
+  color: var(--text-dim);
 }
 .conv {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 9px 10px;
+  padding: 8px 6px;
   border-radius: 8px;
   cursor: pointer;
   color: var(--text);
@@ -145,7 +235,7 @@ body {
 }
 .conv.active {
   background: var(--accent-soft);
-  box-shadow: inset 2px 0 0 var(--accent);
+  color: var(--accent-bright);
   font-weight: 600;
 }
 .conv-title {
@@ -160,7 +250,7 @@ body {
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
-  font-size: 16px;
+  font-size: 14px;
   line-height: 1;
   opacity: 0;
 }
@@ -170,6 +260,12 @@ body {
 .conv-del:hover {
   color: var(--danger);
 }
+.conv-empty {
+  padding: 16px 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+  text-align: center;
+}
 .sidebar-foot {
   padding: 10px 12px;
   font-size: 12px;
@@ -178,23 +274,49 @@ body {
   text-align: center;
 }
 
-/* ---- main ---- */
+/* ---- main ----
+   `flex: 1` is load-bearing: `.main` is a flex item of the column-flex `.app`,
+   so without it the shell sizes to content and the composer rides up right
+   under the last message instead of sitting at the bottom. It also gives the
+   empty state the free space its `margin: auto 0` centring needs. */
 .main {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   min-height: 0;
   min-width: 0;
+  position: relative;
+}
+/* Empty thread: the greeting and the composer ride together in the middle of
+   the screen instead of the greeting floating alone at the top. Both margins
+   take the slack, so the pair is centred as a unit and the composer stays one
+   gap below the greeting. */
+.main.empty .thread {
+  flex: 0 0 auto;
+  margin: auto 0;
+}
+.main.empty .thread-inner {
+  min-height: 0;
+}
+.main.empty .center-wrap {
+  flex: 0 0 auto;
 }
 .topbar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 10px 16px;
-  border-bottom: 1px solid var(--border);
+  position: relative;
 }
-.brand {
-  font-weight: 700;
-  letter-spacing: 0.2px;
+/* Centred readout of the active mode -- the quiet counterpart to ChatGPT's
+   centred model selector, so the bar's weight stays on the thread. */
+.topbar-mode {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
 }
 .spacer {
   flex: 1;
@@ -219,11 +341,17 @@ body {
   background: var(--accent);
 }
 .icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 32px;
+  height: 32px;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text-dim);
   border-radius: 8px;
-  padding: 6px 10px;
+  padding: 0;
   cursor: pointer;
   font: inherit;
   font-size: 13px;
@@ -233,21 +361,51 @@ body {
   border-color: var(--accent-bright);
   color: var(--accent-bright);
 }
+/* Borderless sibling: for controls sitting in already-quiet chrome (the drawer
+   trigger and the sidebar's own close button) where a box on every control
+   turns the bar into a row of tiles. */
+.icon-btn.ghost {
+  border-color: transparent;
+  background: transparent;
+}
+.icon-btn.ghost:hover {
+  border-color: var(--border);
+}
+/* Text carried for screen readers only -- every control above is icon-only. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* ---- messages ---- */
 .thread {
   flex: 1;
   overflow-y: auto;
-  padding: 22px 18px 8px;
+  padding: 18px 18px 8px;
   min-height: 0;
 }
+/* Width lives here, not on every child: the greeting and each turn then only
+   have to lay themselves out. min-height keeps the empty state vertically
+   centred instead of collapsing to the top of the scroll area. */
+.thread-inner {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  max-width: 768px;
+  margin: 0 auto;
+}
 .center-wrap {
-  height: 100%;
+  flex: 1;
   display: flex;
   flex-direction: column;
   justify-content: center;
-  max-width: 780px;
-  margin: 0 auto;
 }
 .greeting {
   text-align: center;
@@ -255,9 +413,15 @@ body {
   font-weight: 600;
   margin-bottom: 22px;
 }
+/* No horizontal auto margins here: `.msg` is a flex item of the column-flex
+   `.thread-inner`, and auto cross-axis margins cancel `align-items: stretch`.
+   The box would then shrink to fit its content and sit in the middle of the
+   column -- which also makes a child `max-width: 82%` resolve against a
+   content-sized parent (circular), so the user bubble came out narrow and
+   floating mid-thread. Stretching gives every turn the full column, and the
+   user turn right-aligns inside it. */
 .msg {
-  max-width: 780px;
-  margin: 0 auto 22px;
+  margin: 0 0 22px;
   display: flex;
   gap: 12px;
 }
@@ -278,8 +442,12 @@ body {
   color: var(--accent-bright);
   margin-top: 2px;
 }
+/* The user turn parks its bubble against the right edge; the assistant turn
+   keeps `flex-start`. Explicit `justify-content` rather than `row-reverse`:
+   there is only ever one child, so ordering it is meaningless and this states
+   the intent directly. */
 .msg.user {
-  flex-direction: row-reverse;
+  justify-content: flex-end;
 }
 .msg.user .avatar {
   background: var(--accent);
@@ -477,6 +645,11 @@ body {
   background: var(--danger-soft);
   color: var(--danger);
 }
+/* Copy turns into a tick and stays lit for the moment after the click, so the
+   action confirms itself without a toast. */
+.act.done {
+  color: var(--accent-bright);
+}
 .act:disabled {
   opacity: 0.45;
   cursor: default;
@@ -490,6 +663,8 @@ body {
 /* ---- markdown output ---- */
 .body {
   overflow-wrap: break-word;
+  font-size: 16px;
+  line-height: 1.7;
 }
 .body > :first-child {
   margin-top: 0;
@@ -640,26 +815,145 @@ body {
 .body pre.code code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+/* highlight.js emits a background/colour on .hljs; our code block already
+   supplies --code-bg / --code-text, so neutralise the theme's so they don't
+   fight. Token colours from the github-dark theme still apply. */
+.body pre.code code.hljs {
+  background: transparent;
+  padding: 0;
+  color: var(--code-text);
+}
+.body pre.code code.hljs .hljs-comment,
+.body pre.code code.hljs .hljs-quote {
+  color: #8b949e;
+  font-style: italic;
+}
+
+/* ---- math (KaTeX) ---- */
+.math-display {
+  text-align: center;
+  margin: 12px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.math-display > .katex-display {
+  margin: 0;
+}
+/* KaTeX inherits currentColor, so it follows the theme text colour in both
+   light and dark. Nudge the size so inline formulas sit nicely on the line. */
+.body .katex {
+  font-size: 1.04em;
+}
 
 /* ---- composer ---- */
+.composer-dock {
+  position: relative;
+  flex: none;
+}
+/* The thread fades into the composer instead of being cut off by it, so a long
+   answer reads as continuing under the box rather than ending at a hard edge.
+   Only with content: on the empty screen there is nothing to fade. */
+.main:not(.empty) .composer-wrap::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -20px;
+  height: 20px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0), var(--bg));
+}
 .composer-wrap {
   padding: 12px 16px 18px;
 }
+/* Empty-state prompts, under the centred composer (ChatGPT-style rows). They
+   vanish the moment a turn exists, so they never compete with the thread. */
+.suggestions {
+  max-width: 768px;
+  margin: 14px auto 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sugg {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.sugg:hover {
+  border-color: var(--accent-bright);
+  background: var(--accent-soft);
+}
+.sugg-ico {
+  flex: none;
+  color: var(--text-dim);
+}
+/* Jump-to-latest: appears once the reader scrolls away from the bottom. Anchored
+   to the dock, not the viewport, so it tracks the composer as the draft grows. */
+.jump {
+  position: absolute;
+  left: 50%;
+  top: -44px;
+  transform: translateX(-50%);
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  animation: jump-in 0.14s ease;
+}
+.jump:hover {
+  border-color: var(--accent-bright);
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+@keyframes jump-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%);
+  }
+}
 .composer {
-  max-width: 780px;
+  max-width: 768px;
   margin: 0 auto;
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: 26px;
   background: var(--bg);
-  box-shadow: var(--shadow);
-  padding: 10px 12px;
+  box-shadow: var(--shadow-lg);
+  padding: 8px 12px;
   transition:
     border-color 0.15s ease,
     box-shadow 0.15s ease;
 }
+/* The draft is focused on load, so this is the composer's resting look, not a
+   rare state: a hairline accent border with a whisper of a ring reads as
+   "ready for typing" without a halo around the whole box. */
 .composer:focus-within {
   border-color: var(--accent-bright);
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-lg);
 }
 .attached {
   display: flex;
@@ -705,21 +999,139 @@ body {
   align-items: flex-end;
   gap: 8px;
 }
-.attach-btn {
+/* ---- composer menu (mode picker + attach) ----
+   One trigger on the row; the panel floats above it, anchored to its own
+   wrapper so it follows the button when the textarea grows. */
+.cmenu {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+}
+.cmenu-btn {
   width: 36px;
   height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--border);
   background: var(--bg-elev);
   color: var(--text);
-  border-radius: 8px;
+  border-radius: 10px;
   cursor: pointer;
-  font-size: 20px;
-  flex: none;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease;
 }
-.attach-btn:hover {
+.cmenu-btn:hover,
+.cmenu-btn.open {
   border-color: var(--accent-bright);
+  background: var(--accent-soft);
   color: var(--accent-bright);
 }
+/* A non-default mode repaints the trigger: the row then reads "the '+'
+   is doing something" without a badge competing with Send. */
+.cmenu-btn.active {
+  border-color: var(--accent-bright);
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+.cmenu-panel {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  min-width: 246px;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  /* A panel this tall from a composer near the bottom can outgrow a short
+     window; cap it and scroll rather than let it run off the top. */
+  max-height: min(70vh, 440px);
+  overflow-y: auto;
+  animation: menu-rise 0.14s ease;
+}
+.cmenu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.cmenu-current {
+  color: var(--accent-bright);
+  font-weight: 600;
+}
+.cmenu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.cmenu-item:hover {
+  background: var(--accent-soft);
+}
+.cmenu-item.on {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+  font-weight: 600;
+}
+.cmenu-ico {
+  flex: none;
+  color: var(--text-dim);
+}
+.cmenu-item.on .cmenu-ico {
+  color: var(--accent-bright);
+}
+.cmenu-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+.cmenu-label {
+  font-size: 14px;
+}
+.cmenu-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.cmenu-check {
+  flex: none;
+  color: var(--accent-bright);
+}
+.cmenu-sep {
+  height: 1px;
+  margin: 5px 4px;
+  background: var(--border);
+}
+@keyframes menu-rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 .draft {
   flex: 1;
   resize: none;
@@ -733,34 +1145,41 @@ body {
   min-height: 36px;
   line-height: 1.5;
 }
-.send {
+/* Send/Stop share one footprint so the row does not jump when they swap. */
+.round {
+  width: 36px;
   height: 36px;
-  padding: 0 16px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   background: var(--accent);
   color: var(--on-accent);
-  border-radius: 8px;
+  border-radius: 50%;
   cursor: pointer;
-  font: inherit;
-  font-weight: 600;
-  flex: none;
+  transition:
+    background 0.15s ease,
+    opacity 0.15s ease;
 }
-.send:hover {
+.round:hover {
   background: var(--accent-hover);
 }
-.send:disabled {
-  opacity: 0.5;
+.round:disabled {
+  opacity: 0.4;
   cursor: default;
 }
-.send.danger {
+.round.stop {
   background: var(--danger);
   color: #ffffff;
 }
-.hint {
-  font-size: 12px;
+.round.stop:hover {
+  background: var(--danger);
+  opacity: 0.85;
+}
+.att-ico {
   color: var(--text-dim);
-  margin-top: 6px;
-  text-align: center;
+  flex: none;
 }
 
 /* ---- frosted-glass modal (connection / settings) ---- */
@@ -788,6 +1207,11 @@ body {
   backdrop-filter: blur(24px) saturate(160%);
   -webkit-backdrop-filter: blur(24px) saturate(160%);
   box-shadow: var(--glass-shadow);
+  /* Clips the scrolling body to the rounded corners. Without it a long panel
+     -- Connection and Settings are both long forms -- grows past max-height and
+     spills out over the page instead of scrolling inside the dialog, because a
+     flex item defaults to `min-height: auto` and refuses to shrink. */
+  overflow: hidden;
   animation: modal-rise 0.18s ease;
 }
 .modal-head {
@@ -795,21 +1219,26 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 14px 10px 16px;
+  padding: 12px 12px 12px 18px;
   border-bottom: 1px solid var(--border);
+  flex: none;
 }
 .modal-head h3 {
   margin: 0;
   font-size: 15px;
+  font-weight: 650;
 }
 .modal-x {
-  font-size: 18px;
-  line-height: 1;
-  padding: 2px 9px;
+  flex: none;
 }
+/* `min-height: 0` is what lets this shrink and scroll; `flex: 1 1 auto` lets it
+   take whatever height is left under the header. */
 .modal-body {
-  padding: 14px 16px 16px;
+  padding: 16px 18px 18px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 @keyframes modal-fade {
   from {
@@ -835,11 +1264,19 @@ body {
     animation: none;
   }
   .actions,
-  .composer {
+  .composer,
+  .round,
+  .sidebar,
+  .scrim,
+  .app {
     transition: none;
   }
+  .cmenu-panel,
+  .jump {
+    animation: none;
+  }
   /* Keep the indicator (it is the only feedback while waiting) but stop moving
-     it: a steady bar plus the label conveys the same state. */
+    it: a steady bar plus the label conveys the same state. */
   .bars i,
   .thinking.writing .bars i {
     animation: none;
@@ -901,14 +1338,36 @@ body {
   margin-top: 6px;
 }
 
-@media (max-width: 720px) {
-  .app {
-    grid-template-columns: 0 1fr;
+/* ---- narrow layout: the sidebar becomes a drawer ----
+   Below this width the 260px column costs more than the conversations are
+   worth, so the list moves off-canvas and the hamburger/scrim/X come back.
+   The sidebar slides rather than being display:none'd, so opening it animates
+   and -- because it is still in the tree -- Escape, the scrim and the X all
+   act on the same element. */
+@media (max-width: 900px) {
+  /* No gutter to reserve: the drawer covers the thread and the scrim dims it. */
+  .app.drawer-open {
+    padding-left: 0;
   }
   .sidebar {
-    display: none;
+    width: min(280px, 84vw);
+    box-shadow: var(--shadow-lg);
+  }
+  .app.drawer-open .sidebar {
+    transform: none;
+  }
+  .app.drawer-open .scrim {
+    display: block;
+    opacity: 1;
+    pointer-events: auto;
   }
   .msg.user .content {
     max-width: 92%;
+  }
+  .thread {
+    padding: 16px 12px 8px;
+  }
+  .composer-wrap {
+    padding: 10px 12px 14px;
   }
 }

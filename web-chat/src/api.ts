@@ -12,7 +12,7 @@ export function apiBase(conn: Connection): string {
   return (conn.baseUrl || '').replace(/\/+$/, '')
 }
 
-function headers(conn: Connection): Record<string, string> {
+export function headers(conn: Connection): Record<string, string> {
   const h: Record<string, string> = {}
   if (conn.apiKey) h['Authorization'] = 'Bearer ' + conn.apiKey
   return h
@@ -21,6 +21,22 @@ function headers(conn: Connection): Record<string, string> {
 export interface Delta {
   content?: string
   reasoning?: string
+  /**
+   * Tool calls requested by the model. forge-server emits them as a single
+   * terminal delta (it buffers call syntax while tools are offered, so no raw
+   * markers reach the client), so this arrives at most once per turn, after the
+   * last content delta.
+   */
+  toolCalls?: ToolCallWire[]
+  /** "tool_calls" means the loop must run tools and send the results back. */
+  finishReason?: string
+}
+
+/** One entry of the OpenAI `message.tool_calls` array. */
+export interface ToolCallWire {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
 }
 
 /**
@@ -76,10 +92,14 @@ export async function chatCompletion(
   if (!(payload.stream === true && resp.body)) {
     const j = await resp.json()
     const ch = j.choices && j.choices[0]
-    onDelta({
+    const d: Delta = {
       content: (ch && ch.message && ch.message.content) || '',
       reasoning: (ch && ch.message && ch.message.reasoning_content) || '',
-    })
+    }
+    const calls = ch && ch.message && ch.message.tool_calls
+    if (Array.isArray(calls) && calls.length) d.toolCalls = calls as ToolCallWire[]
+    if (ch && ch.finish_reason) d.finishReason = ch.finish_reason
+    onDelta(d)
     if (onUsage && j.usage) onUsage(j.usage as Usage)
     return
   }
@@ -107,11 +127,18 @@ export async function chatCompletion(
           if (onUsage) onUsage(j.usage as Usage)
           continue
         }
-        const delta = (j.choices && j.choices[0] && j.choices[0].delta) || {}
+        const choice = (j.choices && j.choices[0]) || {}
+        const delta = choice.delta || {}
         const d: Delta = {}
         if (delta.content) d.content = delta.content
         if (delta.reasoning_content) d.reasoning = delta.reasoning_content
-        if (d.content || d.reasoning) onDelta(d)
+        // Terminal chunk: the whole tool_calls array plus finish_reason land
+        // together, so one delta carries both.
+        if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+          d.toolCalls = delta.tool_calls as ToolCallWire[]
+        }
+        if (choice.finish_reason) d.finishReason = choice.finish_reason
+        if (d.content || d.reasoning || d.toolCalls) onDelta(d)
       } catch {
         /* partial JSON line */
       }

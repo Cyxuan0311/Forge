@@ -8,6 +8,7 @@
  * only owns the overlay, the glass surface and the header.
  */
 import { onBeforeUnmount, onMounted } from 'vue'
+import { Icon } from '../icons'
 
 defineProps<{ title: string }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
@@ -25,7 +26,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
     <div class="modal glass" role="dialog" aria-modal="true" :aria-label="title">
       <div class="modal-head">
         <h3>{{ title }}</h3>
-        <button class="icon-btn modal-x" aria-label="Close" @click="emit('close')">&times;</button>
+        <button class="icon-btn modal-x" aria-label="Close" title="Close" @click="emit('close')">
+          <Icon name="close" :size="16" />
+        </button>
       </div>
       <div class="modal-body">
         <slot />

@@ -18,6 +18,58 @@
  * (one sentence per line), and collapsing them loses that.
  */
 
+import hljs from 'highlight.js/lib/core'
+import katex from 'katex'
+
+import bash from 'highlight.js/lib/languages/bash'
+import c from 'highlight.js/lib/languages/c'
+import cpp from 'highlight.js/lib/languages/cpp'
+import csharp from 'highlight.js/lib/languages/csharp'
+import cssLang from 'highlight.js/lib/languages/css'
+import go from 'highlight.js/lib/languages/go'
+import htmlXml from 'highlight.js/lib/languages/xml'
+import java from 'highlight.js/lib/languages/java'
+import javascript from 'highlight.js/lib/languages/javascript'
+import json from 'highlight.js/lib/languages/json'
+import markdownLang from 'highlight.js/lib/languages/markdown'
+import python from 'highlight.js/lib/languages/python'
+import rust from 'highlight.js/lib/languages/rust'
+import sql from 'highlight.js/lib/languages/sql'
+import typescript from 'highlight.js/lib/languages/typescript'
+import yaml from 'highlight.js/lib/languages/yaml'
+
+// A curated set covering what code models actually emit. Registering a subset of
+// highlight.js keeps the bundle a few hundred KB smaller than the all-languages
+// build, and `highlightAuto` falls back to this set for unregistered langs.
+hljs.registerLanguage('bash', bash)
+hljs.registerLanguage('sh', bash)
+hljs.registerLanguage('shell', bash)
+hljs.registerLanguage('c', c)
+hljs.registerLanguage('cpp', cpp)
+hljs.registerLanguage('c++', cpp)
+hljs.registerLanguage('c#', csharp)
+hljs.registerLanguage('csharp', csharp)
+hljs.registerLanguage('cs', csharp)
+hljs.registerLanguage('css', cssLang)
+hljs.registerLanguage('go', go)
+hljs.registerLanguage('html', htmlXml)
+hljs.registerLanguage('xml', htmlXml)
+hljs.registerLanguage('java', java)
+hljs.registerLanguage('javascript', javascript)
+hljs.registerLanguage('js', javascript)
+hljs.registerLanguage('json', json)
+hljs.registerLanguage('markdown', markdownLang)
+hljs.registerLanguage('md', markdownLang)
+hljs.registerLanguage('python', python)
+hljs.registerLanguage('py', python)
+hljs.registerLanguage('rust', rust)
+hljs.registerLanguage('rs', rust)
+hljs.registerLanguage('sql', sql)
+hljs.registerLanguage('typescript', typescript)
+hljs.registerLanguage('ts', typescript)
+hljs.registerLanguage('yaml', yaml)
+hljs.registerLanguage('yml', yaml)
+
 function escapeHtml(s: string): string {
   return String(s).replace(
     /[&<>"']/g,
@@ -59,6 +111,40 @@ function renderInline(raw: string): string {
     return '\u0000C' + (codes.length - 1) + '\u0000'
   })
 
+  // Lift math before escaping so its contents are never HTML-escaped or read as
+  // emphasis/links, exactly like code spans. Display ($$...$$) and inline ($...$)
+  // are handled here (not in the block parser) so they work inside any inline
+  // context; block-level $$ is handled separately in renderBlocks.
+  const maths: string[] = []
+  // A backslash-escaped dollar is a literal dollar, not a math delimiter.
+  s = s.replace(/\\\$/g, '\u0001')
+  // LaTeX \[ ... \] (display) and \( ... \) (inline) delimiters -- many models
+  // emit these instead of the dollar forms. Lifted before the $ rules so a $
+  // inside a \(..\) span is not mistaken for a delimiter.
+  s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_m, tex: string) => {
+    maths.push(renderMath(tex, true))
+    return '\u0000M' + (maths.length - 1) + '\u0000'
+  })
+  s = s.replace(/\\\(([\s\S]+?)\\\)/g, (_m, tex: string) => {
+    maths.push(renderMath(tex, false))
+    return '\u0000M' + (maths.length - 1) + '\u0000'
+  })
+  s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_m, tex: string) => {
+    maths.push(renderMath(tex, true))
+    return '\u0000M' + (maths.length - 1) + '\u0000'
+  })
+  // Inline $...$: opening $ not preceded by alnum/$, and not followed by
+  // whitespace or a digit; closing $ not preceded by whitespace and not followed
+  // by alnum/$. This keeps common currency ("$5 and $10") out of math while
+  // accepting normal formulas.
+  s = s.replace(
+    /(?<![A-Za-z0-9$])\$(?![\s\d])([^$\n]+?)(?<!\s)\$(?![A-Za-z0-9$])/g,
+    (_m, tex: string) => {
+      maths.push(renderMath(tex, false))
+      return '\u0000M' + (maths.length - 1) + '\u0000'
+    },
+  )
+
   s = escapeHtml(s)
 
   // [text](url) -- the href arrives escaped, so quotes inside it cannot break
@@ -86,17 +172,55 @@ function renderInline(raw: string): string {
     /\u0000C(\d+)\u0000/g,
     (_m, i: string) => '<code class="inline">' + escapeHtml(codes[Number(i)]) + '</code>',
   )
+  // Restore math (trusted KaTeX HTML) and literal backslash-dollars.
+  s = s.replace(/\u0000M(\d+)\u0000/g, (_m, i: string) => maths[Number(i)])
+  s = s.replace(/\u0001/g, '$')
   return s
 }
 
+/**
+ * Render a LaTeX fragment to HTML with KaTeX. `throwOnError: false` turns a bad
+ * formula into a red error span instead of throwing, so a typo in the model's
+ * output never blanks the message. The output is trusted HTML (KaTeX escapes its
+ * own input), so it is inserted verbatim after the rest of the inline/block
+ * passes have run.
+ */
+function renderMath(tex: string, display: boolean): string {
+  try {
+    return katex.renderToString(tex.trim(), {
+      displayMode: display,
+      throwOnError: false,
+      output: 'htmlAndMathml',
+    })
+  } catch {
+    // renderToString only throws if throwOnError is true; keep this belt-and-braces.
+    return escapeHtml(tex)
+  }
+}
+
 function codeBlock(lang: string, code: string): string {
+  const key = (lang || '').toLowerCase()
+  let body: string
+  // highlight.js escapes its own output, so we must NOT escapeHtml() the code
+  // again -- doing so would double-encode and mangle the token spans.
+  try {
+    if (key && hljs.getLanguage(key)) {
+      body = hljs.highlight(code, { language: key, ignoreIllegals: true }).value
+    } else {
+      body = hljs.highlightAuto(code).value
+    }
+  } catch {
+    body = escapeHtml(code)
+  }
   return (
     '<div class="codeblock">' +
     '<div class="codebar"><span class="codelang">' +
     escapeHtml(lang || 'code') +
     '</span><button type="button" class="code-copy">Copy</button></div>' +
-    '<pre class="code"><code>' +
-    escapeHtml(code) +
+    '<pre class="code"><code class="hljs' +
+    (key ? ' language-' + escapeHtml(key) : '') +
+    '">' +
+    body +
     '</code></pre></div>'
   )
 }
@@ -111,6 +235,8 @@ const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/
 const HR_RE = /^\s*([-*_])\s*(\1\s*){2,}$/
 const BULLET_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/
 const TABLE_DELIM_RE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/
+// A line that opens a display-math block ($$\n.. or \[.. , incl. single-line).
+const MATH_OPEN_RE = /^\s*(\$\$|\\\[)/
 
 /** True for lines that must not be swallowed as paragraph continuation. */
 function isBlockStart(line: string): boolean {
@@ -119,7 +245,8 @@ function isBlockStart(line: string): boolean {
     HEADING_RE.test(line) ||
     HR_RE.test(line) ||
     /^\s*>/.test(line) ||
-    BULLET_RE.test(line)
+    BULLET_RE.test(line) ||
+    MATH_OPEN_RE.test(line)
   )
 }
 
@@ -162,6 +289,51 @@ function renderBlocks(lines: string[]): string[] {
       while (i < lines.length && !/^\s*```+\s*$/.test(lines[i])) body.push(lines[i++])
       i++ // closing fence (or EOF)
       out.push(codeBlock(lang, body.join('\n')))
+      continue
+    }
+
+    // ---- display math block ($$ ... $$) -----------------------------------
+    // A line that opens with $$ (alone, or with content on the same line) starts
+    // a display-math block, collected until a closing $$ line. Runs before the
+    // paragraph pass so $$ fenced math is never wrapped in <p>.
+    if (/^\s*\$\$\s*$/.test(line) || /^\s*\$\$[^\s]/.test(line)) {
+      const body: string[] = []
+      const openInline = line.replace(/^\s*\$\$/, '').replace(/\$\$\s*$/, '').trim()
+      // A single `$$ ... $$` on one line is self-contained; only fall through to
+      // collecting further lines when the opening line has no closing $$ (i.e. a
+      // standalone `$$` fence followed by content on later lines).
+      const selfContained = openInline.length > 0 && /\$\$\s*$/.test(line)
+      if (openInline) body.push(openInline)
+      i++
+      if (!selfContained) {
+        while (i < lines.length && !/^\s*\$\$\s*$/.test(lines[i])) body.push(lines[i++])
+        if (i < lines.length) i++ // closing $$
+      }
+      out.push('<div class="math-display">' + renderMath(body.join('\n'), true) + '</div>')
+      continue
+    }
+
+    // ---- display math block (\[ ... \]) -----------------------------------
+    // Same idea as the $$ block above, for the \[ ... \] delimiters that many
+    // models emit. The closing \] may sit on its own line or end a content line.
+    if (/^\s*\\\[/.test(line)) {
+      const body: string[] = []
+      let rest = line.replace(/^\s*\\\[/, '')
+      let closed = false
+      for (;;) {
+        const m = /\\\]\s*$/.exec(rest)
+        if (m) {
+          body.push(rest.slice(0, m.index))
+          closed = true
+          break
+        }
+        body.push(rest)
+        i++
+        if (i >= lines.length) break
+        rest = lines[i]
+      }
+      if (closed) i++
+      out.push('<div class="math-display">' + renderMath(body.join('\n'), true) + '</div>')
       continue
     }
 
