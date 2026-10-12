@@ -269,6 +269,19 @@ target_include_directories(
                                    ${PROJECT_SOURCE_DIR}/third_party)
 add_test(NAME tool-dialects COMMAND forge-tool-dialects-test)
 
+# Tool executor registry (src/agent/tools/): argument schema validation, the
+# never-throw executor contract, output clamping, and run_python's timeout.
+add_executable(
+  forge-tool-registry-test
+  test_tool_registry.cpp ${PROJECT_SOURCE_DIR}/src/agent/tool_registry.cpp
+  ${PROJECT_SOURCE_DIR}/src/agent/tools/python_exec.cpp
+  ${PROJECT_SOURCE_DIR}/src/agent/tools/web_search.cpp)
+target_include_directories(
+  forge-tool-registry-test PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                   ${PROJECT_SOURCE_DIR}/third_party)
+add_test(NAME tool-registry COMMAND forge-tool-registry-test)
+
+
 # Q3_K MMQ decode bisect -- a host-only mechanical debugging tool (not a
 # normal ctest assertion suite). Built on demand, not registered with CTest.
 add_executable(
