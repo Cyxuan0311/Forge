@@ -16,6 +16,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "forge/agent/tool_dialect.h"
+#include "forge/agent/tool_registry.h"
 #include "forge/arch_registry.h"
 #include "forge/engines/transformer_engine.h"
 #include "forge/gguf_model.h"
@@ -128,6 +130,10 @@ bool ServerState::load(const ServerOptions& opt, std::string& error) {
     // Tool-call dialect selection is a process-wide setting: resolve the env
     // override once (FORGE_TOOL_DIALECT, default "auto").
     agent_cfg_ = agent_pipeline_config_from_env();
+    // --enable-code-exec gates the run_python tool. The registry reads
+    // FORGE_ALLOW_CODE_EXEC itself, so the flag has to be pushed in before the
+    // tool catalogue is first built (first request, or the startup probe).
+    forge::set_code_exec_enabled(opt.enable_code_exec);
     ensure_engines_registered();
     ensure_loaders_registered();
 
@@ -414,6 +420,11 @@ ChatCompletionResult ServerState::chat_completion(
 
     // Everything below runs under inference_mutex_, so this is the one safe
     // place to read KV occupancy for the dashboard. See engine.h's note.
+    //
+    // The message count is only a placeholder until the prompt is tokenized;
+    // it is replaced by the real count just below (see AFTER_PROMPT_IDS).
+    // `req.messages.size()` used to be the final value, which reported 1 for a
+    // single-turn chat no matter how long the rendered prompt was.
     if (scope && scope->recording()) {
         scope->on_lock_acquired();
         scope->set_prompt_tokens(static_cast<int>(req.messages.size()));
@@ -513,6 +524,7 @@ ChatCompletionResult ServerState::chat_completion(
         }
         sessions_[req.session_id].messages.clear();
         sessions_[req.session_id].last_reply.clear();
+        sessions_[req.session_id].last_reply_tool_calls.clear();
         sessions_[req.session_id].kv_tokens.clear();
     }
     if (!req.delta_messages.empty()) {
@@ -533,7 +545,19 @@ ChatCompletionResult ServerState::chat_completion(
             ChatTemplateMessage reply;
             reply.role = "assistant";
             reply.content = it->second.last_reply;
-            if (!reply.content.empty())
+            // Carry the parsed calls too. `last_reply` is the raw generated text:
+            // for a tool turn it is the call syntax itself, which the jinja
+            // template would render as literal assistant prose. Replaying it
+            // without `tool_calls` leaves the following tool result unpaired, and
+            // templates that render <tool_call> via tool_call_id then show the
+            // model a result with no call -- which it answers by calling the
+            // tool again, forever.
+            reply.tool_calls = it->second.last_reply_tool_calls;
+            // Strip any leftover call syntax so it cannot be double-rendered as
+            // text when the template does not use the tool_calls variable.
+            if (!reply.tool_calls.empty() && !reply.content.empty())
+                reply.content = strip_all_tool_syntax(reply.content);
+            if (!reply.content.empty() || !reply.tool_calls.empty())
                 history.push_back(std::move(reply));
         }
         history.insert(history.end(), req.delta_messages.begin(), req.delta_messages.end());
@@ -552,6 +576,13 @@ ChatCompletionResult ServerState::chat_completion(
     input.add_generation_prompt = true;
     input.tools_json = tools_json;
     std::vector<int32_t> prompt_ids = chat_template_->apply(input);
+
+    // Replace the message-count placeholder with the real tokenised size, now
+    // that the template has been rendered. The dashboard reads this from the
+    // live snapshot, so during a decoding request it is what makes "prompt
+    // tokens" meaningful instead of a constant 1.
+    if (scope && scope->recording())
+        scope->set_prompt_tokens(static_cast<int>(prompt_ids.size()));
 
     // ---- DEBUG (set FORGE_DEBUG_TEMPLATE=1 to enable) ----
     // Dumps the rendered chat-template prompt so we can see whether the VLM
@@ -1279,6 +1310,13 @@ ChatCompletionResult ServerState::chat_completion(
         if (tools_active)
             out.tool_calls = std::move(fin.tool_calls);
     }
+
+    // Record the parsed calls for the next delta turn's assistant replay (see
+    // SessionState::last_reply_tool_calls). Must happen after the finalize
+    // above, which is where the calls are extracted.
+    sess.last_reply_tool_calls.clear();
+    for (const auto& tc : out.tool_calls)
+        sess.last_reply_tool_calls.push_back(ChatTemplateToolCall{tc.id, tc.name, tc.arguments});
 
     out.prompt_tokens = result.num_prompt_tokens;
     out.completion_tokens = result.num_generated_tokens;

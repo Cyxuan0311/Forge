@@ -15,6 +15,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "forge/agent/tool_registry.h"
 #include "forge/dashboard.h"
 #include "server.h"
 
@@ -1261,8 +1262,99 @@ void setup_middleware(httplib::Server& svr, const ServerOptions& opt) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Tool execution endpoints
+//
+// /v1/chat/completions returns tool_calls but never runs them: by design the
+// caller owns execution. These two routes are the server side of that split —
+// the embedded chat UI drives the loop (it renders the result cards) and calls
+// here to actually run a tool.
+//
+//   GET  /v1/tools       -> catalogue + per-tool availability, so the UI can
+//                           hide modes whose backing tool is not configured.
+//   POST /v1/tools/exec  -> run one tool: {"name": "...", "arguments": {...},
+//                           "api_key": "optional client-supplied key"}
+// ---------------------------------------------------------------------------
+
+void handle_tools_list(httplib::Response& res) {
+    fsrv::ensure_default_tools();
+    json j;
+    j["object"] = "list";
+    j["tools"] = fsrv::tool_catalogue();
+    // Surfaced so the UI can say *why* a mode is unavailable without
+    // duplicating the env-var names in TypeScript.
+    j["code_exec_enabled"] = fsrv::code_exec_enabled();
+    j["search_provider"] = fsrv::search_provider();
+    j["search_configured"] = !fsrv::search_provider().empty() || !fsrv::search_api_key().empty();
+    res.set_content(j.dump(), "application/json");
+}
+
+void handle_tool_exec(const httplib::Request& http_req, httplib::Response& res) {
+    fsrv::ensure_default_tools();
+
+    json body = json::parse(http_req.body, nullptr, false);
+    if (body.is_discarded()) {
+        res.status = 400;
+        json j;
+        j["error"]["message"] = "Invalid JSON in request body";
+        j["error"]["type"] = "invalid_request_error";
+        res.set_content(j.dump(), "application/json");
+        return;
+    }
+    if (!body.is_object() || !body.contains("name") || !body["name"].is_string()) {
+        res.status = 400;
+        json j;
+        j["error"]["message"] = "'name' is required and must be a string";
+        j["error"]["type"] = "invalid_request_error";
+        res.set_content(j.dump(), "application/json");
+        return;
+    }
+
+    fsrv::ToolContext ctx;
+    if (body.contains("api_key") && body["api_key"].is_string())
+        ctx.api_key = body["api_key"].get<std::string>();
+    if (body.contains("provider") && body["provider"].is_string())
+        ctx.provider = body["provider"].get<std::string>();
+    if (body.contains("timeout_sec") && body["timeout_sec"].is_number_integer())
+        ctx.timeout_sec = body["timeout_sec"].get<int>();
+    if (body.contains("max_output_bytes") && body["max_output_bytes"].is_number_integer())
+        ctx.max_output_bytes = body["max_output_bytes"].get<size_t>();
+
+    // `arguments` is the OpenAI name; accept `args` too since that is what the
+    // wire format of tool_calls uses.
+    json args = json::object();
+    if (body.contains("arguments") && body["arguments"].is_object())
+        args = body["arguments"];
+    else if (body.contains("args") && body["args"].is_object())
+        args = body["args"];
+
+    const fsrv::ToolResult r =
+        fsrv::execute_tool(body["name"].get<std::string>(), args, ctx);
+
+    // A failed tool is still a successful HTTP call: the model needs the error
+    // text to react to ("the search failed, answer without it"). Only an
+    // unparseable request is a 4xx.
+    json j;
+    j["id"] = gen_id("toolcall");
+    j["object"] = "tool.result";
+    j["name"] = body["name"];
+    j["ok"] = r.ok;
+    j["content"] = r.content;
+    if (!r.error.empty())
+        j["error"] = r.error;
+    res.set_content(j.dump(), "application/json");
+}
+
 void register_routes(httplib::Server& svr, ServerState& state) {
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) { handle_health(res); });
+
+    svr.Get("/v1/tools", [](const httplib::Request&, httplib::Response& res) {
+        handle_tools_list(res);
+    });
+
+    svr.Post("/v1/tools/exec", [](const httplib::Request& req, httplib::Response& res) {
+        handle_tool_exec(req, res);
+    });
 
     svr.Get("/v1/models",
             [&state](const httplib::Request&, httplib::Response& res) { handle_models(state, res); });

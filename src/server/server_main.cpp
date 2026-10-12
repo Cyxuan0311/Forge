@@ -109,6 +109,8 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
             opt.mmproj_path = value_of(i, "--mmproj");
         } else if (arg == "--max-inflight") {
             opt.max_inflight = std::stoi(value_of(i, "--max-inflight"));
+        } else if (arg == "--enable-code-exec") {
+            opt.enable_code_exec = true;
         } else if (arg == "--perf") {
             opt.perf = true;
         } else if (arg == "--perf-detail") {
@@ -209,6 +211,13 @@ fsrv::ServerOptions parse_args(int argc, char** argv) {
                 << "                          startup (served at http://HOST:PORT/chat/; static\n"
                 << "                          assets are key-exempt, /v1 still requires the\n"
                 << "                          API key). Needs a Node.js build\n"
+                << "\n"
+                << "Tools:\n"
+                << "      --enable-code-exec  Allow POST /v1/tools/exec to run the run_python\n"
+                << "                          tool, which executes model-authored Python as\n"
+                << "                          this user. Off by default: the rlimits and timeout\n"
+                << "                          bound runaway resource use but are NOT a sandbox.\n"
+                << "                          (env: FORGE_ALLOW_CODE_EXEC=1)\n"
                 << "  -h, --help              Show this help\n";
             std::exit(0);
         } else {

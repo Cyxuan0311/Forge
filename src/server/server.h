@@ -74,6 +74,12 @@ struct ServerOptions {
     // back to transient scratch); >0 = explicit budget.
     long dequant_cache_mb = -1;
     std::string api_key;   // "" = no auth; otherwise "Authorization: Bearer <key>" required
+    // --enable-code-exec: allow POST /v1/tools/exec to run the run_python tool.
+    // Off by default because that executes model-authored code as the server
+    // user; the rlimits and timeout in python_exec.cpp bound runaway resource
+    // use but are NOT a sandbox. /v1/tools reports the tool as unavailable
+    // unless this is set (or FORGE_ALLOW_CODE_EXEC=1 is in the environment).
+    bool enable_code_exec = false;
     int max_inflight = 4;  // max queued inference requests (excess -> 429)
     std::string mmproj_path;  // "" = no vision encoder; otherwise the mmproj GGUF
     // Per-request performance logging on stdout after every chat completion:
@@ -256,6 +262,12 @@ public:
         // alternating (and so tool_calls replies survive, which a client cannot
         // reproduce byte-for-byte).
         std::string last_reply;
+        // Parsed tool calls from that reply, in order. Needed alongside
+        // last_reply: for a tool-calling turn `last_reply` holds the RAW call
+        // syntax, so replaying it as assistant *content* gives the template no
+        // tool_calls to render and the tool result that follows has no call to
+        // pair with -- the model then just calls the tool again, forever.
+        std::vector<ChatTemplateToolCall> last_reply_tool_calls;
         // Tokens fed into the working set's logical history (KVMem path), kept in
         // step with kv_tokens so a session can be restored or inspected.
         int64_t last_active_ms = 0;
