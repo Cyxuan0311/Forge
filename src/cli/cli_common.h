@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -13,7 +14,19 @@
 
 #ifndef _WIN32
 #    include <unistd.h>
+#else
+#    include <io.h>
 #endif
+
+// Portable environment-variable setter: POSIX setenv() has no Windows
+// equivalent, so route Windows through _putenv_s().
+inline void cli_setenv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
 
 #include "forge/chat_template.h"
 #include "forge/cli_common_args.h"
@@ -196,7 +209,11 @@ inline std::string bold(const std::string& s) {
 // tty: piped/redirected input is never echoed, so there is nothing to color
 // and leaving a span open would leak into subsequent output.
 inline bool input_echo_color() {
+#ifdef _WIN32
+    return enabled() && _isatty(_fileno(stdin)) != 0;
+#else
     return enabled() && ::isatty(fileno(stdin)) != 0;
+#endif
 }
 inline std::string orange_open() {
     return enabled() ? "\x1b[38;5;208m" : "";

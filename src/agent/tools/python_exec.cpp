@@ -93,6 +93,9 @@ except BaseException:
 // this, and the UI can tighten it per call via ToolContext::timeout_sec.
 constexpr int kDefaultTimeoutSec = 15;
 
+#if !defined(_WIN32)
+
+/// Best-effort cleanup of a partially-written temp dir on a failed run.
 // 512 MiB address space is enough for numpy-free work and stops a fork bomb or
 // a huge allocation from taking the box down.
 constexpr rlim_t kAddressSpaceBytes = 512ull * 1024 * 1024;
@@ -100,9 +103,6 @@ constexpr rlim_t kFileSizeBytes = 64ull * 1024 * 1024;
 constexpr rlim_t kMaxProcesses = 64;
 constexpr rlim_t kMaxFileDescriptors = 256;
 
-#if !defined(_WIN32)
-
-/// Best-effort cleanup of a partially-written temp dir on a failed run.
 void remove_tree(const std::filesystem::path& p) {
     std::error_code ec;
     std::filesystem::remove_all(p, ec);

@@ -581,7 +581,7 @@ CliArgs parse_args(int argc, char** argv) {
             // Enable the per-phase PerfProfiler breakdown at generation end. Takes
             // effect only when forge was built with -DFORGE_PROFILING=ON; the
             // generator's decode-only dump (DECODE-ONLY PROFILE) reads this env.
-            setenv("FORGE_PERF_DECODE", "1", 1);
+            cli_setenv("FORGE_PERF_DECODE", "1");
         } else if (arg == "--perf-cuda-events") {
             // Same breakdown, but timed with CUDA events instead of host wall
             // clock. More faithful per-op DEVICE time (host wall mis-attributes
@@ -589,14 +589,14 @@ CliArgs parse_args(int argc, char** argv) {
             // calls, which dominates wall time on launch-bound decode shapes --
             // measured ~5x end-to-end slowdown on a 2B/42-layer target. Use only
             // when the device/host split itself is the question.
-            setenv("FORGE_PERF_DECODE", "1", 1);
-            setenv("FORGE_PERF_CUDA_EVENTS", "1", 1);
+            cli_setenv("FORGE_PERF_DECODE", "1");
+            cli_setenv("FORGE_PERF_CUDA_EVENTS", "1");
         } else if (arg == "--sync-prof") {
             // Leaf-level device timing. Arms the hard-sync timers that bracket
             // each op individually; only meaningful together with --perf, and
             // diagnostic-only (a full pipeline drain per scope).
-            setenv("FORGE_PERF_DECODE", "1", 1);
-            setenv("FORGE_SYNC_PROF", "1", 1);
+            cli_setenv("FORGE_PERF_DECODE", "1");
+            cli_setenv("FORGE_SYNC_PROF", "1");
         } else if (arg == "--spec-ngram-mod") {
             args.spec.enabled = true;
             args.spec.use_ngram_mod = true;
