@@ -106,6 +106,19 @@ struct ModelConfig {
     int head_dim_swa = 0;           // head dimension for SWA layers (0 = same as head_dim)
     int num_heads_swa = 0;     // number of attention heads for SWA layers (0 = same as num_heads)
     int num_kv_heads_swa = 0;  // number of KV heads for SWA layers (0 = same as num_kv_heads)
+    std::vector<int> num_kv_heads_per_layer;  // per-layer KV head count (Gemma4
+                                              // attention.head_count_kv array). Empty when the
+                                              // GGUF only provides a scalar.
+
+    // KV head count for `layer`. Falls back to the SWA / full scalar when the GGUF
+    // has no per-layer array, which keeps every other architecture unchanged.
+    int kv_heads_for_layer(int layer, bool is_swa) const {
+        if (layer >= 0 && layer < static_cast<int>(num_kv_heads_per_layer.size()) &&
+            num_kv_heads_per_layer[layer] > 0)
+            return num_kv_heads_per_layer[layer];
+        return (is_swa && num_kv_heads_swa > 0) ? num_kv_heads_swa : num_kv_heads;
+    }
+
     float rope_theta_swa = 10000.0f;  // RoPE freq base for SWA layers
     int rope_dim_count = 0;           // RoPE dimension count for full-attention layers
     int rope_dim_count_swa = 0;       // RoPE dimension count for SWA layers

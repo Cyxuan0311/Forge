@@ -608,10 +608,16 @@ bool Model::load_from_loader(ModelLoader& loader, const std::vector<DeviceType>&
             auto ple = load_tensor("per_layer_token_embd.weight", first_layer_dev);
             if (ple)
                 weight_store_.set("per_layer_tok_embd", ple);
-            auto plmp = load_tensor("per_layer_model_proj.weight", last_layer_dev);
+            // per_layer_model_proj / per_layer_proj_norm are consumed only by the
+            // embedding stage (Gemma4Embedding::embed), where the activation lives
+            // on the embedding device. last_layer_dev is CPU under partial offload
+            // (-ngl < n_layers), which fed a host pointer to the CUDA matmul
+            // kernels -> sticky illegal memory access at warmup. Same reasoning as
+            // per_layer_tok_embd above.
+            auto plmp = load_tensor("per_layer_model_proj.weight", emb_dev);
             if (plmp)
                 weight_store_.set("per_layer_model_proj", plmp);
-            auto plpn = load_tensor("per_layer_proj_norm.weight", last_layer_dev);
+            auto plpn = load_tensor("per_layer_proj_norm.weight", emb_dev);
             if (plpn)
                 weight_store_.set("per_layer_proj_norm", plpn);
             // RoPE frequency factors for proportional RoPE (full-attention layers)

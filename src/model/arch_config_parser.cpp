@@ -688,6 +688,20 @@ ModelConfig parse_gemma4_config(ModelLoader& loader, const std::string& arch) {
         cfg.num_kv_heads_swa = cfg.num_kv_heads;
     }
 
+    // Per-layer KV head counts. Gemma4 stores attention.head_count_kv as an array
+    // because SWA and full-attention layers can use different KV head counts --
+    // Gemma-4-12B is 8 for the five SWA layers of each group and 1 for the
+    // full-attention layer (blk.5.attn_k.weight is [3840, 512] = 1 x 512, while
+    // blk.0.attn_k.weight is [3840, 2048] = 8 x 256). parse_common_gguf_config can
+    // only read the first element, so without this every layer is sized with the
+    // SWA head count and the full-attention layers' K/V run past their tensor.
+    auto kv_heads_per_layer = loader.get_metadata_int_array(arch + ".attention.head_count_kv", {});
+    if ((int)kv_heads_per_layer.size() >= cfg.num_layers) {
+        cfg.num_kv_heads_per_layer.resize(cfg.num_layers);
+        for (int i = 0; i < cfg.num_layers; ++i)
+            cfg.num_kv_heads_per_layer[i] = static_cast<int>(kv_heads_per_layer[i]);
+    }
+
     // SWA RoPE frequency base
     cfg.rope_theta_swa =
         static_cast<float>(loader.get_metadata_float(arch + ".rope.freq_base_swa", cfg.rope_theta));
