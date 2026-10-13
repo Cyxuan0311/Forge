@@ -76,34 +76,6 @@ uint32_t fnv1a32(const std::string& s) {
     return h;
 }
 
-double percentile_sorted(const std::vector<float>& sorted, double p) {
-    if (sorted.empty())
-        return 0.0;
-    if (p <= 0.0)
-        return sorted.front();
-    if (p >= 1.0)
-        return sorted.back();
-    const double rank = p * (static_cast<double>(sorted.size()) - 1.0);
-    const size_t lo = static_cast<size_t>(rank);
-    const size_t hi = std::min(lo + 1, sorted.size() - 1);
-    const double frac = rank - static_cast<double>(lo);
-    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
-}
-
-double percentile_sorted(const std::vector<double>& sorted, double p) {
-    if (sorted.empty())
-        return 0.0;
-    if (p <= 0.0)
-        return sorted.front();
-    if (p >= 1.0)
-        return sorted.back();
-    const double rank = p * (static_cast<double>(sorted.size()) - 1.0);
-    const size_t lo = static_cast<size_t>(rank);
-    const size_t hi = std::min(lo + 1, sorted.size() - 1);
-    const double frac = rank - static_cast<double>(lo);
-    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
-}
-
 // ---- host gauges -----------------------------------------------------------
 
 int64_t read_rss_bytes() {
@@ -562,73 +534,6 @@ void MetricsRegistry::RequestScope::on_token() {
     }
     if (have)
         reg.publish_engine_gauges(g);
-}
-
-void MetricsRegistry::RequestScope::finish(const GenerationResult& result, RequestStatus status) {
-    if (!recording_ || finished_)
-        return;
-    finished_ = true;
-
-    RequestRecord rec;
-    rec.start_ms = start_ms_;
-    rec.end_ms = now_wall_ms();
-    rec.total_ms = static_cast<double>(rec.end_ms - rec.start_ms);
-    // Both deltas are measured from the monotonic arrival instant, so ttft_ms
-    // includes queue_ms -- that is what a user waiting on a token actually
-    // experiences, and it is deliberately NOT result.prefill_ms (which starts
-    // after the lock and covers only the prompt forward plus the first sample).
-    rec.queue_ms = lock_recorded_ ? std::max(0.0, lock_ms_ - start_mono_ms_) : 0.0;
-    if (first_token_recorded_) {
-        rec.has_ttft = true;
-        rec.ttft_ms = std::max(0.0, first_token_ms_ - start_mono_ms_);
-    }
-    rec.prefill_ms = result.prefill_ms;
-    rec.decode_ms = result.decode_ms;
-    rec.prompt_tokens = result.num_prompt_tokens > 0 ? result.num_prompt_tokens : prompt_tokens_;
-    rec.completion_tokens = result.num_generated_tokens;
-    rec.prefix_reused = prefix_reused_;
-    rec.tok_per_s = result.tokens_per_sec();
-    rec.status = status;
-    rec.streaming = streaming_;
-    rec.session_hash = session_hash_;
-
-    std::vector<float> itl = std::move(itl_);
-    if (!itl.empty()) {
-        std::sort(itl.begin(), itl.end());
-        rec.itl_p50_ms = percentile_sorted(itl, 0.50);
-        rec.itl_p90_ms = percentile_sorted(itl, 0.90);
-    }
-    if (result.spec_stats && result.spec_stats->n_draft_tokens > 0) {
-        rec.spec_accept = result.spec_stats->acceptance_rate();
-    }
-
-    MetricsRegistry& reg = MetricsRegistry::instance();
-    reg.n_requests_.fetch_add(1, std::memory_order_relaxed);
-    if (status == RequestStatus::Error)
-        reg.n_errors_.fetch_add(1, std::memory_order_relaxed);
-    if (status == RequestStatus::Rejected)
-        reg.n_rejected_.fetch_add(1, std::memory_order_relaxed);
-    reg.total_prompt_tokens_.fetch_add(static_cast<uint64_t>(std::max(rec.prompt_tokens, 0)),
-                                       std::memory_order_relaxed);
-    reg.total_completion_tokens_.fetch_add(
-        static_cast<uint64_t>(std::max(rec.completion_tokens, 0)), std::memory_order_relaxed);
-    reg.total_prefill_us_.fetch_add(
-        static_cast<uint64_t>(static_cast<long long>(rec.prefill_ms * 1000.0)),
-        std::memory_order_relaxed);
-    reg.total_decode_us_.fetch_add(
-        static_cast<uint64_t>(static_cast<long long>(rec.decode_ms * 1000.0)),
-        std::memory_order_relaxed);
-    reg.total_queue_us_.fetch_add(
-        static_cast<uint64_t>(static_cast<long long>(rec.queue_ms * 1000.0)),
-        std::memory_order_relaxed);
-
-    reg.clear_live();
-    reg.push_request(rec, itl);
-    if (!operators_.empty()) {
-        std::lock_guard<std::mutex> lock(reg.mutex_);
-        reg.operators_ = std::move(operators_);
-        reg.operators_available_ = true;
-    }
 }
 
 void MetricsRegistry::RequestScope::set_operators(std::vector<OperatorRecord>&& ops) {
