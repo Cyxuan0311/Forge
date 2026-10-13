@@ -1088,8 +1088,8 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
                     for (int k = 0; k < K; ++k) {
                         // Same widening the vector path uses, so the two agree.
                         const float wv = (b->dtype() == DataType::FP16)
-                                             ? cpu::WgtF16::scalar(b_row[k])
-                                             : cpu::WgtBF16::scalar(b_row[k]);
+                                             ? cpu::wgt_f16_scalar(b_row[k])
+                                             : cpu::wgt_bf16_scalar(b_row[k]);
                         acc += static_cast<double>(a_row[k]) * wv;
                     }
                     o_row[n] = static_cast<float>(acc);

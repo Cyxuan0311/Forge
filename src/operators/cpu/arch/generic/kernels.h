@@ -89,6 +89,14 @@ inline void fmadd_f32(float* acc, const float* src, int n, float weight) {
         acc[i] += weight * src[i];
 }
 
+// ---- mul_vec_f32: dst[i] *= v[i] for i in [0, n) ----
+// Provided here (and in every arch kernels.h) so gdn.cpp compiles on the
+// scalar/generic fallback where arch/x86/attn_kernels.h is not selected.
+inline void mul_vec_f32(float* dst, const float* v, int n) {
+    for (int i = 0; i < n; ++i)
+        dst[i] *= v[i];
+}
+
 // ---- simd_gemm: C[M x N] += A[M x K] * B[K x N] (row-major, N contiguous) ----
 // Accumulating GEMM used by tiled prefill attention. Scalar fallback; the x86
 // path provides an AVX2 micro-kernel version with identical semantics. No

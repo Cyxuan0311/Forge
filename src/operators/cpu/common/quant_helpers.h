@@ -84,6 +84,33 @@ static inline int nearest_int_f(float fval) {
     return (int)(val - 12582912.0f);
 }
 
+// Portable FP16 / BF16 -> FP32 widening used by the scalar (non-AVX2) matmul
+// reference path. Mirrors the arithmetic of WgtF16::scalar / WgtBF16::scalar in
+// arch/x86/gemv.h but without x86 intrinsics, so the FP16/BF16 GEMV reference
+// compiles and runs on arm64 / ppc64 / generic builds.
+static inline float wgt_f16_scalar(uint16_t bits) {
+    const uint32_t sign = (bits >> 15) & 1u;
+    const uint32_t exponent = (bits >> 10) & 0x1Fu;
+    const uint32_t mantissa = bits & 0x3FFu;
+    if (exponent == 0) {
+        if (mantissa == 0)
+            return 0.0f;
+        const float v = std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
+        return sign ? -v : v;
+    }
+    const float v = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
+                               static_cast<int>(exponent) - 15);
+    return sign ? -v : v;
+}
+
+static inline float wgt_bf16_scalar(uint16_t bits) {
+    // BF16 is the top 16 bits of an FP32; widening is an exact zero-extend.
+    const uint32_t u = static_cast<uint32_t>(bits) << 16;
+    float out;
+    std::memcpy(&out, &u, sizeof(out));
+    return out;
+}
+
 // Quantize one FP32 row to Q8_K format.
 // Mirrors llama.cpp quantize_row_q8_K_ref exactly: iscale = -127/max_signed
 // (so d carries the sign of the max-magnitude element), integer range

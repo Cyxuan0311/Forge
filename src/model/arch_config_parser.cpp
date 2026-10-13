@@ -1,4 +1,5 @@
 #include <cmath>
+#include <stdexcept>
 
 #include "forge/arch_config_parsers.h"
 #include "forge/arch_registry.h"

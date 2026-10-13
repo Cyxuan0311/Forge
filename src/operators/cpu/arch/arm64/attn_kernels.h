@@ -109,6 +109,18 @@ static inline void fmadd_f32(float* acc, const float* src, int n, float weight) 
     }
 }
 
+// ---- mul_vec_f32: dst[i] *= v[i] for i in [0, n) ----
+static inline void mul_vec_f32(float* dst, const float* v, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t a = vld1q_f32(dst + i);
+        float32x4_t b = vld1q_f32(v + i);
+        vst1q_f32(dst + i, vmulq_f32(a, b));
+    }
+    for (; i < n; ++i)
+        dst[i] *= v[i];
+}
+
 // ---- simd_gemm: C[M x N] += A[M x K] * B[K x N] (row-major, N contiguous) ----
 // Scalar fallback for tiled prefill attention (x86 provides an AVX2 version).
 // Accumulating GEMM, no internal memset / no internal OpenMP.
