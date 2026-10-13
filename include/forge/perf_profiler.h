@@ -579,7 +579,11 @@ void dump_phase_profile(const char* title, double wall_ms, int n_tokens,
 // never wrapping another SYNC_SCOPE. SYNC_SCOPE_TOTAL gives the outer total so
 // the leaf sum can be checked against it -- a large residual is itself the
 // finding (it means cost sits outside the instrumented ops).
-#ifdef USE_CUDA
+//
+// SyncProfiler / SyncScopeTimer are defined unconditionally (not just under
+// USE_CUDA) because neither has a hard CUDA dependency: SyncScopeTimer's
+// cudaDeviceSynchronize() is itself guarded by USE_CUDA. The inference engines
+// and generator.cpp use them on CPU-only builds too.
 class SyncProfiler {
 public:
     static SyncProfiler& instance() {
@@ -664,7 +668,6 @@ private:
     const char* label_;
     double t0_ = 0.0;
 };
-#endif  // USE_CUDA
 
 // ---- RAII timer ----
 // Phase 3: 增加 stream 参数，显式记录到指定 CUDA stream。
