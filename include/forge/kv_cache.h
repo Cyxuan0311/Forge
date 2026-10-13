@@ -203,8 +203,17 @@ public:
     // min(max_seq_len, swa_window) for those layers and the Full layers keep the
     // full length; the per-token cost then drops from "every layer" to "Full layers
     // only". Cells metadata follows the same per-layer count.
+    // `kv_config` selects the per-row dtype (default FP32). Quantized per-layer
+    // stores allocate block_nbytes(dtype, kv_dim) rows and are read through
+    // dequantize_layer() exactly like init_quantized's uniform stores. NOTE: a
+    // quantized store has no live FP32 mirror, so a SlidingWindow ring policy on
+    // such a layer would serve stale rows after the ring wraps (the ring
+    // overwrites physical rows below dequantize_layer's incremental cursor);
+    // engines combining quantized per-layer KV with SWA must disable the ring
+    // and enforce the window at read time.
     bool init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
-                        DeviceType device, const std::vector<int>& rows_per_layer = {});
+                        DeviceType device, const std::vector<int>& rows_per_layer = {},
+                        const KVCacheTypeConfig& kv_config = {});
 
     // Per-layer device init: call after init_quantized/init_per_layer to place
     // each layer's KV cache on its target device (CPU or CUDA).

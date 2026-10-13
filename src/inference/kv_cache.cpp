@@ -960,14 +960,16 @@ bool KVCache::init_quantized(int num_layers, int num_kv_heads, int head_dim, int
 // =========================================================================
 
 bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, int max_seq_len,
-                             DeviceType device, const std::vector<int>& rows_per_layer) {
+                             DeviceType device, const std::vector<int>& rows_per_layer,
+                             const KVCacheTypeConfig& kv_config) {
     kv_dim_per_layer_ = kv_dims;
     num_kv_heads_ = 0;
     head_dim_ = 0;
     max_seq_len_ = max_seq_len;
     device_ = device;
-    kv_dtype_ = KVCacheDType::FP32;
-    kv_config_ = {};
+    kv_config_ = kv_config;
+    kv_dtype_ = static_cast<KVCacheDType>(
+        std::max(static_cast<int>(kv_config.type_k), static_cast<int>(kv_config.type_v)));
 
     // Per-layer row counts. Default (empty) = every layer spans the full context.
     // A caller that passes a shorter count for SlidingWindow layers gets a
@@ -999,9 +1001,12 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
         }
         const int rows = layer_rows(i);
         if (dim > 0) {
-            size_t row_bytes = dim * sizeof(float);
-            layers_[i].key_store.alloc(KVCacheDType::FP32, layer_dev, rows, row_bytes);
-            layers_[i].value_store.alloc(KVCacheDType::FP32, layer_dev, rows, row_bytes);
+            // Native-dtype rows: quantized per-layer stores hold block rows and
+            // are read via dequantize_layer(), same as init_quantized.
+            size_t k_row_bytes = block_nbytes(kv_config.type_k, dim);
+            size_t v_row_bytes = block_nbytes(kv_config.type_v, dim);
+            layers_[i].key_store.alloc(kv_config.type_k, layer_dev, rows, k_row_bytes);
+            layers_[i].value_store.alloc(kv_config.type_v, layer_dev, rows, v_row_bytes);
             total_rows += rows;
         }
         layers_[i].filled = 0;
@@ -1010,6 +1015,7 @@ bool KVCache::init_per_layer(int num_layers, const std::vector<int>& kv_dims, in
 
     LOG_INFO("KVCache init_per_layer: " + std::to_string(num_layers) + " layers, max_seq_len=" +
              std::to_string(max_seq_len) + ", " + (device == DeviceType::CUDA ? "CUDA" : "CPU") +
+             ", K=" + kv_dtype_name(kv_config.type_k) + ", V=" + kv_dtype_name(kv_config.type_v) +
              (rows_per_layer_.empty() ? ""
                                       : ", allocated rows=" + std::to_string(total_rows) +
                                             " (SWA layers sized to window)"));

@@ -304,6 +304,17 @@ bool PagedKVStorage::init(int num_layers, const std::vector<int>& kv_dims, int m
     bool unchanged = reinit_same_geometry;
     for (int l = 0; l < num_layers_; ++l) {
         auto& pool = layer_pools_[l];
+        const int kv_dim = (l < (int)kv_dims_.size()) ? kv_dims_[l] : kv_dims_[0];
+        if (kv_dim <= 0) {
+            // Layers without own KV (KV-reuse layers, e.g. Gemma4's) need no
+            // pages: their writes and reads always resolve to another layer.
+            // max_pages stays 0, which free_pages_full() already skips (a pool
+            // smaller than max_pages_ never binds admission).
+            pool.max_pages = 0;
+            if (unchanged && !layer_pages_[l].empty())
+                unchanged = false;
+            continue;
+        }
         if (pool.policy == KVLayerPolicy::SlidingWindow && pool.window_size > 0) {
             int swa_pages = (pool.window_size + page_size_ - 1) / page_size_;
             // SWA needs a few extra pages for the wrap-around cursor
@@ -379,7 +390,10 @@ bool PagedKVStorage::allocate_page_pools_locked() {
         void* k_slab = nullptr;
         void* v_slab = nullptr;
         size_t k_slab_bytes = 0, v_slab_bytes = 0;
-        if (device_ == DeviceType::CUDA && lmax > 0) {
+        // row_bytes == 0 (layers without own KV, e.g. Gemma4's KV-reuse layers):
+        // skip the slab (cudaMalloc(0) is not portable) and fall through to the
+        // per-page path, which allocates zero-byte storage harmlessly.
+        if (device_ == DeviceType::CUDA && lmax > 0 && k_row_bytes > 0 && v_row_bytes > 0) {
 #ifdef USE_CUDA
             k_slab_bytes = static_cast<size_t>(lmax) * page_size_ * k_row_bytes;
             v_slab_bytes = static_cast<size_t>(lmax) * page_size_ * v_row_bytes;
