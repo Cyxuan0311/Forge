@@ -244,10 +244,10 @@ target_link_libraries(forge_tokenizer PUBLIC forge_core)
 # Pluggable tool-call dialects + <think> reasoning separation for the server.
 # Pure host logic (nlohmann/json + std); no engine or tokenizer dependency.
 add_library(
-  forge_agent STATIC src/agent/tool_dialect.cpp src/agent/reasoning_filter.cpp
-                     src/agent/agent_pipeline.cpp src/agent/tool_registry.cpp
-                     src/agent/tools/python_exec.cpp
-                     src/agent/tools/web_search.cpp)
+  forge_agent STATIC
+  src/agent/tool_dialect.cpp src/agent/reasoning_filter.cpp
+  src/agent/agent_pipeline.cpp src/agent/tool_registry.cpp
+  src/agent/tools/python_exec.cpp src/agent/tools/web_search.cpp)
 target_include_directories(
   forge_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                      ${CMAKE_CURRENT_SOURCE_DIR}/third_party)

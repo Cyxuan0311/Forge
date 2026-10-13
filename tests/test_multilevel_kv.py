@@ -12,8 +12,6 @@ The hard correctness assertion everywhere is that greedy output is identical
 to a from-scratch run, which proves the restored/refetched KV is bit-exact.
 """
 
-import os
-
 import pytest
 
 import forge

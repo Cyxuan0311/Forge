@@ -281,7 +281,6 @@ target_include_directories(
                                    ${PROJECT_SOURCE_DIR}/third_party)
 add_test(NAME tool-registry COMMAND forge-tool-registry-test)
 
-
 # Q3_K MMQ decode bisect -- a host-only mechanical debugging tool (not a
 # normal ctest assertion suite). Built on demand, not registered with CTest.
 add_executable(
