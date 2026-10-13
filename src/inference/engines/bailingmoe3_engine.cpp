@@ -203,10 +203,17 @@ TensorPtr Bailingmoe3Engine::forward_layer(const TensorPtr& hidden,
                         lctx.config.head_count_kv[lctx.layer_idx] == 0;
 
 
+#ifdef USE_CUDA
     TensorPtr attn_out = is_recurrent ? (cuda_mode_ ? apply_gdn_cuda(normed, lctx)
                                                     : apply_gdn(normed, lctx))
                                       : (cuda_mode_ ? apply_mla_cuda(normed, lctx)
                                                     : apply_mla(normed, lctx));
+#else
+    // CPU-only 构建: CUDA 分支 (apply_*_cuda / cuda::* 符号) 未编译, 直接走
+    // 与之一一对应的 CPU 实现 (数学严格对齐, 见 apply_mla / apply_gdn)。
+    TensorPtr attn_out = is_recurrent ? apply_gdn(normed, lctx)
+                                      : apply_mla(normed, lctx);
+#endif
     if (!attn_out)
         return hidden;
 
@@ -407,6 +414,7 @@ TensorPtr Bailingmoe3Engine::apply_mla(const TensorPtr& normed, const LayerExecu
     return ops::matmul_transB(out, lw.wo());
 }
 
+#ifdef USE_CUDA
 // CUDA 后端 MLA 分支: 与 apply_mla 数学严格对齐, 所有张量/状态均驻留设备。
 TensorPtr Bailingmoe3Engine::apply_mla_cuda(const TensorPtr& normed,
                                            const LayerExecutionContext& lctx) {
@@ -839,6 +847,7 @@ TensorPtr Bailingmoe3Engine::apply_gdn_cuda(const TensorPtr& normed,
         return ops::matmul_transB(out, lw.wo());
     }
 }
+#endif  // USE_CUDA
 
 // ============================================================================
 // FFN
@@ -1137,11 +1146,14 @@ TensorPtr Bailingmoe3Engine::apply_moe_ffn(const TensorPtr& x,
             TensorPtr u = ops::matmul_transB(th, uw);
             TensorPtr gated = ops::silu_multiply(g, u);
             TensorPtr er = ops::matmul_transB(gated, dw);
+#ifdef USE_CUDA
             if (cuda_mode_) {
                 // 设备端加权累加: expert_out[s,:] += w * er
                 cuda::moe_accumulate_launch(orow, static_cast<const float*>(er->data()),
                                             w, hidden_dim);
-            } else {
+            } else
+#endif
+            {
                 const float* erd = static_cast<const float*>(er->data());
                 for (int d = 0; d < hidden_dim; ++d)
                     orow[d] += w * erd[d];

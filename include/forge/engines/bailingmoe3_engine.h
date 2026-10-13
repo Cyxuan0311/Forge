@@ -57,9 +57,13 @@ private:
     TensorPtr apply_gdn(const TensorPtr& normed, const LayerExecutionContext& lctx);
 
     // CUDA 后端分支 (设备感知)。输入/输出均为 CUDA 张量, 状态缓冲由
-    // recurrent_memory_ 的设备后端持有。
+    // recurrent_memory_ 的设备后端持有。仅在 USE_CUDA 构建中可用; CPU-only
+    // 构建走 apply_mla/apply_gdn, 故此处声明一并守卫, 避免链接器为
+    // 未编译的 cuda::* 符号报 undefined reference。
+#ifdef USE_CUDA
     TensorPtr apply_mla_cuda(const TensorPtr& normed, const LayerExecutionContext& lctx);
     TensorPtr apply_gdn_cuda(const TensorPtr& normed, const LayerExecutionContext& lctx);
+#endif
 
     // FFN 分支
     TensorPtr apply_ffn(const TensorPtr& attn_residual, const LayerExecutionContext& lctx);
