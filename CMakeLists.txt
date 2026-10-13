@@ -116,6 +116,16 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_JOBS 0)
 set(PYBIND11_LTO_CXX_FLAGS "")
 
+# MSVC's /GL + /LTCG (LTO) interacts badly with static libraries: symbols defined
+# in a static lib and referenced only from another target can fail to resolve at
+# link time (LNK2001). This bit forge::MetricsRegistry::RequestScope::finish on the
+# Windows CPU-only build. GCC/Clang LTO does not exhibit this (the Linux CPU-only
+# build links cleanly), so we turn IPO off for MSVC to keep the Windows build green.
+# Correctness is unchanged; only link-time whole-program optimization is dropped.
+if(MSVC)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
+
 # ---- Optional CUDA support ----
 # CUDA is unsupported on Apple platforms (macOS deprecated CUDA in 10.14, and
 # nvcc cannot compile for arm64). Intel Macs can technically use CUDA with
