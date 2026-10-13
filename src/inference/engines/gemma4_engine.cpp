@@ -11,6 +11,7 @@
 #include "forge/inference/layers/gemma4_moe.h"
 #include "forge/inference/tensor_device_utils.h"
 #include "forge/inference_batch.h"
+#include "forge/kv_cache_dtype.h"
 #include "forge/logger.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
@@ -129,13 +130,21 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
     }
 
     // ---- KV device ----
+    // Paged mode always uses a host-backed page pool: Gemma4Attention resolves
+    // K/V through per-sequence materialized reads (row mirrors / read_key_seq),
+    // which a CUDA-backed page pool does not support (its pages are reachable
+    // only through the fused paged attention kernels Gemma4Attention does not
+    // use). The host pool serves CUDA compute through the device row mirror, so
+    // every -ngl works.
+    const bool paged = kv_memory_ && kv_memory_->is_paged();
+
     // layer_devices_ is the source of truth, not gpu_layers_: -1 means "auto =
     // all layers on GPU", and comparing that against num_layers made the KV
     // cache land on the CPU, get allocated there, and then be copied to the GPU
     // by set_layer_devices() below. Mixed placement keeps KV on the CPU, since
     // attention for CPU-resident layers would otherwise fault on device pointers.
     DeviceType kv_dev = DeviceType::CPU;
-    if (ctx_.params().offload_kqv) {
+    if (!paged && ctx_.params().offload_kqv) {
         bool all_layers_cuda = !layer_devices_.empty();
         for (const auto& t : layer_devices_) {
             if (!t.is_cuda()) {
@@ -154,7 +163,7 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
         if (i < cfg.n_layer_kv_from_start) {
             bool is_swa = (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1);
             int hd = is_swa ? cfg.head_dim_swa : cfg.head_dim;
-            int n_kv = is_swa ? cfg.num_kv_heads_swa : cfg.num_kv_heads;
+            int n_kv = cfg.kv_heads_for_layer(i, is_swa);
             kv_dims[i] = n_kv * hd;
         }
         // else: no own KV, will reuse from another layer; kv_dims[i] stays 0
@@ -165,7 +174,19 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
     // SWA layer can be allocated only window_size rows.
     // Diagnostic A/B (FORGE_NO_SWA_RING=1): keep SWA layers on the growing
     // (non-evicting) store so the ring-buffer wrap path can be isolated.
-    const bool swa_ring = cfg.n_swa > 0 && !std::getenv("FORGE_NO_SWA_RING");
+    // Quantized stores force the ring off: a quantized store has no live FP32
+    // mirror, and a ring wrap overwrites physical rows below dequantize_layer's
+    // incremental cursor, so attention would read stale rows after the context
+    // crosses the window. With the ring off, the window is enforced at read
+    // time (see Gemma4Attention).
+    const bool kv_quantized = kv_cache_type_config_.type_k != KVCacheDType::FP32 ||
+                              kv_cache_type_config_.type_v != KVCacheDType::FP32;
+    if (kv_quantized && cfg.n_swa > 0 && !std::getenv("FORGE_NO_SWA_RING")) {
+        LOG_INFO(
+            "Quantized KV cache (--kv-cache-dtype): SWA ring buffer disabled, sliding "
+            "window enforced at read time");
+    }
+    const bool swa_ring = cfg.n_swa > 0 && !kv_quantized && !std::getenv("FORGE_NO_SWA_RING");
 
     // ---- Memory-aware fit (the reason the old fixed cap existed) ----
     // Per-token cost is NOT uniform: a ring-buffered SWA layer holds at most
@@ -173,6 +194,9 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
     // full-attention layers scale with -c. Sizing those by the requested context
     // and letting VRAM decide is what lets -c reach the model's real length
     // instead of stopping at the first number that did not OOM.
+    // Skipped in paged mode: no contiguous cache is allocated there and the
+    // page pool sizes itself from the free device budget (mirrors
+    // TransformerEngine::init_kv_cache).
     size_t per_token_bytes = 0;
     for (int i = 0; i < cfg.num_layers; ++i) {
         if (kv_dims[i] <= 0)
@@ -195,7 +219,7 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
         }
     }
 
-    if (per_token_bytes > 0) {
+    if (!paged && per_token_bytes > 0) {
         // A fixed margin plus one micro-batch of prefill activations, so a long
         // prefill cannot OOM on top of the KV cache. Mirrors TransformerEngine.
         const int n_ubatch = ctx_.params().n_ubatch > 0 ? ctx_.params().n_ubatch : 256;
@@ -280,29 +304,56 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
         }
     }
 
-    LOG_INFO("KV cache init (Gemma4 per-layer): layers=" + std::to_string(cfg.num_layers) +
-             ", max_seq_len=" + std::to_string(kv_max_seq) +
-             ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU") + ", head_dim=" +
-             std::to_string(cfg.head_dim) + ", head_dim_swa=" + std::to_string(cfg.head_dim_swa) +
-             (swa_ring ? ", swa_window=" + std::to_string(effective_window) : ""));
-
-    kv_cache_.init_per_layer(cfg.num_layers, kv_dims, kv_max_seq, kv_dev, rows_per_layer);
-    if (swa_ring) {
-        std::vector<KVLayerPolicy> policies(cfg.num_layers, KVLayerPolicy::Full);
-        for (int i = 0; i < cfg.num_layers; ++i) {
-            if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1)
-                policies[i] = KVLayerPolicy::SlidingWindow;
+    if (paged) {
+        LOG_INFO("KV cache init (Gemma4 paged): layers=" + std::to_string(cfg.num_layers) +
+                 ", max_seq_len=" + std::to_string(kv_max_seq) +
+                 ", host-backed page pool, head_dim=" + std::to_string(cfg.head_dim) +
+                 ", head_dim_swa=" + std::to_string(cfg.head_dim_swa) +
+                 (kv_quantized
+                      ? std::string(", K=") + kv_cache_dtype_name(kv_cache_type_config_.type_k) +
+                            ", V=" + kv_cache_dtype_name(kv_cache_type_config_.type_v)
+                      : std::string()));
+        // Roadmap 1.2 knobs: page_size defaults to 16; max_num_seqs == 0 lets
+        // PagedKVStorage auto-size from the free device budget.
+        const int page_size = ctx_.params().page_size > 0 ? ctx_.params().page_size : 16;
+        const int max_num_seqs = ctx_.params().max_num_seqs;
+        if (!kv_memory_->init_storage(cfg.num_layers, kv_dims, kv_max_seq, kv_dev,
+                                      kv_cache_type_config_, page_size, max_num_seqs)) {
+            throw std::runtime_error("Gemma4Engine: failed to initialize paged KV storage");
         }
-        kv_cache_.set_layer_policies(policies, effective_window);
+    } else {
+        LOG_INFO("KV cache init (Gemma4 per-layer): layers=" + std::to_string(cfg.num_layers) +
+                 ", max_seq_len=" + std::to_string(kv_max_seq) +
+                 ", dev=" + (kv_dev == DeviceType::CUDA ? "CUDA" : "CPU") +
+                 ", head_dim=" + std::to_string(cfg.head_dim) +
+                 ", head_dim_swa=" + std::to_string(cfg.head_dim_swa) +
+                 (swa_ring ? ", swa_window=" + std::to_string(effective_window) : "") +
+                 (kv_quantized
+                      ? std::string(", K=") + kv_cache_dtype_name(kv_cache_type_config_.type_k) +
+                            ", V=" + kv_cache_dtype_name(kv_cache_type_config_.type_v)
+                      : std::string()));
+
+        kv_cache_.init_per_layer(cfg.num_layers, kv_dims, kv_max_seq, kv_dev, rows_per_layer,
+                                 kv_cache_type_config_);
+        if (swa_ring) {
+            std::vector<KVLayerPolicy> policies(cfg.num_layers, KVLayerPolicy::Full);
+            for (int i = 0; i < cfg.num_layers; ++i) {
+                if (i < (int)cfg.swa_layers.size() && cfg.swa_layers[i] == 1)
+                    policies[i] = KVLayerPolicy::SlidingWindow;
+            }
+            kv_cache_.set_layer_policies(policies, effective_window);
+        }
+        // Place each layer's KV cache on the corresponding device
+        if (!layer_devices_.empty()) {
+            kv_cache_.set_layer_devices(layer_devices_);
+        }
     }
-    // Place each layer's KV cache on the corresponding device
-    if (!layer_devices_.empty()) {
-        kv_cache_.set_layer_devices(layer_devices_);
-    }
+    attention_.set_kv_memory(paged ? kv_memory_.get() : nullptr);
     set_kv_cache_initialized(true);
 
     LOG_INFO("KV cache initialized successfully, actual size: " +
-             std::to_string(kv_cache_.nbytes() / (1024 * 1024)) + " MB");
+             std::to_string((paged ? kv_memory_->nbytes() : kv_cache_.nbytes()) / (1024 * 1024)) +
+             " MB");
 }
 
 TensorPtr Gemma4Engine::forward_request(const ForwardRequest& req) {

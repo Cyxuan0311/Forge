@@ -13,6 +13,8 @@
 
 #ifdef USE_CUDA
 #    include <cuda_runtime.h>
+
+#    include "forge/cuda_kernels.h"
 #endif
 
 namespace forge {

@@ -5,6 +5,7 @@
 #include "forge/cuda_kernels.h"
 #include "forge/inference/layers/per_head_norm.h"
 #include "forge/inference/tensor_device_utils.h"
+#include "forge/kv_memory.h"
 #include "forge/operators.h"
 #include "forge/perf_profiler.h"
 
@@ -71,7 +72,7 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
 
     int head_dim = is_swa_layer ? cfg.head_dim_swa : cfg.head_dim;
     int num_heads = is_swa_layer ? cfg.num_heads_swa : cfg.num_heads;
-    int num_kv_heads = is_swa_layer ? cfg.num_kv_heads_swa : cfg.num_kv_heads;
+    int num_kv_heads = cfg.kv_heads_for_layer(layer_idx, is_swa_layer);
 
     TensorPtr q = ops::matmul_transB(normed, lw.wq());
 
@@ -192,7 +193,21 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
 
         {
             PERF_SCOPE("layer/kv_cache_update");
-            if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) < 0) {
+            if (kv_mem_) {
+                // Paged mode: KVMemory::write_kv is the single write facade -- it
+                // stages K/V for the storage backend (host pools need the rows on
+                // the host; quantization happens per page write) and appends to
+                // the sequence's pages.
+                if (!kv_mem_->write_kv(layer_idx, lctx.seq_id(), start_pos, seq_len, k_rope, v)) {
+                    throw KVOverflowError("paged KV write failed at layer " +
+                                          std::to_string(layer_idx) +
+                                          ": pos=" + std::to_string(start_pos) +
+                                          " seq_len=" + std::to_string(seq_len) +
+                                          " (page pool exhausted -- reduce --ctx-size "
+                                          "or free memory)");
+                }
+            } else if (kv_cache_.update(layer_idx, lctx.seq_id(), start_pos, k_rope, v, seq_len) <
+                       0) {
                 // KVOverflowError, not a bare runtime_error: the entry points
                 // catch this type and print an actionable message, whereas an
                 // uncaught std::runtime_error here aborted the process with a
@@ -236,44 +251,101 @@ TensorPtr Gemma4Attention::attend(const TensorPtr& normed, const LayerExecutionC
     int attn_num_kv_heads = num_kv_heads;
     int attn_head_dim = head_dim;
 
-    if (has_kv) {
-        total_len = kv_cache_.filled(layer_idx);
-        k_sliced = kv_cache_.get_key_filled(layer_idx);
-        v_sliced = kv_cache_.get_value_filled(layer_idx);
-    } else {
-        // 无自有 KV 的层复用最后两个 KV 层:
-        // SWA 层复用 n_layer_kv_from_start - 2, full-attention 层复用 - 1。
-        // 与 llama.cpp 参考实现一致。
-        int reuse_layer =
+    // KV actually read: own layer when it has KV, otherwise the reused layer.
+    // SWA 层复用 n_layer_kv_from_start - 2, full-attention 层复用 - 1,
+    // 与 llama.cpp 参考实现一致。
+    int read_layer = layer_idx;
+    bool read_is_swa = is_swa_layer;
+    if (!has_kv) {
+        read_layer =
             is_swa_layer ? (cfg.n_layer_kv_from_start - 2) : (cfg.n_layer_kv_from_start - 1);
-        total_len = kv_cache_.filled(reuse_layer);
-        k_sliced = kv_cache_.get_key_filled(reuse_layer);
-        v_sliced = kv_cache_.get_value_filled(reuse_layer);
-        bool reuse_is_swa =
-            (reuse_layer < (int)cfg.swa_layers.size() && cfg.swa_layers[reuse_layer] == 1);
-        attn_num_kv_heads = reuse_is_swa ? cfg.num_kv_heads_swa : cfg.num_kv_heads;
-        attn_head_dim = reuse_is_swa ? cfg.head_dim_swa : cfg.head_dim;
+        read_is_swa = (read_layer < (int)cfg.swa_layers.size() && cfg.swa_layers[read_layer] == 1);
+        attn_num_kv_heads = cfg.kv_heads_for_layer(read_layer, read_is_swa);
+        attn_head_dim = read_is_swa ? cfg.head_dim_swa : cfg.head_dim;
+    }
+
+    if (kv_mem_) {
+        // Paged mode: resolve K/V per sequence from the storage backend. The
+        // row-mirror fast paths (device mirror for CUDA compute, host mirror for
+        // CPU compute) hand back persistent views; the fallback materializes the
+        // sequence's rows (dequantizing quantized pages on the fly).
+        KVStorage& st = kv_mem_->storage();
+        const int sid = lctx.seq_id();
+        total_len = sid >= 0 ? st.seq_filled(read_layer, sid) : st.filled(read_layer);
+        if (total_len <= 0) {
+            // Empty view: nothing written yet -- causal attention has no valid
+            // keys. Return zeros (mirrors AttentionExecutor's guard).
+            auto out = std::make_shared<Tensor>(
+                DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, dev);
+            out->zero_();
+            return out;
+        }
+        if (sid >= 0) {
+            if (dev == DeviceType::CUDA && st.device() == DeviceType::CPU)
+                st.read_window_cuda(read_layer, sid, &k_sliced, &v_sliced);
+            else if (dev == DeviceType::CPU && st.device() == DeviceType::CPU)
+                st.read_window_host(read_layer, sid, &k_sliced, &v_sliced);
+            if (!k_sliced)
+                k_sliced = st.read_key_seq(read_layer, sid);
+            if (!v_sliced)
+                v_sliced = st.read_value_seq(read_layer, sid);
+        }
+        if (!k_sliced)
+            k_sliced = st.read_key(read_layer);
+        if (!v_sliced)
+            v_sliced = st.read_value(read_layer);
+        if (!k_sliced || !v_sliced) {
+            throw std::runtime_error(
+                "paged KV storage cannot materialize K/V for attention (layer=" +
+                std::to_string(read_layer) + ", seq=" + std::to_string(lctx.seq_id()) + ")");
+        }
+    } else {
+        // Contiguous mode. Quantized stores have no live FP32 rows --
+        // dequantize_layer() refreshes the FP32 shadow incrementally and is a
+        // no-op for FP32 caches (and for ring layers, whose shadow is the native
+        // store itself).
+        kv_cache_.dequantize_layer(read_layer);
+        total_len = kv_cache_.filled(read_layer);
+        k_sliced = kv_cache_.get_key_filled(read_layer);
+        v_sliced = kv_cache_.get_value_filled(read_layer);
     }
 
     // SWA 的滑动窗口由 KV cache 的 ring buffer 处理, get_key_filled()/filled()
-    // 已只返回最后 window_size 个位置, 这里不再手工切片。
+    // 已只返回最后 window_size 个位置。当 ring 未启用时 (量化 store 无实时 FP32
+    // 镜像, ring 回绕会读到陈旧行; 分页后端没有 ring), 窗口语义在读取侧执行:
+    // attention 只看最后 n_swa 个 token。
+    const bool ring_handled = !kv_mem_ && kv_cache_.use_ring_buffer(read_layer);
+    if (read_is_swa && cfg.n_swa > 0 && !ring_handled && total_len > cfg.n_swa) {
+        const int64_t start_row = static_cast<int64_t>(total_len) - cfg.n_swa;
+        k_sliced = std::make_shared<Tensor>(k_sliced->slice(0, start_row, total_len));
+        v_sliced = std::make_shared<Tensor>(v_sliced->slice(0, start_row, total_len));
+        total_len = cfg.n_swa;
+    }
 
-    if (dev == DeviceType::CUDA && k_sliced && k_sliced->device() == DeviceType::CPU) {
-        auto k_cuda = std::make_shared<Tensor>(DataType::FP32, k_sliced->shape(), DeviceType::CUDA);
-        k_cuda->copy_from(*k_sliced);
-        k_sliced = k_cuda;
-        auto v_cuda = std::make_shared<Tensor>(DataType::FP32, v_sliced->shape(), DeviceType::CUDA);
-        v_cuda->copy_from(*v_sliced);
-        v_sliced = v_cuda;
+    // KV reuse crosses layer devices under mixed offload (-ngl < n_layers): a
+    // CPU layer reuses KV held by a CUDA layer (and vice versa). Transfer the
+    // slice to this layer's device, or the attention kernel dereferences a
+    // foreign pointer (host SEGV for CPU layers, sticky illegal access for
+    // CUDA layers).
+    if (k_sliced && k_sliced->device() != dev) {
+        auto k_dev = std::make_shared<Tensor>(DataType::FP32, k_sliced->shape(), dev);
+        k_dev->copy_from(*k_sliced);
+        k_sliced = k_dev;
+        auto v_dev = std::make_shared<Tensor>(DataType::FP32, v_sliced->shape(), dev);
+        v_dev->copy_from(*v_sliced);
+        v_sliced = v_dev;
     }
 
     if (attn_num_kv_heads < num_heads) {
-        return ops::scaled_dot_product_attention_2d_gqa(q_rope_out, k_sliced, v_sliced, seq_len,
-                                                        total_len, num_heads, attn_num_kv_heads,
-                                                        attn_head_dim, nullptr, true);
+        auto out = ops::scaled_dot_product_attention_2d_gqa(q_rope_out, k_sliced, v_sliced, seq_len,
+                                                            total_len, num_heads, attn_num_kv_heads,
+                                                            attn_head_dim, nullptr, true);
+        return out;
     }
-    return ops::scaled_dot_product_attention_2d(q_rope_out, k_sliced, v_sliced, seq_len, total_len,
-                                                num_heads, attn_head_dim, nullptr, true);
+    auto out2 =
+        ops::scaled_dot_product_attention_2d(q_rope_out, k_sliced, v_sliced, seq_len, total_len,
+                                             num_heads, attn_head_dim, nullptr, true);
+    return out2;
 }
 
 }  // namespace forge
