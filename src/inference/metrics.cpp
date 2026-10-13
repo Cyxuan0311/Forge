@@ -11,8 +11,8 @@
 #include "forge/generator.h"
 
 #ifdef _WIN32
-#    include <psapi.h>
 #    include <windows.h>
+#    include <psapi.h>
 #else
 #    include <sys/resource.h>
 #    include <unistd.h>

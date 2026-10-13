@@ -530,6 +530,7 @@ TensorPtr Bailingmoe3Engine::apply_mla_cuda(const TensorPtr& normed,
 
     return ops::matmul_transB(out, lw.wo());
 }
+#endif  // USE_CUDA
 
 // ============================================================================
 // GDN / KDA recurrent branch
@@ -623,6 +624,7 @@ TensorPtr Bailingmoe3Engine::apply_gdn(const TensorPtr& normed, const LayerExecu
 }
 
 // CUDA 后端 GDN 分支: 与 apply_gdn 数学严格对齐, 所有张量/状态均驻留设备。
+#ifdef USE_CUDA
 TensorPtr Bailingmoe3Engine::apply_gdn_cuda(const TensorPtr& normed,
                                             const LayerExecutionContext& lctx) {
     const auto& cfg = lctx.config;

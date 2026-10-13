@@ -752,6 +752,7 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
     // Asymmetric K/V prefill. One case, dispatching on the dtype pair inside:
     // six FORGE_PAGED_MIXED_PREFILL_CASE invocations would be six `case` labels
     // on the same enumerator, which does not compile.
+#ifdef USE_CUDA
     case AttentionPath::CUDA_PAGED_MIXED_PREFILL: {
         attn_out = std::make_shared<Tensor>(
             DataType::FP32, std::vector<int64_t>{seq_len, num_heads * head_dim}, DeviceType::CUDA);
@@ -788,6 +789,18 @@ TensorPtr AttentionExecutor::attend(const TensorPtr& q, const ModelConfig& cfg, 
         }
         break;
     }
+#else
+    // CPU-only 回退: 物化分页 K/V 后走 FP32 GQA SDPA (与 FORGE_PAGED_PREFILL_CASE
+    // 的非 CUDA 分支一致), 不引用任何 cuda:: 符号。
+    case AttentionPath::CUDA_PAGED_MIXED_PREFILL: {
+        TensorPtr k_paged, v_paged;
+        get_kv_on_device(k_paged, v_paged);
+        attn_out = ops::scaled_dot_product_attention_2d_gqa(
+            q, k_paged, v_paged, seq_len, total_len, num_heads, num_kv_heads, head_dim, mask,
+            causal);
+        break;
+    }
+#endif
     FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_F16_PREFILL, KVCacheDType::F16,
                              launch_paged_flash_attention_gqa_prefill_f16)
     FORGE_PAGED_PREFILL_CASE(AttentionPath::CUDA_PAGED_Q8_0_PREFILL, KVCacheDType::Q8_0,
