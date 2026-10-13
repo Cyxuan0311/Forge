@@ -48,6 +48,23 @@ globalThis.document = {
   execCommand: () => true,
 }
 
+// addFiles() reads text via FileReader. The fakes below carry their payload on
+// `__text`/`__dataUrl`, so the stub just echoes it back and fires onload (which
+// addFiles has already assigned before calling readAsText/readAsDataURL).
+globalThis.FileReader = class {
+  constructor() {
+    this.result = ''
+  }
+  readAsText(blob) {
+    this.result = blob && blob.__text !== undefined ? blob.__text : ''
+    if (this.onload) this.onload()
+  }
+  readAsDataURL(blob) {
+    this.result = blob && blob.__dataUrl !== undefined ? blob.__dataUrl : ''
+    if (this.onload) this.onload()
+  }
+}
+
 const calls = []
 let replyText = ''
 // What the server would report in `usage` for the current reply.
@@ -95,7 +112,7 @@ globalThis.fetch = async (url, init) => {
 }
 
 const mod = await import(tmp)
-const { store, newChat, send, deleteMessage, regenerate, copyText, uid } = mod
+const { store, newChat, send, deleteMessage, regenerate, copyText, uid, addFiles } = mod
 
 let failed = 0
 function check(name, cond, got) {
@@ -219,6 +236,71 @@ console.log('=== regenerate re-sends images from the message ===')
     'regenerated request still carries the image',
     lastRequest().messages[0].content[1].image_url.url,
     'data:image/png;base64,AAA',
+  )
+}
+
+console.log('=== file attachment with no typed text still ships ===')
+{
+  newChat()
+  const conv = store.conversations.find((c) => c.id === store.activeId)
+  // Simulate a small text file that addFiles() has already read into text.
+  store.pending.push({
+    id: uid(),
+    name: 'notes.txt',
+    kind: 'file',
+    size: 11,
+    text: 'hello world',
+  })
+  store.draft = '' // no typed text: the classic "attach and send" flow
+  replyText = 'got it'
+  await send()
+  const content = lastRequest().messages[0].content
+  check('content is an array (not collapsed to empty)', Array.isArray(content), JSON.stringify(content))
+  check(
+    'file text reached the request',
+    Array.isArray(content) &&
+      content.some((p) => typeof p.text === 'string' && p.text.includes('<file name="notes.txt">')),
+    JSON.stringify(content),
+  )
+  eq('user message recorded the file', conv.messages[0].files, [{ name: 'notes.txt', size: 11 }])
+}
+
+console.log('=== addFiles inlines text past the old 64 KiB cap ===')
+{
+  newChat()
+  // A .md larger than the old 64 KiB limit must still inline its text.
+  addFiles([{ name: 'notes.md', size: 200 * 1024, type: 'text/markdown', __text: 'hello notes' }])
+  check('file staged', store.pending.length === 1)
+  store.draft = 'describe this file'
+  replyText = 'ok'
+  await send()
+  const content = lastRequest().messages[0].content
+  check(
+    'oversized .md content reached the request',
+    Array.isArray(content) &&
+      content.some(
+        (p) =>
+          typeof p.text === 'string' &&
+          p.text.includes('<file name="notes.md">') &&
+          p.text.includes('hello notes'),
+      ),
+    JSON.stringify(content),
+  )
+
+  // A binary file with no readable text still degrades to a filename note.
+  newChat()
+  addFiles([{ name: 'paper.pdf', size: 4096, type: 'application/pdf', __text: 'PDFBYTES' }])
+  store.draft = 'read this'
+  replyText = 'ok'
+  await send()
+  const c2 = lastRequest().messages[0].content
+  check(
+    'binary file becomes a placeholder note',
+    Array.isArray(c2) &&
+      c2.some(
+        (p) => typeof p.text === 'string' && p.text.includes('[attached file: paper.pdf (4096 bytes)]'),
+      ),
+    JSON.stringify(c2),
   )
 }
 

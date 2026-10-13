@@ -185,6 +185,29 @@ function titleFrom(text: string): string {
 const TEXT_FILE_RE =
   /\.(md|txt|json|py|js|ts|tsx|vue|cpp|c|h|hpp|go|rs|java|sh|yml|yaml|toml|csv|log|xml|html|css)$/i
 
+/**
+ * How much of a text file is inlined into the prompt. The old limit was 64 KiB,
+ * which real notes/docs (e.g. a markdown file of exam notes) blow past -- and a
+ * file the model never receives is indistinguishable from an upload that did
+ * nothing. Oversized files are truncated to this many bytes with a marker
+ * rather than dropped.
+ */
+const MAX_INLINE_TEXT = 1 << 20 // 1 MiB
+
+/** Extensions that are binary even when the browser reports no/opaque MIME. */
+const BINARY_EXT_RE =
+  /\.(png|jpe?g|gif|webp|bmp|ico|tiff?|pdf|zip|gz|tgz|bz2|xz|7z|rar|tar|exe|dll|so|dylib|bin|o|a|class|jar|pyc|woff2?|ttf|otf|eot|mp3|mp4|wav|ogg|webm|mov|avi|mkv|docx?|xlsx?|pptx?|sqlite|db|parquet|npy|npz|pt|pth|onnx|safetensors|wasm)$/i
+
+/** Whether a file's bytes are worth reading as UTF-8 text into the prompt. */
+function isTextLike(f: File): boolean {
+  if (f.type && f.type.startsWith('text/')) return true
+  if (f.type === 'application/json' || f.type === 'application/xml') return true
+  if (TEXT_FILE_RE.test(f.name)) return true
+  // Unknown/opaque MIME and an unrecognised extension: inline it unless the
+  // name is a known binary type, so e.g. a .md served without a MIME still works.
+  return !BINARY_EXT_RE.test(f.name)
+}
+
 export function addFiles(fileList: FileList | File[]): void {
   for (const f of Array.from(fileList)) {
     const isImage = !!f.type && f.type.startsWith('image/')
@@ -201,15 +224,20 @@ export function addFiles(fileList: FileList | File[]): void {
         att.dataUrl = String(rd.result)
       }
       rd.readAsDataURL(f)
-    } else if (
-      f.size <= 65536 &&
-      ((!!f.type && f.type.startsWith('text/')) || TEXT_FILE_RE.test(f.name))
-    ) {
+    } else if (isTextLike(f)) {
+      // Read at most MAX_INLINE_TEXT bytes. A head of a big file is far more
+      // useful to the model than a bare "[attached file: ...]" placeholder, so
+      // truncate instead of skipping, and say so in the payload.
+      const truncated = f.size > MAX_INLINE_TEXT
       const rt = new FileReader()
       rt.onload = () => {
-        att.text = String(rt.result)
+        att.text =
+          String(rt.result) +
+          (truncated
+            ? '\n\n[truncated: showing first ' + MAX_INLINE_TEXT + ' of ' + f.size + ' bytes]'
+            : '')
       }
-      rt.readAsText(f)
+      rt.readAsText(truncated ? f.slice(0, MAX_INLINE_TEXT) : f)
     }
     store.pending.push(att)
   }
@@ -268,7 +296,12 @@ function buildContent(m: ChatMessage, sent: Attachment[]): string | Array<Record
       })
     }
   }
-  if (parts.length > 1 || (m.images && m.images.length)) return parts
+  // Ship as a multimodal array whenever there is more than one part, or any
+  // media (image or file). A lone file with no typed text must still go out as
+  // an array -- otherwise the branch below collapses to m.text and the file
+  // content is silently dropped (the "upload has no effect" bug).
+  const hasMedia = (m.images && m.images.length > 0) || (m.files && m.files.length > 0)
+  if (parts.length > 1 || hasMedia) return parts
   return m.text || ''
 }
 export async function send(): Promise<void> {
