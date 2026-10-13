@@ -7,6 +7,8 @@
 #include "matmul_cuda.h"
 #include "forge/perf_profiler.h"
 
+#include "forge/perf_profiler.h"
+
 #ifdef USE_CUDA
 
 #    include <algorithm>
@@ -471,6 +473,17 @@ void cuda_matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
     require_dtype_supported("cuda_matmul_transB/a", OpType::MUL_MAT_TRANSB, a->dtype());
     require_dtype_supported("cuda_matmul_transB/b", OpType::MUL_MAT_TRANSB, b->dtype());
     require_dtype_supported("cuda_matmul_transB/out", OpType::MUL_MAT_TRANSB, out->dtype());
+
+    // Cross-device operands would make the kernels read a host pointer as device
+    // memory: a sticky "illegal memory access" with no hint where it came from.
+    // Mirror the Phase 4 hard rule: fail loudly instead.
+    if (a->device() != b->device()) {
+        throw std::runtime_error(
+            "cuda_matmul_transB: cross-device operands (a on " +
+            std::to_string(static_cast<int>(a->device())) + ", b on " +
+            std::to_string(static_cast<int>(b->device())) +
+            ") -- no implicit transfer; run the matmul on the weight's device.");
+    }
 
     // A natively-BF16 weight (the GGUF loader no longer expands it) meeting the
     // FP32 activation chain: narrow the activation and run a Tensor Core GEMM

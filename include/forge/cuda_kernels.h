@@ -34,8 +34,8 @@ void launch_rms_norm(const float* x, const float* weight, float* out, int rows, 
 
 // FP32 LayerNorm (2-D x [rows, cols]); weight/bias may be null. Two-pass
 // mean/variance matching the CPU reference in operators/cpu/norm.cpp.
-void launch_layer_norm(const float* x, const float* weight, const float* bias, float* out,
-                       int rows, int cols, float eps, cudaStream_t stream = 0);
+void launch_layer_norm(const float* x, const float* weight, const float* bias, float* out, int rows,
+                       int cols, float eps, cudaStream_t stream = 0);
 
 void launch_rms_norm_unweighted(const float* x, float* out, int rows, int cols, float eps,
                                 cudaStream_t stream = 0);
@@ -55,7 +55,7 @@ void launch_rms_norm_unweighted_fp16(const __half* x, __half* out, int rows, int
 // forge/dtype_contract.h (RMS_NORM already whitelisted; require_no_bf16 no
 // longer applies to it -- retired op-by-op as native kernels land).
 void launch_rms_norm_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* out,
-                           int rows, int cols, float eps, cudaStream_t stream = 0);
+                          int rows, int cols, float eps, cudaStream_t stream = 0);
 void launch_rms_norm_unweighted_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int rows, int cols,
                                      float eps, cudaStream_t stream = 0);
 
@@ -122,8 +122,7 @@ void launch_gelu_multiply(const float* gate, const float* up, float* out, int n,
 // Phase 6-A-8.0: native FP16 elementwise ADD / MUL (FP16 storage, FP32 compute
 // per element, FP16 output) -- the residual-add and gate*up nodes of the 6-A-8
 // end-to-end FP16 loop. Gated by op_supports_lowp (ADD / MUL).
-void launch_add_fp16(const __half* a, const __half* b, __half* out, int n,
-                     cudaStream_t stream = 0);
+void launch_add_fp16(const __half* a, const __half* b, __half* out, int n, cudaStream_t stream = 0);
 void launch_multiply_fp16(const __half* a, const __half* b, __half* out, int n,
                           cudaStream_t stream = 0);
 
@@ -133,7 +132,7 @@ void launch_multiply_fp16(const __half* a, const __half* b, __half* out, int n,
 void launch_add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, int n,
                      cudaStream_t stream = 0);
 void launch_multiply_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, int n,
-                           cudaStream_t stream = 0);
+                          cudaStream_t stream = 0);
 
 void launch_embedding_fp32(const float* weight, const int32_t* indices, float* out, int num_indices,
                            int embed_dim, int vocab_size, bool transposed, cudaStream_t stream = 0);
@@ -353,9 +352,9 @@ void launch_flash_attention_gqa(const float* Q, const float* K, const float* V, 
 // Phase 2-C: Vectorized FP32 prefill (Q tile in shared mem + float4 K/V loads).
 // Numerically identical to launch_flash_attention_gqa; prefer via the selector.
 void launch_flash_attention_gqa_vectorized(const float* Q, const float* K, const float* V, float* O,
-                                            int q_len, int kv_len, int num_heads, int num_kv_heads,
-                                            int head_dim, const float* mask = nullptr,
-                                            bool causal = true, cudaStream_t stream = 0);
+                                           int q_len, int kv_len, int num_heads, int num_kv_heads,
+                                           int head_dim, const float* mask = nullptr,
+                                           bool causal = true, cudaStream_t stream = 0);
 
 void launch_flash_attention_gqa_decode(const float* Q, const float* K, const float* V, float* O,
                                        int kv_len, int num_heads, int num_kv_heads, int head_dim,
@@ -364,9 +363,8 @@ void launch_flash_attention_gqa_decode(const float* Q, const float* K, const flo
 // 6-A-7: native FP16 GQA decode (__half storage, FP32 QK^T/softmax/PV, __half
 // output). HD 16/32/64/96/128; larger dims rejected host-side, never fallback.
 void launch_flash_attention_gqa_decode_fp16(const __half* Q, const __half* K, const __half* V,
-                                            __half* O, int kv_len, int num_heads,
-                                            int num_kv_heads, int head_dim,
-                                            const __half* mask_row_or_null = nullptr,
+                                            __half* O, int kv_len, int num_heads, int num_kv_heads,
+                                            int head_dim, const __half* mask_row_or_null = nullptr,
                                             cudaStream_t stream = 0);
 
 // 6-B-6: native BF16-Q GQA decode (decode-first). Q is __nv_bfloat16, K/V stay
@@ -408,13 +406,10 @@ void launch_flash_attention_gqa_prefill_fp16(const __half* Q, const __half* K, c
 // Frozen 6-A-7.2 vectorized prefill, reachable explicitly. Test/bench A/B arm
 // vs the promoted wmma path, and the target of the production entry's
 // fallback for every scope outside (hd=64, causal, no mask).
-void launch_flash_attention_gqa_prefill_fp16_vectorized(const __half* Q, const __half* K,
-                                                        const __half* V, __half* O, int q_len,
-                                                        int kv_len, int num_heads,
-                                                        int num_kv_heads, int head_dim,
-                                                        const __half* mask_or_null = nullptr,
-                                                        bool causal = true,
-                                                        cudaStream_t stream = 0);
+void launch_flash_attention_gqa_prefill_fp16_vectorized(
+    const __half* Q, const __half* K, const __half* V, __half* O, int q_len, int kv_len,
+    int num_heads, int num_kv_heads, int head_dim, const __half* mask_or_null = nullptr,
+    bool causal = true, cudaStream_t stream = 0);
 
 // Phase 2 round 2: __half2 decode candidate (paired __half22float2 conversions
 // + hoisted V loads; same FP32 math contract and summation order as the 6-A-7
@@ -434,10 +429,9 @@ void launch_flash_attention_gqa_decode_fp16_h2(const __half* Q, const __half* K,
 // rounding vs the 6-A-7 vectorized baseline). HEAD_DIM=64 only, causal/no
 // mask only. Round-3 default shape (Br=32/Bc=32/2 warps); kept for the
 // round-3/4 measurement history.
-void launch_flash_attention_gqa_prefill_mma_fp16(const __half* Q, const __half* K,
-                                                 const __half* V, __half* O, int q_len,
-                                                 int kv_len, int num_heads, int num_kv_heads,
-                                                 int head_dim, bool causal,
+void launch_flash_attention_gqa_prefill_mma_fp16(const __half* Q, const __half* K, const __half* V,
+                                                 __half* O, int q_len, int kv_len, int num_heads,
+                                                 int num_kv_heads, int head_dim, bool causal,
                                                  cudaStream_t stream = 0);
 
 // Phase 2 round 4: explicit-tile-config scan entry for the wmma prefill
@@ -445,11 +439,10 @@ void launch_flash_attention_gqa_prefill_mma_fp16(const __half* Q, const __half* 
 // bc in {16,32,64} x warps in {2,4}, minus br=32 & warps=4 (wmma M=16: each
 // warp must own >= 16 query rows). Other combos fail loudly. The round-4
 // winner (64,16,4) is now wired into launch_flash_attention_gqa_prefill_fp16.
-void launch_flash_attention_gqa_prefill_mma_cfg(const __half* Q, const __half* K,
-                                                const __half* V, __half* O, int q_len,
-                                                int kv_len, int num_heads, int num_kv_heads,
-                                                int head_dim, bool causal, int br, int bc,
-                                                int warps, cudaStream_t stream = 0);
+void launch_flash_attention_gqa_prefill_mma_cfg(const __half* Q, const __half* K, const __half* V,
+                                                __half* O, int q_len, int kv_len, int num_heads,
+                                                int num_kv_heads, int head_dim, bool causal, int br,
+                                                int bc, int warps, cudaStream_t stream = 0);
 
 void launch_quantize_q4_0(const float* data, void* q_data, int n, cudaStream_t stream = 0);
 
@@ -557,8 +550,8 @@ void launch_cublas_gemm_fp16(const __half* A, const __half* B, __half* C, int M,
 // activation policy. Used by the native BF16 matmul route (MUL_MAT_TRANSB) so
 // a weight that already lives as Tensor::BF16 flows into cuBLAS without an
 // FP32 detour. MUL_MAT_TRANSB is retired from require_no_bf16.
-void launch_cublas_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
-                             int K, int N, bool transB, cudaStream_t stream = 0);
+void launch_cublas_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C,
+                             int M, int K, int N, bool transB, cudaStream_t stream = 0);
 
 // Phase 3/5 (Tensor Core): dequantize the whole quantized B [N, K] matrix to
 // FP16 and run the FP16 cuBLAS GEMM (FP32 accumulate) on Tensor Cores.
@@ -664,7 +657,6 @@ void launch_output_proj_q5_k(const float* x, const void* q_weight, float* out, i
 void launch_output_proj_q6_k(const float* x, const void* q_weight, float* out, int K, int N,
                              cudaStream_t stream = 0);
 
-
 // ---- Output Proj Q4_K Cooperative (small K, e.g., K=1536) ----
 // Uses cooperative warp processing instead of split-K for better lane utilization
 void launch_output_proj_q4_k_cooperative(const float* x, const void* q_weight, float* out, int K,
@@ -750,9 +742,8 @@ void launch_fused_flash_attention_gqa_decode_q8_0(const float* Q, const void* q_
 bool launch_fused_flash_attention_gqa_decode_mixed(const float* Q, const void* q_K, const void* q_V,
                                                    float* O, int kv_len, int num_heads,
                                                    int num_kv_heads, int head_dim,
-                                                   size_t k_row_size, size_t v_row_size,
-                                                   int k_fmt, int v_fmt,
-                                                   const float* mask_row = nullptr,
+                                                   size_t k_row_size, size_t v_row_size, int k_fmt,
+                                                   int v_fmt, const float* mask_row = nullptr,
                                                    cudaStream_t stream = 0);
 
 // Paged mixed-dtype decode: same dtype coverage and same head_dim limits as the
@@ -788,19 +779,18 @@ void launch_fused_flash_attention_gqa_decode_fp8_e5m2(
 
 // Contiguous FP32 KV (row stride = num_kv_heads * head_dim floats).
 void launch_fused_flash_attention_gqa_prefill_fp32(const float* Q, const float* K, const float* V,
-                                                    float* O, int q_len, int kv_len, int num_heads,
-                                                    int num_kv_heads, int head_dim,
-                                                    const float* mask = nullptr,
-                                                    bool causal = true, cudaStream_t stream = 0);
+                                                   float* O, int q_len, int kv_len, int num_heads,
+                                                   int num_kv_heads, int head_dim,
+                                                   const float* mask = nullptr, bool causal = true,
+                                                   cudaStream_t stream = 0);
 
 // Contiguous quantized KV (row_bytes =
 // KVCache::block_nbytes(dtype, num_kv_heads * head_dim)).
-#define FORGE_DECL_QUANT_PREFILL(NAME)                                                          \
+#define FORGE_DECL_QUANT_PREFILL(NAME)                                                           \
     void NAME(const float* Q, const void* q_K, const void* q_V, float* O, int q_len, int kv_len, \
-              int num_heads, int num_kv_heads, int head_dim, size_t q_row_size,                \
-              const float* mask = nullptr, bool causal = true,                                 \
-              const float* k_scales = nullptr, const float* v_scales = nullptr,                 \
-              cudaStream_t stream = 0)
+              int num_heads, int num_kv_heads, int head_dim, size_t q_row_size,                  \
+              const float* mask = nullptr, bool causal = true, const float* k_scales = nullptr,  \
+              const float* v_scales = nullptr, cudaStream_t stream = 0)
 
 FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_q4_0);
 FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_f16);
@@ -809,12 +799,11 @@ FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e4m3);
 FORGE_DECL_QUANT_PREFILL(launch_fused_flash_attention_gqa_prefill_fp8_e5m2);
 
 // Paged quantized KV: rows resolve through page_ptrs[page_ids[j / page_size]].
-#define FORGE_DECL_PAGED_PREFILL(NAME)                                                        \
-    void NAME(const float* Q, void* const* k_pages, void* const* v_pages,                    \
-              const int32_t* page_ids, float* O, int q_len, int kv_len, int num_heads,        \
-              int num_kv_heads, int head_dim, int page_size, size_t q_row_size,               \
-              const float* mask = nullptr, bool causal = true,                                \
-              const float* k_scales = nullptr, const float* v_scales = nullptr,               \
+#define FORGE_DECL_PAGED_PREFILL(NAME)                                                             \
+    void NAME(const float* Q, void* const* k_pages, void* const* v_pages, const int32_t* page_ids, \
+              float* O, int q_len, int kv_len, int num_heads, int num_kv_heads, int head_dim,      \
+              int page_size, size_t q_row_size, const float* mask = nullptr, bool causal = true,   \
+              const float* k_scales = nullptr, const float* v_scales = nullptr,                    \
               cudaStream_t stream = 0)
 
 FORGE_DECL_PAGED_PREFILL(launch_paged_flash_attention_gqa_prefill_fp32);
@@ -882,7 +871,7 @@ void launch_paged_flash_attention_gqa_decode_fp8_e4m3(
 void launch_paged_flash_attention_gqa_decode_fp8_e5m2(
     const float* Q, void* const* k_page_ptrs, void* const* v_page_ptrs, const int32_t* page_ids,
     float* O, int kv_len, int num_heads, int num_kv_heads, int head_dim, int page_size,
-    size_t q_row_size,         const float* mask_row = nullptr, cudaStream_t stream = 0);
+    size_t q_row_size, const float* mask_row = nullptr, cudaStream_t stream = 0);
 
 // ---- MoE Router ----
 void launch_moe_router(const float* logits, int* expert_indices, float* expert_weights,
@@ -891,11 +880,10 @@ void launch_moe_router(const float* logits, int* expert_indices, float* expert_w
 
 // bailingmoe3 语义路由 (sigmoid + bias + 分组 top-k + renorm), 全程设备端。
 // bias 为 nullptr 时不加偏置; norm_w 非 0 时权重除以 max(topk_sum, 6.1e-5)。
-void launch_moe_router_sigmoid(const float* logits, const float* bias,
-                               int* expert_indices, float* expert_weights,
-                               int n_expert, int n_expert_used, int n_group,
-                               int n_group_used, int norm_w, float w_scale,
-                               int seq_len, cudaStream_t stream = 0);
+void launch_moe_router_sigmoid(const float* logits, const float* bias, int* expert_indices,
+                               float* expert_weights, int n_expert, int n_expert_used, int n_group,
+                               int n_group_used, int norm_w, float w_scale, int seq_len,
+                               cudaStream_t stream = 0);
 
 void launch_moe_router_scale(const float* x, const float* scale, float* out, int hidden_dim,
                              float inv_sqrt, float eps, int seq_len, cudaStream_t stream = 0);
@@ -968,8 +956,8 @@ void launch_dequant_iq3_s_matrix(const void* q_data, float* out, int N, int K,
 // step). Layout must match launch_dequant_iq3_s_matrix: [N rows, K cols],
 // quant row-major; transposed tables pass row=dim, col=vocab (K=vocab_size).
 void launch_embedding_iq3_s(const void* q_weight, const int32_t* indices, float* out,
-                            int num_indices, int embed_dim, int vocab_size,
-                            bool transposed, cudaStream_t stream = 0);
+                            int num_indices, int embed_dim, int vocab_size, bool transposed,
+                            cudaStream_t stream = 0);
 
 void launch_dequant_iq4_nl_matrix(const void* q_data, float* out, int N, int K,
                                   cudaStream_t stream = 0);
@@ -1008,18 +996,16 @@ void launch_ssm_gated_norm(float* delta_out, const float* z, const float* norm_w
 void launch_lfm2_bcx_split(const float* bcx, float* bx, float* gate, int seq_len, int hidden,
                            cudaStream_t stream = 0);
 
-
 // ---- Paged MIXED prefill (asymmetric K/V) ----
 //
 // -ctk/-ctv can give K and V different dtypes, so the row strides AND the
 // per-head byte offsets differ per side. Each entry point names its pair; there
 // is no monomorphic entry because there is no single row size to pass.
-#define FORGE_DECLARE_PAGED_MIXED_PREFILL(name)                                                \
-    void name(const float* Q, void* const* k_pages, void* const* v_pages,                      \
-              const int32_t* page_ids, float* O, int q_len, int kv_len, int num_heads,          \
-              int num_kv_heads, int head_dim, int page_size, size_t k_row_bytes,                \
-              size_t v_row_bytes, const float* mask, bool causal, const float* k_scales,        \
-              const float* v_scales, cudaStream_t stream = 0);
+#define FORGE_DECLARE_PAGED_MIXED_PREFILL(name)                                                    \
+    void name(const float* Q, void* const* k_pages, void* const* v_pages, const int32_t* page_ids, \
+              float* O, int q_len, int kv_len, int num_heads, int num_kv_heads, int head_dim,      \
+              int page_size, size_t k_row_bytes, size_t v_row_bytes, const float* mask,            \
+              bool causal, const float* k_scales, const float* v_scales, cudaStream_t stream = 0);
 
 FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_q8_0_q4_0)
 FORGE_DECLARE_PAGED_MIXED_PREFILL(launch_paged_flash_attention_gqa_prefill_q4_0_q8_0)
